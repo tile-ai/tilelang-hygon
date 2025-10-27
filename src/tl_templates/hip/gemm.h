@@ -24,8 +24,12 @@ template <> struct MfmaTraits<int8_t> {
 template <> struct MfmaTraits<half> {
   template <typename AccType>
   static TL_DEVICE void mfma_op(const half *b, const half *a, AccType *c) {
+#if 0
     *c = __builtin_amdgcn_mfma_f32_16x16x16f16(*((float16x4 *)b),
                                                *((float16x4 *)a), *c, 0, 0, 0);
+#endif
+    *c = __builtin_hcu_mmac_f32_16x16x16_f16(*((float16x4 *)a),
+                                             *((float16x4 *)b), *c);
   }
 };
 

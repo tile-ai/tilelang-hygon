@@ -6,4 +6,5 @@
 	url = https://github.com/TileLang/tvm
 [submodule "3rdparty/composable_kernel"]
 	path = 3rdparty/composable_kernel
-	url = https://github.com/ROCm/composable_kernel
+	# url = https://github.com/ROCm/composable_kernel
+	url = http://10.65.42.70:9080/aidev/composable_kernel
