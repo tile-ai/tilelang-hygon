@@ -21,6 +21,7 @@ endif()
 set(USE_CUDA OFF)
 set(USE_ROCM OFF)
 set(USE_METAL OFF)
+set(USE_HCU OFF)
 set(PREBUILD_CYTHON ON)
 # Configs end
 
@@ -56,6 +57,12 @@ if($ENV{USE_METAL})
 elseif(APPLE)
   message(STATUS "Enable Metal support by default.")
   set(USE_METAL ON)
+elseif($ENV{USE_HCU})
+  # HCU is dependent on ROCm
+  set(ENV{USE_ROCM} ON)
+  set(USE_ROCM ON)
+  set(USE_HCU ON)
+  message(STATUS "Enable HCU support by default.")
 elseif($ENV{USE_ROCM})
   set(USE_ROCM ON)
 else()
@@ -82,6 +89,9 @@ elseif(USE_ROCM)
   include(${TVM_SOURCE}/cmake/utils/FindROCM.cmake)
   find_rocm($ENV{USE_ROCM})
   add_compile_definitions(__HIP_PLATFORM_AMD__ __HIP_PLATFORM_HCC__=1)
+  if(USE_HCU)
+    add_compile_definitions(USE_HCU=1)
+  endif()
 
   file(GLOB TILE_LANG_HIP_SRCS
     src/target/codegen_hip.cc

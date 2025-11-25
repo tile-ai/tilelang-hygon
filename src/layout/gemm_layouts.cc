@@ -99,17 +99,13 @@ Fragment makeGemmFragmentC16x16CDNA() {
   IterVar i = make_itervar("i", 16);
   IterVar j = make_itervar("j", 16);
   IterVar rep = make_itervar("rep", 1);
-  PrimExpr forward_thread = 16 * FloorDiv(j->var, 4) + i;
-  PrimExpr index = FloorMod(j->var, 4);
-  return Fragment({i, j}, {index}, forward_thread, rep);
-}
-
-Fragment makeGemmFragmentC16x16HCU() {
-  IterVar i = make_itervar("i", 16);
-  IterVar j = make_itervar("j", 16);
-  IterVar rep = make_itervar("rep", 1);
+#ifdef USE_HCU
   PrimExpr forward_thread = 16 * FloorMod(j->var, 4) + i;
   PrimExpr index = FloorDiv(j->var, 4);
+#else
+  PrimExpr forward_thread = 16 * FloorDiv(j->var, 4) + i;
+  PrimExpr index = FloorMod(j->var, 4);
+#endif
   return Fragment({i, j}, {index}, forward_thread, rep);
 }
 
@@ -174,10 +170,7 @@ Fragment makeGemmFragmentCCDNA(const int block_m, const int block_n,
   ICHECK(block_n % warp_n == 0);
   ICHECK(warp_m % 16 == 0) << "warp_m=" << warp_m;
   ICHECK(warp_n % 16 == 0) << "warp_n=" << warp_n;
-#if 0
   auto base_layout = makeGemmFragmentC16x16CDNA()->Repeat({1, 1}, false);
-#endif
-  auto base_layout = makeGemmFragmentC16x16HCU()->Repeat({1, 1}, false);
   auto warp_layout =
       base_layout->Repeat({warp_m / 16, warp_n / 16}, false, true);
   auto block_layout =

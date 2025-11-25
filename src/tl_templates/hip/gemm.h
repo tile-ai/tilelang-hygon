@@ -3,6 +3,9 @@
 #include "common.h"
 #include <type_traits>
 
+// FIXME: Always enable for now, need to find a way to enable at runtime.
+#define USE_HCU 1
+
 namespace tl {
 
 // Trait to determine the MFMA instruction to use based on data type
@@ -12,11 +15,18 @@ template <typename T> struct MfmaTraits;
 template <> struct MfmaTraits<int8_t> {
   template <typename AccType>
   static TL_DEVICE void mfma_op(const int8_t *b, const int8_t *a, AccType *c) {
+#ifdef USE_HCU
+    int32x2 *a_packed = reinterpret_cast<int32x2 *>(const_cast<int8_t *>(a));
+    int32x2 *b_packed = reinterpret_cast<int32x2 *>(const_cast<int8_t *>(b));
+
+    *c = __builtin_hcu_mmac_i32_16x16x32_i8(*a_packed, *b_packed, *c);
+#else
     int64_t *b_packed = reinterpret_cast<int64_t *>(const_cast<int8_t *>(b));
     int64_t *a_packed = reinterpret_cast<int64_t *>(const_cast<int8_t *>(a));
 
     *c = __builtin_amdgcn_mfma_i32_16x16x32_i8(*b_packed, *a_packed, *c, 0, 0,
                                                0);
+#endif
   }
 };
 
@@ -24,12 +34,13 @@ template <> struct MfmaTraits<int8_t> {
 template <> struct MfmaTraits<half> {
   template <typename AccType>
   static TL_DEVICE void mfma_op(const half *b, const half *a, AccType *c) {
-#if 0
+#ifdef USE_HCU
+    *c = __builtin_hcu_mmac_f32_16x16x16_f16(*((float16x4 *)a),
+                                             *((float16x4 *)b), *c);
+#else
     *c = __builtin_amdgcn_mfma_f32_16x16x16f16(*((float16x4 *)b),
                                                *((float16x4 *)a), *c, 0, 0, 0);
 #endif
-    *c = __builtin_hcu_mmac_f32_16x16x16_f16(*((float16x4 *)a),
-                                             *((float16x4 *)b), *c);
   }
 };
 
@@ -51,7 +62,11 @@ template <> struct MfmaTraits<bfloat16_t> {
     }
 
     // Call the intrinsic and store the result directly to c
+#ifdef USE_HCU
+    *c = __builtin_hcu_mmac_f32_16x16x16_bf16(a_vec, b_vec, *c);
+#else
     *c = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(b_vec, a_vec, *c, 0, 0, 0);
+#endif
   }
 };
 

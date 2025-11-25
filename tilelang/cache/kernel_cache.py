@@ -6,6 +6,8 @@ import os
 import shutil
 import threading
 import uuid
+import subprocess
+import tempfile
 from hashlib import sha256
 from typing import Callable, List, Literal, Optional, Union
 
@@ -20,11 +22,55 @@ from tilelang import __version__
 
 KERNEL_PATH = "kernel.cu"
 WRAPPED_KERNEL_PATH = "wrapped_kernel.cu"
+ASM_KERNEL_PATH = "kernel.s"
+TIR_KERNEL_PATH = "kernel.tir"
 KERNEL_LIB_PATH = "kernel_lib.so"
 KERNEL_CUBIN_PATH = "kernel.cubin"
 KERNEL_PY_PATH = "kernel.py"
 PARAMS_PATH = "params.pkl"
 
+def _make_amdgcn(src) -> Optional[str]:
+    from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
+
+    src_path = src if isinstance(src, str) else src.name
+    arch = get_rocm_arch(find_rocm_path())
+    asm_file = tempfile.NamedTemporaryFile(mode="w", suffix=".amdgcn", delete=False)
+    asm_file_path = asm_file.name
+    asm_file.close()
+
+    command = [
+        "hipcc",
+        "-std=c++17",
+        f"--offload-arch={arch}",
+        "-I" + env.COMPOSABLE_KERNEL_INCLUDE_DIR,
+        "-I" + env.TILELANG_TEMPLATE_PATH,
+        "-g",
+        src_path,
+        "-S",
+        "-o", asm_file_path,
+    ]
+
+    try:
+        ret = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if ret.returncode != 0:
+            raise RuntimeError(
+                "ASM compilation failed!\n"
+                f"Command: {' '.join(command)}\n"
+                f"Stdout:\n{ret.stdout}\nStderr:\n{ret.stderr}"
+            )
+        with open(asm_file_path, "r") as f:
+            return f.read()
+    except Exception as e:
+        raise RuntimeError(f"ASM generation failed: {e}") from e
+    finally:
+        if os.path.exists(asm_file_path):
+            os.remove(asm_file_path)
 
 class KernelCache:
     """
@@ -265,11 +311,17 @@ class KernelCache:
         # Save kernel source code
         try:
             kernel_path = os.path.join(cache_path, KERNEL_PATH)
+            asm_kernel_path = os.path.join(cache_path, ASM_KERNEL_PATH)
+            tir_kernel_path = os.path.join(cache_path, TIR_KERNEL_PATH)
             if verbose:
                 self.logger.debug(f"Saving kernel source code to file: {kernel_path}")
             if kernel.kernel_source is not None:
                 KernelCache._safe_write_file(kernel_path, "w",
                                              lambda file: file.write(kernel.kernel_source))
+                KernelCache._safe_write_file(asm_kernel_path, "w",
+                                             lambda file: file.write(_make_amdgcn(kernel_path)))
+                KernelCache._safe_write_file(tir_kernel_path, "w",
+                                             lambda file: file.write(kernel.prim_func.script(show_meta=True)))
         except Exception as e:
             self.logger.error(f"Error saving kernel source code to disk: {e}")
 
