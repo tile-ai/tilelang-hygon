@@ -78,6 +78,21 @@ bool TargetIsCDNA(Target target) {
   return false;
 }
 
+bool TargetIsHCU(Target target) {
+  // TODO: add more HCU targets
+  static const std::set<std::string> hcu_targets = {
+    "gfx928", "gfx936", "gfx938", "gfx92a", "gfx946"
+  };
+
+  if (!TargetIsRocm(target))
+    return false;
+  if (target->attrs.count("mcpu")) {
+    std::string mcpu = Downcast<String>(target->attrs.at("mcpu"));
+    return hcu_targets.find(mcpu) != hcu_targets.end();
+  }
+  return false;
+}
+
 bool TargetHasAsyncCopy(Target target) {
   if (TargetIsCuda(target)) {
     int arch = GetArchInt(target);

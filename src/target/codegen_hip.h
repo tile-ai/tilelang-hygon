@@ -32,6 +32,8 @@ public:
                         PrimExpr rhs,
                         std::ostream &os) final;      // NOLINT(*)
   void PrintType(DataType t, std::ostream &os) final; // NOLINT(*)
+  std::string GetVecLoad(DataType t, const BufferNode *buffer,
+                         PrimExpr base) final;
   void PrintVecElemLoad(const std::string &vec, DataType t, int i,
                         std::ostream &os) final; // NOLINT(*)
   void PrintVecElemStore(const std::string &vec, DataType t, int i,
@@ -61,12 +63,24 @@ protected:
                        std::ostream &os) final; // NOLINT(*)
 
 private:
+  // Structure to store buffer descriptor for HCU buffer load/store optimization
+  struct BufferDesc {
+    std::string wave_ptr;           // wavewise base pointer
+    std::string offset;
+    std::string element_space_size;
+    std::string data_type;
+    std::string scope;
+    int num_elements;
+  };
+
   // Handle volatile loads
   void HandleVolatileLoads(const std::string &value, const BufferLoadNode *op,
                            std::ostream &os) final;
 
   // Whether scope such as "__shared__" or "__constant__"  is part of type.
   bool IsScopePartOfType() const final { return false; }
+
+  BufferDesc GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr base);
 
   friend void PrintConst(const FloatImmNode *op, std::ostream &os,
                          CodeGenTileLangHIP *p);

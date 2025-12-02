@@ -15,8 +15,9 @@ from os import path
 # specifically designed for for MMA operations
 # which ensures the consistency with the nvidia CUTLASS Library.
 # to avoid bank conflicts and maximize the performance.
-from tilelang.intrinsics import (
-    make_mma_swizzle_layout as make_swizzle_layout,)
+# from tilelang.intrinsics import (
+#     make_mma_swizzle_layout as make_swizzled_layout,)
+# from tilelang.layout.swizzle import make_swizzled_layout
 
 def ref_program(A, B):
     """
@@ -219,34 +220,46 @@ def matmul(M, N, K, block_M, block_N, block_K,
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=thread_num) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
+            #A_local = T.alloc_fragment((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_N, block_K), dtype)
+            #B_local = T.alloc_fragment((block_N, block_K), dtype)
             #B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             #C_shared = T.alloc_shared((block_M, block_N), dtype)
             # Apply layout optimizations or define your own layout (Optional)
             # If not specified, we will deduce the layout automatically
-            # T.annotate_layout({
-            #     A_shared: make_swizzle_layout(A_shared),
-            #     B_shared: make_swizzle_layout(B_shared),
-            # })
+            #T.annotate_layout({
+            #    A_shared: make_swizzled_layout(A_shared),
+            #    B_shared: make_swizzled_layout(B_shared),
+            #})
             T.use_swizzle(panel_size=10, enable=enable_rasteration)
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=0):
                 T.copy(A[by * block_M, k * block_K], A_shared, coalesced_width=8)
+                #T.ptx_cp_async("uint8", A_shared.data, 0, A[by * block_M, k * block_K], 0, 8)
+                #for i, j in T.Parallel(block_N, block_K):
+                #    B_shared[i, j] = B[bx * block_N + i, k * block_K + j]
+                #T.copy(B[bx * block_N, k * block_K], B_shared, coalesced_width=8)
                 #for i, j in T.Parallel(block_N, block_K):
                 #    B_shared[i, j] = B[bx * block_N + i, k * block_K + j]
                 T.copy(B[bx * block_N, k * block_K], B_shared, coalesced_width=8)
-                #T.copy(B[k * block_K, bx * block_N], B_shared, coalesced_width=8)
-                # Use T.Parallel instead of T.copy to let each wave read only its portion
-                # This partitions the work across threads/waves automatically
-                #for i, j in T.Parallel(T.ceildiv(block_M, 64), T.ceildiv(block_K, 64)):
-                #    A_shared[i, j] = A[by * block_M + i * 64, k * block_K + j * 64]
-                #for i, j in T.Parallel(T.ceildiv(block_N, 64), T.ceildiv(block_K, 64)):
-                #    B_shared[i, j] = B[bx * block_N + i * 64, k * block_K + j * 64]
+                #for wave_i, wave_j in T.Parallel(T.ceildiv(block_M, 64), T.ceildiv(block_N, 64)):
+                #    for ii in range(64):
+                #        for jj in range(64):
+                #            a_row = by * block_M + wave_i * 64 + ii
+                #            a_col = k * block_K + wave_j * 64 + jj
+                #            if a_row < M and a_col < K:
+                #                A_shared[wave_i * 64 + ii, wave_j * 64 + jj] = A[a_row, a_col]
+                #    for ii in range(64):
+                #        for jj in range(64):
+                #            b_row = bx * block_N + wave_i * 64 + ii
+                #            b_col = k * block_K + wave_j * 64 + jj
+                #            if b_row < N and b_col < K:
+                #                B_shared[wave_i * 64 + ii, wave_j * 64 + jj] = B[b_row, b_col]
                 T.gemm(A_shared, B_shared, C_local, k_pack=2, transpose_B=True)
             #T.copy(C_local, C_shared)
             #T.copy(C_shared, C[by * block_M, bx * block_N])
-            T.copy(C_local, C[by * block_M, bx * block_N])
+            T.copy(C_local, C[by * block_M, bx * block_N], coalesced_width=8)
 
     return naive_gemm
 
@@ -258,8 +271,8 @@ def main(M: int = 4096,
     free_hcus = device.get_free_devices()
     if len(free_hcus) == 0:
         raise RuntimeError("No free HCU devices found.")
-    print("Using HCU device:", free_hcus[-1])
-    torch.set_default_device(f"cuda:{free_hcus[-1]}")
+    print("Using HCU device:", free_hcus[0])
+    torch.set_default_device(f"cuda:{free_hcus[0]}")
     if use_autotune:
         result = get_best_config(M, N, K, with_roller)
         print(result.config)
