@@ -34,6 +34,8 @@ public:
   void PrintType(DataType t, std::ostream &os) final; // NOLINT(*)
   std::string GetVecLoad(DataType t, const BufferNode *buffer,
                          PrimExpr base) final;
+  void PrintVecStore(const BufferNode* buffer, DataType t, PrimExpr base,
+                     const std::string& value) final;
   void PrintVecElemLoad(const std::string &vec, DataType t, int i,
                         std::ostream &os) final; // NOLINT(*)
   void PrintVecElemStore(const std::string &vec, DataType t, int i,
@@ -56,6 +58,10 @@ public:
   void AddFunction(const PrimFunc &f);
 
 protected:
+  // Override BufferStore lowering so we can emit CK buffer store ops for
+  // global memory using amd_buffer_store.
+  void VisitStmt_(const BufferStoreNode *op) final;
+
   virtual std::string GetBufferRef(DataType t, const BufferNode *buffer,
                                    PrimExpr index) final;
   void PrintCallExtern(Type ret_type, String global_symbol,
@@ -81,6 +87,11 @@ private:
   bool IsScopePartOfType() const final { return false; }
 
   BufferDesc GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr base);
+  bool CanUseBufferOps(DataType t, const BufferDesc &desc) {
+    auto value = std::getenv("HCU_USE_BUFFER_OPS");
+    return (value == nullptr || std::atoi(value) != 0) && desc.scope == "global" &&
+           (t.bits() * t.lanes() <= 512);
+  }
 
   friend void PrintConst(const FloatImmNode *op, std::ostream &os,
                          CodeGenTileLangHIP *p);

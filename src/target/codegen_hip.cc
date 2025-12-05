@@ -179,6 +179,44 @@ void CodeGenTileLangHIP::VisitStmt_(const tir::ForNode *op) {
   stream << "}\n";
 }
 
+void CodeGenTileLangHIP::VisitStmt_(const BufferStoreNode *op) {
+  // Try to use CK buffer store for global memory when enabled.
+  DataType value_dtype = op->value.dtype();
+  DataType element_dtype = op->buffer->dtype;
+
+  // Only handle the common case where lanes match; otherwise, fall back to the default
+  // CodeGenC implementation (which may invoke PrintVecStore to emit buffer/vectorized store
+  // instructions).
+  if (value_dtype.lanes() == element_dtype.lanes()) {
+    BufferDesc desc = GetBufferDesc(value_dtype, op->buffer.get(), op->indices[0]);
+
+    if (CanUseBufferOps(value_dtype, desc)) {
+      std::string value = PrintExpr(op->value);
+
+      // Convert the value expression to a thread_buffer using bit_cast.
+      // For lanes==1 this becomes thread_buffer<T,1>.
+      std::string src_thread_buffer = "ck_tile::bit_cast<ck_tile::thread_buffer<" +
+                                      desc.data_type + ", " +
+                                      std::to_string(desc.num_elements) + ">>(" +
+                                      value + ")";
+
+      PrintIndent();
+      stream << "ck_tile::amd_buffer_store<"
+             << desc.data_type << ", " << desc.num_elements << ">("
+             << src_thread_buffer << ", "
+             << desc.wave_ptr << ", "
+             << desc.offset << ", "
+             << "true, "  // dst_thread_element_valid - always true for now
+             << desc.element_space_size << ");\n";
+
+      return;
+    }
+  }
+
+  // Fallback to the base implementation.
+  CodeGenC::VisitStmt_(op);
+}
+
 void CodeGenTileLangHIP::BindThreadIndex(const IterVar &iv) {
   ICHECK(!var_idmap_.count(iv->var.get()));
   var_idmap_[iv->var.get()] =
@@ -501,18 +539,10 @@ CodeGenTileLangHIP::GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr
 std::string CodeGenTileLangHIP::GetVecLoad(DataType t, const BufferNode *buffer,
                                            PrimExpr base) {
   auto desc = GetBufferDesc(t, buffer, base);
-  bool use_buffer_load = [&]() {
-    // Use buffer ops by default because it is benifical in most cases,
-    // disable it by setting HCU_USE_BUFFER_OPS=0
-    // FIXME: add a config option on python side to control buffer ops
-    auto value = std::getenv("HCU_USE_BUFFER_OPS");
-    return (value == nullptr || std::atoi(value) != 0) && desc.scope == "global" &&
-           (t.bits() * t.lanes() <= 512);
-  }();
 
   // Generate CK buffer load for global memory accesses
   // FIXME: Should we check if the offset is not negative?
-  if (use_buffer_load) {
+  if (CanUseBufferOps(t, desc)) {
     std::ostringstream os;
     os << "*(";
     PrintType(t, os);
@@ -528,79 +558,37 @@ std::string CodeGenTileLangHIP::GetVecLoad(DataType t, const BufferNode *buffer,
   return CodeGenC::GetVecLoad(t, buffer, base);
 }
 
-#if 0
-void CodeGenTileLangHIP::PrintVecStore(const BufferNode *buffer, DataType t,
-                                       PrimExpr base, const std::string &value) {
+void CodeGenTileLangHIP::PrintVecStore(const BufferNode* buffer, DataType t,
+                                       PrimExpr base, const std::string& value) {
   auto desc = GetBufferDesc(t, buffer, base);
-  auto use_buffer_store= [&desc]() {
-    auto value = std::getenv("HCU_USE_BUFFER_OPS");
-    return value != nullptr && std::atoi(value) != 0 && (desc.scope == "global");
-  }();
 
-  // If not using buffer ops, use the global store.
-  if (!use_buffer_store) {
+  // If not using buffer store, use the base class implementation
+  if (!CanUseBufferOps(t, desc)) {
     CodeGenC::PrintVecStore(buffer, t, base, value);
     return;
   }
 
-  // Extract global load arguments from the value expression which is emitted by GetVecLoad.
-  auto load_args = [&value]() {
-    std::stringstream ss(value);
-    std::vector<std::string> args;
-    std::string v;
-    while (std::getline(ss, v, ',')) {
-      args.push_back(v);
-    }
-    return std::move(args);
-  }();
-  ICHECK_EQ(load_args.size(), 6) << "Expected 6 arguments for global load";
+  // Convert value to thread_buffer and use amd_buffer_store
+  // amd_buffer_store signature:
+  //   amd_buffer_store<type, num_elements>(src_thread_data, dst_ptr, dst_offset,
+  //                                        is_valid, element_space_size)
+  // Convert the value expression to a thread_buffer using bit_cast
+  std::string src_thread_buffer = "ck_tile::bit_cast<ck_tile::thread_buffer<" +
+                                  desc.data_type + ", " +
+                                  std::to_string(desc.num_elements) + ">>(" + value + ")";
 
-  // Generate direct load from global to LDS using hcu_async_buffer_load_asm
-  auto ptr_cast = [](const std::string &type, const std::string &ptr) {
-    return "(" + type + "*)" + ptr;
-  };
-
-  // Extract parameters from load_args
-  // load_args format: data_type, num_elements, global_ptr, global_offset, is_valid, element_space_size
-  const std::string& element_type = load_args[0];
-  int num_elements = desc.num_elements;  // Use from desc instead of parsing
-  std::string global_ptr = ptr_cast(element_type, load_args[2]);
-  const std::string& global_offset = load_args[3];  // voffset
-  const std::string& is_valid = load_args[4];
-
-  // Calculate total buffer size in bytes for buffer resource
-  // element_space_size is in elements, need to multiply by element size
-  int element_bytes = buffer->dtype.element_of().bytes();
-  std::string total_size_bytes = load_args[5] + " * " + std::to_string(element_bytes);
-
-  // Create buffer resource descriptor
-  std::string buffer_res_var = name_supply_->FreshName("buffer_res");
-  PrintIndent();
-  stream << "int32x4_t " << buffer_res_var
-               << " = ck_tile::make_wave_buffer_resource("
-               << global_ptr << ", " << total_size_bytes << ");\n";
-
-  // Generate the async buffer load call
-  // Parameters: smem (LDS pointer), buffer_res, voffset (global offset),
-  //            ioffset (LDS offset, must be <= 0xFFF), is_valid_element
-  // Note: ioffset is limited to 12 bits (0xFFF = 4095)
-  // If LDS offset is larger, it should be incorporated into the LDS pointer
-  std::string lds_ptr = ptr_cast(element_type, desc.wave_ptr);
-  std::string lds_offset = desc.offset;
-
-  // Call hcu_async_buffer_load_asm
-  // Template: <T, N, oob_conditional_check>
-  // oob_conditional_check = true to enable bounds checking
-  PrintIndent();
-  stream << "ck_tile::hcu_async_buffer_load_asm<"
-         << element_type << ", " << num_elements << ", true>("
-         << lds_ptr << ", " << buffer_res_var << ", "
-         << global_offset << ", " << lds_offset << ", "
-         << is_valid << ");\n";
+  // Generate the buffer store call
+  this->PrintIndent();
+  this->stream << "ck_tile::amd_buffer_store<"
+               << desc.data_type << ", " << desc.num_elements << ">("
+               << src_thread_buffer << ", "
+               << desc.wave_ptr << ", "
+               << desc.offset << ", "
+               << "true, "  // dst_thread_element_valid - always true for now
+               << desc.element_space_size << ");\n";
 
   return;
 }
-#endif
 
 void CodeGenTileLangHIP::PrintVecElemLoad(const std::string &vec, DataType t,
                                           int i,

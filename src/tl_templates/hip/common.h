@@ -92,6 +92,21 @@ using float32x16 = __attribute__((__vector_size__(16 * sizeof(float)))) float;
 
 using int8x4 = __attribute__((__vector_size__(4 * sizeof(int8_t)))) int8_t;
 
+// __shfl overload for _Float16/half_t
+// There is no half_t version of __shfl in HIP, look at hip/amd_detail/amd_warp_functions.h
+// for the HIP implementation.
+// Bit-preserving shuffle: use union to preserve exact bit pattern
+__device__
+inline
+half_t __shfl(half_t var, int src_lane, int width = __AMDGCN_WAVEFRONT_SIZE) {
+    static_assert(sizeof(half_t) == sizeof(unsigned short), "");
+    union { unsigned short us; half_t f; } tmp; tmp.f = var;
+    // Cast to int for __shfl, then cast back to preserve exact bits
+    int shuffled = __shfl(static_cast<int>(tmp.us), src_lane, width);
+    tmp.us = static_cast<unsigned short>(shuffled);
+    return tmp.f;
+}
+
 // Pack two half_t values.
 TL_DEVICE unsigned __pack_half2(const half_t x, const half_t y) {
   unsigned v0 = *((unsigned short *)&x);

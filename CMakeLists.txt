@@ -21,7 +21,7 @@ endif()
 set(USE_CUDA OFF)
 set(USE_ROCM OFF)
 set(USE_METAL OFF)
-set(USE_HCU OFF)
+set(USE_HCU ON)
 set(PREBUILD_CYTHON ON)
 # Configs end
 

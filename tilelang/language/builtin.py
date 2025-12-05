@@ -465,6 +465,29 @@ def barrier_arrive(barrier_id: Union[int, PrimExpr, tir.Call]):
     """
     return mbarrier_arrive(barrier_id)
 
+def activemask():
+    """Return the active mask of the current warp.
+    """
+    if _IS_HIP_AVAILABLE:
+        return tir.call_extern("uint64", "__builtin_amdgcn_read_exec")
+    else:
+        return tir.call_extern("uint32", "__activemask")
+
+def shfl(value: Union[int, PrimExpr, tir.Call], lane: Union[int, PrimExpr, tir.Call]):
+    """Perform a shuffle operation.
+
+    Args:
+        value: Optional[int, PrimExpr]
+            The value to shuffle
+        lane: Optional[int, PrimExpr]
+            The lane to shuffle to
+    Returns:
+        tir.Call: A handle to the shuffle operation
+    """
+    if _IS_HIP_AVAILABLE:
+        return tir.call_extern(value.dtype, "__shfl", value, lane)
+    else:
+        return tir.call_extern(value.dtype, "__shfl_sync", 0xffffffff, value, lane)
 
 def shfl_xor(value: Union[int, PrimExpr, tir.Call], offset: Union[int, PrimExpr, tir.Call]):
     """Perform a shuffle operation with XOR offset.

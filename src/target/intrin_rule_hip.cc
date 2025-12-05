@@ -247,7 +247,7 @@ TVM_REGISTER_OP("tir.hip.__shfl_sync")
     .add_argument("lane", "Expr", "The source thread id.")
     .add_argument("width", "Expr",
                   "The warp thread width, must be a power of 2.")
-    .set_attr<TGlobalSymbol>("TGlobalSymbol", "__shfl_sync")
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "__shfl")
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque))
     .set_attr<bool>("hip.need_warp_shuffle", true);
@@ -259,7 +259,7 @@ TVM_REGISTER_OP("tir.hip.__shfl_up_sync")
     .add_argument("delta", "Expr", "The source lane id offset to be added.")
     .add_argument("width", "Expr",
                   "The warp thread width, must be a power of 2.")
-    .set_attr<TGlobalSymbol>("TGlobalSymbol", "__shfl_up_sync")
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "__shfl_up")
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque))
     .set_attr<bool>("hip.need_warp_shuffle", true);
@@ -272,14 +272,14 @@ TVM_REGISTER_OP("tir.hip.__shfl_down_sync")
                   "The source lane id offset to be subtracted.")
     .add_argument("width", "Expr",
                   "The warp thread width, must be a power of 2.")
-    .set_attr<TGlobalSymbol>("TGlobalSymbol", "__shfl_down_sync")
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "__shfl_down")
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque))
     .set_attr<bool>("hip.need_warp_shuffle", true);
 
 TVM_REGISTER_OP("tir.hip.__activemask")
     .set_num_inputs(0)
-    .set_attr<TGlobalSymbol>("TGlobalSymbol", "__activemask")
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "__builtin_amdgcn_read_exec")
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kPure))
     .set_attr<bool>("hip.need_warp_shuffle", true);
