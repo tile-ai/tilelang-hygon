@@ -129,8 +129,10 @@ class Fragment(Layout):
 
         Parameters
         ----------
-        repeats : int
-            Number of times to repeat.
+        repeats : list[int] or Array[PrimExpr]
+            Number of times to repeat along each dimension. Should match the number
+            of dimensions in the fragment shape. For example, [2, 1] repeats the
+            first dimension 2 times and the second dimension 1 time.
         repeat_on_thread : bool, optional
             If set, the repeat will happen on the thread dimension.
         lower_dim_first : bool, optional
@@ -140,6 +142,12 @@ class Fragment(Layout):
         -------
         Fragment
             A new Fragment with the repeated iteration space.
+
+        Examples
+        --------
+        >>> base = Fragment([8, 8], ...)
+        >>> # Repeat first dim 2x, second dim 1x, on thread dimension
+        >>> larger = base.repeat([2, 1], repeat_on_thread=True)
         """
         return _ffi_api.Fragment_repeat(self, repeats, repeat_on_thread, lower_dim_first)
 

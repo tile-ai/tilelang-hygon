@@ -174,6 +174,26 @@ public:
     return n_row * continuous + n_col;
   }
 
+#if 0
+  //FIXME: This shuffle function is not correct but just for testing,
+  //       we leave it here for reference.
+  static TL_DEVICE void vectorize_c_local(int lane, C_type *C_local) {
+    // For each float in the float32x4 vector, compute which thread has the
+    // value we need in consecutive layout and shuffle it
+    for (int i = 0; i < warp_rows; ++i) {
+      for (int j = 0; j < warp_cols; ++j) {
+        float permuted_vec[4];
+        auto acc_ptr = ((float32x4 *)C_local) + ((i * warp_cols) + j);
+        permuted_vec[0] = ck_tile::warp_shuffle(((C_type*)acc_ptr)[0], (lane + 16) % warp_size);
+        //permuted_vec[1] = ck_tile::warp_shuffle(acc_ptr[0], (lane + 32) % warp_size);
+        //permuted_vec[2] = ck_tile::warp_shuffle(acc_ptr[0], (lane + 48) % warp_size);
+        //permuted_vec[3] = ck_tile::warp_shuffle(acc_ptr[0], (lane + 64) % warp_size);
+        ((C_type*)acc_ptr)[0] = permuted_vec[0];
+       }
+    }
+  }
+#endif
+
   static TL_DEVICE void body(A_type *A_shared, B_type *B_shared,
                              C_type *C_local) {
     auto tid = threadIdx.x;

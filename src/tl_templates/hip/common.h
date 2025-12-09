@@ -93,13 +93,10 @@ using float32x16 = __attribute__((__vector_size__(16 * sizeof(float)))) float;
 using int8x4 = __attribute__((__vector_size__(4 * sizeof(int8_t)))) int8_t;
 
 // __shfl overload for _Float16/half_t
-// There is no half_t version of __shfl in HIP, look at hip/amd_detail/amd_warp_functions.h
-// for the HIP implementation.
-// Bit-preserving shuffle: use union to preserve exact bit pattern
-__device__
-inline
-half_t __shfl(half_t var, int src_lane, int width = __AMDGCN_WAVEFRONT_SIZE) {
+// There is no half_t version of __shfl in HIP, so we implement it ourselves here.
+TL_DEVICE half_t __shfl(half_t var, int src_lane, int width = __AMDGCN_WAVEFRONT_SIZE) {
     static_assert(sizeof(half_t) == sizeof(unsigned short), "");
+    // Bit-preserving shuffle: use union to preserve exact bit pattern.
     union { unsigned short us; half_t f; } tmp; tmp.f = var;
     // Cast to int for __shfl, then cast back to preserve exact bits
     int shuffled = __shfl(static_cast<int>(tmp.us), src_lane, width);
@@ -128,7 +125,7 @@ TL_DEVICE void AtomicAdd(T1 *address, T2 val) {
 
 // Overload for when the first argument is a value instead of a pointer
 template <typename T1, typename T2>
-TL_DEVICE void AtomicAdd(T1 address, T2 val) {
+TL_DEVICE void AtomicAdd(T1& address, T2 val) {
   atomicAdd(reinterpret_cast<T1 *>(&address), static_cast<T1>(val));
 }
 
