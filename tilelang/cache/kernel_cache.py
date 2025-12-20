@@ -19,24 +19,38 @@ from tilelang.engine.param import KernelParam
 from tilelang import env
 from tilelang.jit import JITKernel
 from tilelang import __version__
+from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
+from tilelang.contrib.hcu import get_hcu_compile_flags
 
 KERNEL_PATH = "kernel.cu"
 WRAPPED_KERNEL_PATH = "wrapped_kernel.cu"
 ASM_KERNEL_PATH = "kernel.s"
+LLIR_KERNEL_PATH = "kernel.llir"
 TIR_KERNEL_PATH = "kernel.tir"
 KERNEL_LIB_PATH = "kernel_lib.so"
 KERNEL_CUBIN_PATH = "kernel.cubin"
 KERNEL_PY_PATH = "kernel.py"
 PARAMS_PATH = "params.pkl"
 
-def _make_amdgcn(src) -> Optional[str]:
-    from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
+def _make_obj(src, fmt: Literal["s", "llir"]) -> Optional[str]:
+    """
+    Makes an object file from a source file.
+
+    Args:
+        src: The source file path or file object.
+        fmt: The format of the object file.
+            - "s": Assembly file.
+            - "llir": LLVM IR file.
+
+    Returns:
+        The object file path.
+    """
 
     src_path = src if isinstance(src, str) else src.name
     arch = get_rocm_arch(find_rocm_path())
-    asm_file = tempfile.NamedTemporaryFile(mode="w", suffix=".amdgcn", delete=False)
-    asm_file_path = asm_file.name
-    asm_file.close()
+    obj_file = tempfile.NamedTemporaryFile(mode="w", suffix=f".{fmt}", delete=False)
+    obj_file_path = obj_file.name
+    obj_file.close()
 
     command = [
         "hipcc",
@@ -47,8 +61,10 @@ def _make_amdgcn(src) -> Optional[str]:
         "-g",
         src_path,
         "-S",
-        "-o", asm_file_path,
+        "-emit-llvm" if fmt == "llir" else "",
+        "-o", obj_file_path,
     ]
+    command += get_hcu_compile_flags(arch)
 
     try:
         ret = subprocess.run(
@@ -60,17 +76,17 @@ def _make_amdgcn(src) -> Optional[str]:
         )
         if ret.returncode != 0:
             raise RuntimeError(
-                "ASM compilation failed!\n"
+                f"{fmt} compilation failed!\n"
                 f"Command: {' '.join(command)}\n"
                 f"Stdout:\n{ret.stdout}\nStderr:\n{ret.stderr}"
             )
-        with open(asm_file_path, "r") as f:
+        with open(obj_file_path, "r") as f:
             return f.read()
     except Exception as e:
-        raise RuntimeError(f"ASM generation failed: {e}") from e
+        raise RuntimeError(f"{fmt} generation failed: {e}") from e
     finally:
-        if os.path.exists(asm_file_path):
-            os.remove(asm_file_path)
+        if os.path.exists(obj_file_path):
+            os.remove(obj_file_path)
 
 class KernelCache:
     """
@@ -312,6 +328,7 @@ class KernelCache:
         try:
             kernel_path = os.path.join(cache_path, KERNEL_PATH)
             asm_kernel_path = os.path.join(cache_path, ASM_KERNEL_PATH)
+            llir_kernel_path = os.path.join(cache_path, LLIR_KERNEL_PATH)
             tir_kernel_path = os.path.join(cache_path, TIR_KERNEL_PATH)
             if verbose:
                 self.logger.debug(f"Saving kernel source code to file: {kernel_path}")
@@ -319,7 +336,9 @@ class KernelCache:
                 KernelCache._safe_write_file(kernel_path, "w",
                                              lambda file: file.write(kernel.kernel_source))
                 KernelCache._safe_write_file(asm_kernel_path, "w",
-                                             lambda file: file.write(_make_amdgcn(kernel_path)))
+                                             lambda file: file.write(_make_obj(kernel_path, "asm")))
+                KernelCache._safe_write_file(llir_kernel_path, "w",
+                                             lambda file: file.write(_make_obj(kernel_path, "llir")))
                 KernelCache._safe_write_file(tir_kernel_path, "w",
                                              lambda file: file.write(kernel.prim_func.script(show_meta=True)))
         except Exception as e:

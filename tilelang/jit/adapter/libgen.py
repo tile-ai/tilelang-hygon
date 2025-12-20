@@ -13,6 +13,7 @@ from tilelang import tvm as tvm
 from tilelang.transform import PassConfigKey
 from tilelang.contrib.nvcc import get_nvcc_compiler, get_target_arch, get_target_compute_version
 from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
+from tilelang.contrib.hcu import get_hcu_compile_flags
 from tilelang.env import TILELANG_TEMPLATE_PATH
 from tilelang.utils.deprecated import deprecated_warning
 
@@ -123,6 +124,7 @@ class LibraryGenerator(object):
                 "--shared",
                 src.name,
             ]
+            command += get_hcu_compile_flags(arch)
             command += [
                 "-I" + COMPOSABLE_KERNEL_INCLUDE_DIR,
             ]
