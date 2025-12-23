@@ -144,7 +144,7 @@ std::string CodeGenTileLangHIP::Finish() {
   }
 
   if (enable_fp8_) {
-    decl_stream << "#include <tl_templates/hip/hip_fp8.h>\n";
+    decl_stream << "#include <tl_templates/hip/hcu_fp8.h>\n";
   }
 
   decl_stream << "#include <tl_templates/hip/gemm.h>\n";
@@ -729,6 +729,12 @@ std::string CodeGenTileLangHIP::CastFromTo(std::string value, DataType from,
       os << "u";
     }
     os << "int)";
+  } else if (from.is_bfloat16() || target.is_bfloat16()) {
+    os << "(bf16_cvt_t)";
+  } else if (from.is_float8_e4m3fn() || target.is_float8_e4m3fn()) {
+    os << "(fp8_cvt_t)";
+  } else if (from.is_float8_e5m2() || target.is_float8_e5m2()) {
+    os << "(bf8_cvt_t)";
   }
   os << value << ")";
   return os.str();
@@ -743,6 +749,14 @@ void CodeGenTileLangHIP::VisitExpr_(const CastNode *op, std::ostream &os) {
   if (from_ty.is_scalar())
     return CodeGenC::VisitExpr_(op, os);
 
+  auto type_cvt = "";
+  if (from_ty.is_bfloat16() || target_ty.is_bfloat16()) {
+    type_cvt = "(bf16_cvt_t)";
+  } else if (from_ty.is_float8_e4m3fn() || target_ty.is_float8_e4m3fn()) {
+    type_cvt = "(fp8_cvt_t)";
+  } else if (from_ty.is_float8_e5m2() || target_ty.is_float8_e5m2()) {
+    type_cvt = "(bf8_cvt_t)";
+  }
   // We could emit make_float4 like calls, but the emitted code looks
   // too compact to read. Emit this as vectorized unary ops.
   std::string sret = name_supply_->FreshName("_");
@@ -755,7 +769,7 @@ void CodeGenTileLangHIP::VisitExpr_(const CastNode *op, std::ostream &os) {
       std::ostringstream val;
       val << "(";
       PrintType(target_ty.element_of(), val);
-      val << ")(";
+      val << ")" << type_cvt << "(";
       PrintVecElemLoad(src, from_ty, i, val);
       val << ")";
       PrintVecElemStore(sret, target_ty, i, val.str());
@@ -1048,23 +1062,26 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
         {"int8", "char"},
         {"int32", "int"},
         {"int8x4", "int32_t"},
-        {"int8x8", "int64_t"},
+        {"int8x8", "int32x2"},
         {"int32x4", "int32x4"},
         {"float16", "half"},
         {"float32", "float"},
         {"float64", "double"},
         {"float16x4", "float16x4"},
         {"bfloat16x4", "bfloat16x4"},
+        {"float32x2", "float32x2"},
         {"float32x4", "float32x4"},
         {"float8_e4m3fnuzx4", "fp8_e4_4_t"},
         {"float8_e4m3fnuzx8", "long"},
+        {"float8_e4m3fnx8", "int32x2"},
+        {"float8_e5m2x8", "int32x2"},
         {"float32x16", "float32x16"}};
     std::string call_mfma_code = R"({
       *((({C_dtype}*){c_ref}) + {c_bias}) = {mfma_buildin}(*((({A_dtype}*){a_ref}) + {a_bias}),
                     *((({B_dtype}*){b_ref}) + {b_bias}),
-                    *((({C_dtype}*){c_ref}) + {c_bias}), 0, 0, 0);
+                    *((({C_dtype}*){c_ref}) + {c_bias}));
     })";
-    std::string mfma_buildin = "__builtin_amdgcn_mfma_" + prefix;
+    std::string mfma_buildin = "__builtin_hcu_mmac_" + prefix;
     Replacer replacer;
 
     replacer.register_rule("{mfma_buildin}", mfma_buildin);

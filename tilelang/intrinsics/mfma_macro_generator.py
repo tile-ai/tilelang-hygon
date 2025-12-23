@@ -28,6 +28,7 @@ class MatrixCoreIntrinEmitter(object):
         "float8_e4m3": "e4m3",
         "float8_e5m2": "e5m2",
         "float8_e4m3fnuz": "e4m3fnuz",
+        "float8_e4m3fn": "e4m3fn",
     }
 
     # k_pack represents the number of elements in a vectorized instruction
@@ -83,7 +84,7 @@ class MatrixCoreIntrinEmitter(object):
 
     def _initialize_k_dim(self, a_dtype="float16"):
         if isinstance(a_dtype, str):
-            if a_dtype in ["float8_e4m3fnuz", "int8"]:
+            if a_dtype in ["float8_e4m3fnuz", "float8_e4m3fn", "float8_e5m2", "int8"]:
                 self.k_dim = 32
                 return
             a_dtype = DataType(a_dtype)
@@ -121,12 +122,18 @@ class MatrixCoreIntrinEmitter(object):
             "int8": "i8",
             "int32": "i32",
             "float8_e4m3fnuz": "fp8",
+            "float8_e4m3fn": "fp8",
+            "float8_e5m2": "bf8",
         }[in_dtype]
 
         if in_dtype_abbrv == "fp8":
             self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_fp8_fp8"
+        elif in_dtype_abbrv == "bf8":
+            self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_bf8_bf8"
         elif in_dtype_abbrv == "i8":
             self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_i8"
+        elif in_dtype_abbrv == "f16":
+            self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_f16"
         else:
             self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}{in_dtype_abbrv}"
 
@@ -340,10 +347,10 @@ class MatrixCoreIntrinEmitter(object):
                     compute_a_dtype,
                     compute_b_dtype,
                     compute_out_dtype,
-                    B_local_buf.data,
-                    ((j * k_pack + kp) * local_size_b) // local_size_b,
                     A_local_buf.data,
                     ((i * k_pack + kp) * local_size_a) // local_size_a,
+                    B_local_buf.data,
+                    ((j * k_pack + kp) * local_size_b) // local_size_b,
                     C_local_buf.data,
                     (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
                     dtype=compute_out_dtype,
@@ -365,7 +372,6 @@ class MatrixCoreIntrinEmitter(object):
         M_DIM, N_DIM = self.M_DIM, self.N_DIM
         C_buf_dims = len(C_buf.shape)
         assert C_buf_dims in {2, 4}, "C_buf should be 2D or 4D"
-
         # STS
         # MMA Store must be in simulated instead of TVM Intrins
         # As TVM Intrins is like a hack that the threadIdx.x should be always

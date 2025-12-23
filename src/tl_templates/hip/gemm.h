@@ -70,15 +70,45 @@ template <> struct MfmaTraits<bfloat16_t> {
   }
 };
 
+// Specialization for float
+template <> struct MfmaTraits<float> {
+  template <typename AccType>
+  static TL_DEVICE void mfma_op(const float *b, const float *a, AccType *c) {
+#ifdef USE_HCU
+    *c = __builtin_hcu_mmac_16x16x8_f32(*((float32x2 *)a),
+                                        *((float32x2 *)b), *c);
+#endif
+  }
+};
+
 #if defined(HIP_FP8_ENABLED)
 // Specialization for fp8_e4_t
 template <> struct MfmaTraits<fp8_e4_t> {
   template <typename AccType>
   static TL_DEVICE void mfma_op(const fp8_e4_t *b, const fp8_e4_t *a,
                                 AccType *c) {
+#ifdef USE_HCU
+    int32x2 a_val = *reinterpret_cast<const int32x2 *>(a);
+    int32x2 b_val = *reinterpret_cast<const int32x2 *>(b);
+    *c = __builtin_hcu_mmac_f32_16x16x32_fp8_fp8(a_val, b_val, *c);
+#else
     int64_t a_val = *reinterpret_cast<const int64_t *>(a);
     int64_t b_val = *reinterpret_cast<const int64_t *>(b);
     *c = __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(b_val, a_val, *c, 0, 0, 0);
+#endif
+  }
+};
+
+// Specialization for fp8_e5_t
+template <> struct MfmaTraits<fp8_e5_t> {
+  template <typename AccType>
+  static TL_DEVICE void mfma_op(const fp8_e5_t *b, const fp8_e5_t *a,
+                                AccType *c) {
+#ifdef USE_HCU
+    int32x2 a_val = *reinterpret_cast<const int32x2 *>(a);
+    int32x2 b_val = *reinterpret_cast<const int32x2 *>(b);
+    *c = __builtin_hcu_mmac_f32_16x16x32_bf8_bf8(a_val, b_val, *c);
+#endif
   }
 };
 #endif
