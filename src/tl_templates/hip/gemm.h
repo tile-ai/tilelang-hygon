@@ -18,8 +18,12 @@ template <> struct MfmaTraits<int8_t> {
 #ifdef USE_HCU
     int32x2 *a_packed = reinterpret_cast<int32x2 *>(const_cast<int8_t *>(a));
     int32x2 *b_packed = reinterpret_cast<int32x2 *>(const_cast<int8_t *>(b));
-
+#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
+    // default: lit en, clamp disable, lts disable
+    *c = __builtin_hcu_mmac_i32_16x16x32_i8_lit_clamp_lts(*a_packed, *b_packed, *c, 1, 0, 0);
+#else
     *c = __builtin_hcu_mmac_i32_16x16x32_i8(*a_packed, *b_packed, *c);
+#endif
 #else
     int64_t *b_packed = reinterpret_cast<int64_t *>(const_cast<int8_t *>(b));
     int64_t *a_packed = reinterpret_cast<int64_t *>(const_cast<int8_t *>(a));
@@ -35,8 +39,13 @@ template <> struct MfmaTraits<half> {
   template <typename AccType>
   static TL_DEVICE void mfma_op(const half *b, const half *a, AccType *c) {
 #ifdef USE_HCU
+#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
+    *c = __builtin_hcu_mmac_f32_16x16x16_f16_lit_lts(*((float16x4 *)a),
+                                             *((float16x4 *)b), *c, 1, 0);
+#else
     *c = __builtin_hcu_mmac_f32_16x16x16_f16(*((float16x4 *)a),
                                              *((float16x4 *)b), *c);
+#endif
 #else
     *c = __builtin_amdgcn_mfma_f32_16x16x16f16(*((float16x4 *)b),
                                                *((float16x4 *)a), *c, 0, 0, 0);
@@ -63,7 +72,11 @@ template <> struct MfmaTraits<bfloat16_t> {
 
     // Call the intrinsic and store the result directly to c
 #ifdef USE_HCU
+#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
+    *c = __builtin_hcu_mmac_f32_16x16x16_bf16_lit_lts(a_vec, b_vec, *c, 1, 0);
+#else
     *c = __builtin_hcu_mmac_f32_16x16x16_bf16(a_vec, b_vec, *c);
+#endif
 #else
     *c = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(b_vec, a_vec, *c, 0, 0, 0);
 #endif
@@ -90,7 +103,9 @@ template <> struct MfmaTraits<fp8_e4_t> {
 #ifdef USE_HCU
     int32x2 a_val = *reinterpret_cast<const int32x2 *>(a);
     int32x2 b_val = *reinterpret_cast<const int32x2 *>(b);
-    *c = __builtin_hcu_mmac_f32_16x16x32_fp8_fp8(a_val, b_val, *c);
+#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
+    *c = __builtin_hcu_mmac_f32_16x16x32_fp8_fp8_lit_lts(a_val, b_val, *c, 1, 0);
+#endif
 #else
     int64_t a_val = *reinterpret_cast<const int64_t *>(a);
     int64_t b_val = *reinterpret_cast<const int64_t *>(b);
@@ -107,7 +122,9 @@ template <> struct MfmaTraits<fp8_e5_t> {
 #ifdef USE_HCU
     int32x2 a_val = *reinterpret_cast<const int32x2 *>(a);
     int32x2 b_val = *reinterpret_cast<const int32x2 *>(b);
-    *c = __builtin_hcu_mmac_f32_16x16x32_bf8_bf8(a_val, b_val, *c);
+#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
+    *c = __builtin_hcu_mmac_f32_16x16x32_bf8_bf8_lit_lts(a_val, b_val, *c, 1, 0);
+#endif
 #endif
   }
 };

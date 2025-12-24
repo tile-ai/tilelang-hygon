@@ -93,6 +93,20 @@ bool TargetIsHCU(Target target) {
   return false;
 }
 
+bool TargetHasMmacLitLts(Target target) {
+  static const std::set<std::string> hcu_targets = {
+    "gfx938", "gfx92a", "gfx946"
+  };
+
+  if (!TargetIsHCU(target))
+    return false;
+  if (target->attrs.count("mcpu")) {
+    std::string mcpu = Downcast<String>(target->attrs.at("mcpu"));
+    return hcu_targets.find(mcpu) != hcu_targets.end();
+  }
+  return false;
+}
+
 bool TargetHasAsyncCopy(Target target) {
   if (TargetIsCuda(target)) {
     int arch = GetArchInt(target);
@@ -174,7 +188,11 @@ TVM_FFI_STATIC_INIT_BLOCK({
       .def("tl.TargetHasBulkCopy",
            [](Target target) { return TargetHasBulkCopy(target); })
       .def("tl.TargetGetWarpSize",
-           [](Target target) { return TargetGetWarpSize(target); });
+           [](Target target) { return TargetGetWarpSize(target); })
+      .def("tl.TargetIsHCU",
+           [](Target target) { return TargetIsHCU(target); })
+      .def("tl.TargetHasMmacLitLts",
+           [](Target target) { return TargetHasMmacLitLts(target); });
 });
 
 } // namespace tl

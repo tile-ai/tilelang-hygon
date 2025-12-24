@@ -149,3 +149,11 @@ def target_has_bulk_copy(target: Target) -> bool:
 
 def target_get_warp_size(target: Target) -> int:
     return _ffi_api.TargetGetWarpSize(target)
+
+
+def target_is_hcu(target: Target) -> bool:
+    return _ffi_api.TargetIsHCU(target)
+
+
+def target_has_mmac_lit_lts(target: Target) -> bool:
+    return _ffi_api.TargetHasMmacLitLts(target)

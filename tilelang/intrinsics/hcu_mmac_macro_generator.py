@@ -5,13 +5,13 @@ from tvm import DataType
 from tvm.tir import PrimExpr
 from tvm.runtime import convert
 from typing import Optional
-from .utils import (
-    mfma_store_index_map,)
+from tvm.target import Target
+from tilelang.utils.target import target_has_mmac_lit_lts, determine_target
 
 lift = convert
 
 
-class MatrixCoreIntrinEmitter(object):
+class HCUMatrixCoreIntrinEmitter(object):
     """
     To eliminate Python syntax within TIR Macro.
     """
@@ -28,11 +28,9 @@ class MatrixCoreIntrinEmitter(object):
         "float8_e4m3": "e4m3",
         "float8_e5m2": "e5m2",
         "float8_e4m3fnuz": "e4m3fnuz",
+        "float8_e4m3fn": "e4m3fn",
     }
 
-    # k_pack represents the number of elements in a vectorized instruction
-    # Detail information can be found in the triton documentation
-    # https://github.com/triton-lang/triton/blob/433037206d8870f0b82a3cd669097001084a29ed/third_party/amd/lib/TritonAMDGPUTransforms/AccelerateAMDMatmul.cpp#L419
     k_pack = 1
     # Represent the thread binding in the form of (tx, warp_n, warp_m)
     is_m_first = False
@@ -66,10 +64,12 @@ class MatrixCoreIntrinEmitter(object):
         self.warp_row_tiles = warp_row_tiles
         self.warp_col_tiles = warp_col_tiles
         self.chunk = chunk
+        # get arch target on current device
+        self.target = Target(determine_target("auto", return_object=True))
         self._initialize_k_dim(a_dtype)
         self._initialize_abbrev(a_dtype, b_dtype, accum_dtype)
         self._initialize_local_size(self.M_DIM, self.N_DIM, self.k_dim, self.WARP_SIZE)
-        self._initialize_mfma_prefix(self.k_dim)
+        self._initialize_mmac_prefix(self.k_dim)
         self._initialize_micro_size(self.M_DIM, self.N_DIM, self.k_dim)
         self._initialize_k_pack(k_pack)
         self._initialize_is_m_first(is_m_first)
@@ -83,15 +83,19 @@ class MatrixCoreIntrinEmitter(object):
 
     def _initialize_k_dim(self, a_dtype="float16"):
         if isinstance(a_dtype, str):
-            if a_dtype in ["float8_e4m3fnuz", "int8"]:
+            if a_dtype in ["float8_e4m3fnuz", "float8_e4m3fn", "float8_e5m2", "int8"]:
                 self.k_dim = 32
                 return
             a_dtype = DataType(a_dtype)
 
         if a_dtype.bits == 32:
-            self.k_dim = 4
-        elif a_dtype.bits in {16, 8}:
+            self.k_dim = 8
+        elif a_dtype.bits == 16:
             self.k_dim = 16
+        elif a_dtype.bits == 8:
+            self.k_dim = 32
+        elif a_dtype.bits == 4:
+            self.k_dim = 64
         else:
             raise ValueError(f"Unsupported a_dtype = {a_dtype}")
 
@@ -105,7 +109,7 @@ class MatrixCoreIntrinEmitter(object):
         self.b_dtype_abbrv = self.dtype_abbrv[b_dtype]
         self.accum_dtype_abbrv = self.dtype_abbrv[accum_dtype]
 
-    def _initialize_mfma_prefix(self, k_dim=16):
+    def _initialize_mmac_prefix(self, k_dim=16):
         in_dtype, out_dtype = self.a_dtype, self.accum_dtype
         M_DIM, N_DIM = self.M_DIM, self.N_DIM
         out_dtype_abbrv = {
@@ -121,14 +125,37 @@ class MatrixCoreIntrinEmitter(object):
             "int8": "i8",
             "int32": "i32",
             "float8_e4m3fnuz": "fp8",
+            "float8_e4m3fn": "fp8",
+            "float8_e5m2": "bf8",
         }[in_dtype]
 
-        if in_dtype_abbrv == "fp8":
-            self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_fp8_fp8"
-        elif in_dtype_abbrv == "i8":
-            self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_i8"
+        target = self.target
+        if target is not None and target_has_mmac_lit_lts(target):
+            if in_dtype_abbrv == "fp8":
+                self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_fp8_fp8_lit_lts"
+            elif in_dtype_abbrv == "bf8":
+                self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_bf8_bf8_lit_lts"
+            elif in_dtype_abbrv == "i8":
+                self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_i8_lit_clamp_lts"
+            elif in_dtype_abbrv == "f16":
+                self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_f16_lit_lts"
+            elif in_dtype_abbrv == "f32":
+                self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_f32_lit_lts"
+            else:
+                assert False, f"Unsupported in_dtype_abbrv = {in_dtype_abbrv}"
         else:
-            self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}{in_dtype_abbrv}"
+            if in_dtype_abbrv == "fp8":
+                self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_fp8_fp8"
+            elif in_dtype_abbrv == "bf8":
+                self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_bf8_bf8"
+            elif in_dtype_abbrv == "i8":
+                self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_i8"
+            elif in_dtype_abbrv == "f16":
+                self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_f16"
+            elif in_dtype_abbrv == "f32":
+                self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_f32"
+            else:
+                assert False, f"Unsupported in_dtype_abbrv = {in_dtype_abbrv}"
 
     def _initialize_micro_size(self, m_dim=16, n_dim=16, k_dim=16):
         self.micro_size_x = m_dim
@@ -148,7 +175,7 @@ class MatrixCoreIntrinEmitter(object):
             self.b_preshuffle = b_preshuffle
 
     def get_ldmatrix_index_map(self, is_b=False):
-        from .mfma_layout import (
+        from .hcu_mmac_layout import (
             shared_16x4_to_local_64x1_layout_A,
             shared_4x16_to_local_64x1_layout_B,
             shared_16x16_to_local_64x4_layout_A,
@@ -200,6 +227,19 @@ class MatrixCoreIntrinEmitter(object):
             raise ValueError("k_dim must be 4 or 16 or 32 or 64 currently")
 
         return index_map, reverse_index_map
+
+    def get_store_index_map(self):
+        from .hcu_mmac_layout import (
+            thread_id_shared_access_64x4_to_16x16_layout_C_m_n,
+            thread_id_shared_access_64x4_to_16x16_layout_C_m_n_v2,
+        )
+        # use target on current device
+        target = self.target
+        # check if target has mmac lit lts
+        if target is not None and target_has_mmac_lit_lts(target):
+            return thread_id_shared_access_64x4_to_16x16_layout_C_m_n_v2
+        else:
+            return thread_id_shared_access_64x4_to_16x16_layout_C_m_n
 
     def extract_thread_binding(self,
                                thread_id,
@@ -317,14 +357,14 @@ class MatrixCoreIntrinEmitter(object):
 
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
 
-    def mfma(self, A_local_buf, B_local_buf, C_local_buf):
+    def mmac(self, A_local_buf, B_local_buf, C_local_buf):
         warp_rows = self.warp_rows
         warp_cols = self.warp_cols
         local_size_a = self.local_size_a
         local_size_b = self.local_size_b
         local_size_out = self.local_size_out
         k_pack = self.k_pack
-        mfma_suffix = self.mfma_suffix
+        mmac_suffix = self.mmac_suffix
         a_dtype, b_dtype, out_dtype = self.a_dtype, self.b_dtype, self.accum_dtype
         compute_a_dtype = a_dtype if local_size_a == 1 else f"{a_dtype}x{local_size_a}"
         compute_b_dtype = b_dtype if local_size_b == 1 else f"{b_dtype}x{local_size_b}"
@@ -334,16 +374,16 @@ class MatrixCoreIntrinEmitter(object):
         def _warp_mma(A_local_buf, B_local_buf, C_local_buf):
             for kp, i, j in T.grid(k_pack, warp_rows, warp_cols):
                 T.tvm_mfma(
-                    mfma_suffix,
+                    mmac_suffix,
                     "row",
                     "row",
                     compute_a_dtype,
                     compute_b_dtype,
                     compute_out_dtype,
-                    B_local_buf.data,
-                    ((j * k_pack + kp) * local_size_b) // local_size_b,
                     A_local_buf.data,
                     ((i * k_pack + kp) * local_size_a) // local_size_a,
+                    B_local_buf.data,
+                    ((j * k_pack + kp) * local_size_b) // local_size_b,
                     C_local_buf.data,
                     (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
                     dtype=compute_out_dtype,
@@ -365,6 +405,7 @@ class MatrixCoreIntrinEmitter(object):
         M_DIM, N_DIM = self.M_DIM, self.N_DIM
         C_buf_dims = len(C_buf.shape)
         assert C_buf_dims in {2, 4}, "C_buf should be 2D or 4D"
+        mmac_store_index_map = self.get_store_index_map()
 
         # STS
         # MMA Store must be in simulated instead of TVM Intrins
@@ -375,7 +416,7 @@ class MatrixCoreIntrinEmitter(object):
             tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
             for i, j in T.grid(warp_rows, warp_cols):
                 for local_id in T.vectorized(local_size_out):
-                    row, col = T.meta_var(mfma_store_index_map(tx, local_id))
+                    row, col = T.meta_var(mmac_store_index_map(tx, local_id))
                     if C_buf_dims == 2:
                         C_buf[(warp_m * warp_rows + i) * M_DIM + row,
                               (warp_n * warp_cols + j) * N_DIM +
@@ -391,7 +432,7 @@ class MatrixCoreIntrinEmitter(object):
             tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
             for i, j in T.grid(warp_rows, warp_cols):
                 for local_id in T.vectorized(local_size_out):
-                    row, col = T.meta_var(mfma_store_index_map(tx, local_id))
+                    row, col = T.meta_var(mmac_store_index_map(tx, local_id))
                     C_buf[(pid_m * BLOCK_M + warp_m * warp_rows + i) * M_DIM + row,
                           (pid_n * BLOCK_N + warp_n * warp_cols + j) * N_DIM +
                           col] = C_local_buf[i * warp_cols * local_size_out + j * local_size_out +
@@ -402,7 +443,7 @@ class MatrixCoreIntrinEmitter(object):
                                          C_local_buf, C_buf, thread_binding)
 
 
-class MatrixCorePreshuffleIntrinEmitter(MatrixCoreIntrinEmitter):
+class HCUMatrixCorePreshuffleIntrinEmitter(HCUMatrixCoreIntrinEmitter):
 
     def __init__(
         self,
@@ -435,10 +476,11 @@ class MatrixCorePreshuffleIntrinEmitter(MatrixCoreIntrinEmitter):
         self.warp_row_tiles = warp_row_tiles
         self.warp_col_tiles = warp_col_tiles
         self.chunk = chunk
+        self.target = Target(determine_target("auto", return_object=True))
         self._initialize_k_dim(a_dtype)
         self._initialize_abbrev(a_dtype, b_dtype, accum_dtype)
         self._initialize_local_size(self.M_DIM, self.N_DIM, self.k_dim, self.WARP_SIZE)
-        self._initialize_mfma_prefix(self.k_dim)
+        self._initialize_mmac_prefix(self.k_dim)
         self._initialize_micro_size(self.M_DIM, self.N_DIM, self.k_dim)
         self._initialize_k_pack(k_pack)
         self._initialize_is_m_first(is_m_first)

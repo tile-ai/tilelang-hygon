@@ -12,3 +12,4 @@ from .mma_layout import get_swizzle_layout  # noqa: F401
 from .mma_layout import make_mma_swizzle_layout  # noqa: F401
 
 from .mfma_layout import make_mfma_swizzle_layout  # noqa: F401
+from .hcu_mmac_layout import make_mmac_swizzle_layout

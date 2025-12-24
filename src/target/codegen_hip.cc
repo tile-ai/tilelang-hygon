@@ -1076,10 +1076,24 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
         {"float8_e4m3fnx8", "int32x2"},
         {"float8_e5m2x8", "int32x2"},
         {"float32x16", "float32x16"}};
+
+    std::string lit = "";
+    if (prefix.find("_lit") != std::string::npos) {
+      lit = ", 1";
+    }
+    std::string clamp = "";
+    if (prefix.find("_clamp") != std::string::npos) {
+      clamp = ", 0";
+    }
+    std::string lts = "";
+    if (prefix.find("_lts") != std::string::npos) {
+      lts = ", 0";
+    }
+
     std::string call_mfma_code = R"({
       *((({C_dtype}*){c_ref}) + {c_bias}) = {mfma_buildin}(*((({A_dtype}*){a_ref}) + {a_bias}),
                     *((({B_dtype}*){b_ref}) + {b_bias}),
-                    *((({C_dtype}*){c_ref}) + {c_bias}));
+                    *((({C_dtype}*){c_ref}) + {c_bias}){lit_suffix}{clamp_suffix}{lts_suffix});
     })";
     std::string mfma_buildin = "__builtin_hcu_mmac_" + prefix;
     Replacer replacer;
@@ -1094,6 +1108,9 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("{b_bias}", b_bias);
     replacer.register_rule("{c_ref}", c_ref);
     replacer.register_rule("{c_bias}", c_bias);
+    replacer.register_rule("{lit_suffix}", lit);
+    replacer.register_rule("{clamp_suffix}", clamp);
+    replacer.register_rule("{lts_suffix}", lts);
     os << replacer.rewrite(call_mfma_code);
   } else if (op->op.same_as(builtin::thread_return())) {
     os << "return";

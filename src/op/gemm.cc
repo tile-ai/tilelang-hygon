@@ -826,6 +826,44 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
       }
       results.Set(C, res);
     }
+  } else if (TargetIsHCU(T.target)) {
+    ICHECK(C.scope() == "local.fragment")
+        << "CDNA gemm (FMMA) only supports C in local.fragment scope, got "
+        << C.scope();
+    auto fragment =
+        makeGemmFragmentHCU(M, N, M / warp_m, N / warp_n, C->dtype.bits());
+    if (TargetHasMmacLitLts(T.target)) {
+      fragment = makeGemmFragmentHCUV2(M, N, M / warp_m, N / warp_n, C->dtype.bits());
+    }
+    results.Set(C, fragment->BindThreadRange(thread_range));
+
+    if (A.scope() == "shared" || A.scope() == "shared.dyn") {
+      int dim_A = A->shape.size();
+      auto shared_layout = makeGemmABLayoutCDNA(
+          *as_const_int(A->shape[dim_A - 2]),
+          *as_const_int(A->shape[dim_A - 1]), A->dtype.bits(), kPack);
+      results.Set(A, shared_layout);
+    } else if (A.scope() == "local.fragment") {
+      auto fragment = makeGemmFragmentACDNA(M, N, K, M / warp_m, N / warp_n,
+                                            A->dtype.bits(), kPack, trans_A);
+      results.Set(A, fragment->BindThreadRange(thread_range));
+    } else {
+      ICHECK(0);
+    }
+    if (B.scope() == "shared" || B.scope() == "shared.dyn") {
+      int dim_B = B->shape.size();
+      auto shared_layout = makeGemmABLayoutCDNA(
+          *as_const_int(B->shape[dim_B - 2]),
+          *as_const_int(B->shape[dim_B - 1]), B->dtype.bits(), kPack);
+
+      results.Set(B, shared_layout);
+    } else if (B.scope() == "local.fragment") {
+      auto fragment =
+          makeGemmFragmentB(M, N, K, M / warp_m, N / warp_n, trans_B);
+      results.Set(B, fragment->BindThreadRange(thread_range));
+    } else {
+      ICHECK(0);
+    }
   } else if (TargetIsCDNA(T.target)) {
     ICHECK(C.scope() == "local.fragment")
         << "CDNA gemm (FMMA) only supports C in local.fragment scope, got "
