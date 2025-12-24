@@ -211,7 +211,8 @@ warp_layout->Repeat({block_m / warp_m, block_n / warp_n}, true, false);
 return block_layout;
 }
 
-Fragment makeGemmFragmentHCUV2(const int block_m, const int block_n,
+// Lit 4 interleaved
+Fragment makeGemmFragmentHCULit(const int block_m, const int block_n,
   const int warp_m, const int warp_n,
   const int element_size) {
 if (element_size == 64)

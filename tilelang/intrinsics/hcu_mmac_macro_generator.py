@@ -231,13 +231,13 @@ class HCUMatrixCoreIntrinEmitter(object):
     def get_store_index_map(self):
         from .hcu_mmac_layout import (
             thread_id_shared_access_64x4_to_16x16_layout_C_m_n,
-            thread_id_shared_access_64x4_to_16x16_layout_C_m_n_v2,
+            thread_id_shared_access_64x4_to_16x16_layout_C_m_n_lit,
         )
         # use target on current device
         target = self.target
         # check if target has mmac lit lts
         if target is not None and target_has_mmac_lit_lts(target):
-            return thread_id_shared_access_64x4_to_16x16_layout_C_m_n_v2
+            return thread_id_shared_access_64x4_to_16x16_layout_C_m_n_lit
         else:
             return thread_id_shared_access_64x4_to_16x16_layout_C_m_n
 

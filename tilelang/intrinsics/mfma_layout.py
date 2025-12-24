@@ -68,7 +68,7 @@ shared_16x16_to_local_64x4_layout_k_n = shared_16x16_to_local_64x4_layout_B
 
 
 def thread_id_shared_access_64x4_to_16x16_layout_C_m_n(thread_id, local_id):
-    i = local_id * 4 + (thread_id // 16)
+    i = local_id + (thread_id // 16) * 4
     j = thread_id % 16
     return i, j
 

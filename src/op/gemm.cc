@@ -828,12 +828,12 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
     }
   } else if (TargetIsHCU(T.target)) {
     ICHECK(C.scope() == "local.fragment")
-        << "CDNA gemm (FMMA) only supports C in local.fragment scope, got "
+        << "hcu gemm (mmac) only supports C in local.fragment scope, got "
         << C.scope();
     auto fragment =
         makeGemmFragmentHCU(M, N, M / warp_m, N / warp_n, C->dtype.bits());
     if (TargetHasMmacLitLts(T.target)) {
-      fragment = makeGemmFragmentHCUV2(M, N, M / warp_m, N / warp_n, C->dtype.bits());
+      fragment = makeGemmFragmentHCULit(M, N, M / warp_m, N / warp_n, C->dtype.bits());
     }
     results.Set(C, fragment->BindThreadRange(thread_range));
 

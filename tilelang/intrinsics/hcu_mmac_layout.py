@@ -78,14 +78,14 @@ def thread_id_shared_access_64x4_to_16x16_layout_C_n_m(thread_id, local_id):
     j = thread_id % 16
     return i, j
 
-
-def thread_id_shared_access_64x4_to_16x16_layout_C_m_n_v2(thread_id, local_id):
+# lit: 4 interleaved
+def thread_id_shared_access_64x4_to_16x16_layout_C_m_n_lit(thread_id, local_id):
     i = thread_id % 16
     j = local_id + (thread_id // 16) * 4
     return i, j
 
 
-def thread_id_shared_access_64x4_to_16x16_layout_C_n_m_v2(thread_id, local_id):
+def thread_id_shared_access_64x4_to_16x16_layout_C_n_m_lit(thread_id, local_id):
     i = local_id + (thread_id // 16) * 4
     j = thread_id % 16
     return i, j
