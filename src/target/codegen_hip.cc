@@ -153,7 +153,7 @@ std::string CodeGenTileLangHIP::Finish() {
   decl_stream << "#include <tl_templates/hip/ldsm.h>\n";
   decl_stream << "#include <tl_templates/hip/threadblock_swizzle.h>\n";
   decl_stream << "#include <tl_templates/hip/debug.h>\n";
-  decl_stream << "#include <ck_tile/core/arch/amd_buffer_addressing.hpp>\n";
+  decl_stream << "#include <tl_templates/hip/hcu.h>\n";
   decl_stream << "\n";
   return CodeGenC::Finish();
 }

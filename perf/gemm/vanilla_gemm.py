@@ -13,7 +13,7 @@ def gemm_vanilla(M, N, K, block_M, block_N, block_K,
            dtype="float16", accum_dtype="float"):
     """
     Vanilla GEMM kernel with optional group swizzling optimization.
-    
+
     Args:
         group_size: Size of tile groups for swizzling (1 disables group swizzling).
                    When > 1, uses the same group swizzling pattern as gemm_persistent.
@@ -21,7 +21,7 @@ def gemm_vanilla(M, N, K, block_M, block_N, block_K,
     m_blocks = T.ceildiv(M, block_M)
     n_blocks = T.ceildiv(N, block_N)
     total_tiles = m_blocks * n_blocks
-    
+
     @T.prim_func
     def _gemm_vanilla(
             A: T.Tensor((M, K), dtype),
@@ -34,7 +34,7 @@ def gemm_vanilla(M, N, K, block_M, block_N, block_K,
                 A_shared = T.alloc_shared((block_M, block_K), dtype)
                 B_shared = T.alloc_shared((block_N, block_K), dtype)
                 C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
-                
+
                 T.clear(C_local)
 
                 # Group swizzling: same pattern as persistent_gemm
@@ -77,7 +77,7 @@ def get_best_vanilla_config(M, N, K, with_roller=False):
     ):
         dtype = "float16"
         accum_dtype = "float"
-        
+
         m_blocks = T.ceildiv(M, block_M)
         n_blocks = T.ceildiv(N, block_N)
         total_tiles = m_blocks * n_blocks
@@ -95,11 +95,11 @@ def get_best_vanilla_config(M, N, K, with_roller=False):
                     B_shared = T.alloc_shared((block_N, block_K), dtype)
                     C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
                     C_shared = T.alloc_shared((block_M, block_N), dtype)
-                    
+
                     # Group swizzling
                     bx = (tile_id // group_size) % m_blocks
                     by = (tile_id % group_size) + (tile_id // group_size) // m_blocks * group_size
-                    
+
                     if bx * block_M < M and by * block_N < N:
                         T.clear(C_local)
                         for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):

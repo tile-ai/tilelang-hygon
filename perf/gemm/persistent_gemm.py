@@ -11,7 +11,7 @@ from perf.gemm.utils import _generate_configs_from_product, _run_autotuner
 def get_persistent_configs(M, N, K):
     """
     Generate a list of kernel tuning configuration dictionaries for persistent GEMM.
-    
+
     Similar to get_configs but for persistent kernels. Adds wgs_per_cu parameter.
     """
     param_dict = {
@@ -58,7 +58,7 @@ def get_best_persistent_config(M, N, K):
                 A_shared = T.alloc_shared((block_M, block_K), dtype)
                 B_shared = T.alloc_shared((block_N, block_K), dtype)
                 C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
-       
+
                 for w in T.serial(waves):
                     tile_id = grid_size * w + block_id
                     bx = (tile_id // group_size) % m_blocks
@@ -72,7 +72,7 @@ def get_best_persistent_config(M, N, K):
                             T.gemm(A_shared, B_shared, C_local, k_pack=2, transpose_B=True)
 
                         T.copy(C_local, C[bx * block_M, by * block_N])
-       
+
         return main
 
     return _run_autotuner(kernel, get_persistent_configs(M, N, K))

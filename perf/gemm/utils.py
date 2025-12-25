@@ -2,24 +2,21 @@
 Common utility functions for GEMM implementations.
 """
 
-import argparse
 import itertools
 import torch
 import tilelang as tl
-import tilelang.language as T
 from tilelang.autotuner import AutoTuner
 from tilelang.carver.template import MatmulTemplate
 from tilelang.carver.arch import CUDA
 from tilelang.carver.arch import CDNA
 from tilelang.carver.roller.rasterization import NoRasterization
-from perf.utils.device import get_free_devices
 
 
 def ref_program(A, B):
     """
     Compute the matrix product of A and the transpose of B.
 
-    A and B are expected to be 2-D tensors where A has shape (M, K) and B has shape (N, K). 
+    A and B are expected to be 2-D tensors where A has shape (M, K) and B has shape (N, K).
     The result is a tensor with shape (M, N) equal to A @ B.T, using the inputs' dtypes.
     """
     return A @ B.T
@@ -28,11 +25,11 @@ def ref_program(A, B):
 def _generate_configs_from_product(param_dict):
     """
     Generate configuration dictionaries from Cartesian product of parameter lists.
-    
+
     Args:
         param_dict: Dictionary mapping parameter names to lists of candidate values.
                     Keys are used in insertion order (Python 3.7+).
-        
+
     Returns:
         List of configuration dictionaries
     """
@@ -48,14 +45,14 @@ def _generate_configs_from_product(param_dict):
 def _get_roller_configs(M, N, K, topk=20):
     """
     Generate configurations using MatmulTemplate roller.
-    
+
     Args:
         M, N, K: GEMM dimensions
         topk: Maximum number of roller hints to request
-        
+
     Returns:
         List of configuration dictionaries
-        
+
     Raises:
         ValueError: if roller returns no hints
     """
@@ -74,7 +71,7 @@ def _get_roller_configs(M, N, K, topk=20):
     roller_hints = carve_template.recommend_hints(topk=topk)
     if roller_hints is None:
         raise ValueError("No Roller Hints Found for TensorCore Scheduling")
-    
+
     configs = []
     for hint in roller_hints:
         block_m, block_n = hint.block
@@ -136,11 +133,11 @@ def get_configs(M, N, K, with_roller=False, topk=20):
 def _create_autotuner(kernel, configs):
     """
     Create and configure an AutoTuner instance with common settings.
-    
+
     Args:
         kernel: The kernel function to tune
         configs: List of configuration dictionaries to test
-        
+
     Returns:
         Configured AutoTuner instance
     """
@@ -160,13 +157,13 @@ def _create_autotuner(kernel, configs):
 def _run_autotuner(kernel, configs, warmup=3, rep=20):
     """
     Run autotuning with common settings.
-    
+
     Args:
         kernel: The kernel function to tune
         configs: List of configuration dictionaries to test
         warmup: Number of warmup iterations
         rep: Number of benchmark repetitions
-        
+
     Returns:
         Best configuration result from autotuner
     """

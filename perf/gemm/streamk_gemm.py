@@ -19,13 +19,13 @@ def gemm_streamk(M, N, K, block_M, block_N, block_K, num_stages, thread_num,
     n_blocks = T.ceildiv(N, block_N)
     total_tiles = m_blocks * n_blocks
     iters_per_tile = T.ceildiv(K, block_K)
-    
+
     # Calculate Stream-K parameters
     streamk_programs = cu_num
     streamk_tiles = total_tiles % streamk_programs
     if (total_tiles - streamk_tiles > streamk_programs):
         streamk_tiles += streamk_programs
-    
+
     blocking_tiles = total_tiles - streamk_tiles
     streamk_iters = streamk_tiles * iters_per_tile
     streamk_full_tiles = streamk_iters // streamk_programs
