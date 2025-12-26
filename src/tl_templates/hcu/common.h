@@ -4,10 +4,6 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-#include <rocwmma/rocwmma.hpp>
-
-// FIXME: Always enable for now, need to find a way to enable at runtime.
-#define USE_HCU 1
 
 #define HIPRT_INF_F __int_as_float(0x7f800000)
 #define HIPRT_NEGINF_F __int_as_float(0xff800000)
@@ -66,8 +62,6 @@ using float16x16 =
     __attribute__((__vector_size__(16 * sizeof(float16_t)))) float16_t;
 
 using half_t = float16_t;
-
-#ifdef USE_HCU
 using bfloat16_t = ck_tile::bf16_t;
 using bfloat16x2 = ck_tile::bf16x2_t;
 using bfloat16x4 = ck_tile::bf16x4_t;
@@ -137,26 +131,6 @@ struct __align__(2) bf16_cvt_t {
   TL_DEVICE constexpr raw_type get() const { return data; }
 };
 
-#else
-using bfloat16_t = hip_bfloat16;
-
-struct bfloat16x2 {
-  bfloat16_t x, y;
-};
-
-struct bfloat16x4 {
-  bfloat16_t data[4];
-};
-
-struct bfloat16x8 {
-  bfloat16_t data[8];
-};
-
-struct bfloat16x16 {
-  bfloat16_t data[16];
-};
-#endif
-
 typedef
     __attribute__((__vector_size__(4 * sizeof(short)))) short bfloat16x4_vec;
 
@@ -192,19 +166,4 @@ TL_DEVICE unsigned __pack_bfloat162(const bfloat16_t x, const bfloat16_t y) {
   unsigned v0 = *((unsigned short *)&x);
   unsigned v1 = *((unsigned short *)&y);
   return (v1 << 16) | v0;
-}
-
-template <typename T1, typename T2>
-TL_DEVICE void AtomicAdd(T1 *address, T2 val) {
-  atomicAdd(reinterpret_cast<T1 *>(address), static_cast<T1>(val));
-}
-
-// Overload for when the first argument is a value instead of a pointer
-template <typename T1, typename T2>
-TL_DEVICE void AtomicAdd(T1& address, T2 val) {
-  AtomicAdd(&address, val);
-}
-
-template <typename T1, typename T2> TL_DEVICE T1 AtomicAddRet(T1 &ref, T2 val) {
-  return atomicAdd(&ref, static_cast<T1>(val));
 }

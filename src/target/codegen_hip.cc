@@ -137,6 +137,22 @@ void CodeGenTileLangHIP::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
 }
 
 std::string CodeGenTileLangHIP::Finish() {
+#if USE_HCU
+  // TODO: Move to the hcu folder when the hcu codegen is complete.
+  decl_stream << "#include <hip/hip_runtime.h>\n";
+
+  if (enable_fp8_) {
+    decl_stream << "#include <tl_templates/hcu/hcu_fp8.h>\n";
+  }
+
+  decl_stream << "#include <tl_templates/hcu/atomic.h>\n";
+  decl_stream << "#include <tl_templates/hcu/gemm.h>\n";
+  decl_stream << "#include <tl_templates/hcu/copy.h>\n";
+  decl_stream << "#include <tl_templates/hcu/reduce.h>\n";
+  decl_stream << "#include <tl_templates/hcu/ldsm.h>\n";
+  decl_stream << "#include <tl_templates/hcu/threadblock_swizzle.h>\n";
+  decl_stream << "#include <tl_templates/hcu/debug.h>\n";
+#else
   // hip must need a header file.
   decl_stream << "#include <hip/hip_runtime.h>\n";
   if (need_mma_h_) {
@@ -144,7 +160,7 @@ std::string CodeGenTileLangHIP::Finish() {
   }
 
   if (enable_fp8_) {
-    decl_stream << "#include <tl_templates/hip/hcu_fp8.h>\n";
+    decl_stream << "#include <tl_templates/hip/hip_fp8.h>\n";
   }
 
   decl_stream << "#include <tl_templates/hip/gemm.h>\n";
@@ -153,7 +169,7 @@ std::string CodeGenTileLangHIP::Finish() {
   decl_stream << "#include <tl_templates/hip/ldsm.h>\n";
   decl_stream << "#include <tl_templates/hip/threadblock_swizzle.h>\n";
   decl_stream << "#include <tl_templates/hip/debug.h>\n";
-  decl_stream << "#include <tl_templates/hip/hcu.h>\n";
+#endif
   decl_stream << "\n";
   return CodeGenC::Finish();
 }
