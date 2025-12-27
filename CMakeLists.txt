@@ -94,6 +94,7 @@ elseif(USE_ROCM)
   endif()
 
   file(GLOB TILE_LANG_HIP_SRCS
+    src/target/codegen_hcu.cc
     src/target/codegen_hip.cc
     src/target/rt_mod_hip.cc
   )

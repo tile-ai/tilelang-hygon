@@ -3,9 +3,6 @@
 #include "common.h"
 #include <type_traits>
 
-// FIXME: Always enable for now, need to find a way to enable at runtime.
-#define USE_HCU 1
-
 namespace tl {
 
 // Trait to determine the MFMA instruction to use based on data type
@@ -15,22 +12,11 @@ template <typename T> struct MfmaTraits;
 template <> struct MfmaTraits<int8_t> {
   template <typename AccType>
   static TL_DEVICE void mfma_op(const int8_t *b, const int8_t *a, AccType *c) {
-#ifdef USE_HCU
-    int32x2 *a_packed = reinterpret_cast<int32x2 *>(const_cast<int8_t *>(a));
-    int32x2 *b_packed = reinterpret_cast<int32x2 *>(const_cast<int8_t *>(b));
-#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
-    // default: lit en, clamp disable, lts disable
-    *c = __builtin_hcu_mmac_i32_16x16x32_i8_lit_clamp_lts(*a_packed, *b_packed, *c, 1, 0, 0);
-#else
-    *c = __builtin_hcu_mmac_i32_16x16x32_i8(*a_packed, *b_packed, *c);
-#endif
-#else
     int64_t *b_packed = reinterpret_cast<int64_t *>(const_cast<int8_t *>(b));
     int64_t *a_packed = reinterpret_cast<int64_t *>(const_cast<int8_t *>(a));
 
     *c = __builtin_amdgcn_mfma_i32_16x16x32_i8(*b_packed, *a_packed, *c, 0, 0,
                                                0);
-#endif
   }
 };
 
@@ -38,18 +24,8 @@ template <> struct MfmaTraits<int8_t> {
 template <> struct MfmaTraits<half> {
   template <typename AccType>
   static TL_DEVICE void mfma_op(const half *b, const half *a, AccType *c) {
-#ifdef USE_HCU
-#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
-    *c = __builtin_hcu_mmac_f32_16x16x16_f16_lit_lts(*((float16x4 *)a),
-                                             *((float16x4 *)b), *c, 1, 0);
-#else
-    *c = __builtin_hcu_mmac_f32_16x16x16_f16(*((float16x4 *)a),
-                                             *((float16x4 *)b), *c);
-#endif
-#else
     *c = __builtin_amdgcn_mfma_f32_16x16x16f16(*((float16x4 *)b),
                                                *((float16x4 *)a), *c, 0, 0, 0);
-#endif
   }
 };
 
@@ -71,26 +47,7 @@ template <> struct MfmaTraits<bfloat16_t> {
     }
 
     // Call the intrinsic and store the result directly to c
-#ifdef USE_HCU
-#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
-    *c = __builtin_hcu_mmac_f32_16x16x16_bf16_lit_lts(a_vec, b_vec, *c, 1, 0);
-#else
-    *c = __builtin_hcu_mmac_f32_16x16x16_bf16(a_vec, b_vec, *c);
-#endif
-#else
     *c = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(b_vec, a_vec, *c, 0, 0, 0);
-#endif
-  }
-};
-
-// Specialization for float
-template <> struct MfmaTraits<float> {
-  template <typename AccType>
-  static TL_DEVICE void mfma_op(const float *b, const float *a, AccType *c) {
-#ifdef USE_HCU
-    *c = __builtin_hcu_mmac_16x16x8_f32(*((float32x2 *)a),
-                                        *((float32x2 *)b), *c);
-#endif
   }
 };
 
@@ -100,32 +57,9 @@ template <> struct MfmaTraits<fp8_e4_t> {
   template <typename AccType>
   static TL_DEVICE void mfma_op(const fp8_e4_t *b, const fp8_e4_t *a,
                                 AccType *c) {
-#ifdef USE_HCU
-    int32x2 a_val = *reinterpret_cast<const int32x2 *>(a);
-    int32x2 b_val = *reinterpret_cast<const int32x2 *>(b);
-#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
-    *c = __builtin_hcu_mmac_f32_16x16x32_fp8_fp8_lit_lts(a_val, b_val, *c, 1, 0);
-#endif
-#else
     int64_t a_val = *reinterpret_cast<const int64_t *>(a);
     int64_t b_val = *reinterpret_cast<const int64_t *>(b);
     *c = __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(b_val, a_val, *c, 0, 0, 0);
-#endif
-  }
-};
-
-// Specialization for fp8_e5_t
-template <> struct MfmaTraits<fp8_e5_t> {
-  template <typename AccType>
-  static TL_DEVICE void mfma_op(const fp8_e5_t *b, const fp8_e5_t *a,
-                                AccType *c) {
-#ifdef USE_HCU
-    int32x2 a_val = *reinterpret_cast<const int32x2 *>(a);
-    int32x2 b_val = *reinterpret_cast<const int32x2 *>(b);
-#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
-    *c = __builtin_hcu_mmac_f32_16x16x32_bf8_bf8_lit_lts(a_val, b_val, *c, 1, 0);
-#endif
-#endif
   }
 };
 #endif
@@ -220,26 +154,6 @@ public:
         make_mfma_swizzle_layout<continuous, element_size>(row, col);
     return n_row * continuous + n_col;
   }
-
-#if 0
-  //FIXME: This shuffle function is not correct but just for testing,
-  //       we leave it here for reference.
-  static TL_DEVICE void vectorize_c_local(int lane, C_type *C_local) {
-    // For each float in the float32x4 vector, compute which thread has the
-    // value we need in consecutive layout and shuffle it
-    for (int i = 0; i < warp_rows; ++i) {
-      for (int j = 0; j < warp_cols; ++j) {
-        float permuted_vec[4];
-        auto acc_ptr = ((float32x4 *)C_local) + ((i * warp_cols) + j);
-        permuted_vec[0] = ck_tile::warp_shuffle(((C_type*)acc_ptr)[0], (lane + 16) % warp_size);
-        //permuted_vec[1] = ck_tile::warp_shuffle(acc_ptr[0], (lane + 32) % warp_size);
-        //permuted_vec[2] = ck_tile::warp_shuffle(acc_ptr[0], (lane + 48) % warp_size);
-        //permuted_vec[3] = ck_tile::warp_shuffle(acc_ptr[0], (lane + 64) % warp_size);
-        ((C_type*)acc_ptr)[0] = permuted_vec[0];
-       }
-    }
-  }
-#endif
 
   static TL_DEVICE void body(A_type *A_shared, B_type *B_shared,
                              C_type *C_local) {

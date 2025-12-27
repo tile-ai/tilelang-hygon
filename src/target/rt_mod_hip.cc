@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hiprtc.h>
 
+#include "codegen_hcu.h"
 #include "codegen_hip.h"
 #include "runtime/rocm/rocm_module.h"
 #include <tvm/ffi/function.h>
@@ -50,7 +51,11 @@ ExtractFuncInfo(const IRModule &mod) {
 
 runtime::Module BuildTileLangHIP(IRModule mod, Target target) {
   bool output_ssa = false;
+#ifdef USE_HCU
+  CodeGenTileLangHCU cg;
+#else
   CodeGenTileLangHIP cg;
+#endif
   cg.Init(output_ssa);
 
   for (auto kv : mod->functions) {
@@ -86,7 +91,11 @@ runtime::Module BuildTileLangHIP(IRModule mod, Target target) {
 
 runtime::Module BuildTileLangHIPWithoutCompile(IRModule mod, Target target) {
   bool output_ssa = false;
+#ifdef USE_HCU
+  CodeGenTileLangHCU cg;
+#else
   CodeGenTileLangHIP cg;
+#endif
   cg.Init(output_ssa);
 
   for (auto kv : mod->functions) {
