@@ -48,21 +48,6 @@ def main(M: int = 4096,
         with_roller: Whether to enable BitBLAS roller for search space (default: False)
         device: Device ID (default: -1, auto find free device)
     """
-    free_hcus = get_free_devices()
-    if len(free_hcus) == 0:
-        raise RuntimeError("No free HCU devices found")
-    if device == -1:
-        device_id = free_hcus[0]
-    else:
-        device_id = device
-    torch.cuda.set_device(device_id)
-    print(f"Using HCU device: {device_id}")
-    print(f"GEMM shape: M={M}, N={N}, K={K}")
-    print(f"Data type: {dtype}")
-    print(f"GEMM implementation: {impl}")
-    print(f"Autotune: {autotune}")
-    print(f"With roller: {with_roller}")
-
     # Convert dtype string to torch dtype
     dtype = normalize_dtype(dtype)
 
@@ -93,6 +78,21 @@ def main(M: int = 4096,
         else:
             raise ValueError(f"Unknown implementation: {impl}. "
                            f"Supported: vanilla, persistent, splitk, streamk")
+
+    free_hcus = get_free_devices()
+    if len(free_hcus) == 0:
+        raise RuntimeError("No free HCU devices found")
+    if device == -1:
+        device_id = free_hcus[0]
+    else:
+        device_id = device
+    torch.cuda.set_device(device_id)
+    print(f"Using HCU device: {device_id}")
+    print(f"GEMM shape: M={M}, N={N}, K={K}")
+    print(f"Data type: {dtype}")
+    print(f"GEMM implementation: {impl}")
+    print(f"Autotune: {autotune}")
+    print(f"With roller: {with_roller}")
 
     # benchmark
     profiler = kernel.get_profiler(tensor_supply_type=tl.TensorSupplyType.Auto)

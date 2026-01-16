@@ -5,8 +5,35 @@ Persistent GEMM implementation.
 import torch
 import tilelang as tl
 import tilelang.language as T
+from tilelang.intrinsics import get_swizzle_layout
+from tilelang.layout.swizzle import make_linear_layout
+from tvm import DataType
 from perf.gemm.utils import _generate_configs_from_product, _run_autotuner
 
+
+def make_block_swizzle_layout(buffer, block_m, block_n, swizzle_bytes=128):
+    """Create a layout that applies the swizzle inside each block tile.
+
+    The transform splits a global index (i, j) into tile and local indices,
+    applies make_mmac_swizzle_layout to the local indices (within block_m x block_n),
+    and maps back to global coordinates.
+    If the block tile isn't swizzleable for the given dtype, return identity.
+    """
+    dtype = buffer.dtype
+    shape = buffer.shape
+    # Check if swizzle is possible for the block width
+    can_swizzle = (block_n * DataType(dtype).bits) % 512 == 0
+    if not can_swizzle:
+        return T.Layout(shape, lambda *args: args)
+
+    def transform(i, j):
+        tile_i = i // block_m
+        tile_j = j // block_n
+        local_i = i % block_m
+        local_j = j % block_n
+        new_local_i, new_local_j = get_swizzle_layout(local_i, local_j, block_n, dtype, swizzle_bytes)
+        return tile_i * block_m + new_local_i, tile_j * block_n + new_local_j
+    return T.Layout(shape, transform)
 
 def get_persistent_configs(M, N, K):
     """
@@ -80,6 +107,8 @@ def get_best_persistent_config(M, N, K):
 
 # FIXME: Boudary check is not considered, so non-divisible block_N and group_size may cause
 #        correctness issue.
+# Note: Use pass_configs={"tl.disable_safe_memory_legalize": True} to disable safe memory legalize
+#       during using vectorized with swizzled layout.
 @tl.jit(out_idx=[-1])
 def gemm_persistent(M, N, K, block_M, block_N, block_K,
                     num_stages, thread_num, group_size=8, wgs_per_cu=2,
@@ -108,7 +137,30 @@ def gemm_persistent(M, N, K, block_M, block_N, block_K,
 
                 if bx * block_M < M and by * block_N < N:
                     T.clear(C_local)
+                    #T.annotate_layout({
+                    #    A: make_block_swizzle_layout(A, block_M, block_K),
+                    #    A_shared: make_linear_layout(A_shared),
+                    #    B_shared: make_linear_layout(B_shared),
+                    #})
                     for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                        #for i in T.Parallel(block_M):
+                        #    for j in T.Parallel(block_K):
+                        #        # Apply swizzle layout to local block indices
+                        #        si, sj = get_swizzle_layout(i, j, block_K, dtype, 128)
+                        #        # Global indices in A (swizzled)
+                        #        gi = bx * block_M + si
+                        #        gk = k * block_K + sj
+                        #        # Load from swizzled global positions
+                        #        A_shared[i, j] = A[gi, gk]
+                        #for i in T.Parallel(block_N):
+                        #    for j in T.Parallel(block_K):
+                        #        # Apply swizzle layout to local block indices
+                        #        si, sj = get_swizzle_layout(i, j, block_K, dtype, 128)
+                        #        # Global indices in A (swizzled)
+                        #        gi = by * block_N + si
+                        #        gk = k * block_K + sj
+                        #        # Load from swizzled global positions
+                        #        B_shared[i, j] = B[gi, gk]
                         T.copy(A[bx * block_M, k * block_K], A_shared, coalesced_width=8)
                         T.copy(B[by * block_N, k * block_K], B_shared, coalesced_width=8)
                         T.gemm(A_shared, B_shared, C_local, k_pack=2, transpose_B=True)

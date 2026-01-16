@@ -10,13 +10,14 @@
 #include <tvm/tir/op.h>
 
 #include <string>
+#include <unordered_map>
 
 #include "target/source/codegen_c.h"
 
 namespace tvm {
 namespace codegen {
 
-class CodeGenTileLangHCU final : public CodeGenC{
+class CodeGenTileLangHCU final : public CodeGenC {
 public:
   CodeGenTileLangHCU();
   std::string Finish();
@@ -52,6 +53,7 @@ public:
   void VisitExpr_(const CastNode *op, std::ostream &os) final;
   void VisitStmt_(const AllocateNode *op) final;
   void VisitStmt_(const AttrStmtNode *op) final;
+  void VisitStmt_(const BlockNode *op) final;
 
   // Override this as a work around for __grid_constant__ parameter
   void AddFunction(const PrimFunc &f);
@@ -86,11 +88,29 @@ private:
   bool IsScopePartOfType() const final { return false; }
 
   BufferDesc GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr base);
-  bool CanUseBufferOps(DataType t, const BufferDesc &desc) {
+  bool CanUseVMBufferOps(const BufferNode *buffer, int num_elements) {
     auto value = std::getenv("HCU_USE_BUFFER_OPS");
-    return (value == nullptr || std::atoi(value) != 0) && desc.scope == "global" &&
-           (t.bits() * t.lanes() <= 512);
+    auto scope = GetPtrStorageScope(buffer->data);
+    return (value == nullptr || std::atoi(value) != 0) && scope == "global" &&
+           (num_elements * buffer->dtype.bits() <= 128);
   }
+  bool CanUseLDSBufferOps(const BufferStoreNode *buffer_store) {
+    auto value = std::getenv("HCU_DIRECT_TO_LDS");
+    if (value == nullptr || std::atoi(value) == 0)
+      return false;
+
+    if (const auto *buffer_load = buffer_store->value.as<BufferLoadNode>()) {
+      auto src_scope = GetPtrStorageScope(buffer_load->buffer->data);
+      auto dst_scope = GetPtrStorageScope(buffer_store->buffer->data);
+
+      return src_scope == "global" && (dst_scope == "shared" || dst_scope == "shared.dyn") &&
+             (buffer_load->dtype.bits() * buffer_load->dtype.lanes() <= 128);
+    }
+
+    return false;
+  }
+
+  bool TryToEmitLDSBufferOp(const BufferStoreNode *op);
 
   friend void PrintConst(const FloatImmNode *op, std::ostream &os,
                          CodeGenTileLangHCU *p);
@@ -112,6 +132,7 @@ private:
   // The alignment of the barrier array in shared memory
   // Set to 16 to maintain minimum alignment requirements for async bulk copy
   const int barrier_alignment_bytes_ = 16;
+  std::unordered_map<const VarNode*, bool> direct_to_lds_map_;
 };
 
 } // namespace codegen

@@ -7,6 +7,7 @@
 #include <tvm/ffi/function.h>
 #include <tvm/tir/index_map.h>
 #include <tvm/tir/op.h>
+#include "arith/pattern_match.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -117,6 +118,43 @@ public:
   PrimExpr threadIdx_z_ext = Integer(1);
 };
 
+// TODO: Add a optimization pass to identify eligible direct_to_lds buffer store
+//       patterns instead of performing check here.
+bool CodeGenTileLangHCU::TryToEmitLDSBufferOp(const BufferStoreNode *buffer_store) {
+  const auto *buffer_load = buffer_store->value.as<BufferLoadNode>();
+  const auto* dst_var = buffer_store->buffer->data.get();
+  if (buffer_load == nullptr || !direct_to_lds_map_.count(dst_var) || !direct_to_lds_map_[dst_var])
+    return false;
+
+  auto src_scope = GetPtrStorageScope(buffer_load->buffer->data);
+  auto dst_scope = GetPtrStorageScope(buffer_store->buffer->data);
+  int read_bytes = buffer_load->dtype.bits() * buffer_load->dtype.lanes() / 8;
+  bool condition = src_scope == "global" && (dst_scope == "shared" || dst_scope == "shared.dyn") &&
+                   (read_bytes == 4 || read_bytes == 8 || read_bytes == 16);
+  if (!condition)
+    return false;
+
+  DataType value_dtype = buffer_store->value.dtype();
+  DataType element_dtype = buffer_store->buffer->dtype;
+  auto store_desc =
+    GetBufferDesc(value_dtype, buffer_store->buffer.get(), buffer_store->indices[0]);
+  auto load_desc =
+    GetBufferDesc(buffer_load->dtype, buffer_load->buffer.get(), buffer_load->indices[0]);
+  std::string lds_base = "(" + store_desc.data_type + "*)" + store_desc.wave_ptr;
+  PrintIndent();
+  stream << "ck::hcu_direct_load_global_to_lds<"
+         << load_desc.data_type << ", " << value_dtype.lanes() << ", false>("
+         << load_desc.wave_ptr << ", "              // global_base_ptr
+         << load_desc.offset << ", "                // global_offset (in elements)
+         << lds_base << ", "                        // lds_base_ptr
+         << store_desc.offset << ", "               // lds_offset (in elements)
+         << "true, "                                // is_valid
+         << load_desc.element_space_size << ", "    // src_element_space_size (in elements)
+         << "0);\n";                                // wave_lds_wrap_offset
+
+  return true;
+}
+
 void CodeGenTileLangHCU::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
   LaunchConfigExtractor extractor;
   extractor(f->body);
@@ -137,6 +175,7 @@ void CodeGenTileLangHCU::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
 
 std::string CodeGenTileLangHCU::Finish() {
   decl_stream << "#include <hip/hip_runtime.h>\n";
+  decl_stream << "#include <ck/utility/amd_buffer_addressing.hpp>\n";
 
   if (enable_fp8_) {
     decl_stream << "#include <tl_templates/hcu/hcu_fp8.h>\n";
@@ -179,13 +218,15 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
   DataType value_dtype = op->value.dtype();
   DataType element_dtype = op->buffer->dtype;
 
+  if (TryToEmitLDSBufferOp(op))
+    return;
+
   // Only handle the common case where lanes match; otherwise, fall back to the default
   // CodeGenC implementation (which may invoke PrintVecStore to emit buffer/vectorized store
   // instructions).
   if (value_dtype.lanes() == element_dtype.lanes()) {
     BufferDesc desc = GetBufferDesc(value_dtype, op->buffer.get(), op->indices[0]);
-
-    if (CanUseBufferOps(value_dtype, desc)) {
+    if (CanUseVMBufferOps(op->buffer.get(), value_dtype.lanes())) {
       std::string value = PrintExpr(op->value);
 
       // Convert the value expression to a thread_buffer using bit_cast.
@@ -208,7 +249,7 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
     }
   }
 
-  // Fallback to the base implementation.
+  // Fallback to the base implementation which emits vectorized stores.
   CodeGenC::VisitStmt_(op);
 }
 
@@ -500,7 +541,7 @@ void CodeGenTileLangHCU::PrintVecBinaryOp(const std::string &op, DataType t,
 }
 
 CodeGenTileLangHCU::BufferDesc
-CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr base) {
+CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr offset) {
   const VarNode *buffer_var = buffer->data.get();
   std::string scope;
 
@@ -520,9 +561,16 @@ CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr
   std::ostringstream stream;
   PrintType(buffer->dtype.element_of(), stream);
 
+  if (offset.as<RampNode>()) {
+    arith::PVar<PrimExpr> base;
+    arith::ramp(base, 1, t.lanes()).Match(offset);
+    offset = base.Eval();
+    ICHECK(offset.defined()) << "Non-contiguous ramp offset is not supported.";
+  }
+
   BufferDesc desc;
   desc.wave_ptr = GetVarID(buffer_var);
-  desc.offset = PrintExpr(base);
+  desc.offset = PrintExpr(offset);
   desc.element_space_size = element_space_size;
   desc.data_type = stream.str();
   desc.scope = scope;
@@ -533,11 +581,10 @@ CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr
 
 std::string CodeGenTileLangHCU::GetVecLoad(DataType t, const BufferNode *buffer,
                                            PrimExpr base) {
-  auto desc = GetBufferDesc(t, buffer, base);
-
   // Generate CK buffer load for global memory accesses
   // FIXME: Should we check if the offset is not negative?
-  if (CanUseBufferOps(t, desc)) {
+  if (CanUseVMBufferOps(buffer, t.lanes())) {
+    auto desc = GetBufferDesc(t, buffer, base);
     std::ostringstream os;
     os << "*(";
     PrintType(t, os);
@@ -555,14 +602,13 @@ std::string CodeGenTileLangHCU::GetVecLoad(DataType t, const BufferNode *buffer,
 
 void CodeGenTileLangHCU::PrintVecStore(const BufferNode* buffer, DataType t,
                                        PrimExpr base, const std::string& value) {
-  auto desc = GetBufferDesc(t, buffer, base);
-
   // If not using buffer store, use the base class implementation
-  if (!CanUseBufferOps(t, desc)) {
+  if (!CanUseVMBufferOps(buffer, t.lanes())) {
     CodeGenC::PrintVecStore(buffer, t, base, value);
     return;
   }
 
+  auto desc = GetBufferDesc(t, buffer, base);
   // Convert value to thread_buffer and use amd_buffer_store
   // amd_buffer_store signature:
   //   amd_buffer_store<type, num_elements>(src_thread_data, dst_ptr, dst_offset,
@@ -1161,6 +1207,19 @@ void CodeGenTileLangHCU::VisitStmt_(const AttrStmtNode *op) {
     return;
   }
   CodeGenC::VisitStmt_(op);
+}
+
+void CodeGenTileLangHCU::VisitStmt_(const tir::BlockNode *op) {
+  if (op->annotations.count(tl::attr::kDirectToLDSMap)) {
+    auto map = op->annotations.Get(tl::attr::kDirectToLDSMap)->as<Map<Var, PrimExpr>>().value();
+    for (const auto &[var, enabled] : map) {
+      if (auto int_val = enabled.as<IntImmNode>()) {
+        direct_to_lds_map_[var.get()] = (int_val->value != 0);
+      }
+    }
+  }
+
+  this->VisitStmt(op->body);
 }
 
 void CodeGenTileLangHCU::VisitStmt_(const AllocateNode *op) {

@@ -146,6 +146,64 @@ def annotate_layout(layout_map: Dict):
     return block_attr({"layout_map": _layout_map})
 
 
+def annotate_direct_to_lds(buffers):
+    """Annotate buffers to use direct-to-LDS loading
+
+    This annotation enables direct global-to-LDS memory transfers for specified buffers,
+    bypassing VGPR intermediate storage. This is an HCU-specific optimization that
+    can improve memory bandwidth utilization for global-to-shared copies.
+
+    Args:
+        buffer_map: Either a single buffer, a list of buffers, or a dict mapping buffers to bool.
+                    If a list/single buffer is provided, all buffers will be enabled for direct-to-LDS.
+                    If a dict is provided, only buffers with True value will use direct-to-LDS.
+
+    Returns:
+        block_attr: an block attribute statement
+
+    Example:
+        @T.prim_func
+        def gemm_kernel(
+                A: T.Tensor((M, K), dtype),
+                B: T.Tensor((K, N), dtype),
+                C: T.Tensor((M, N), dtype),
+        ):
+            with T.Kernel(grid_m, grid_n, threads=128) as (bx, by):
+                A_shared = T.alloc_shared((block_M, block_K), dtype)
+                B_shared = T.alloc_shared((block_K, block_N), dtype)
+
+                # Enable direct-to-LDS for both shared buffers
+                T.annotate_hcu_direct_to_lds([A_shared, B_shared])
+                # Or use a dict for finer control:
+                # T.annotate_hcu_direct_to_lds({A_shared: True, B_shared: False})
+
+                # Copy from global to shared (will use direct-to-LDS)
+                for i, j in T.Parallel(block_M, block_K):
+                    A_shared[i, j] = A[bx * block_M + i, j]
+                for i, j in T.Parallel(block_K, block_N):
+                    B_shared[i, j] = B[i, by * block_N + j]
+                # ... rest of kernel
+
+        return gemm_kernel
+    """
+    from tvm.tir import IntImm
+
+    # Normalize input to dict format
+    _direct_to_lds_map = {}
+    if isinstance(buffers, dict):
+        # Already a dict, use as-is
+        for buffer, enabled in buffers.items():
+            _direct_to_lds_map[buffer.data] = IntImm("int32", 1 if enabled else 0)
+    elif isinstance(buffers, (list, tuple)):
+        # List of buffers, enable all
+        for buffer in buffers:
+            _direct_to_lds_map[buffer.data] = IntImm("int32", 1)
+    else:
+        # Single buffer, enable it
+        _direct_to_lds_map[buffers.data] = IntImm("int32", 1)
+    return block_attr({"direct_to_lds": _direct_to_lds_map})
+
+
 def annotate_padding(padding_map: Dict):
     """Annotate the padding of the buffer
 

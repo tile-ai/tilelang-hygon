@@ -27,6 +27,7 @@ static constexpr const char *kWarpSpecializationScope =
     "kWarpSpecializationScope";
 static constexpr const char *kCustomWarpSpecialization =
     "kCustomWarpSpecialization";
+static constexpr const char *kDirectToLDSMap = "direct_to_lds_map";
 } // namespace attr
 
 static constexpr const char *kDebugMergeSharedMemoryAllocations =

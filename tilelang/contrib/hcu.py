@@ -1,7 +1,7 @@
 """Utility for HCU backend"""
 
 def get_hcu_compile_flags(arch: str):
-    if arch in ["gfx936", "gfx938"]:
+    if arch in ["gfx928", "gfx936", "gfx938"]:
         return [
             #"-mllvm=-support-768-vgprs=true",
             "-mllvm=-enable-latency-hack=true",
