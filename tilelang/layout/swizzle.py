@@ -17,6 +17,14 @@ def make_swizzled_layout(buffer: tvm.tir.Buffer, k_major: bool = True, allow_pad
         allow_pad,
     )
 
+def make_hcu_swizzled_layout(buffer: tvm.tir.Buffer, major_pack: int = 1):
+    assert len(buffer.shape) == 2
+    return _ffi_api.make_hcu_swizzled_layout(
+        int(buffer.shape[0]),
+        int(buffer.shape[1]),
+        int(tvm.DataType(buffer.dtype).bits),
+        major_pack,
+    )
 
 # for WGMMA Intrinsics
 def make_wgmma_swizzled_layout(buffer: tvm.tir.Buffer,

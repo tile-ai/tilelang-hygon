@@ -195,10 +195,17 @@ Fragment makeGemmFragmentCCDNA(const int block_m, const int block_n,
 }
 
 Fragment makeGemmFragmentHCU(const int block_m, const int block_n,
-  const int warp_m, const int warp_n,
+  const int num_warp_m, const int num_warp_n,
   const int element_size) {
 if (element_size == 64)
-LOG(FATAL) << "Not supported";
+  LOG(FATAL) << "Not supported";
+
+auto min_n_per_warp = 16;
+auto warp_m = block_m / num_warp_m;
+auto num_warp_n_no_recompute = std::min(num_warp_n, block_n / min_n_per_warp);
+auto warp_n = block_n / num_warp_n_no_recompute;
+auto n_recompute = num_warp_n / num_warp_n_no_recompute;
+
 ICHECK(block_m % warp_m == 0);
 ICHECK(block_n % warp_n == 0);
 ICHECK(warp_m % 16 == 0) << "warp_m=" << warp_m;
@@ -208,15 +215,25 @@ auto warp_layout =
 base_layout->Repeat({warp_m / 16, warp_n / 16}, false, true);
 auto block_layout =
 warp_layout->Repeat({block_m / warp_m, block_n / warp_n}, true, false);
+if (n_recompute > 1) {
+  block_layout = block_layout->Replicate(n_recompute);
+}
 return block_layout;
 }
 
 // Lit 4 interleaved
 Fragment makeGemmFragmentHCULit(const int block_m, const int block_n,
-  const int warp_m, const int warp_n,
+  const int num_warp_m, const int num_warp_n,
   const int element_size) {
 if (element_size == 64)
-LOG(FATAL) << "Not supported";
+  LOG(FATAL) << "Not supported";
+
+auto min_n_per_warp = 16;
+auto warp_m = block_m / num_warp_m;
+auto num_warp_n_no_recompute = std::min(num_warp_n, block_n / min_n_per_warp);
+auto warp_n = block_n / num_warp_n_no_recompute;
+auto n_recompute = num_warp_n / num_warp_n_no_recompute;
+
 ICHECK(block_m % warp_m == 0);
 ICHECK(block_n % warp_n == 0);
 ICHECK(warp_m % 16 == 0) << "warp_m=" << warp_m;
@@ -226,6 +243,9 @@ auto warp_layout =
 base_layout->Repeat({warp_m / 16, warp_n / 16}, false, true);
 auto block_layout =
 warp_layout->Repeat({block_m / warp_m, block_n / warp_n}, true, false);
+if (n_recompute > 1) {
+  block_layout = block_layout->Replicate(n_recompute);
+}
 return block_layout;
 }
 
@@ -349,6 +369,90 @@ Fragment makeGemmFragmentACDNA(const int block_m, const int block_n,
         base_layout->Repeat({warp_m / 16, block_k / mfma_k}, false, false);
     auto block_layout = warp_layout->Repeat({block_m / warp_m, 1}, true, true)
                             ->Replicate(block_n / warp_n);
+    return block_layout;
+  }
+}
+
+Fragment makeGemmFragmentAHCU(const int block_m, const int block_n,
+                               const int block_k, const int num_warp_m,
+                               const int num_warp_n, const int element_size,
+                               const int k_pack, bool transposed) {
+  auto warp_m = block_m / num_warp_m;
+  // assume not transposed
+  ICHECK(block_m % warp_m == 0);
+  ICHECK(warp_m % 16 == 0);
+  const int mfma_k = k_pack * (element_size == 16 ? 16 : 32);
+  ICHECK(block_k % mfma_k == 0);
+  ICHECK(element_size == 8 || element_size == 16)
+      << "element bitwidth=" << element_size;
+  if (transposed) {
+    auto base_layout =
+        element_size == 16
+            ? makeGemmFragmentAB16x16CDNATransposed(k_pack)->Repeat(
+                  {1, 1}, false, false)
+            : makeGemmFragmentAB16x32CDNATransposed(k_pack)->Repeat(
+                  {1, 1}, false, false);
+    auto warp_layout =
+        base_layout->Repeat({block_k / mfma_k, warp_m / 16}, false, true);
+    auto block_layout = warp_layout->Repeat({1, block_m / warp_m}, true, true)
+                            ->Replicate(num_warp_n);
+    return block_layout;
+  } else {
+    auto base_layout =
+        element_size == 16
+            ? makeGemmFragmentAB16x16CDNA(k_pack)->Repeat({1, 1}, false, false)
+            : makeGemmFragmentAB16x32CDNA(k_pack)->Repeat({1, 1}, false, false);
+    auto warp_layout =
+        base_layout->Repeat({warp_m / 16, block_k / mfma_k}, false, false);
+    auto block_layout = warp_layout->Repeat({block_m / warp_m, 1}, true, true)
+                            ->Replicate(num_warp_n);
+    return block_layout;
+  }
+}
+
+Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
+                               const int block_k, const int num_warp_m,
+                               const int num_warp_n, const int element_size,
+                               const int k_pack, bool transposed) {
+  ICHECK(block_n % 16 == 0);
+  // for now we only support recompute for N dimension
+  auto warp_n_no_recompute = std::min(num_warp_n, block_n / 16);
+  auto warp_n = block_n / warp_n_no_recompute;
+  auto n_recompute = warp_n / warp_n_no_recompute;
+
+  ICHECK(block_n % warp_n == 0);
+  ICHECK(warp_n % 16 == 0);
+  const int mfma_k = k_pack * (element_size == 16 ? 16 : 32);
+  ICHECK(block_k % mfma_k == 0);
+  ICHECK(element_size == 8 || element_size == 16)
+      << "element bitwidth=" << element_size;
+  if (transposed) {
+    auto base_layout =
+        element_size == 16
+            ? makeGemmFragmentAB16x16CDNA(k_pack)->Repeat({1, 1}, false, false)
+            : makeGemmFragmentAB16x32CDNA(k_pack)->Repeat({1, 1}, false, false);
+    auto warp_layout =
+        base_layout->Repeat({warp_n / 16, block_k / mfma_k}, false, false);
+    auto block_layout = warp_layout->Replicate(num_warp_m)
+                                      ->Repeat({block_n / warp_n, 1}, true, true);
+    if (n_recompute > 1) {
+      block_layout = block_layout->Replicate(n_recompute);
+    }
+    return block_layout;
+  } else {
+    auto base_layout =
+        element_size == 16
+            ? makeGemmFragmentAB16x16CDNATransposed(k_pack)->Repeat(
+                  {1, 1}, false, false)
+            : makeGemmFragmentAB16x32CDNATransposed(k_pack)->Repeat(
+                  {1, 1}, false, false);
+    auto warp_layout =
+        base_layout->Repeat({block_k / mfma_k, warp_n / 16}, false, true);
+    auto block_layout = warp_layout->Replicate(num_warp_m)
+                                     ->Repeat({1, block_n / warp_n}, true, true);
+    if (n_recompute > 1) {
+      block_layout = block_layout->Replicate(n_recompute);
+    }
     return block_layout;
   }
 }

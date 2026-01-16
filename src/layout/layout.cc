@@ -529,6 +529,11 @@ TVM_FFI_STATIC_INIT_BLOCK({
                                              element_size, k_inner);
              }
            })
+      .def("tl.make_hcu_swizzled_layout",
+      [](int stride, int continuous, int element_size, int inner_pack = 1) {
+          return makeGemmABLayoutCDNA(stride, continuous,
+                                        element_size, inner_pack);
+      })
       .def("tl.make_wgmma_swizzled_layout",
            [](int stride, int mat_continuous, int continuity, int element_size,
               bool k_inner) {

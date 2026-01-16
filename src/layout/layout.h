@@ -147,10 +147,10 @@ Fragment makeGemmFragmentCCDNA(const int block_m, const int block_n,
                                const int warp_m, const int warp_n,
                                const int element_size);
 Fragment makeGemmFragmentHCU(const int block_m, const int block_n,
-                               const int warp_m, const int warp_n,
+                               const int num_warp_m, const int num_warp_n,
                                const int element_size);
 Fragment makeGemmFragmentHCULit(const int block_m, const int block_n,
-                               const int warp_m, const int warp_n,
+                               const int num_warp_m, const int num_warp_n,
                                const int element_size);
 Fragment makeGemmFragmentCHopper(const int block_m, const int block_n,
                                  const int warp_m, const int warp_n,
@@ -166,6 +166,16 @@ Fragment makeGemmFragmentB(const int block_m, const int block_n,
 Fragment makeGemmFragmentACDNA(const int block_m, const int block_n,
                                const int block_k, const int warp_m,
                                const int warp_n, const int element_size,
+                               const int k_pack, bool transposed = false);
+
+Fragment makeGemmFragmentAHCU(const int block_m, const int block_n,
+                               const int block_k, const int num_warp_m,
+                               const int num_warp_n, const int element_size,
+                               const int k_pack, bool transposed = false);
+
+Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
+                               const int block_k, const int num_warp_m,
+                               const int num_warp_n, const int element_size,
                                const int k_pack, bool transposed = false);
 
 // Default Memory Layout

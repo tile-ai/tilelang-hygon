@@ -126,10 +126,11 @@ public:
 
   static constexpr int block_row_warps = num_warp_m;
   static constexpr int block_col_warps = num_warp_n;
+  static constexpr int block_col_warps_no_recompute = std::min(num_warp_n, N_Tile / micro_size_y);
 
   static constexpr int inner_k = K_Tile / (micro_size_k * kPack);
   static constexpr int warp_rows = M_Tile / (block_row_warps * micro_size_x);
-  static constexpr int warp_cols = N_Tile / (block_col_warps * micro_size_y);
+  static constexpr int warp_cols = N_Tile / (block_col_warps_no_recompute * micro_size_y);
 
   // The kPadA, kPadB, kPadC & kBlockPerCu should also come from the Codegen
   // part.
@@ -220,9 +221,13 @@ public:
     auto tid = threadIdx.x;
     auto warp_id = tid / warp_size;
     auto warp_n = warp_id / block_row_warps;
+    // we allways recompute on n warps when total warps > max warps needed
+    if constexpr (block_col_warps_no_recompute != block_col_warps) {
+      warp_n = warp_n % block_col_warps_no_recompute;
+    }
     auto warp_m = warp_id % block_row_warps;
-    auto warp_row_tiles = warp_rows * micro_size_x;
-    auto warp_col_tiles = warp_cols * micro_size_y;
+    constexpr auto warp_row_tiles = warp_rows * micro_size_x;
+    constexpr auto warp_col_tiles = warp_cols * micro_size_y;
 
     auto lane_id = tid % warp_size;
     auto tx = lane_id;
@@ -296,9 +301,12 @@ public:
     auto tid = threadIdx.x;
     auto warp_id = tid / warp_size;
     auto warp_n = warp_id / block_row_warps;
-    auto warp_m = warp_id % block_row_warps;
-    auto warp_row_tiles = warp_rows * micro_size_x;
-    auto warp_col_tiles = warp_cols * micro_size_y;
+    // we allways recompute on n warps when total warps > max warps needed
+    if constexpr (block_col_warps_no_recompute != block_col_warps) {
+      warp_n = warp_n % block_col_warps_no_recompute;
+    }
+    constexpr auto warp_row_tiles = warp_rows * micro_size_x;
+    constexpr auto warp_col_tiles = warp_cols * micro_size_y;
 
     auto lane_id = tid % warp_size;
     auto tx = lane_id;
@@ -349,6 +357,77 @@ public:
       }
     }
   }
+
+  static TL_DEVICE void body_rr(A_type *A_local, B_type *B_local,
+                                C_type *C_local) {
+    for (int ki = 0; ki < inner_k; ki++) {
+      // Compute
+      for (int kp = 0; kp < kPack; kp++) {
+        for (int i = 0; i < warp_rows; ++i) {
+          for (int j = 0; j < warp_cols; ++j) {
+            auto acc_ptr = ((float32x4 *)C_local) + ((i * warp_cols) + j);
+            auto b_ptr = ((B_type *)B_local) +
+                         (ki * warp_cols * kPack + j * kPack + kp) * vec_size;
+            auto a_ptr = ((A_type *)A_local) +
+                         (ki * warp_rows * kPack + i * kPack + kp) * vec_size;
+            // Use the trait to select the correct MMAC instruction, either fp8,
+            // fp16 or bf16 currently
+            MmacTraits<A_type>::mmac_op(b_ptr, a_ptr, acc_ptr);
+          }
+        }
+      }
+    }
+  }
+
+  static TL_DEVICE void body_sr(A_type *A_shared, B_type *B_local,
+                             C_type *C_local) {
+    auto tid = threadIdx.x;
+    auto warp_id = tid / warp_size;
+    auto warp_m = warp_id % block_row_warps;
+    constexpr auto warp_row_tiles = warp_rows * micro_size_x;
+    auto lane_id = tid % warp_size;
+
+    constexpr auto local_size_a = (micro_size_x * micro_size_k) / warp_size;
+    constexpr auto last_dim_a = TransposeA ? M_Tile : K_Tile;
+
+    A_type A_local[warp_rows * kPack * local_size_a];
+
+    for (int ki = 0; ki < inner_k; ki++) {
+      // Fetch A into register
+      for (int i = 0; i < warp_rows; i++) {
+        const auto l = warp_m * warp_row_tiles + i * micro_size_x;
+        const auto r = ki * (kPack * micro_size_k);
+        for (int local_id = 0; local_id < (kPack * local_size_a); local_id++) {
+          if constexpr (TransposeA) {
+            auto [row, col] = reverse_index_map_transposed(lane_id, local_id);
+            A_local[i * kPack * local_size_a + local_id] =
+                A_shared[make_swizzle_layout<last_dim_a, sizeof(A_type)>(
+                    r + row, l + col)];
+          } else {
+            auto [row, col] = reverse_index_map(lane_id, local_id);
+            A_local[i * kPack * local_size_a + local_id] =
+                A_shared[make_swizzle_layout<last_dim_a, sizeof(A_type)>(
+                    l + row, r + col)];
+          }
+        }
+      }
+      // Compute
+      for (int kp = 0; kp < kPack; kp++) {
+        for (int i = 0; i < warp_rows; ++i) {
+          for (int j = 0; j < warp_cols; ++j) {
+            auto acc_ptr = ((float32x4 *)C_local) + ((i * warp_cols) + j);
+            auto b_ptr = ((B_type *)B_local) +
+                         (ki * warp_cols * kPack + j * kPack + kp) * vec_size;
+            auto a_ptr = ((A_type *)A_local) + (i * kPack + kp) * vec_size;
+
+            // Use the trait to select the correct MMAC instruction, either fp8,
+            // fp16 or bf16 currently
+            MmacTraits<A_type>::mmac_op(b_ptr, a_ptr, acc_ptr);
+          }
+        }
+      }
+    }
+  }
 };
 
 } // namespace tl
@@ -373,6 +452,26 @@ TL_DEVICE void gemm_rs(A_type *pA, B_type *pB, C_type *accum) {
       GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A, trans_B,
                    clear_accum, kPack, A_type, B_type, C_type>;
   Compute::body_rs(pA, pB, accum);
+}
+
+template <int M, int N, int K, int num_warp_m, int num_warp_n, bool trans_A,
+          bool trans_B, bool clear_accum, int kPack, typename A_type,
+          typename B_type, typename C_type>
+TL_DEVICE void gemm_rr(A_type *pA, B_type *pB, C_type *accum) {
+  using Compute =
+      GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A, trans_B,
+                   clear_accum, kPack, A_type, B_type, C_type>;
+  Compute::body_rr(pA, pB, accum);
+}
+
+template <int M, int N, int K, int num_warp_m, int num_warp_n, bool trans_A,
+          bool trans_B, bool clear_accum, int kPack, typename A_type,
+          typename B_type, typename C_type>
+TL_DEVICE void gemm_sr(A_type *pA, B_type *pB, C_type *accum) {
+  using Compute =
+      GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A, trans_B,
+                   clear_accum, kPack, A_type, B_type, C_type>;
+  Compute::body_sr(pA, pB, accum);
 }
 
 } // namespace tl

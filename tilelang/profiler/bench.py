@@ -133,6 +133,84 @@ def do_bench(
     else:
         raise ValueError(f"Unknown profiler backend: {backend}")
 
+def _summarize_statistics(times, quantiles, return_mode):
+    import torch
+    if quantiles is not None:
+        ret = torch.quantile(times, torch.tensor(quantiles, dtype=torch.float)).tolist()
+        if len(ret) == 1:
+            ret = ret[0]
+        return ret
+    if return_mode == "all":
+        return times.tolist()
+    return getattr(torch, return_mode)(times).item()
+
+def do_bench_cudagraph(
+    fn: Callable,
+    rep: float = 20,
+    grad_to_none=None,
+    quantiles: Optional[List[float]] = None,
+    return_mode: Literal["min", "max", "mean", "median", "all"] = "mean"):
+    """
+    Benchmark the runtime of the provided function.
+
+    :param fn: Function to benchmark
+    :type fn: Callable
+    :param rep: Repetition time (in ms)
+    :type rep: int
+    :param grad_to_none: Reset the gradient of the provided tensor to None
+    :type grad_to_none: torch.tensor, optional
+    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all" Default is "mean".
+    :type return_mode: str
+    """
+    import torch
+    assert return_mode in ["min", "max", "mean", "median", "all"]
+
+    with torch.cuda.stream(torch.cuda.Stream()):
+        # warmup
+        fn()
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.detach_()
+                x.requires_grad_(True)
+                x.grad = None
+        # step 1 - we estimate the amount of time the kernel call takes
+        # NOTE: this estimate isn't super accurate because the GPU isn't warmed up at this point
+        #       but it is probably good enough
+        # NOTE: we don't use a graph to estimate the runtime because creating a graph is expensive,
+        #       ~300ms on A100, so we default to the same method used in `do_bench` (minus the L2
+        #       cache flush).
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(5):
+            fn()
+        end_event.record()
+        torch.cuda.synchronize()
+        estimate_ms = start_event.elapsed_time(end_event) / 5
+        n_repeat = max(1, int(rep / estimate_ms))
+        # step 2 - construct a cuda graph with `n_repeat` unrolled function calls to minimize
+        # host overhead
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(n_repeat):
+                if grad_to_none is not None:
+                    for x in grad_to_none:
+                        x.grad = None
+                fn()
+        torch.cuda.synchronize()
+        # measure time and return
+        ret = []
+        n_retries = 10
+        for _ in range(n_retries):
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            g.replay()
+            end_event.record()
+            torch.cuda.synchronize()
+            ret += [start_event.elapsed_time(end_event) / n_repeat]
+        return _summarize_statistics(torch.tensor(ret), quantiles, return_mode)
+
 
 def _bench_with_cuda_events(
     fn: Callable,

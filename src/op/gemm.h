@@ -60,6 +60,10 @@ public:
                                            Target target,
                                            GemmInst gemm_inst) const;
 
+  std::pair<int, int> ComputeWarpPartitionHCU(int M, int N, int block_size,
+                                          Target target,
+                                          GemmInst gemm_inst) const;
+
   bool isSquare() const {
     return policy_type == int(GemmWarpPolicyType::kSquare);
   }
