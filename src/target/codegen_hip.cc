@@ -9,7 +9,6 @@
 #include <tvm/tir/op.h>
 
 #include <cmath>
-#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
@@ -137,22 +136,6 @@ void CodeGenTileLangHIP::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
 }
 
 std::string CodeGenTileLangHIP::Finish() {
-#if USE_HCU
-  // TODO: Move to the hcu folder when the hcu codegen is complete.
-  decl_stream << "#include <hip/hip_runtime.h>\n";
-
-  if (enable_fp8_) {
-    decl_stream << "#include <tl_templates/hcu/hcu_fp8.h>\n";
-  }
-
-  decl_stream << "#include <tl_templates/hcu/atomic.h>\n";
-  decl_stream << "#include <tl_templates/hcu/gemm.h>\n";
-  decl_stream << "#include <tl_templates/hcu/copy.h>\n";
-  decl_stream << "#include <tl_templates/hcu/reduce.h>\n";
-  decl_stream << "#include <tl_templates/hcu/ldsm.h>\n";
-  decl_stream << "#include <tl_templates/hcu/threadblock_swizzle.h>\n";
-  decl_stream << "#include <tl_templates/hcu/debug.h>\n";
-#else
   // hip must need a header file.
   decl_stream << "#include <hip/hip_runtime.h>\n";
   if (need_mma_h_) {
@@ -169,7 +152,6 @@ std::string CodeGenTileLangHIP::Finish() {
   decl_stream << "#include <tl_templates/hip/ldsm.h>\n";
   decl_stream << "#include <tl_templates/hip/threadblock_swizzle.h>\n";
   decl_stream << "#include <tl_templates/hip/debug.h>\n";
-#endif
   decl_stream << "\n";
   return CodeGenC::Finish();
 }
@@ -193,44 +175,6 @@ void CodeGenTileLangHIP::VisitStmt_(const tir::ForNode *op) {
   this->EndScope(for_scope);
   PrintIndent();
   stream << "}\n";
-}
-
-void CodeGenTileLangHIP::VisitStmt_(const BufferStoreNode *op) {
-  // Try to use CK buffer store for global memory when enabled.
-  DataType value_dtype = op->value.dtype();
-  DataType element_dtype = op->buffer->dtype;
-
-  // Only handle the common case where lanes match; otherwise, fall back to the default
-  // CodeGenC implementation (which may invoke PrintVecStore to emit buffer/vectorized store
-  // instructions).
-  if (value_dtype.lanes() == element_dtype.lanes()) {
-    BufferDesc desc = GetBufferDesc(value_dtype, op->buffer.get(), op->indices[0]);
-
-    if (CanUseBufferOps(value_dtype, desc)) {
-      std::string value = PrintExpr(op->value);
-
-      // Convert the value expression to a thread_buffer using bit_cast.
-      // For lanes==1 this becomes thread_buffer<T,1>.
-      std::string src_thread_buffer = "ck_tile::bit_cast<ck_tile::thread_buffer<" +
-                                      desc.data_type + ", " +
-                                      std::to_string(desc.num_elements) + ">>(" +
-                                      value + ")";
-
-      PrintIndent();
-      stream << "ck_tile::amd_buffer_store<"
-             << desc.data_type << ", " << desc.num_elements << ">("
-             << src_thread_buffer << ", "
-             << desc.wave_ptr << ", "
-             << desc.offset << ", "
-             << "true, "  // dst_thread_element_valid - always true for now
-             << desc.element_space_size << ");\n";
-
-      return;
-    }
-  }
-
-  // Fallback to the base implementation.
-  CodeGenC::VisitStmt_(op);
 }
 
 void CodeGenTileLangHIP::BindThreadIndex(const IterVar &iv) {
@@ -520,92 +464,6 @@ void CodeGenTileLangHIP::PrintVecBinaryOp(const std::string &op, DataType t,
   os << sret;
 }
 
-CodeGenTileLangHIP::BufferDesc
-CodeGenTileLangHIP::GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr base) {
-  const VarNode *buffer_var = buffer->data.get();
-  std::string scope;
-
-  if (alloc_storage_scope_.count(buffer_var)) {
-    scope = alloc_storage_scope_.at(buffer_var);
-  }
-  if (scope.empty()) {
-    scope = GetPtrStorageScope(buffer->data);
-  }
-
-  ICHECK_NE(buffer->shape.size(), 0) << "Buffer shape is empty";
-  PrimExpr total_size = IntImm(DataType::Int(32), 1);
-  for (const auto& dim : buffer->shape) {
-    total_size = total_size * dim;
-  }
-  std::string element_space_size = PrintExpr(total_size);
-  std::ostringstream stream;
-  PrintType(buffer->dtype.element_of(), stream);
-
-  BufferDesc desc;
-  desc.wave_ptr = GetVarID(buffer_var);
-  desc.offset = PrintExpr(base);
-  desc.element_space_size = element_space_size;
-  desc.data_type = stream.str();
-  desc.scope = scope;
-  desc.num_elements = t.lanes();
-
-  return std::move(desc);
-}
-
-std::string CodeGenTileLangHIP::GetVecLoad(DataType t, const BufferNode *buffer,
-                                           PrimExpr base) {
-  auto desc = GetBufferDesc(t, buffer, base);
-
-  // Generate CK buffer load for global memory accesses
-  // FIXME: Should we check if the offset is not negative?
-  if (CanUseBufferOps(t, desc)) {
-    std::ostringstream os;
-    os << "*(";
-    PrintType(t, os);
-    os << "*)&(ck_tile::amd_buffer_load_invalid_element_return_zero<"
-       << desc.data_type << ", " << desc.num_elements << ">("
-       << desc.wave_ptr << ", " << desc.offset << ", true, " << desc.element_space_size
-       << ").get())";
-
-    return os.str();
-  }
-
-  // For other cases, use the global load.
-  return CodeGenC::GetVecLoad(t, buffer, base);
-}
-
-void CodeGenTileLangHIP::PrintVecStore(const BufferNode* buffer, DataType t,
-                                       PrimExpr base, const std::string& value) {
-  auto desc = GetBufferDesc(t, buffer, base);
-
-  // If not using buffer store, use the base class implementation
-  if (!CanUseBufferOps(t, desc)) {
-    CodeGenC::PrintVecStore(buffer, t, base, value);
-    return;
-  }
-
-  // Convert value to thread_buffer and use amd_buffer_store
-  // amd_buffer_store signature:
-  //   amd_buffer_store<type, num_elements>(src_thread_data, dst_ptr, dst_offset,
-  //                                        is_valid, element_space_size)
-  // Convert the value expression to a thread_buffer using bit_cast
-  std::string src_thread_buffer = "ck_tile::bit_cast<ck_tile::thread_buffer<" +
-                                  desc.data_type + ", " +
-                                  std::to_string(desc.num_elements) + ">>(" + value + ")";
-
-  // Generate the buffer store call
-  this->PrintIndent();
-  this->stream << "ck_tile::amd_buffer_store<"
-               << desc.data_type << ", " << desc.num_elements << ">("
-               << src_thread_buffer << ", "
-               << desc.wave_ptr << ", "
-               << desc.offset << ", "
-               << "true, "  // dst_thread_element_valid - always true for now
-               << desc.element_space_size << ");\n";
-
-  return;
-}
-
 void CodeGenTileLangHIP::PrintVecElemLoad(const std::string &vec, DataType t,
                                           int i,
                                           std::ostream &os) { // NOLINT(*)
@@ -745,12 +603,6 @@ std::string CodeGenTileLangHIP::CastFromTo(std::string value, DataType from,
       os << "u";
     }
     os << "int)";
-  } else if (from.is_bfloat16() || target.is_bfloat16()) {
-    os << "(bf16_cvt_t)";
-  } else if (from.is_float8_e4m3fn() || target.is_float8_e4m3fn()) {
-    os << "(fp8_cvt_t)";
-  } else if (from.is_float8_e5m2() || target.is_float8_e5m2()) {
-    os << "(bf8_cvt_t)";
   }
   os << value << ")";
   return os.str();
@@ -765,14 +617,6 @@ void CodeGenTileLangHIP::VisitExpr_(const CastNode *op, std::ostream &os) {
   if (from_ty.is_scalar())
     return CodeGenC::VisitExpr_(op, os);
 
-  auto type_cvt = "";
-  if (from_ty.is_bfloat16() || target_ty.is_bfloat16()) {
-    type_cvt = "(bf16_cvt_t)";
-  } else if (from_ty.is_float8_e4m3fn() || target_ty.is_float8_e4m3fn()) {
-    type_cvt = "(fp8_cvt_t)";
-  } else if (from_ty.is_float8_e5m2() || target_ty.is_float8_e5m2()) {
-    type_cvt = "(bf8_cvt_t)";
-  }
   // We could emit make_float4 like calls, but the emitted code looks
   // too compact to read. Emit this as vectorized unary ops.
   std::string sret = name_supply_->FreshName("_");
@@ -785,7 +629,7 @@ void CodeGenTileLangHIP::VisitExpr_(const CastNode *op, std::ostream &os) {
       std::ostringstream val;
       val << "(";
       PrintType(target_ty.element_of(), val);
-      val << ")" << type_cvt << "(";
+      val << ")(";
       PrintVecElemLoad(src, from_ty, i, val);
       val << ")";
       PrintVecElemStore(sret, target_ty, i, val.str());
@@ -1078,40 +922,23 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
         {"int8", "char"},
         {"int32", "int"},
         {"int8x4", "int32_t"},
-        {"int8x8", "int32x2"},
+        {"int8x8", "int64_t"},
         {"int32x4", "int32x4"},
         {"float16", "half"},
         {"float32", "float"},
         {"float64", "double"},
         {"float16x4", "float16x4"},
         {"bfloat16x4", "bfloat16x4"},
-        {"float32x2", "float32x2"},
         {"float32x4", "float32x4"},
         {"float8_e4m3fnuzx4", "fp8_e4_4_t"},
         {"float8_e4m3fnuzx8", "long"},
-        {"float8_e4m3fnx8", "int32x2"},
-        {"float8_e5m2x8", "int32x2"},
         {"float32x16", "float32x16"}};
-
-    std::string lit = "";
-    if (prefix.find("_lit") != std::string::npos) {
-      lit = ", 1";
-    }
-    std::string clamp = "";
-    if (prefix.find("_clamp") != std::string::npos) {
-      clamp = ", 0";
-    }
-    std::string lts = "";
-    if (prefix.find("_lts") != std::string::npos) {
-      lts = ", 0";
-    }
-
     std::string call_mfma_code = R"({
       *((({C_dtype}*){c_ref}) + {c_bias}) = {mfma_buildin}(*((({A_dtype}*){a_ref}) + {a_bias}),
                     *((({B_dtype}*){b_ref}) + {b_bias}),
-                    *((({C_dtype}*){c_ref}) + {c_bias}){lit_suffix}{clamp_suffix}{lts_suffix});
+                    *((({C_dtype}*){c_ref}) + {c_bias}), 0, 0, 0);
     })";
-    std::string mfma_buildin = "__builtin_hcu_mmac_" + prefix;
+    std::string mfma_buildin = "__builtin_amdgcn_mfma_" + prefix;
     Replacer replacer;
 
     replacer.register_rule("{mfma_buildin}", mfma_buildin);
@@ -1124,9 +951,6 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("{b_bias}", b_bias);
     replacer.register_rule("{c_ref}", c_ref);
     replacer.register_rule("{c_bias}", c_bias);
-    replacer.register_rule("{lit_suffix}", lit);
-    replacer.register_rule("{clamp_suffix}", clamp);
-    replacer.register_rule("{lts_suffix}", lts);
     os << replacer.rewrite(call_mfma_code);
   } else if (op->op.same_as(builtin::thread_return())) {
     os << "return";
