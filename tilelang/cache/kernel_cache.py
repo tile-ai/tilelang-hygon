@@ -32,15 +32,16 @@ KERNEL_CUBIN_PATH = "kernel.cubin"
 KERNEL_PY_PATH = "kernel.py"
 PARAMS_PATH = "params.pkl"
 
-def _make_obj(src, fmt: Literal["s", "llir"]) -> Optional[str]:
+def _make_obj(src, fmt: Literal["asm", "llir", "so"], mode: str) -> Optional[str]:
     """
     Makes an object file from a source file.
 
     Args:
         src: The source file path or file object.
         fmt: The format of the object file.
-            - "s": Assembly file.
+            - "asm": Assembly file.
             - "llir": LLVM IR file.
+            - "so": Shared object file.
 
     Returns:
         The object file path.
@@ -58,12 +59,22 @@ def _make_obj(src, fmt: Literal["s", "llir"]) -> Optional[str]:
         f"--offload-arch={arch}",
         "-I" + env.COMPOSABLE_KERNEL_INCLUDE_DIR,
         "-I" + env.TILELANG_TEMPLATE_PATH,
-        "-g",
+        #"-g",
         src_path,
-        "-S",
-        "-emit-llvm" if fmt == "llir" else "",
+        #"-S",
+        #"-emit-llvm" if fmt == "llir" else "",
         "-o", obj_file_path,
     ]
+    match fmt:
+        case "asm": # assembly
+            command += ["-S", "-g"]
+        case "llir": # LLVM IR
+            command += ["-S",  "-g", "-emit-llvm"]
+        case "so": # shared object
+            command += ["--shared", "-fPIC"]
+        case _:
+            return None
+
     command += get_hcu_compile_flags(arch)
 
     try:
@@ -80,7 +91,7 @@ def _make_obj(src, fmt: Literal["s", "llir"]) -> Optional[str]:
                 f"Command: {' '.join(command)}\n"
                 f"Stdout:\n{ret.stdout}\nStderr:\n{ret.stderr}"
             )
-        with open(obj_file_path, "r") as f:
+        with open(obj_file_path, mode) as f:
             return f.read()
     except Exception as e:
         raise RuntimeError(f"{fmt} generation failed: {e}") from e
@@ -336,9 +347,9 @@ class KernelCache:
                 KernelCache._safe_write_file(kernel_path, "w",
                                              lambda file: file.write(kernel.kernel_source))
                 KernelCache._safe_write_file(asm_kernel_path, "w",
-                                             lambda file: file.write(_make_obj(kernel_path, "asm")))
+                                             lambda file: file.write(_make_obj(kernel_path, "asm", "r")))
                 KernelCache._safe_write_file(llir_kernel_path, "w",
-                                             lambda file: file.write(_make_obj(kernel_path, "llir")))
+                                             lambda file: file.write(_make_obj(kernel_path, "llir", "r")))
                 KernelCache._safe_write_file(tir_kernel_path, "w",
                                              lambda file: file.write(kernel.prim_func.script(show_meta=True)))
         except Exception as e:
@@ -436,6 +447,12 @@ class KernelCache:
                     f"Loading wrapped kernel source code from file: {wrapped_kernel_path}")
             with open(wrapped_kernel_path, "r") as f:
                 kernel_global_source = f.read()
+
+            if env.TILELANG_SOURCE_RECOMPILE.lower() in ("1", "true", "yes", "on"):
+                self.logger.debug(f"Recompiling {WRAPPED_KERNEL_PATH} from disk cache.")
+                 # Re-generate assembly & shared library code from source
+                KernelCache._safe_write_file(kernel_lib_path, "wb",
+                                             lambda file: file.write(_make_obj(wrapped_kernel_path,"so", "rb")))
         except Exception as e:
             self.logger.error(f"Error loading wrapped kernel source code from disk: {e}")
 
