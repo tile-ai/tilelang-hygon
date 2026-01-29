@@ -13,6 +13,7 @@ class GemmWarpPolicy(IntEnum):
     Square = 0  # Balance warps evenly in a "square" aspect ratio.
     FullRow = 1  # Assign all warps to rows.
     FullCol = 2  # Assign all warps to columns.
+    FullColK = 3  # Assign all warps to columns and K.
 
     def is_square(self) -> bool:
         """

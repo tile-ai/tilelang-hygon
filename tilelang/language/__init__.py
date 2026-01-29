@@ -58,6 +58,8 @@ from .reduce import (
     reduce_sum,  # noqa: F401
     reduce_abssum,  # noqa: F401
     reduce_absmax,  # noqa: F401
+    reduce_warp,  # noqa: F401
+    reduce_sum_warp,  # noqa: F401
     cumsum,  # noqa: F401
     finalize_reducer,  # noqa: F401
 )

@@ -10,6 +10,7 @@
 #include <tvm/tir/op.h>
 #include <tvm/tir/op_attr_types.h>
 #include <tvm/tir/transform.h>
+#include <tuple>
 
 #include "../target/utils.h"
 
@@ -201,17 +202,24 @@ GemmInst GemmNode::GetGemmInst(int block_size, Target target) const {
   }
 }
 
-std::pair<int, int> GemmWarpPolicyNode::ComputeWarpPartitionHCU(
-  int M, int N, int block_size, Target target, GemmInst gemm_inst) const {
+std::tuple<int, int, int> GemmWarpPolicyNode::ComputeWarpPartitionHCU(
+  int M, int N, int K, int k_pack, int element_byte_size, int block_size,
+  Target target, GemmInst gemm_inst) const {
 
   int num_warps = block_size / TargetGetWarpSize(target);
-  int m_warp = 1, n_warp = 1;
+  int m_warp = 1, n_warp = 1, k_warp = 1;
   constexpr int kMPerWarp = 16; // Rows processed by a single warp
   constexpr int kNPerWarp = 16;  // Columns processed by a single warp
+  ICHECK(element_byte_size == 1 || element_byte_size == 2)
+      << "element bitwidth=" << element_byte_size;
+  int kKPerWarp = k_pack * (32 / element_byte_size);
+
   ICHECK(M % kMPerWarp == 0)
       << "M must be divisible by " << kMPerWarp << ", but got " << M;
   ICHECK(N % kNPerWarp == 0)
       << "N must be divisible by " << kNPerWarp << ", but got " << N;
+  ICHECK(K % kKPerWarp == 0)
+      << "K must be divisible by " << kKPerWarp << ", but got " << K;
 
   if (this->isFullRow()) {
     // Try to partition M first
@@ -224,7 +232,7 @@ std::pair<int, int> GemmWarpPolicyNode::ComputeWarpPartitionHCU(
       // Calculate how many warps we can use for M
       m_warp = M / kMPerWarp;
       // Use remaining warps for N, warps for n may has recompute
-      int n_warp = num_warps / m_warp;
+      n_warp = num_warps / m_warp;
       if (n_warp == 0)
         n_warp = 1;
     }
@@ -233,13 +241,13 @@ std::pair<int, int> GemmWarpPolicyNode::ComputeWarpPartitionHCU(
     m_warp = 1;
     n_warp = num_warps;
 
-    // If N cannot be evenly divided by n_warp*8, try to split remaining warps
+    // If N cannot be evenly divided by n_warp, try to split remaining warps
     // to M
     if (N % (n_warp * kNPerWarp) != 0) {
       // Calculate how many warps we can use for N
       int n_warps_no_recompute = N / kNPerWarp;
       // Use remaining warps for M
-      int m_warp = num_warps / n_warps_no_recompute;
+      m_warp = num_warps / n_warps_no_recompute;
       if (m_warp == 0)
           m_warp = 1;
       if (M % (m_warp * kMPerWarp) != 0) {
@@ -291,26 +299,39 @@ std::pair<int, int> GemmWarpPolicyNode::ComputeWarpPartitionHCU(
     int recompute = num_warps / max_no_recompute_warps;
     m_warp = best_m;
     n_warp = best_n * recompute;
+  } else if (this->isFullColK()) {
+    // Try to partition N first
+    n_warp = num_warps;
+    k_warp = 1;
+
+    // if num_warps is larger than n_warp needed, try to split remaining warps to N
+    if (N % (n_warp * kNPerWarp) != 0) {
+      // Calculate how many warps we can use for K
+      n_warp = N / kNPerWarp;
+      // Use remaining warps for N
+      k_warp = num_warps / n_warp;
+      if (k_warp == 0)
+          k_warp = 1;
+      // if the remaining warps is too large for K, not support recompute for now.
+      ICHECK(K % (k_warp * kKPerWarp) == 0) << "K must be divisible by " << k_warp << " * " << kKPerWarp;
+    }
   } else {
     ICHECK(0) << "Unknown GemmWarpPolicy";
   }
-  ICHECK(m_warp * n_warp == num_warps)
+  ICHECK(m_warp * n_warp * k_warp == num_warps)
       << "m_warp * n_warp must equal num_warps, m_warp: " << m_warp
-      << ", n_warp: " << n_warp << ", num_warps: " << num_warps;
+      << ", n_warp: " << n_warp << ", k_warp: " << k_warp << ", num_warps: " << num_warps;
 
   // Store the computed values in the object's member variables
   this->m_warp = m_warp;
   this->n_warp = n_warp;
+  this->k_warp = k_warp;
 
-  return {m_warp, n_warp};
+  return std::make_tuple(m_warp, n_warp, k_warp);
 }
 
 std::pair<int, int> GemmWarpPolicyNode::ComputeWarpPartition(
     int M, int N, int block_size, Target target, GemmInst gemm_inst) const {
-  if (TargetIsHCU(target)) {
-    return ComputeWarpPartitionHCU(M, N, block_size, target, gemm_inst);
-  }
-
   int num_warps = block_size / TargetGetWarpSize(target);
   if (gemm_inst == GemmInst::kTCGEN5MMA) {
     return {1, num_warps}; // TCGEN5MMA doesn't care about warp partitioning
@@ -613,8 +634,22 @@ static int GetArchInt(Target target) {
 Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   auto block_size = *as_const_int(T.thread_bounds->extent);
   GemmInst gemm_inst = GetGemmInst(block_size, T.target);
-  auto [warp_m, warp_n] =
-      policy->ComputeWarpPartition(M, N, block_size, T.target, gemm_inst);
+
+  auto warp_m = 1, warp_n = 1, warp_k = 1;
+  if (TargetIsHCU(T.target)) {
+    int element_byte_size = A->dtype.bits() / 8;
+    auto [warp_m_tmp, warp_n_tmp, warp_k_tmp] =
+        policy->ComputeWarpPartitionHCU(M, N, K, kPack, element_byte_size,
+                                         block_size, T.target, gemm_inst);
+    warp_m = warp_m_tmp;
+    warp_n = warp_n_tmp;
+    warp_k = warp_k_tmp;
+  } else {
+    auto [warp_m_tmp, warp_n_tmp] =
+    policy->ComputeWarpPartition(M, N, block_size, T.target, gemm_inst);
+    warp_m = warp_m_tmp;
+    warp_n = warp_n_tmp;
+  }
 
   std::stringstream ss;
   std::string op_name;
@@ -701,6 +736,9 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
   ss << op_name << "<" << M << ", " << N << ", " << K << ", ";
   ss << warp_m << ", " << warp_n << ", ";
+  if (warp_k > 1) {
+    ss << warp_k << ", ";
+  }
   ss << trans_A << ", " << trans_B;
   auto clear_accum_bool = clear_accum.as<Bool>();
   ICHECK(clear_accum_bool.has_value())
@@ -766,8 +804,23 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
   auto thread_range = T.thread_bounds;
   auto block_size = *as_const_int(thread_range->extent);
   GemmInst gemm_inst = GetGemmInst(block_size, T.target);
-  auto [warp_m, warp_n] =
-      policy->ComputeWarpPartition(M, N, block_size, T.target, gemm_inst);
+
+  auto warp_m = 1, warp_n = 1, warp_k = 1;
+  if (TargetIsHCU(T.target)) {
+    int element_byte_size = A->dtype.bits() / 8;
+    auto [warp_m_tmp, warp_n_tmp, warp_k_tmp] =
+        policy->ComputeWarpPartitionHCU(M, N, K, kPack, element_byte_size,
+                                         block_size, T.target, gemm_inst);
+    warp_m = warp_m_tmp;
+    warp_n = warp_n_tmp;
+    warp_k = warp_k_tmp;
+  } else {
+    auto [warp_m_tmp, warp_n_tmp] =
+    policy->ComputeWarpPartition(M, N, block_size, T.target, gemm_inst);
+    warp_m = warp_m_tmp;
+    warp_n = warp_n_tmp;
+  }
+
   if (TargetIsVolta(T.target)) {
     ICHECK(C.scope() == "local.fragment")
         << "Volta gemm only supports C in local.fragment scope, got "
@@ -942,9 +995,9 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
         << "hcu gemm (mmac) only supports C in local.fragment scope, got "
         << C.scope();
     auto fragment =
-        makeGemmFragmentHCU(M, N, warp_m, warp_n, C->dtype.bits());
+        makeGemmFragmentHCU(M, N, warp_m, warp_n, warp_k, C->dtype.bits());
     if (TargetHasMmacLitLts(T.target)) {
-      fragment = makeGemmFragmentHCULit(M, N, warp_m, warp_n, C->dtype.bits());
+      fragment = makeGemmFragmentHCULit(M, N, warp_m, warp_n, warp_k, C->dtype.bits());
     }
     results.Set(C, fragment->BindThreadRange(thread_range));
 
@@ -955,7 +1008,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
           *as_const_int(A->shape[dim_A - 1]), A->dtype.bits(), kPack);
       results.Set(A, shared_layout);
     } else if (A.scope() == "local.fragment") {
-      auto fragment = makeGemmFragmentAHCU(M, N, K, warp_m, warp_n,
+      auto fragment = makeGemmFragmentAHCU(M, N, K, warp_m, warp_n, warp_k,
                                             A->dtype.bits(), kPack, trans_A);
       results.Set(A, fragment->BindThreadRange(thread_range));
     } else {
@@ -969,7 +1022,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
 
       results.Set(B, shared_layout);
     } else if (B.scope() == "local.fragment") {
-      auto fragment = makeGemmFragmentBHCU(M, N, K, warp_m, warp_n,
+      auto fragment = makeGemmFragmentBHCU(M, N, K, warp_m, warp_n, warp_k,
                                            B->dtype.bits(), kPack, trans_B);
       results.Set(B, fragment->BindThreadRange(thread_range));
     } else {

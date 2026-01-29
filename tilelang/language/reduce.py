@@ -47,6 +47,45 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clea
     )
 
 
+def reduce_warp(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, clear: bool = True):
+    """Perform warp-level reduction across multiple warps.
+
+    This function performs a reduction operation across data from multiple warps,
+    with the output having the same dimensions as the input (e.g., 16x32 input, 16x32 output).
+    The reduction iterates over all local registers within each warp and reduces
+    across warps using AllReduce.
+
+    Args:
+        buffer (tir.Buffer): The input buffer
+        out (tir.Buffer): The output buffer (must have same shape as input)
+        reduce_type (str): Type of reduction ('max', 'min', 'sum', 'abssum', 'absmax')
+        clear (bool, optional): If True, output buffer will be cleared before reduction.
+                              If False, results will be accumulated on existing values.
+                              Defaults to True.
+                              If buffer == out, we will compute in place.
+
+    Returns:
+        tir.Call: Handle to the warp-level reduction operation
+    """
+    # For warp reduce, input and output shapes must be the same
+    if list(buffer.shape) != list(out.shape):
+        raise ValueError(
+            f"Invalid warp reduce output shape, buffer shape is {buffer.shape}, "
+            f"output shape is {out.shape}, they must be the same for warp reduce.")
+    buffer = buffer.access_ptr("r")
+    out = out.access_ptr("w")
+    # Use dim = -1 as special marker for warp reduce (not legalized)
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.reduce"),
+        buffer,
+        out,
+        reduce_type,
+        -1,
+        clear,
+    )
+
+
 def reduce_max(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True):
     """Perform reduce max on input buffer, store the result to output buffer
 
@@ -108,6 +147,26 @@ def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
     dim = _legalize_dim(buffer, dim)
     return reduce(buffer, out, "sum", dim, clear)
 
+def reduce_sum_warp(buffer: tir.Buffer, out: tir.Buffer, clear: bool = True):
+    """Perform warp-level reduce sum across multiple warps.
+
+    This function performs a reduce sum operation across data from multiple warps,
+    with the output having the same dimensions as the input (e.g., 16x32 input, 16x32 output).
+    The reduction iterates over all local registers within each warp and reduces
+    across warps using AllReduce.
+
+    Args:
+        buffer (tir.Buffer): The input buffer
+        out (tir.Buffer): The output buffer (must have same shape as input)
+        clear (bool, optional): If True, output buffer will be cleared before reduction.
+                              If False, results will be accumulated on existing values.
+                              Defaults to True.
+                              If buffer == out, we will compute in place.
+
+    Returns:
+        tir.Call: Handle to the warp-level reduction operation
+    """
+    return reduce_warp(buffer, out, "sum", clear)
 
 def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1):
     """Perform reduce absolute sum on input buffer, store the result to output buffer.

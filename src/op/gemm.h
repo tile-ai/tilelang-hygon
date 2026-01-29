@@ -19,7 +19,8 @@ enum class GemmWarpPolicyType : uint8_t {
   kSquare = 0,
   kFullRow = 1,
   kFullCol = 2,
-  kFree = 3,
+  kFullColK = 3,
+  kFree = 4,
 };
 
 // Target GEMM instruction
@@ -28,6 +29,7 @@ class GemmWarpPolicyNode : public Object {
 public:
   mutable int m_warp{0};
   mutable int n_warp{0};
+  mutable int k_warp{0};
   int policy_type;
 
   static constexpr const char *_type_key = "tl.GemmWarpPolicy";
@@ -38,19 +40,21 @@ public:
     refl::ObjectDef<GemmWarpPolicyNode>()
         .def_ro("policy_type", &GemmWarpPolicyNode::policy_type)
         .def_ro("m_warp", &GemmWarpPolicyNode::m_warp)
-        .def_ro("n_warp", &GemmWarpPolicyNode::n_warp);
+        .def_ro("n_warp", &GemmWarpPolicyNode::n_warp)
+        .def_ro("k_warp", &GemmWarpPolicyNode::k_warp);
   }
 
   bool SEqualReduce(const GemmWarpPolicyNode *other,
                     SEqualReducer equal) const {
     return equal(policy_type, other->policy_type) &&
-           equal(m_warp, other->m_warp) && equal(n_warp, other->n_warp);
+           equal(m_warp, other->m_warp) && equal(n_warp, other->n_warp) && equal(k_warp, other->k_warp);
   }
 
   void SHashReduce(SHashReducer hash_reduce) const {
     hash_reduce(policy_type);
     hash_reduce(m_warp);
     hash_reduce(n_warp);
+    hash_reduce(k_warp);
   }
 
   static constexpr bool _type_has_method_sequal_reduce = true;
@@ -60,9 +64,12 @@ public:
                                            Target target,
                                            GemmInst gemm_inst) const;
 
-  std::pair<int, int> ComputeWarpPartitionHCU(int M, int N, int block_size,
-                                          Target target,
-                                          GemmInst gemm_inst) const;
+  std::tuple<int, int, int> ComputeWarpPartitionHCU(int M, int N, int K,
+                                                     int k_pack,
+                                                     int element_byte_size,
+                                                     int block_size,
+                                                     Target target,
+                                                     GemmInst gemm_inst) const;
 
   bool isSquare() const {
     return policy_type == int(GemmWarpPolicyType::kSquare);
@@ -72,6 +79,9 @@ public:
   }
   bool isFullCol() const {
     return policy_type == int(GemmWarpPolicyType::kFullCol);
+  }
+  bool isFullColK() const {
+    return policy_type == int(GemmWarpPolicyType::kFullColK);
   }
   bool isFree() const { return policy_type == int(GemmWarpPolicyType::kFree); }
 };
@@ -92,10 +102,11 @@ public:
     data_ = std::move(node);
   }
 
-  explicit GemmWarpPolicy(int m_warp, int n_warp) {
+  explicit GemmWarpPolicy(int m_warp, int n_warp, int k_warp=1) {
     auto node = make_object<GemmWarpPolicyNode>();
     node->m_warp = m_warp;
     node->n_warp = n_warp;
+    node->k_warp = k_warp;
     node->policy_type = (int)GemmWarpPolicyType::kFree;
     data_ = std::move(node);
   }

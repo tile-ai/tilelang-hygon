@@ -128,6 +128,8 @@ private:
   PrimExpr MakeReduce(const PrimExpr &a, const PrimExpr &b) const;
   /// Generate codegen reducer string
   std::string MakeCodegenReducer() const;
+  /// Lower warp-level reduce (dim == -1)
+  Stmt LowerWarpReduce(const LowerArgs &T, arith::Analyzer *analyzer) const;
 };
 
 /// Wrapper class for reduction operations

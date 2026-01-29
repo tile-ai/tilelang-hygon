@@ -113,6 +113,201 @@ std::string ReduceOpNode::MakeCodegenReducer() const {
   }
 }
 
+Stmt ReduceOpNode::LowerWarpReduce(const LowerArgs &T, arith::Analyzer *analyzer) const {
+  ICHECK(this->src.scope() == "local.fragment" &&
+         this->dst.scope() == "local.fragment")
+      << "Reduce for shared memory not implemented.";
+  auto src_buffer = T.buffer_remap[this->src];
+  auto dst_buffer = T.buffer_remap[this->dst];
+  Fragment src_layout = T.layout_map[this->src].as<Fragment>().value();
+  Fragment dst_layout = T.layout_map[this->dst].as<Fragment>().value();
+  size_t src_dim = src_layout->InputDim();
+  size_t dst_dim = dst_layout->InputDim();
+
+  // Warp-level reduce: src_dim == dst_dim, reduce across warps
+  ICHECK(src_dim == dst_dim) << "Warp reduce requires same input/output dimensions.";
+
+  Array<IterVar> dst_vars;
+  for (size_t i = 0; i < dst_dim; i++) {
+    Var var = Var(std::string{char('i' + i)});
+    dst_vars.push_back(IterVar(Range(0, dst_layout->InputShape()[i]), var,
+                               IterVarType::kDataPar));
+  }
+  // For warp reduce, src_vars == dst_vars (no extra dimension)
+  Array<IterVar> src_vars = dst_vars;
+  Array<PrimExpr> src_indices = src_layout->Forward(
+      src_vars.Map([](const auto &iv) { return PrimExpr(iv->var); }));
+  Array<PrimExpr> dst_indices = dst_layout->Forward(
+      dst_vars.Map([](const auto &iv) { return PrimExpr(iv->var); }));
+
+  Array<Stmt> stmts;
+
+  Buffer clear_buffer = dst_buffer;
+
+  bool clear_buffer_same_as_src = clear_buffer->data.same_as(src_buffer->data);
+  // Warp-level reduce: iterate over all register positions and reduce across warps
+  // For warp reduce, we directly reduce from src to dst for each register position
+  // No local reduce needed since src and dst have the same dimensions
+  // Check that target is HCU
+  ICHECK(TargetIsHCU(T.target))
+      << "Warp reduce (dim=-1) is only supported on HCU target.";
+
+  // Get the number of register positions
+  // For warp reduce, we iterate over all physical register positions
+  // Use src_layout->OutputShape() to get the number of registers per thread/warp
+  // This is consistent with how normal reduce gets register count via CompressIterator
+  auto output_shape = src_layout->OutputShape();
+  ICHECK(output_shape.size() > 0) << "Warp reduce requires at least one output dimension.";
+  PrimExpr num_registers = output_shape[0];
+
+  // Calculate warp size (typically 64 for HCU)
+  int warp_size = TargetGetWarpSize(T.target);
+  auto all_threads_int = as_const_int(T.thread_bounds->extent);
+  ICHECK(all_threads_int) << "Thread bounds extent must be constant for warp reduce.";
+  int all_threads = *all_threads_int;
+
+  // Analyze thread mapping to determine reduce pattern
+  // For warp reduce:
+  // - reducing_threads = total number of threads (all_threads)
+  // - scale = number of threads per output replica (all_threads / ReplicateExtent)
+  //   This represents how many threads work together to compute one output copy
+  int reducing_threads = all_threads;
+  
+  // Calculate scale based on ReplicateExtent
+  // If ReplicateExtent = 2, it means there are 2 replicas (e.g., wave0+wave1 and wave2+wave3)
+  // Each replica has all_threads / ReplicateExtent threads
+  auto rep_extent = as_const_int(dst_layout->ReplicateExtent());
+  ICHECK(rep_extent) << "ReplicateExtent must be constant for warp reduce.";
+  int scale = all_threads / (*rep_extent);
+
+  ICHECK(scale >= warp_size) << "Scale must be greater than or equal to warp size for warp reduce.";
+  ICHECK(all_threads % (*rep_extent) == 0) 
+      << "Total threads must be divisible by ReplicateExtent for warp reduce.";
+  // Create loop variable for register index
+  Var rv = Var("rv");
+
+  // Build indices for accessing each register position
+  // For a simple case, we use [rv] as the index
+  // But we need to map this through the layout if needed
+  Array<PrimExpr> register_dst_indices;
+  // For multi-dimensional output, we need to map rv to the correct indices
+  // This is complex and depends on the layout, so for now we assume 1D
+  ICHECK(dst_layout->OutputDim() == 1) 
+      << "Warp reduce currently only supports 1D output layout.";
+  register_dst_indices = {rv};
+
+  // Build the body for each register position
+  Stmt warp_reduce_body;
+
+  // If all_threads == scale, no need for AllReduce (all threads work on same replica)
+  bool need_allreduce = (all_threads != scale);
+
+  if (clear_buffer_same_as_src) {
+    // If clear_buffer == src_buffer, prepare value
+    // For abs operations, need to convert clear_buffer value to absolute value first
+    PrimExpr clear_value = BufferLoad(clear_buffer, register_dst_indices);
+    if (this->type->isAbsSum() || this->type->isAbsMax()) {
+      clear_value = Max(clear_value, -clear_value);  // abs(clear_value)
+    }
+
+    if (need_allreduce) {
+      Array<PrimExpr> allreduce_args = {clear_value};
+
+      PrimExpr workspace = T.AddWorkspace(all_threads, clear_buffer->dtype);
+      allreduce_args.push_back(workspace);
+
+      std::stringstream ss;
+      auto thread_offset = T.thread_bounds->min;
+      ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
+          << reducing_threads << ", " << scale << ", " << thread_offset
+          << ">::run";
+
+      allreduce_args.insert(allreduce_args.begin(), StringImm(ss.str()));
+
+      warp_reduce_body = BufferStore(
+          clear_buffer,
+          Call(clear_buffer->dtype, builtin::call_extern(), allreduce_args),
+          register_dst_indices);
+    } else {
+      // No AllReduce needed, just store the value
+      warp_reduce_body = BufferStore(
+          clear_buffer,
+          clear_value,
+          register_dst_indices);
+    }
+  } else {
+    // If clear_buffer != src_buffer, handle differently based on reduce type
+    Stmt init_stmt;
+    bool need_clear = this->clear;
+    if (this->type->isSum() || this->type->isAbsSum()) {
+      // If clear_buffer != src_buffer, this->clear must be true
+      ICHECK(this->clear) << "Warp reduce requires clear=true when src_buffer != dst_buffer for sum/abssum reduce.";
+    }
+
+    if (need_clear) {
+      Stmt clear_stmt = BufferStore(
+          clear_buffer,
+          this->MakeInitValue(),
+          register_dst_indices);
+
+      init_stmt = SeqStmt({
+          clear_stmt,
+          BufferStore(
+              clear_buffer,
+              this->MakeReduce(
+                  BufferLoad(clear_buffer, register_dst_indices),
+                  BufferLoad(src_buffer, register_dst_indices)),
+              register_dst_indices)
+      });
+    } else {
+      init_stmt = BufferStore(
+          clear_buffer,
+          this->MakeReduce(
+              BufferLoad(clear_buffer, register_dst_indices),
+              BufferLoad(src_buffer, register_dst_indices)),
+          register_dst_indices);
+    }
+
+    // Step 2: Reduce from clear_buffer (if needed)
+    if (need_allreduce) {
+      Array<PrimExpr> allreduce_args = {
+          BufferLoad(clear_buffer, register_dst_indices)};
+
+      PrimExpr workspace = T.AddWorkspace(all_threads, clear_buffer->dtype);
+      allreduce_args.push_back(workspace);
+
+      std::stringstream ss;
+      auto thread_offset = T.thread_bounds->min;
+      ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
+          << reducing_threads << ", " << scale << ", " << thread_offset
+          << ">::run";
+
+      allreduce_args.insert(allreduce_args.begin(), StringImm(ss.str()));
+
+      Stmt reduce_stmt = BufferStore(
+          clear_buffer,
+          Call(clear_buffer->dtype, builtin::call_extern(), allreduce_args),
+          register_dst_indices);
+
+      // Combine init and reduce
+      warp_reduce_body = SeqStmt({init_stmt, reduce_stmt});
+    } else {
+      // No AllReduce needed, init_stmt already contains the final result
+      warp_reduce_body = init_stmt;
+    }
+  }
+
+  // Wrap in loop over register positions
+  Stmt warp_reduce_loop = For(rv, 0, num_registers, ForKind::kUnrolled,
+                              warp_reduce_body, std::nullopt,
+                              {{tir::attr::pragma_unroll_explicit, Bool(false)}});
+ 
+  stmts.push_back(warp_reduce_loop);
+  Stmt body = stmts.size() > 1 ? SeqStmt(stmts) : stmts[0];
+
+  return body;
+}
+
 /**
  * @brief Lower the Reduce operator to a TIR statement.
  *
@@ -153,6 +348,12 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   ICHECK(this->src.scope() == "local.fragment" &&
          this->dst.scope() == "local.fragment")
       << "Reduce for shared memory not implemented.";
+
+  // Handle warp reduce (dim == -1) separately
+  if (this->dim == -1) {
+    return LowerWarpReduce(T, analyzer);
+  }
+
   auto src_buffer = T.buffer_remap[this->src];
   auto dst_buffer = T.buffer_remap[this->dst];
   Fragment src_layout = T.layout_map[this->src].as<Fragment>().value();
@@ -179,6 +380,7 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   if (!is_1d_reduce) {
     src_vars = dst_vars;
   }
+
   src_vars.insert(src_vars.begin() + this->dim,
                   {Range(0, src_layout->InputShape()[this->dim]), Var("rv"),
                    IterVarType::kDataPar});
@@ -282,6 +484,7 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       stmts.push_back(BufferStore(clear_buffer, call, dst_indices));
     }
   }
+
   Stmt reduce_interthread = BufferStore(
       clear_buffer, BufferLoad(clear_buffer, dst_indices), dst_indices);
 
@@ -325,64 +528,92 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &T,
       T.layout_map.count(src)) {
     auto src_layout = T.layout_map[src].as<Fragment>().value();
 
-    PrimExpr indice_rep_extent = src->shape[dim];
-    PrimExpr src_rep_extent = src_layout->ReplicateExtent();
-    PrimExpr dest_buffer_rep_extent = indice_rep_extent * src_rep_extent;
+    // For warp reduce (dim == -1), src and dst have the same layout
+    if (this->dim == -1) {
+      // For warp reduce, dst_layout is the same as src_layout
+      Fragment dst_layout = src_layout;
 
-    Array<PrimExpr> fwd;
-    for (int i = 0; i < static_cast<int>(src->shape.size()); i++) {
-      if (i == dim) {
-        fwd.push_back(FloorMod(ReplicationPlaceholder(), indice_rep_extent));
-      } else if (i < dim) {
-        fwd.push_back(InputPlaceholder(i));
-      } else if (i > dim) {
-        fwd.push_back(InputPlaceholder(i - 1));
-      }
-    }
-    auto thd = src_layout->ForwardThread(
-        fwd, FloorDiv(ReplicationPlaceholder(), indice_rep_extent));
-    Fragment dst_layout =
-        Fragment(dst->shape, {}, thd, dest_buffer_rep_extent, std::nullopt)
-            ->CondenseReplicateVar()
-            ->BindThreadRange(T.thread_bounds);
-    if (!T.layout_map.count(dst))
-      return {{dst, dst_layout}};
-    else {
-      // Check if computed layout is compatible with existing: the existing one
-      // must strictly contains the computed layout
-      auto orig_dst_layout =
-          T.layout_map.Get(dst).value().as<Fragment>().value();
-      ICHECK(dst_layout->InputDim() == orig_dst_layout->InputDim());
-      Array<PrimExpr> indices;
-      indices.reserve(dst_layout->InputDim());
-      arith::Analyzer inner_analyzer;
-      for (int i = 0; i < dst_layout->InputDim(); ++i) {
-        auto x = InputPlaceholder(i);
-        indices.push_back(x);
-        // should be literal - literal = 0, any analyzer will work
-        ICHECK(is_zero(inner_analyzer.Simplify(
-            dst_layout->InputShape()[i] - orig_dst_layout->InputShape()[i])));
-        inner_analyzer.Bind(x, Range(0, dst_layout->InputShape()[i]));
-      }
-
-      ICHECK(as_const_int(dst_layout->ReplicateExtent()));
-      ICHECK(as_const_int(src_layout->ReplicateExtent()));
-      auto dst_rep = *as_const_int(dst_layout->ReplicateExtent());
-      auto src_rep = *as_const_int(src_layout->ReplicateExtent());
-      if (dst_rep < src_rep ||
-          !ProveFragmentContains(orig_dst_layout, dst_layout, indices, indices,
-                                 inner_analyzer)) {
-        std::ostringstream oss;
-        oss << "Layout may conflict with ReduceOp for buffer " << dst << " vs. "
-            << src << "\nLHS = " << src_layout->DebugOutput()
-            << "\nRHS = " << orig_dst_layout->DebugOutput()
-            << "\nYou may need to use a shared memory to transform the "
-               "layout";
-        throw LayoutConflictException(oss.str());
-      }
-
-      if (dst_rep > src_rep) {
+      if (!T.layout_map.count(dst)) {
         return {{dst, dst_layout}};
+      } else {
+        // Check if layouts are identical
+        auto orig_dst_layout =
+            T.layout_map.Get(dst).value().as<Fragment>().value();
+
+        if (!dst_layout->IsEqual(orig_dst_layout.as<FragmentNode>(), false)) {
+          std::ostringstream oss;
+          oss << "Layout conflict in warp reduce for buffer " << dst << " vs. "
+              << src << "\nSrc layout = " << src_layout->DebugOutput()
+              << "\nDst layout = " << orig_dst_layout->DebugOutput()
+              << "\nWarp reduce requires identical layouts for src and dst.";
+          throw LayoutConflictException(oss.str());
+        }
+        // Layouts are identical, no need to update
+        return {};
+      }
+    } else {
+      PrimExpr indice_rep_extent = src->shape[dim];
+      PrimExpr src_rep_extent = src_layout->ReplicateExtent();
+      PrimExpr dest_buffer_rep_extent = indice_rep_extent * src_rep_extent;
+
+      Array<PrimExpr> fwd;
+      for (int i = 0; i < static_cast<int>(src->shape.size()); i++) {
+        if (i == dim) {
+          fwd.push_back(FloorMod(ReplicationPlaceholder(), indice_rep_extent));
+        } else if (i < dim) {
+          fwd.push_back(InputPlaceholder(i));
+        } else if (i > dim) {
+          fwd.push_back(InputPlaceholder(i - 1));
+        }
+      }
+      auto thd = src_layout->ForwardThread(
+          fwd, FloorDiv(ReplicationPlaceholder(), indice_rep_extent));
+      Fragment dst_layout =
+          Fragment(dst->shape, {}, thd, dest_buffer_rep_extent, std::nullopt)
+              ->CondenseReplicateVar()
+              ->BindThreadRange(T.thread_bounds);
+
+      if (!T.layout_map.count(dst))
+        return {{dst, dst_layout}};
+      else {
+        // Check if computed layout is compatible with existing: the existing one
+        // must strictly contains the computed layout
+        auto orig_dst_layout =
+            T.layout_map.Get(dst).value().as<Fragment>().value();
+        ICHECK(dst_layout->InputDim() == orig_dst_layout->InputDim());
+        Array<PrimExpr> indices;
+        indices.reserve(dst_layout->InputDim());
+        arith::Analyzer inner_analyzer;
+        for (int i = 0; i < dst_layout->InputDim(); ++i) {
+          auto x = InputPlaceholder(i);
+          indices.push_back(x);
+          // should be literal - literal = 0, any analyzer will work
+          ICHECK(is_zero(inner_analyzer.Simplify(
+              dst_layout->InputShape()[i] - orig_dst_layout->InputShape()[i])));
+          inner_analyzer.Bind(x, Range(0, dst_layout->InputShape()[i]));
+        }
+
+        ICHECK(as_const_int(dst_layout->ReplicateExtent()));
+        ICHECK(as_const_int(src_layout->ReplicateExtent()));
+        auto dst_rep = *as_const_int(dst_layout->ReplicateExtent());
+        auto src_rep = *as_const_int(src_layout->ReplicateExtent());
+
+        // For normal reduce, check one direction
+        if (dst_rep < src_rep ||
+            !ProveFragmentContains(orig_dst_layout, dst_layout, indices, indices,
+                                   inner_analyzer)) {
+          std::ostringstream oss;
+          oss << "Layout may conflict with ReduceOp for buffer " << dst << " vs. "
+              << src << "\nLHS = " << src_layout->DebugOutput()
+              << "\nRHS = " << orig_dst_layout->DebugOutput()
+              << "\nYou may need to use a shared memory to transform the "
+                 "layout";
+          throw LayoutConflictException(oss.str());
+        }
+
+        if (dst_rep > src_rep) {
+          return {{dst, dst_layout}};
+        }
       }
     }
   }

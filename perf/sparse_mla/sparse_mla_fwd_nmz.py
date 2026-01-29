@@ -24,162 +24,78 @@ import math
 
 # @tilelang.autotune(configs=get_configs())
 
-config_map_cu64 = {
-    1: {
-        "block_I": 32,
-        "threads": 256,
-        "num_split": 32,
-        "num_stages": 1,
-    },
-    2: {
-        "block_I": 32,
-        "threads": 256,
-        "num_split": 32,
-        "num_stages": 1,
-    },
-    3: {
-        "block_I": 32,
-        "threads": 256,
-        "num_split": 16,
-        "num_stages": 1,
-    },
-    4: {
-        "block_I": 32,
-        "threads": 256,
-        "num_split": 16,
-        "num_stages": 1,
-    },
-    8: {
-        "block_I": 32,
-        "threads": 256,
-        "num_split": 8,
-        "num_stages": 1,
-    },
-    16: {
-        "block_I": 32,
-        "threads": 256,
-        "num_split": 4,
-        "num_stages": 1,
-    },
-}
-
 config_map_cu72 = {
     1: {
         "block_I": 32,
         "threads": 256,
         "num_split": 32,
-        "num_stages": 1,
+        "num_stages": 0,
+        "batch_head": 1,
+        "num_split_tail": 0,
     },
     2: {
         "block_I": 32,
         "threads": 256,
         "num_split": 32,
-        "num_stages": 1,
+        "num_stages": 0,
+        "batch_head": 2,
+        "num_split_tail": 0,
     },
     3: {
         "block_I": 32,
         "threads": 256,
-        "num_split": 16,
-        "num_stages": 1,
+        "num_split": 32,
+        "num_stages": 0,
+        "batch_head": 3,
+        "num_split_tail": 0,
     },
     4: {
         "block_I": 32,
         "threads": 256,
-        "num_split": 16,
-        "num_stages": 1,
+        "num_split": 32,
+        "num_stages": 0,
+        "batch_head": 4,
+        "num_split_tail": 0,
     },
     8: {
         "block_I": 32,
         "threads": 256,
-        "num_split": 8,
-        "num_stages": 1,
+        "num_split": 16,
+        "num_stages": 0,
+        "batch_head": 8,
+        "num_split_tail": 0,
     },
     16: {
         "block_I": 32,
         "threads": 256,
-        "num_split": 4,
-        "num_stages": 1,
-    },
-}
-
-config_map_cu80 = {
-    1: {
-        "block_I": 32,
-        "threads": 256,
-        "num_split": 32,
-        "num_stages": 1,
-    },
-    2: {
-        "block_I": 32,
-        "threads": 256,
-        "num_split": 32,
-        "num_stages": 1,
-    },
-    3: {
-        "block_I": 32,
-        "threads": 256,
-        "num_split": 16,
-        "num_stages": 1,
-    },
-    4: {
-        "block_I": 32,
-        "threads": 256,
-        "num_split": 16,
-        "num_stages": 1,
-    },
-    8: {
-        "block_I": 32,
-        "threads": 256,
         "num_split": 8,
-        "num_stages": 1,
-    },
-    16: {
-        "block_I": 32,
-        "threads": 256,
-        "num_split": 4,
-        "num_stages": 1,
+        "num_stages": 0,
+        "batch_head": 16,
+        "num_split_tail": 0,
     },
     32: {
         "block_I": 32,
         "threads": 256,
         "num_split": 4,
-        "num_stages": 1,
-    },
-    48: {
-        "block_I": 32,
-        "threads": 256,
-        "num_split": 8,
-        "num_stages": 1,
+        "num_stages": 0,
+        "batch_head": 32,
+        "num_split_tail": 0,
     },
     64: {
         "block_I": 32,
         "threads": 256,
-        "num_split": 8,
-        "num_stages": 1,
-    },
-    80: {
-        "block_I": 32,
-        "threads": 256,
-        "num_split": 1,
-        "num_stages": 1,
-    },
-    96: {
-        "block_I": 32,
-        "threads": 256,
-        "num_split": 4,
-        "num_stages": 1,
-    },
-    112: {
-        "block_I": 32,
-        "threads": 256,
         "num_split": 2,
-        "num_stages": 1,
+        "num_stages": 0,
+        "batch_head": 64,
+        "num_split_tail": 0,
     },
     128: {
         "block_I": 32,
         "threads": 256,
-        "num_split": 4,
-        "num_stages": 1,
+        "num_split": 1,
+        "num_stages": 0,
+        "batch_head": 128,
+        "num_split_tail": 0,
     }
 }
 
@@ -261,14 +177,22 @@ def sparse_mla_fwd(
     if padded_H != H:
         assert kv_group == 1
     BI = block_I
+
+    # e.g. num_split = 2, we take like BI_split0 BI_split1 BI_split0 BI_split1 ... on topk
     topk_per_split = topk // num_split if num_split > 1 else topk
     NI = tilelang.cdiv(topk_per_split, block_I)
+    split_stride = block_I * num_split
+
     topk_per_split_tail = topk // num_split_tail if num_split_tail > 1 else topk
     NI_tail = tilelang.cdiv(topk_per_split_tail, block_I)
+    split_stride_tail = block_I * num_split_tail
+
     D = dim
     D_spilt = dim // 4
     D_tail = tail_dim
     max_block_m = 16
+    if head_kv == 128:
+        max_block_m = 32
 
     if head_kv > max_block_m:
         assert head_kv % max_block_m == 0, f"head_kv should be a multiple of {max_block_m}"
@@ -286,14 +210,25 @@ def sparse_mla_fwd(
     kv_serial_count = BI // warps_line_stride
     kpack = min((kv_vectorized + 3) // 4, 2)
 
-    # print(f"kv_serial_count={kv_serial_count}, warps_line_stride={warps_line_stride}, threads_per_line={threads_per_line}, kv_vectorized={kv_vectorized}, kpack={kpack}")
+    mmac_k = 16 * kpack
+    warps = threads // 64
+    max_warp_k = D_spilt // mmac_k
+    max_warp_n = BI // 16
+    max_warp_m = H_per_block // 16
+    out_shared_reuse = True if H_per_block > 16 else False
+
+    gemm1_policy = T.GemmWarpPolicy.FullColK
+    gemm2_policy = T.GemmWarpPolicy.FullCol
+
+    print(f"kv_serial_count={kv_serial_count}, warps_line_stride={warps_line_stride}, "
+        f"threads_per_line={threads_per_line}, kv_vectorized={kv_vectorized}, kpack={kpack}, "
+        f"block_M={H_per_block}, block_I={BI}, gemm1_policy={gemm1_policy}, gemm2_policy={gemm2_policy}")
 
     @T.macro
     def sparse_mla(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-        q_start_index_s: T.Tensor([1], indices_dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
         with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
@@ -301,17 +236,19 @@ def sparse_mla_fwd(
             by,
             bz,
         ):
-            Q_spilt0_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-            Q_spilt1_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-            Q_spilt2_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-            Q_spilt3_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-            Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
+            Q_spilt0_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+            Q_spilt1_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+            Q_spilt2_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+            Q_spilt3_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+            Q_tail_shared = T.alloc_fragment([H_per_block, D_tail], dtype)
 
             KV_spilt0_shared = T.alloc_shared([BI, D_spilt], dtype)
             KV_spilt1_shared = T.alloc_shared([BI, D_spilt], dtype)
             KV_spilt2_shared = T.alloc_shared([BI, D_spilt], dtype)
-            KV_spilt3_shared = T.alloc_shared([BI, D_spilt], dtype)
-            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            # KV_spilt3_shared = T.alloc_shared([BI, D_spilt], dtype)
+            # K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            KV_spilt3_local = T.alloc_fragment([BI, D_spilt], dtype)
+            K_tail_shared = T.alloc_fragment([BI, D_tail], dtype)
             mask = T.alloc_fragment([BI], "bool")
 
             acc_o0 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
@@ -372,13 +309,6 @@ def sparse_mla_fwd(
                         mask[bi_i], 0, -T.infinity(acc_s.dtype)
                     )
 
-                # for bi_i, d_i in T.Parallel(BI, D_spilt):
-                #     indices_local[0] = Indices[b_i, s_i, g_i, i_i * BI + bi_i]
-                #     indices_local[0] = T.if_then_else(indices_local[0] <= max_kv_i and indices_local[0] >= 0, indices_local[0], 0)
-                #     KV_spilt0_shared[bi_i, d_i] = KV[b_i, indices_local[0], g_i, d_i]
-                #     KV_spilt1_shared[bi_i, d_i] = KV[b_i, indices_local[0], g_i, D_spilt + d_i]
-                #     KV_spilt2_shared[bi_i, d_i] = KV[b_i, indices_local[0], g_i, 2*D_spilt + d_i]
-                #     KV_spilt3_shared[bi_i, d_i] = KV[b_i, indices_local[0], g_i, 3*D_spilt + d_i]
                 for u in T.serial(kv_serial_count):
                     line_stride = u * warps_line_stride
                     indices_local[0] = Indices[b_i, s_i, g_i, i_i * BI + line_stride + tx // threads_per_line]
@@ -394,9 +324,13 @@ def sparse_mla_fwd(
                         KV_spilt2_shared[line_stride + tx // threads_per_line,
                                         (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
                                         2*D_spilt + (tx % threads_per_line) * kv_vectorized + v]
-                        KV_spilt3_shared[line_stride + tx // threads_per_line,
-                                        (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
-                                        3*D_spilt + (tx % threads_per_line) * kv_vectorized + v]
+                        # KV_spilt3_shared[line_stride + tx // threads_per_line,
+                        #                 (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
+                        #                 3*D_spilt + (tx % threads_per_line) * kv_vectorized + v]
+                for bi_i, d_i in T.Parallel(BI, D_spilt):
+                    indices_local[0] = Indices[b_i, s_i, g_i, i_i * BI + bi_i]
+                    indices_local[0] = T.if_then_else(indices_local[0] >= 0, indices_local[0], 0)
+                    KV_spilt3_local[bi_i, d_i] = KV[b_i, indices_local[0], g_i, 3*D_spilt + d_i]
 
                 for bi_i, d_i in T.Parallel(BI, D_tail):
                     indices_tail[0] = Indices[b_i, s_i, g_i, i_i * BI + bi_i]
@@ -406,13 +340,16 @@ def sparse_mla_fwd(
                         b_i, indices_tail[0], g_i, D + d_i
                     ]
 
-                T.gemm(Q_spilt0_shared, KV_spilt0_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                T.gemm(Q_spilt1_shared, KV_spilt1_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                T.gemm(Q_spilt2_shared, KV_spilt2_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                T.gemm(Q_spilt3_shared, KV_spilt3_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+                T.gemm(Q_spilt0_shared, KV_spilt0_shared, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                T.gemm(Q_spilt1_shared, KV_spilt1_shared, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                T.gemm(Q_spilt2_shared, KV_spilt2_shared, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                T.gemm(Q_spilt3_shared, KV_spilt3_local, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=gemm1_policy)
 
                 T.copy(m_i, m_i_prev)
+                if gemm1_policy == T.GemmWarpPolicy.FullColK:
+                    T.reduce_sum_warp(acc_s, acc_s, clear=False)
+
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
                 for h_i in T.Parallel(H_per_block):
                     alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
@@ -430,10 +367,11 @@ def sparse_mla_fwd(
                     acc_o3[h_i, d_i] = acc_o3[h_i, d_i] * alpha[h_i]
 
                 T.copy(acc_s, S_shared)
-                T.gemm(S_shared, KV_spilt0_shared, acc_o0, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                T.gemm(S_shared, KV_spilt1_shared, acc_o1, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                T.gemm(S_shared, KV_spilt2_shared, acc_o2, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                T.gemm(S_shared, KV_spilt3_shared, acc_o3, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
+                T.gemm(S_shared, KV_spilt0_shared, acc_o0, k_pack=kpack, policy=gemm2_policy)
+                T.copy(KV_spilt3_local, KV_spilt0_shared)
+                T.gemm(S_shared, KV_spilt1_shared, acc_o1, k_pack=kpack, policy=gemm2_policy)
+                T.gemm(S_shared, KV_spilt2_shared, acc_o2, k_pack=kpack, policy=gemm2_policy)
+                T.gemm(S_shared, KV_spilt0_shared, acc_o3, k_pack=kpack, policy=gemm2_policy)
             # Rescale
             for h_i, d_i in T.Parallel(H_per_block, D_spilt):
                 acc_o0[h_i, d_i] /= sumexp[h_i]
@@ -441,31 +379,46 @@ def sparse_mla_fwd(
                 acc_o2[h_i, d_i] /= sumexp[h_i]
                 acc_o3[h_i, d_i] /= sumexp[h_i]
 
-            acc_oshared0 = T.alloc_shared([H_per_block, D_spilt], dtype)
-            acc_oshared1 = T.alloc_shared([H_per_block, D_spilt], dtype)
-            acc_oshared2 = T.alloc_shared([H_per_block, D_spilt], dtype)
-            acc_oshared3 = T.alloc_shared([H_per_block, D_spilt], dtype)
-            T.annotate_layout({
-                acc_oshared0: tilelang.layout.make_hcu_swizzled_layout(acc_oshared0, major_pack=2),
-                acc_oshared1: tilelang.layout.make_hcu_swizzled_layout(acc_oshared1, major_pack=2),
-                acc_oshared2: tilelang.layout.make_hcu_swizzled_layout(acc_oshared2, major_pack=2),
-                acc_oshared3: tilelang.layout.make_hcu_swizzled_layout(acc_oshared3, major_pack=2),
-            })
-            T.copy(acc_o0, acc_oshared0)
-            T.copy(acc_o1, acc_oshared1)
-            T.copy(acc_o2, acc_oshared2)
-            T.copy(acc_o3, acc_oshared3)
-            T.copy(acc_oshared0, Output[b_i, s_i, H0:H1, :D_spilt])
-            T.copy(acc_oshared1, Output[b_i, s_i, H0:H1, D_spilt:2*D_spilt])
-            T.copy(acc_oshared2, Output[b_i, s_i, H0:H1, 2*D_spilt:3*D_spilt])
-            T.copy(acc_oshared3, Output[b_i, s_i, H0:H1, 3*D_spilt:4*D_spilt])
+            if out_shared_reuse:
+                acc_oshared0 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                acc_oshared1 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                T.annotate_layout({
+                    acc_oshared0: tilelang.layout.make_hcu_swizzled_layout(acc_oshared0, major_pack=2),
+                    acc_oshared1: tilelang.layout.make_hcu_swizzled_layout(acc_oshared1, major_pack=2),
+                })
+                T.copy(acc_o0, acc_oshared0)
+                T.copy(acc_o1, acc_oshared1)
+                T.copy(acc_oshared0, Output[b_i, s_i, H0:H1, :D_spilt])
+                T.copy(acc_oshared1, Output[b_i, s_i, H0:H1, D_spilt:2*D_spilt])
+                T.copy(acc_o2, acc_oshared0)
+                T.copy(acc_o3, acc_oshared1)
+                T.copy(acc_oshared0, Output[b_i, s_i, H0:H1, 2*D_spilt:3*D_spilt])
+                T.copy(acc_oshared1, Output[b_i, s_i, H0:H1, 3*D_spilt:4*D_spilt])
+            else:
+                acc_oshared0 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                acc_oshared1 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                acc_oshared2 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                acc_oshared3 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                T.annotate_layout({
+                    acc_oshared0: tilelang.layout.make_hcu_swizzled_layout(acc_oshared0, major_pack=2),
+                    acc_oshared1: tilelang.layout.make_hcu_swizzled_layout(acc_oshared1, major_pack=2),
+                    acc_oshared2: tilelang.layout.make_hcu_swizzled_layout(acc_oshared2, major_pack=2),
+                    acc_oshared3: tilelang.layout.make_hcu_swizzled_layout(acc_oshared3, major_pack=2),
+                })
+                T.copy(acc_o0, acc_oshared0)
+                T.copy(acc_o1, acc_oshared1)
+                T.copy(acc_o2, acc_oshared2)
+                T.copy(acc_o3, acc_oshared3)
+                T.copy(acc_oshared0, Output[b_i, s_i, H0:H1, :D_spilt])
+                T.copy(acc_oshared1, Output[b_i, s_i, H0:H1, D_spilt:2*D_spilt])
+                T.copy(acc_oshared2, Output[b_i, s_i, H0:H1, 2*D_spilt:3*D_spilt])
+                T.copy(acc_oshared3, Output[b_i, s_i, H0:H1, 3*D_spilt:4*D_spilt])
 
     @T.macro
     def sparse_mla_split(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-        q_start_index_s: T.Tensor([1], indices_dtype),  # type: ignore
         glse: T.Tensor(glse_shape, dtype),  # type: ignore
         Output_partial: T.Tensor(output_partial_shape, dtype),  # type: ignore
     ):
@@ -473,37 +426,7 @@ def sparse_mla_fwd(
             bx,
             by,
             bz,
-            # split_idx,
         ):
-            Q_spilt0_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-            Q_spilt1_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-            Q_spilt2_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-            Q_spilt3_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-            Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
-
-            KV_spilt0_shared = T.alloc_shared([BI, D_spilt], dtype)
-            KV_spilt1_shared = T.alloc_shared([BI, D_spilt], dtype)
-            KV_spilt2_shared = T.alloc_shared([BI, D_spilt], dtype)
-            KV_spilt3_shared = T.alloc_shared([BI, D_spilt], dtype)
-            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
-            mask = T.alloc_fragment([BI], "bool")
-
-            acc_o0 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
-            acc_o1 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
-            acc_o2 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
-            acc_o3 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
-
-            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
-            S_shared = T.alloc_shared([H_per_block, BI], dtype)
-            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
-            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
-            alpha = T.alloc_fragment([H_per_block], accum_dtype)
-            m_i = T.alloc_fragment([H_per_block], accum_dtype)
-            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
-            indices_local = T.alloc_local([1], indices_dtype)
-            indices_mask = T.alloc_fragment([BI], indices_dtype)
-            indices_tail = T.alloc_local([1], indices_dtype)
-
             split_idx = bz
             b_i = by if kv_group == 1 else (by // kv_group)
             g_i = 0 if kv_group == 1 else (by % kv_group)
@@ -516,20 +439,52 @@ def sparse_mla_fwd(
             H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * max_block_m)
             H1 = H0 + H_per_block
 
-            first_indices = Indices[b_i, s_i, g_i, split_idx * topk_per_split]
-            # if first_indices > max_kv_i and first_indices >= 0:
-            if first_indices < 0:
+            valid_NI = T.alloc_fragment([1], "int")
+            T.fill(valid_NI, 0)
+            for i_i in T.serial(NI):
+                first_indices = Indices[b_i, s_i, g_i, i_i * split_stride + split_idx * BI]
+                # if first_indices <= max_kv_i and first_indices >= 0:
+                if first_indices >= 0:
+                    valid_NI[0] += 1
+
+            if valid_NI[0] == 0:
+                acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
+                sumexp = T.alloc_fragment([H_per_block], accum_dtype)
                 T.fill(sumexp, -T.infinity(accum_dtype))
-                T.fill(acc_o0, 0)
-                T.fill(acc_o1, 0)
-                T.fill(acc_o2, 0)
-                T.fill(acc_o3, 0)
+                T.fill(acc_o, 0)
                 T.copy(sumexp, glse[b_i, s_i, H0:H1, split_idx])
-                T.copy(acc_o0, Output_partial[b_i, s_i, H0:H1, split_idx, :D_spilt])
-                T.copy(acc_o1, Output_partial[b_i, s_i, H0:H1, split_idx, D_spilt:2*D_spilt])
-                T.copy(acc_o2, Output_partial[b_i, s_i, H0:H1, split_idx, 2*D_spilt:3*D_spilt])
-                T.copy(acc_o3, Output_partial[b_i, s_i, H0:H1, split_idx, 3*D_spilt:4*D_spilt])
+                T.copy(acc_o, Output_partial[b_i, s_i, H0:H1, split_idx, :D])
             else:
+                Q_spilt0_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+                Q_spilt1_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+                Q_spilt2_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+                Q_spilt3_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+                Q_tail_shared = T.alloc_fragment([H_per_block, D_tail], dtype)
+
+                KV_spilt0_shared = T.alloc_shared([BI, D_spilt], dtype)
+                KV_spilt1_shared = T.alloc_shared([BI, D_spilt], dtype)
+                KV_spilt2_shared = T.alloc_shared([BI, D_spilt], dtype)
+                # KV_spilt3_shared = T.alloc_shared([BI, D_spilt], dtype)
+                KV_spilt3_local = T.alloc_fragment([BI, D_spilt], dtype)
+                K_tail_shared = T.alloc_fragment([BI, D_tail], dtype)
+
+                mask = T.alloc_fragment([BI], "bool")
+                acc_o0 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
+                acc_o1 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
+                acc_o2 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
+                acc_o3 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
+
+                acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
+                S_shared = T.alloc_shared([H_per_block, BI], dtype)
+                sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+                sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
+                alpha = T.alloc_fragment([H_per_block], accum_dtype)
+                m_i = T.alloc_fragment([H_per_block], accum_dtype)
+                m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+                indices_local = T.alloc_local([1], indices_dtype)
+                indices_mask = T.alloc_fragment([BI], indices_dtype)
+                indices_tail = T.alloc_local([1], indices_dtype)
+
                 tx = T.get_thread_binding()
                 T.copy(Q[b_i, s_i, H0:H1, :D_spilt], Q_spilt0_shared, coalesced_width=kv_vectorized)
                 T.copy(Q[b_i, s_i, H0:H1, D_spilt:2*D_spilt], Q_spilt1_shared, coalesced_width=kv_vectorized)
@@ -544,8 +499,8 @@ def sparse_mla_fwd(
                 T.fill(sumexp, 1)
                 T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
 
-                for i_i in T.Pipelined(NI, num_stages=num_stages):
-                    idx_in_split = split_idx * topk_per_split + i_i * BI
+                for i_i in T.Pipelined(valid_NI[0], num_stages=num_stages):
+                    idx_in_split = i_i * split_stride + split_idx * BI
                     for bi_i in T.Parallel(BI):
                         indices_mask[bi_i] = Indices[b_i, s_i, g_i, idx_in_split + bi_i]
                         # mask[bi_i] = indices_mask[bi_i] <= max_kv_i and indices_mask[bi_i] >= 0
@@ -555,9 +510,9 @@ def sparse_mla_fwd(
                         acc_s[h_i, bi_i] = T.if_then_else(
                             mask[bi_i], 0, -T.infinity(acc_s.dtype)
                         )
-                    # for bi_i, d_i in T.Parallel(BI, D_spilt, coalesced_width=8):
+                    # for bi_i, d_i in T.Parallel(BI, D_spilt):
                     #     indices_local[0] = Indices[b_i, s_i, g_i, idx_in_split + bi_i]
-                    #     indices_local[0] = T.if_then_else(indices_local[0] <= max_kv_i, indices_local[0], 0)
+                    #     indices_local[0] = T.if_then_else(indices_local[0] >= 0, indices_local[0], 0)
                     #     KV_spilt0_shared[bi_i, d_i] = KV[b_i, indices_local[0], g_i, d_i]
                     #     KV_spilt1_shared[bi_i, d_i] = KV[b_i, indices_local[0], g_i, D_spilt + d_i]
                     #     KV_spilt2_shared[bi_i, d_i] = KV[b_i, indices_local[0], g_i, 2*D_spilt + d_i]
@@ -578,9 +533,14 @@ def sparse_mla_fwd(
                             KV_spilt2_shared[line_stride + tx // threads_per_line,
                                             (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
                                             2*D_spilt + (tx % threads_per_line) * kv_vectorized + v]
-                            KV_spilt3_shared[line_stride + tx // threads_per_line,
-                                            (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
-                                            3*D_spilt + (tx % threads_per_line) * kv_vectorized + v]
+                            # KV_spilt3_shared[line_stride + tx // threads_per_line,
+                            #                 (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
+                            #                 3*D_spilt + (tx % threads_per_line) * kv_vectorized + v]
+
+                    for bi_i, d_i in T.Parallel(BI, D_spilt):
+                        indices_local[0] = Indices[b_i, s_i, g_i, idx_in_split + bi_i]
+                        indices_local[0] = T.if_then_else(indices_local[0] >= 0, indices_local[0], 0)
+                        KV_spilt3_local[bi_i, d_i] = KV[b_i, indices_local[0], g_i, 3*D_spilt + d_i]
 
                     for bi_i, d_i in T.Parallel(BI, D_tail):
                         indices_tail[0] = Indices[b_i, s_i, g_i, idx_in_split + bi_i]
@@ -589,14 +549,16 @@ def sparse_mla_fwd(
                         K_tail_shared[bi_i, d_i] = KV[
                             b_i, indices_tail[0], g_i, D + d_i
                         ]
-                                            
-                    T.gemm(Q_spilt0_shared, KV_spilt0_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(Q_spilt1_shared, KV_spilt1_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(Q_spilt2_shared, KV_spilt2_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(Q_spilt3_shared, KV_spilt3_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+
+                    T.gemm(Q_spilt0_shared, KV_spilt0_shared, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                    T.gemm(Q_spilt1_shared, KV_spilt1_shared, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                    T.gemm(Q_spilt2_shared, KV_spilt2_shared, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                    T.gemm(Q_spilt3_shared, KV_spilt3_local, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                    T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=gemm1_policy)
 
                     T.copy(m_i, m_i_prev)
+                    if gemm1_policy == T.GemmWarpPolicy.FullColK:
+                        T.reduce_sum_warp(acc_s, acc_s, clear=False)
                     T.reduce_max(acc_s, m_i, dim=1, clear=False)
                     for h_i in T.Parallel(H_per_block):
                         alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
@@ -614,10 +576,11 @@ def sparse_mla_fwd(
                         acc_o3[h_i, d_i] = acc_o3[h_i, d_i] * alpha[h_i]
 
                     T.copy(acc_s, S_shared)
-                    T.gemm(S_shared, KV_spilt0_shared, acc_o0, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(S_shared, KV_spilt1_shared, acc_o1, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(S_shared, KV_spilt2_shared, acc_o2, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(S_shared, KV_spilt3_shared, acc_o3, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
+                    T.gemm(S_shared, KV_spilt0_shared, acc_o0, k_pack=kpack, policy=gemm2_policy)
+                    T.copy(KV_spilt3_local, KV_spilt0_shared)
+                    T.gemm(S_shared, KV_spilt1_shared, acc_o1, k_pack=kpack, policy=gemm2_policy)
+                    T.gemm(S_shared, KV_spilt2_shared, acc_o2, k_pack=kpack, policy=gemm2_policy)
+                    T.gemm(S_shared, KV_spilt0_shared, acc_o3, k_pack=kpack, policy=gemm2_policy)
 
                 # Rescale
                 for h_i, d_i in T.Parallel(H_per_block, D_spilt):
@@ -626,24 +589,40 @@ def sparse_mla_fwd(
                     acc_o2[h_i, d_i] /= sumexp[h_i]
                     acc_o3[h_i, d_i] /= sumexp[h_i]
 
-                acc_oshared0 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                acc_oshared1 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                acc_oshared2 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                acc_oshared3 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                T.annotate_layout({
-                    acc_oshared0: tilelang.layout.make_hcu_swizzled_layout(acc_oshared0, major_pack=2),
-                    acc_oshared1: tilelang.layout.make_hcu_swizzled_layout(acc_oshared1, major_pack=2),
-                    acc_oshared2: tilelang.layout.make_hcu_swizzled_layout(acc_oshared2, major_pack=2),
-                    acc_oshared3: tilelang.layout.make_hcu_swizzled_layout(acc_oshared3, major_pack=2),
-                })
-                T.copy(acc_o0, acc_oshared0)
-                T.copy(acc_o1, acc_oshared1)
-                T.copy(acc_o2, acc_oshared2)
-                T.copy(acc_o3, acc_oshared3)
-                T.copy(acc_oshared0, Output_partial[b_i, s_i, H0:H1, split_idx, :D_spilt])
-                T.copy(acc_oshared1, Output_partial[b_i, s_i, H0:H1, split_idx, D_spilt:2*D_spilt])
-                T.copy(acc_oshared2, Output_partial[b_i, s_i, H0:H1, split_idx, 2*D_spilt:3*D_spilt])
-                T.copy(acc_oshared3, Output_partial[b_i, s_i, H0:H1, split_idx, 3*D_spilt:4*D_spilt])
+                if out_shared_reuse:
+                    acc_oshared0 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                    acc_oshared1 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                    T.annotate_layout({
+                        acc_oshared0: tilelang.layout.make_hcu_swizzled_layout(acc_oshared0, major_pack=2),
+                        acc_oshared1: tilelang.layout.make_hcu_swizzled_layout(acc_oshared1, major_pack=2),
+                    })
+                    T.copy(acc_o0, acc_oshared0)
+                    T.copy(acc_o1, acc_oshared1)
+                    T.copy(acc_oshared0, Output_partial[b_i, s_i, H0:H1, split_idx, :D_spilt])
+                    T.copy(acc_oshared1, Output_partial[b_i, s_i, H0:H1, split_idx, D_spilt:2*D_spilt])
+                    T.copy(acc_o2, acc_oshared0)
+                    T.copy(acc_o3, acc_oshared1)
+                    T.copy(acc_oshared0, Output_partial[b_i, s_i, H0:H1, split_idx, 2*D_spilt:3*D_spilt])
+                    T.copy(acc_oshared1, Output_partial[b_i, s_i, H0:H1, split_idx, 3*D_spilt:4*D_spilt])
+                else:
+                    acc_oshared0 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                    acc_oshared1 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                    acc_oshared2 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                    acc_oshared3 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                    T.annotate_layout({
+                        acc_oshared0: tilelang.layout.make_hcu_swizzled_layout(acc_oshared0, major_pack=2),
+                        acc_oshared1: tilelang.layout.make_hcu_swizzled_layout(acc_oshared1, major_pack=2),
+                        acc_oshared2: tilelang.layout.make_hcu_swizzled_layout(acc_oshared2, major_pack=2),
+                        acc_oshared3: tilelang.layout.make_hcu_swizzled_layout(acc_oshared3, major_pack=2),
+                    })
+                    T.copy(acc_o0, acc_oshared0)
+                    T.copy(acc_o1, acc_oshared1)
+                    T.copy(acc_o2, acc_oshared2)
+                    T.copy(acc_o3, acc_oshared3)
+                    T.copy(acc_oshared0, Output_partial[b_i, s_i, H0:H1, split_idx, :D_spilt])
+                    T.copy(acc_oshared1, Output_partial[b_i, s_i, H0:H1, split_idx, D_spilt:2*D_spilt])
+                    T.copy(acc_oshared2, Output_partial[b_i, s_i, H0:H1, split_idx, 2*D_spilt:3*D_spilt])
+                    T.copy(acc_oshared3, Output_partial[b_i, s_i, H0:H1, split_idx, 3*D_spilt:4*D_spilt])
 
                 for h_i in T.Parallel(H_per_block):
                     sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
@@ -690,12 +669,11 @@ def sparse_mla_fwd(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-        q_start_index_s: T.Tensor([1], indices_dtype),  # type: ignore
         glse: T.Tensor(glse_shape, dtype),  # type: ignore
         Output_partial: T.Tensor(output_partial_shape, dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
-        sparse_mla_split(Q, KV, Indices, q_start_index_s, glse, Output_partial)
+        sparse_mla_split(Q, KV, Indices, glse, Output_partial)
         combine(glse, Output_partial, Output)
 
     @T.prim_func
@@ -703,185 +681,18 @@ def sparse_mla_fwd(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-        q_start_index_s: T.Tensor([1], indices_dtype),  # type: ignore
         glse: T.Tensor(glse_shape, dtype),  # type: ignore
         Output_partial: T.Tensor(output_partial_shape, dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
-        sparse_mla(Q, KV, Indices, q_start_index_s, Output)
+        sparse_mla(Q, KV, Indices, Output)
 
     if num_split_tail > 0:
-        @T.macro
-        def sparse_mla_tail_no_split(
-            Q: T.Tensor(q_shape, dtype),  # type: ignore
-            KV: T.Tensor(kv_shape, dtype),  # type: ignore
-            Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-            q_start_index_s: T.Tensor([1], indices_dtype),  # type: ignore
-            Output: T.Tensor(o_shape, dtype),  # type: ignore
-        ):
-            with T.Kernel(seq_len * REPLICATE_H, batch - batch_head, kv_group, threads=threads) as (
-                bx,
-                by,
-                bz,
-            ):
-                Q_spilt0_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-                Q_spilt1_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-                Q_spilt2_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-                Q_spilt3_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-                Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
-                
-                KV_spilt0_shared = T.alloc_shared([BI, D_spilt], dtype)
-                KV_spilt1_shared = T.alloc_shared([BI, D_spilt], dtype)
-                KV_spilt2_shared = T.alloc_shared([BI, D_spilt], dtype)
-                KV_spilt3_shared = T.alloc_shared([BI, D_spilt], dtype)
-                K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
-                mask = T.alloc_fragment([BI], "bool")
-
-                acc_o0 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
-                acc_o1 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
-                acc_o2 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
-                acc_o3 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
-
-                acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
-                S_shared = T.alloc_shared([H_per_block, BI], dtype)
-                sumexp = T.alloc_fragment([H_per_block], accum_dtype)
-                sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
-                alpha = T.alloc_fragment([H_per_block], accum_dtype)
-                m_i = T.alloc_fragment([H_per_block], accum_dtype)
-                m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
-                indices_local = T.alloc_local([1], indices_dtype)
-                indices_mask = T.alloc_fragment([BI], indices_dtype)
-                indices_tail = T.alloc_local([1], indices_dtype)
-                valid_NI = T.alloc_fragment([1], "int")
-
-                b_i, g_i = (by + batch_head), bz
-                s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
-                # q_i = q_start_index_s[0] + s_i
-                # max_kv_i = (q_i + 1 - kv_stride) // kv_stride
-                # kv_i = (q_i + 1 - kv_stride) // kv_stride
-                # max_kv_i = kv_i if (kv_i <= seq_len_kv - 1) else seq_len_kv - 1
-
-                H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * max_block_m)
-                H1 = H0 + H_per_block
-
-                tx = T.get_thread_binding()
-                T.copy(Q[b_i, s_i, H0:H1, :D_spilt], Q_spilt0_shared, coalesced_width=kv_vectorized)
-                T.copy(Q[b_i, s_i, H0:H1, D_spilt:2*D_spilt], Q_spilt1_shared, coalesced_width=kv_vectorized)
-                T.copy(Q[b_i, s_i, H0:H1, 2*D_spilt:3*D_spilt], Q_spilt2_shared, coalesced_width=kv_vectorized)
-                T.copy(Q[b_i, s_i, H0:H1, 3*D_spilt:4*D_spilt], Q_spilt3_shared, coalesced_width=kv_vectorized)
-                T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
-
-                T.fill(acc_o0, 0)
-                T.fill(acc_o1, 0)
-                T.fill(acc_o2, 0)
-                T.fill(acc_o3, 0)
-                T.fill(sumexp, 1)
-                T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
-                T.fill(valid_NI, 0)
-
-                for i_i in T.serial(NI_tail):
-                    first_indices = Indices[b_i, s_i, g_i, i_i * BI]
-                    # if first_indices <= max_kv_i and first_indices >= 0:
-                    if first_indices >= 0:
-                        valid_NI[0] += 1
-
-                for i_i in T.Pipelined(valid_NI[0], num_stages=num_stages):
-                    for bi_i in T.Parallel(BI):
-                        indices_mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i]
-                        mask[bi_i] = indices_mask[bi_i] >= 0
-
-                    for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.if_then_else(
-                            mask[bi_i], 0, -T.infinity(acc_s.dtype)
-                        )
-
-                    for u in T.serial(kv_serial_count):
-                        line_stride = u * warps_line_stride
-                        indices_local[0] = Indices[b_i, s_i, g_i, i_i * BI + line_stride + tx // threads_per_line]
-                        # indices_local[0] = T.if_then_else(indices_local[0] <= max_kv_i and indices_local[0] >= 0, indices_local[0], 0)
-                        indices_local[0] = T.if_then_else(indices_local[0] >= 0, indices_local[0], 0)
-                        for v in T.vectorized(kv_vectorized):
-                            KV_spilt0_shared[line_stride + tx // threads_per_line,
-                                            (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
-                                            (tx % threads_per_line) * kv_vectorized + v]
-                            KV_spilt1_shared[line_stride + tx // threads_per_line,
-                                            (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
-                                            D_spilt + (tx % threads_per_line) * kv_vectorized + v]
-                            KV_spilt2_shared[line_stride + tx // threads_per_line,
-                                            (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
-                                            2*D_spilt + (tx % threads_per_line) * kv_vectorized + v]
-                            KV_spilt3_shared[line_stride + tx // threads_per_line,
-                                            (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
-                                            3*D_spilt + (tx % threads_per_line) * kv_vectorized + v]
-
-                    for bi_i, d_i in T.Parallel(BI, D_tail):
-                        indices_tail[0] = Indices[b_i, s_i, g_i, i_i * BI + bi_i]
-                        # indices_tail[0] = T.if_then_else(indices_tail[0] <= max_kv_i and indices_tail[0] >= 0, indices_tail[0], 0)
-                        indices_tail[0] = T.if_then_else(indices_tail[0] >= 0, indices_tail[0], 0)
-                        K_tail_shared[bi_i, d_i] = KV[
-                            b_i, indices_tail[0], g_i, D + d_i
-                        ]
-
-                    T.gemm(Q_spilt0_shared, KV_spilt0_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(Q_spilt1_shared, KV_spilt1_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(Q_spilt2_shared, KV_spilt2_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(Q_spilt3_shared, KV_spilt3_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
-
-                    T.copy(m_i, m_i_prev)
-                    T.reduce_max(acc_s, m_i, dim=1, clear=False)
-                    for h_i in T.Parallel(H_per_block):
-                        alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
-                    for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.exp2(
-                            acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
-                        )
-                    T.reduce_sum(acc_s, sumexp_i, dim=1)
-                    for h_i in T.Parallel(H_per_block):
-                        sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
-                    for h_i, d_i in T.Parallel(H_per_block, D_spilt):
-                        acc_o0[h_i, d_i] = acc_o0[h_i, d_i] * alpha[h_i]
-                        acc_o1[h_i, d_i] = acc_o1[h_i, d_i] * alpha[h_i]
-                        acc_o2[h_i, d_i] = acc_o2[h_i, d_i] * alpha[h_i]
-                        acc_o3[h_i, d_i] = acc_o3[h_i, d_i] * alpha[h_i]
-
-                    T.copy(acc_s, S_shared)
-                    T.gemm(S_shared, KV_spilt0_shared, acc_o0, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(S_shared, KV_spilt1_shared, acc_o1, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(S_shared, KV_spilt2_shared, acc_o2, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(S_shared, KV_spilt3_shared, acc_o3, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                # Rescale
-                for h_i, d_i in T.Parallel(H_per_block, D_spilt):
-                    acc_o0[h_i, d_i] /= sumexp[h_i]
-                    acc_o1[h_i, d_i] /= sumexp[h_i]
-                    acc_o2[h_i, d_i] /= sumexp[h_i]
-                    acc_o3[h_i, d_i] /= sumexp[h_i]
-
-                acc_oshared0 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                acc_oshared1 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                acc_oshared2 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                acc_oshared3 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                T.annotate_layout({
-                    acc_oshared0: tilelang.layout.make_hcu_swizzled_layout(acc_oshared0, major_pack=2),
-                    acc_oshared1: tilelang.layout.make_hcu_swizzled_layout(acc_oshared1, major_pack=2),
-                    acc_oshared2: tilelang.layout.make_hcu_swizzled_layout(acc_oshared2, major_pack=2),
-                    acc_oshared3: tilelang.layout.make_hcu_swizzled_layout(acc_oshared3, major_pack=2),
-                })
-                T.copy(acc_o0, acc_oshared0)
-                T.copy(acc_o1, acc_oshared1)
-                T.copy(acc_o2, acc_oshared2)
-                T.copy(acc_o3, acc_oshared3)
-                T.copy(acc_oshared0, Output[b_i, s_i, H0:H1, :D_spilt])
-                T.copy(acc_oshared1, Output[b_i, s_i, H0:H1, D_spilt:2*D_spilt])
-                T.copy(acc_oshared2, Output[b_i, s_i, H0:H1, 2*D_spilt:3*D_spilt])
-                T.copy(acc_oshared3, Output[b_i, s_i, H0:H1, 3*D_spilt:4*D_spilt])
-
         @T.macro
         def sparse_mla_tail_split(
             Q: T.Tensor(q_shape, dtype),  # type: ignore
             KV: T.Tensor(kv_shape, dtype),  # type: ignore
             Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-            q_start_index_s: T.Tensor([1], indices_dtype),  # type: ignore
             glse_tail: T.Tensor(glse_shape_tail, dtype),  # type: ignore
             Output_partial_tail: T.Tensor(output_partial_shape_tail, dtype),  # type: ignore
         ):
@@ -891,35 +702,6 @@ def sparse_mla_fwd(
                 bz,
                 # split_idx,
             ):
-                Q_spilt0_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-                Q_spilt1_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-                Q_spilt2_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-                Q_spilt3_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-                Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
-                
-                KV_spilt0_shared = T.alloc_shared([BI, D_spilt], dtype)
-                KV_spilt1_shared = T.alloc_shared([BI, D_spilt], dtype)
-                KV_spilt2_shared = T.alloc_shared([BI, D_spilt], dtype)
-                KV_spilt3_shared = T.alloc_shared([BI, D_spilt], dtype)
-                K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
-                mask = T.alloc_fragment([BI], "bool")
-
-                acc_o0 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
-                acc_o1 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
-                acc_o2 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
-                acc_o3 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
-
-                acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
-                S_shared = T.alloc_shared([H_per_block, BI], dtype)
-                sumexp = T.alloc_fragment([H_per_block], accum_dtype)
-                sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
-                alpha = T.alloc_fragment([H_per_block], accum_dtype)
-                m_i = T.alloc_fragment([H_per_block], accum_dtype)
-                m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
-                indices_local = T.alloc_local([1], indices_dtype)
-                indices_mask = T.alloc_fragment([BI], indices_dtype)
-                indices_tail = T.alloc_local([1], indices_dtype)
-
                 split_idx = bz
                 b_head = batch - batch_tail
                 b_i = (by + b_head) if kv_group == 1 else (by // kv_group + b_head)
@@ -934,20 +716,53 @@ def sparse_mla_fwd(
                 H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * max_block_m)
                 H1 = H0 + H_per_block
 
-                first_indices = Indices[b_i, s_i, g_i, split_idx * topk_per_split_tail]
-                # if first_indices > max_kv_i and first_indices >= 0:
-                if first_indices < 0:
+                valid_NI = T.alloc_fragment([1], "int")
+                T.fill(valid_NI, 0)
+                for i_i in T.serial(NI_tail):
+                    first_indices = Indices[b_i, s_i, g_i, i_i * split_stride_tail + split_idx * BI]
+                    # if first_indices <= max_kv_i and first_indices >= 0:
+                    if first_indices >= 0:
+                        valid_NI[0] += 1
+
+                if valid_NI[0] == 0:
+                    acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
+                    sumexp = T.alloc_fragment([H_per_block], accum_dtype)
                     T.fill(sumexp, -T.infinity(accum_dtype))
-                    T.fill(acc_o0, 0)
-                    T.fill(acc_o1, 0)
-                    T.fill(acc_o2, 0)
-                    T.fill(acc_o3, 0)
+                    T.fill(acc_o, 0)
                     T.copy(sumexp, glse_tail[b_i_tail, s_i, H0:H1, split_idx])
-                    T.copy(acc_o0, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, :D_spilt])
-                    T.copy(acc_o1, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, D_spilt:2*D_spilt])
-                    T.copy(acc_o2, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, 2*D_spilt:3*D_spilt])
-                    T.copy(acc_o3, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, 3*D_spilt:4*D_spilt])
+                    T.copy(acc_o, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, :D])
                 else:
+                    Q_spilt0_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+                    Q_spilt1_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+                    Q_spilt2_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+                    Q_spilt3_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+                    Q_tail_shared = T.alloc_fragment([H_per_block, D_tail], dtype)
+
+                    KV_spilt0_shared = T.alloc_shared([BI, D_spilt], dtype)
+                    KV_spilt1_shared = T.alloc_shared([BI, D_spilt], dtype)
+                    KV_spilt2_shared = T.alloc_shared([BI, D_spilt], dtype)
+                    # KV_spilt3_shared = T.alloc_shared([BI, D_spilt], dtype)
+                    # K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+                    KV_spilt3_local = T.alloc_fragment([BI, D_spilt], dtype)
+                    K_tail_shared = T.alloc_fragment([BI, D_tail], dtype)
+                    mask = T.alloc_fragment([BI], "bool")
+
+                    acc_o0 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
+                    acc_o1 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
+                    acc_o2 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
+                    acc_o3 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
+
+                    acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
+                    S_shared = T.alloc_shared([H_per_block, BI], dtype)
+                    sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+                    sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
+                    alpha = T.alloc_fragment([H_per_block], accum_dtype)
+                    m_i = T.alloc_fragment([H_per_block], accum_dtype)
+                    m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+                    indices_local = T.alloc_local([1], indices_dtype)
+                    indices_mask = T.alloc_fragment([BI], indices_dtype)
+                    indices_tail = T.alloc_local([1], indices_dtype)
+
                     tx = T.get_thread_binding()
                     T.copy(Q[b_i, s_i, H0:H1, :D_spilt], Q_spilt0_shared, coalesced_width=kv_vectorized)
                     T.copy(Q[b_i, s_i, H0:H1, D_spilt:2*D_spilt], Q_spilt1_shared, coalesced_width=kv_vectorized)
@@ -962,8 +777,8 @@ def sparse_mla_fwd(
                     T.fill(sumexp, 1)
                     T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
 
-                    for i_i in T.Pipelined(NI_tail, num_stages=num_stages):
-                        idx_in_split = split_idx * topk_per_split_tail + i_i * BI
+                    for i_i in T.Pipelined(valid_NI[0], num_stages=num_stages):
+                        idx_in_split = i_i * split_stride_tail + split_idx * BI
                         for bi_i in T.Parallel(BI):
                             indices_mask[bi_i] = Indices[b_i, s_i, g_i, idx_in_split + bi_i]
                             # mask[bi_i] = indices_mask[bi_i] <= max_kv_i and indices_mask[bi_i] >= 0
@@ -989,9 +804,13 @@ def sparse_mla_fwd(
                                 KV_spilt2_shared[line_stride + tx // threads_per_line,
                                                 (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
                                                 2*D_spilt + (tx % threads_per_line) * kv_vectorized + v]
-                                KV_spilt3_shared[line_stride + tx // threads_per_line,
-                                                (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
-                                                3*D_spilt + (tx % threads_per_line) * kv_vectorized + v]
+                                # KV_spilt3_shared[line_stride + tx // threads_per_line,
+                                #                 (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
+                                #                 3*D_spilt + (tx % threads_per_line) * kv_vectorized + v]
+                        for bi_i, d_i in T.Parallel(BI, D_spilt):
+                            indices_local[0] = Indices[b_i, s_i, g_i, idx_in_split + bi_i]
+                            indices_local[0] = T.if_then_else(indices_local[0] >= 0, indices_local[0], 0)
+                            KV_spilt3_local[bi_i, d_i] = KV[b_i, indices_local[0], g_i, 3*D_spilt + d_i]
 
                         for bi_i, d_i in T.Parallel(BI, D_tail):
                             indices_tail[0] = Indices[b_i, s_i, g_i, idx_in_split + bi_i]
@@ -1001,13 +820,15 @@ def sparse_mla_fwd(
                                 b_i, indices_tail[0], g_i, D + d_i
                             ]
                                                 
-                        T.gemm(Q_spilt0_shared, KV_spilt0_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                        T.gemm(Q_spilt1_shared, KV_spilt1_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                        T.gemm(Q_spilt2_shared, KV_spilt2_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                        T.gemm(Q_spilt3_shared, KV_spilt3_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                        T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+                        T.gemm(Q_spilt0_shared, KV_spilt0_shared, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                        T.gemm(Q_spilt1_shared, KV_spilt1_shared, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                        T.gemm(Q_spilt2_shared, KV_spilt2_shared, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                        T.gemm(Q_spilt3_shared, KV_spilt3_local, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                        T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=gemm1_policy)
 
                         T.copy(m_i, m_i_prev)
+                        if gemm1_policy == T.GemmWarpPolicy.FullColK:
+                            T.reduce_sum_warp(acc_s, acc_s, clear=False)
                         T.reduce_max(acc_s, m_i, dim=1, clear=False)
                         for h_i in T.Parallel(H_per_block):
                             alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
@@ -1025,10 +846,11 @@ def sparse_mla_fwd(
                             acc_o3[h_i, d_i] = acc_o3[h_i, d_i] * alpha[h_i]
 
                         T.copy(acc_s, S_shared)
-                        T.gemm(S_shared, KV_spilt0_shared, acc_o0, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                        T.gemm(S_shared, KV_spilt1_shared, acc_o1, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                        T.gemm(S_shared, KV_spilt2_shared, acc_o2, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                        T.gemm(S_shared, KV_spilt3_shared, acc_o3, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
+                        T.gemm(S_shared, KV_spilt0_shared, acc_o0, k_pack=kpack, policy=gemm2_policy)
+                        T.copy(KV_spilt3_local, KV_spilt0_shared)
+                        T.gemm(S_shared, KV_spilt1_shared, acc_o1, k_pack=kpack, policy=gemm2_policy)
+                        T.gemm(S_shared, KV_spilt2_shared, acc_o2, k_pack=kpack, policy=gemm2_policy)
+                        T.gemm(S_shared, KV_spilt0_shared, acc_o3, k_pack=kpack, policy=gemm2_policy)
 
                     # Rescale
                     for h_i, d_i in T.Parallel(H_per_block, D_spilt):
@@ -1037,24 +859,40 @@ def sparse_mla_fwd(
                         acc_o2[h_i, d_i] /= sumexp[h_i]
                         acc_o3[h_i, d_i] /= sumexp[h_i]
 
-                    acc_oshared0 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                    acc_oshared1 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                    acc_oshared2 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                    acc_oshared3 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                    T.annotate_layout({
-                        acc_oshared0: tilelang.layout.make_hcu_swizzled_layout(acc_oshared0, major_pack=2),
-                        acc_oshared1: tilelang.layout.make_hcu_swizzled_layout(acc_oshared1, major_pack=2),
-                        acc_oshared2: tilelang.layout.make_hcu_swizzled_layout(acc_oshared2, major_pack=2),
-                        acc_oshared3: tilelang.layout.make_hcu_swizzled_layout(acc_oshared3, major_pack=2),
-                    })
-                    T.copy(acc_o0, acc_oshared0)
-                    T.copy(acc_o1, acc_oshared1)
-                    T.copy(acc_o2, acc_oshared2)
-                    T.copy(acc_o3, acc_oshared3)
-                    T.copy(acc_oshared0, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, :D_spilt])
-                    T.copy(acc_oshared1, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, D_spilt:2*D_spilt])
-                    T.copy(acc_oshared2, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, 2*D_spilt:3*D_spilt])
-                    T.copy(acc_oshared3, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, 3*D_spilt:4*D_spilt])
+                    if out_shared_reuse:
+                        acc_oshared0 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                        acc_oshared1 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                        T.annotate_layout({
+                            acc_oshared0: tilelang.layout.make_hcu_swizzled_layout(acc_oshared0, major_pack=2),
+                            acc_oshared1: tilelang.layout.make_hcu_swizzled_layout(acc_oshared1, major_pack=2),
+                        })
+                        T.copy(acc_o0, acc_oshared0)
+                        T.copy(acc_o1, acc_oshared1)
+                        T.copy(acc_oshared0, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, :D_spilt])
+                        T.copy(acc_oshared1, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, D_spilt:2*D_spilt])
+                        T.copy(acc_o2, acc_oshared0)
+                        T.copy(acc_o3, acc_oshared1)
+                        T.copy(acc_oshared0, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, 2*D_spilt:3*D_spilt])
+                        T.copy(acc_oshared1, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, 3*D_spilt:4*D_spilt])
+                    else:
+                        acc_oshared0 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                        acc_oshared1 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                        acc_oshared2 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                        acc_oshared3 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                        T.annotate_layout({
+                            acc_oshared0: tilelang.layout.make_hcu_swizzled_layout(acc_oshared0, major_pack=2),
+                            acc_oshared1: tilelang.layout.make_hcu_swizzled_layout(acc_oshared1, major_pack=2),
+                            acc_oshared2: tilelang.layout.make_hcu_swizzled_layout(acc_oshared2, major_pack=2),
+                            acc_oshared3: tilelang.layout.make_hcu_swizzled_layout(acc_oshared3, major_pack=2),
+                        })
+                        T.copy(acc_o0, acc_oshared0)
+                        T.copy(acc_o1, acc_oshared1)
+                        T.copy(acc_o2, acc_oshared2)
+                        T.copy(acc_o3, acc_oshared3)
+                        T.copy(acc_oshared0, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, :D_spilt])
+                        T.copy(acc_oshared1, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, D_spilt:2*D_spilt])
+                        T.copy(acc_oshared2, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, 2*D_spilt:3*D_spilt])
+                        T.copy(acc_oshared3, Output_partial_tail[b_i_tail, s_i, H0:H1, split_idx, 3*D_spilt:4*D_spilt])    
 
                     for h_i in T.Parallel(H_per_block):
                         sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
@@ -1065,7 +903,6 @@ def sparse_mla_fwd(
             Q: T.Tensor(q_shape, dtype),  # type: ignore
             KV: T.Tensor(kv_shape, dtype),  # type: ignore
             Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-            q_start_index_s: T.Tensor([1], indices_dtype),  # type: ignore
             Output: T.Tensor(o_shape, dtype),  # type: ignore
         ):
             with T.Kernel(seq_len * REPLICATE_H, batch - batch_tail, kv_group, threads=threads) as (
@@ -1073,17 +910,19 @@ def sparse_mla_fwd(
                 by,
                 bz,
             ):
-                Q_spilt0_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-                Q_spilt1_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-                Q_spilt2_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-                Q_spilt3_shared = T.alloc_shared([H_per_block, D_spilt], dtype)
-                Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
+                Q_spilt0_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+                Q_spilt1_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+                Q_spilt2_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+                Q_spilt3_shared = T.alloc_fragment([H_per_block, D_spilt], dtype)
+                Q_tail_shared = T.alloc_fragment([H_per_block, D_tail], dtype)
 
                 KV_spilt0_shared = T.alloc_shared([BI, D_spilt], dtype)
                 KV_spilt1_shared = T.alloc_shared([BI, D_spilt], dtype)
                 KV_spilt2_shared = T.alloc_shared([BI, D_spilt], dtype)
-                KV_spilt3_shared = T.alloc_shared([BI, D_spilt], dtype)
-                K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+                # KV_spilt3_shared = T.alloc_shared([BI, D_spilt], dtype)
+                # K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+                KV_spilt3_local = T.alloc_fragment([BI, D_spilt], dtype)
+                K_tail_shared = T.alloc_fragment([BI, D_tail], dtype)
                 mask = T.alloc_fragment([BI], "bool")
 
                 acc_o0 = T.alloc_fragment([H_per_block, D_spilt], accum_dtype)
@@ -1159,9 +998,13 @@ def sparse_mla_fwd(
                             KV_spilt2_shared[line_stride + tx // threads_per_line,
                                             (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
                                             2*D_spilt + (tx % threads_per_line) * kv_vectorized + v]
-                            KV_spilt3_shared[line_stride + tx // threads_per_line,
-                                            (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
-                                            3*D_spilt + (tx % threads_per_line) * kv_vectorized + v]
+                            # KV_spilt3_shared[line_stride + tx // threads_per_line,
+                            #                 (tx % threads_per_line) * kv_vectorized + v] = KV[b_i, indices_local[0], g_i,
+                            #                 3*D_spilt + (tx % threads_per_line) * kv_vectorized + v]
+                    for bi_i, d_i in T.Parallel(BI, D_spilt):
+                        indices_local[0] = Indices[b_i, s_i, g_i, i_i * BI + bi_i]
+                        indices_local[0] = T.if_then_else(indices_local[0] >= 0, indices_local[0], 0)
+                        KV_spilt3_local[bi_i, d_i] = KV[b_i, indices_local[0], g_i, 3*D_spilt + d_i]
 
                     for bi_i, d_i in T.Parallel(BI, D_tail):
                         indices_tail[0] = Indices[b_i, s_i, g_i, i_i * BI + bi_i]
@@ -1171,13 +1014,15 @@ def sparse_mla_fwd(
                             b_i, indices_tail[0], g_i, D + d_i
                         ]
 
-                    T.gemm(Q_spilt0_shared, KV_spilt0_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(Q_spilt1_shared, KV_spilt1_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(Q_spilt2_shared, KV_spilt2_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(Q_spilt3_shared, KV_spilt3_shared, acc_s, transpose_B=True, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+                    T.gemm(Q_spilt0_shared, KV_spilt0_shared, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                    T.gemm(Q_spilt1_shared, KV_spilt1_shared, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                    T.gemm(Q_spilt2_shared, KV_spilt2_shared, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                    T.gemm(Q_spilt3_shared, KV_spilt3_local, acc_s, transpose_B=True, k_pack=kpack, policy=gemm1_policy)
+                    T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=gemm1_policy)
 
                     T.copy(m_i, m_i_prev)
+                    if gemm1_policy == T.GemmWarpPolicy.FullColK:
+                        T.reduce_sum_warp(acc_s, acc_s, clear=False)
                     T.reduce_max(acc_s, m_i, dim=1, clear=False)
                     for h_i in T.Parallel(H_per_block):
                         alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
@@ -1195,10 +1040,11 @@ def sparse_mla_fwd(
                         acc_o3[h_i, d_i] = acc_o3[h_i, d_i] * alpha[h_i]
 
                     T.copy(acc_s, S_shared)
-                    T.gemm(S_shared, KV_spilt0_shared, acc_o0, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(S_shared, KV_spilt1_shared, acc_o1, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(S_shared, KV_spilt2_shared, acc_o2, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(S_shared, KV_spilt3_shared, acc_o3, k_pack=kpack, policy=T.GemmWarpPolicy.FullCol)
+                    T.gemm(S_shared, KV_spilt0_shared, acc_o0, k_pack=kpack, policy=gemm2_policy)
+                    T.copy(KV_spilt3_local, KV_spilt0_shared)
+                    T.gemm(S_shared, KV_spilt1_shared, acc_o1, k_pack=kpack, policy=gemm2_policy)
+                    T.gemm(S_shared, KV_spilt2_shared, acc_o2, k_pack=kpack, policy=gemm2_policy)
+                    T.gemm(S_shared, KV_spilt0_shared, acc_o3, k_pack=kpack, policy=gemm2_policy)
                 # Rescale
                 for h_i, d_i in T.Parallel(H_per_block, D_spilt):
                     acc_o0[h_i, d_i] /= sumexp[h_i]
@@ -1206,24 +1052,40 @@ def sparse_mla_fwd(
                     acc_o2[h_i, d_i] /= sumexp[h_i]
                     acc_o3[h_i, d_i] /= sumexp[h_i]
 
-                acc_oshared0 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                acc_oshared1 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                acc_oshared2 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                acc_oshared3 = T.alloc_shared([H_per_block, D_spilt], dtype)
-                T.annotate_layout({
-                    acc_oshared0: tilelang.layout.make_hcu_swizzled_layout(acc_oshared0, major_pack=2),
-                    acc_oshared1: tilelang.layout.make_hcu_swizzled_layout(acc_oshared1, major_pack=2),
-                    acc_oshared2: tilelang.layout.make_hcu_swizzled_layout(acc_oshared2, major_pack=2),
-                    acc_oshared3: tilelang.layout.make_hcu_swizzled_layout(acc_oshared3, major_pack=2),
-                })
-                T.copy(acc_o0, acc_oshared0)
-                T.copy(acc_o1, acc_oshared1)
-                T.copy(acc_o2, acc_oshared2)
-                T.copy(acc_o3, acc_oshared3)
-                T.copy(acc_oshared0, Output[b_i, s_i, H0:H1, :D_spilt])
-                T.copy(acc_oshared1, Output[b_i, s_i, H0:H1, D_spilt:2*D_spilt])
-                T.copy(acc_oshared2, Output[b_i, s_i, H0:H1, 2*D_spilt:3*D_spilt])
-                T.copy(acc_oshared3, Output[b_i, s_i, H0:H1, 3*D_spilt:4*D_spilt])
+                if out_shared_reuse:
+                    acc_oshared0 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                    acc_oshared1 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                    T.annotate_layout({
+                        acc_oshared0: tilelang.layout.make_hcu_swizzled_layout(acc_oshared0, major_pack=2),
+                        acc_oshared1: tilelang.layout.make_hcu_swizzled_layout(acc_oshared1, major_pack=2),
+                    })
+                    T.copy(acc_o0, acc_oshared0)
+                    T.copy(acc_o1, acc_oshared1)
+                    T.copy(acc_oshared0, Output[b_i, s_i, H0:H1, 2*D_spilt:3*D_spilt])
+                    T.copy(acc_oshared1, Output[b_i, s_i, H0:H1, 3*D_spilt:4*D_spilt])
+                    T.copy(acc_o2, acc_oshared0)
+                    T.copy(acc_o3, acc_oshared1)
+                    T.copy(acc_oshared0, Output[b_i, s_i, H0:H1, :D_spilt])
+                    T.copy(acc_oshared1, Output[b_i, s_i, H0:H1, D_spilt:2*D_spilt])
+                else:
+                    acc_oshared0 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                    acc_oshared1 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                    acc_oshared2 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                    acc_oshared3 = T.alloc_shared([H_per_block, D_spilt], dtype)
+                    T.annotate_layout({
+                        acc_oshared0: tilelang.layout.make_hcu_swizzled_layout(acc_oshared0, major_pack=2),
+                        acc_oshared1: tilelang.layout.make_hcu_swizzled_layout(acc_oshared1, major_pack=2),
+                        acc_oshared2: tilelang.layout.make_hcu_swizzled_layout(acc_oshared2, major_pack=2),
+                        acc_oshared3: tilelang.layout.make_hcu_swizzled_layout(acc_oshared3, major_pack=2),
+                    })
+                    T.copy(acc_o0, acc_oshared0)
+                    T.copy(acc_o1, acc_oshared1)
+                    T.copy(acc_o2, acc_oshared2)
+                    T.copy(acc_o3, acc_oshared3)
+                    T.copy(acc_oshared0, Output[b_i, s_i, H0:H1, :D_spilt])
+                    T.copy(acc_oshared1, Output[b_i, s_i, H0:H1, D_spilt:2*D_spilt])
+                    T.copy(acc_oshared2, Output[b_i, s_i, H0:H1, 2*D_spilt:3*D_spilt])
+                    T.copy(acc_oshared3, Output[b_i, s_i, H0:H1, 3*D_spilt:4*D_spilt])
 
         @T.macro
         def combine_tail(
@@ -1321,70 +1183,67 @@ def sparse_mla_fwd(
             Q: T.Tensor(q_shape, dtype),  # type: ignore
             KV: T.Tensor(kv_shape, dtype),  # type: ignore
             Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-            q_start_index_s: T.Tensor([1], indices_dtype),  # type: ignore
             glse: T.Tensor(glse_shape, dtype),  # type: ignore
             Output_partial: T.Tensor(output_partial_shape, dtype),  # type: ignore
             glse_tail: T.Tensor(glse_shape_tail, dtype),  # type: ignore
             Output_partial_tail: T.Tensor(output_partial_shape_tail, dtype),  # type: ignore
             Output: T.Tensor(o_shape, dtype),  # type: ignore
         ):
-            sparse_mla_split(Q, KV, Indices, q_start_index_s, glse, Output_partial)
-            sparse_mla_tail_split(Q, KV, Indices, q_start_index_s, glse_tail, Output_partial_tail)
+            sparse_mla_split(Q, KV, Indices, glse, Output_partial)
+            sparse_mla_tail_split(Q, KV, Indices, glse_tail, Output_partial_tail)
             combine_all(glse, Output_partial, glse_tail, Output_partial_tail, Output)
-
-        @T.prim_func
-        def main_head_split(
-            Q: T.Tensor(q_shape, dtype),  # type: ignore
-            KV: T.Tensor(kv_shape, dtype),  # type: ignore
-            Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-            q_start_index_s: T.Tensor([1], indices_dtype),  # type: ignore
-            glse: T.Tensor(glse_shape, dtype),  # type: ignore
-            Output_partial: T.Tensor(output_partial_shape, dtype),  # type: ignore
-            glse_tail: T.Tensor(glse_shape_tail, dtype),  # type: ignore
-            Output_partial_tail: T.Tensor(output_partial_shape_tail, dtype),  # type: ignore
-            Output: T.Tensor(o_shape, dtype),  # type: ignore
-        ):
-            sparse_mla_split(Q, KV, Indices, q_start_index_s, glse, Output_partial)
-            sparse_mla_tail_no_split(Q, KV, Indices, q_start_index_s, Output)
-            combine(glse, Output_partial, Output)
 
         @T.prim_func
         def main_tail_split(
             Q: T.Tensor(q_shape, dtype),  # type: ignore
             KV: T.Tensor(kv_shape, dtype),  # type: ignore
             Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-            q_start_index_s: T.Tensor([1], indices_dtype),  # type: ignore
             glse: T.Tensor(glse_shape, dtype),  # type: ignore
             Output_partial: T.Tensor(output_partial_shape, dtype),  # type: ignore
             glse_tail: T.Tensor(glse_shape_tail, dtype),  # type: ignore
             Output_partial_tail: T.Tensor(output_partial_shape_tail, dtype),  # type: ignore
             Output: T.Tensor(o_shape, dtype),  # type: ignore
         ):
-            sparse_mla_head_no_split(Q, KV, Indices, q_start_index_s, Output)
-            sparse_mla_tail_split(Q, KV, Indices, q_start_index_s, glse_tail, Output_partial_tail)
+            sparse_mla_head_no_split(Q, KV, Indices, Output)
+            sparse_mla_tail_split(Q, KV, Indices, glse_tail, Output_partial_tail)
             combine_tail(glse_tail, Output_partial_tail, Output)
 
     if num_split_tail > 0:
         if num_split > 1 and num_split_tail > 1:
             return main_all_split
-        elif num_split > 1:
-            return main_head_split
         elif num_split_tail > 1:
             return main_tail_split
         else:
-            assert False, "for num_split_tail > 0, any of num_split or num_split_tail need > 1"
+            assert False, "for num_split_tail > 0, at least num_split_tail need > 1"
     if num_split > 1:
         return main_split
     else:
         return main_no_split
 
-def get_best_split(key, cu_count):
-    max_split = 64
-    combine_base = 0.064
-    combine_head = 16
-    min_score = (key + cu_count - 1) // cu_count * max_split
-    num_split = 1
-    if key <= 2:
+def get_benifit(ceil, occupancy):
+    if occupancy <= 1:
+        return 1.0
+    benifit = 1.0
+    if ceil >= occupancy:
+        benifit = 1.8
+    return benifit
+
+def get_score(key, q_heads, cu_count, max_split, split, occupancy, combine_base):
+    combine_score = (key * q_heads + cu_count - 1) // cu_count * combine_base * (split >> 1)
+    score_base = (max_split // split)
+    ceil = (key * split + cu_count - 1) // cu_count
+    benifit = get_benifit(ceil, occupancy)
+
+    remain = ceil % occupancy
+    floor = ceil - remain
+    mla_score = (floor * score_base / benifit + remain * score_base) * (1.05 ** (ceil >> 1))
+    score = mla_score + combine_score
+    return score
+
+def get_best_split(key, cu_count, q_heads, max_split, combine_base, occupancy, split_base=1):
+    min_score = get_score(key, q_heads, cu_count, max_split, split_base, occupancy, combine_base)
+    num_split = split_base
+    if key <= 4:
         splits = [16, 32]
     elif key <= cu_count // 2:
         splits = [1, 2, 4, 8, 16]
@@ -1396,97 +1255,121 @@ def get_best_split(key, cu_count):
         splits = [1, 2]
     else:
         splits = [1]
-    for split in splits:
-        combine_score = (key * combine_head + cu_count - 1) // cu_count * combine_base * (split >> 1)
-        sore_ = (key * split + cu_count - 1) // cu_count * (max_split // split) + combine_score
-        if sore_ < min_score:
-            min_score = sore_
-            num_split = split
-    return num_split
 
-def get_streamk_config(key, count, cu_count):
-    max_split = 64
-    combine_base = 0.064
+    for split in splits:
+        if split % split_base != 0:
+            continue
+        score = get_score(key, q_heads, cu_count, max_split, split, occupancy, combine_base)
+        if score < min_score:
+            min_score = score
+            num_split = split
+    return num_split, min_score
+
+def get_streamk_config(key, count, cu_count, q_heads, max_split, combine_base, occupancy):
     q_head = 16
     tail = key % count
     head = key // count * count
+    head_score = 0
+    tail_score = 0
+    num_split = 0
+    num_split_tail = 0
     if head > 0:
         num_split = cu_count // count
         gcd = math.gcd(head // count, num_split)
         num_split = num_split // gcd
-    else:
-        num_split = 0
-    num_split_tail = 0
-    if tail > 0:
-        num_split_tail = get_best_split(tail, cu_count)
+        if occupancy > 1:
+            num_split, head_score = get_best_split(head, cu_count, q_heads, max_split, combine_base, occupancy, split_base=num_split)
 
+    if tail > 0:
+        num_split_tail, tail_score = get_best_split(tail, cu_count, q_heads, max_split, combine_base, occupancy)
+
+    merged = False
     if num_split == num_split_tail or num_split == 0:
         # split of head and tail are the same, use splitk not streamk
         head = key
         tail = 0
         num_split = num_split_tail
         num_split_tail = 0
+        merged = True
+    elif num_split_tail == 1:
+        # not support tail no split
+        head = key
+        tail = 0
+        num_split, head_score = get_best_split(key, cu_count, q_heads, max_split, combine_base, occupancy)
+        num_split_tail = 0
+        tail_score = 0
 
-    head_sore = (head * num_split + cu_count - 1) // cu_count * (max_split // num_split)
-    combine_score = (head * q_head + cu_count - 1) // cu_count * combine_base * (num_split >> 1)
-    tail_sore = 0
-    combine_tail_score = 0
-    if num_split_tail > 0:
-        tail_sore = (tail * num_split_tail + cu_count - 1) // cu_count * (max_split // num_split_tail)
-        combine_tail_score = (tail * q_head + cu_count - 1) // cu_count * combine_base * (num_split_tail >> 1)
+    if merged:
+        total_score = get_score(key, q_heads, cu_count, max_split, num_split, occupancy, combine_base)
+    else:
+        total_score = head_score + tail_score
+    print(f"{count=} {head=} {head_score=:.3f} {tail=} {tail_score=:.3f} {total_score=:.3f}")
 
-    total_sore = head_sore + tail_sore + combine_score + combine_tail_score
-
-    return total_sore, head, num_split, num_split_tail
+    return total_score, head, num_split, num_split_tail
 
 @functools.lru_cache
-def get_best_config(batch, seq_len):
+def get_best_config(batch, seq_len, q_heads):
     cu_count = torch.cuda.get_device_properties("cuda").multi_processor_count
-    key = batch * seq_len
-    assert key > 0, "batch * seq_len must be greater than 0"
+    # in tp mode, q_heads is 16, so we set block_M == 16, if dp mod need a new kernel for better performance
+    block_M = 16
+    if q_heads == 128:
+        block_M = 32
+
+    replicat_H = q_heads // block_M
+    seq_len_replicat = seq_len * replicat_H
+    key = batch * seq_len_replicat
+    assert key > 0, "batch * seq_len_replicat must be greater than 0"
     assert cu_count > 0, "cu_count must be greater than 0"
     
-    config_map = config_map_cu64
-    key_min = 0
+    config_map = {}
+    key_min = cu_count * 2 // 16
     counts = []
-    if cu_count == 80:
-        counts = [80, 40, 20, 16, 10, 5]
-        key_min = 10
-    elif cu_count == 72:
+
+    if cu_count == 72:
         counts = [72, 36, 18, 9]
         key_min = 9
         config_map = config_map_cu72
     elif cu_count == 64:
-        counts = [64, 32, 16, 8, 4]
+        counts = [64, 32, 16, 8]
         key_min = 8
-        config_map = config_map_cu64
 
-    best_key = min(config_map.keys(), key=lambda x: abs(x - key))
-    config = config_map[best_key]
-    block_I, threads, num_split, num_stages = config["block_I"], config["threads"], config["num_split"], config["num_stages"]
+    if key in config_map.keys() and seq_len_replicat == 1 and block_M == 16:
+        config = config_map[key]
+        block_I, threads, num_stages, num_split, num_split_tail, batch_head = \
+            config["block_I"], config["threads"], config["num_stages"], config["num_split"], config["num_split_tail"], config["batch_head"]
+        return block_I, threads, num_stages, num_split, num_split_tail, batch_head
+
     batch_head = batch
     num_split_tail = 0
-
-    if len(counts) > 0 and cu_count % seq_len == 0 and key >= key_min and key <= 128 and ((key * num_split) % cu_count != 0 or key != best_key):
+    threads = 256
+    num_stages = 0
+    block_I = 32
+    combine_base = 0.04
+    if len(counts) > 0 and cu_count % seq_len_replicat == 0 and key >= key_min and key <= 128:
         # streamk
-        min_score = (key + cu_count - 1) // cu_count * 64
+        max_split = 128
+        # when block_I = 32, occupancy is limited by lds as 2
+        occupancy = 2
+        min_score = get_score(key, q_heads, cu_count, max_split, 1, occupancy, combine_base)
         num_split = 1
         for count in counts:
-            if count % seq_len != 0:
+            if count % seq_len_replicat != 0:
                 continue
-            score, head_, num_split_, num_split_tail_ = get_streamk_config(key, count, cu_count)
-            print(f"count={count}, score={score}, batch_head={head_ // seq_len}, num_split_={num_split_}, num_split_tail_={num_split_tail_}")
+            score, head_, num_split_, num_split_tail_ = get_streamk_config(key, count, cu_count, q_heads, max_split, combine_base, occupancy)
+            # print(f"count={count}, score:{score:.3f} vs {min_score:.3f}, batch_head={head_ // seq_len_replicat}, num_split_={num_split_}, num_split_tail_={num_split_tail_}")
             if score < min_score:
                 min_score = score
                 num_split = num_split_
                 num_split_tail = num_split_tail_
-                batch_head = head_ // seq_len
+                batch_head = head_ // seq_len_replicat
     else:
         # splitK
-        if (key != best_key and (key * num_split) % cu_count != 0 and (key * num_split) // cu_count < 8) or key > cu_count * 4:
-            num_split = get_best_split(key, cu_count)
+        # when block_I = 32, occupancy is limited by lds as 2
+        occupancy = 2
+        max_split = 128
+        num_split, score = get_best_split(key, cu_count, q_heads, max_split, combine_base, occupancy)
 
-    print(f"Using best config for batch={batch}, seq_len={seq_len}, cu_count={cu_count}: block_I={block_I}, threads={threads}, num_stages={num_stages}, num_split={num_split}, num_split_tail={num_split_tail}, batch_head={batch_head}")
+    print(f"Using best config for batch={batch}, seq_len={seq_len}, q_heads={q_heads}, cu_count={cu_count}: block_I={block_I}, threads={threads}, num_stages={num_stages}, num_split={num_split}, num_split_tail={num_split_tail}, batch_head={batch_head}")
     return block_I, threads, num_stages, num_split, num_split_tail, batch_head
 
 def sparse_mla_fwd_interface(q,
@@ -1519,13 +1402,11 @@ def sparse_mla_fwd_interface(q,
     assert indices.shape == (batch, seq_len, kv_group, topk)
 
     if None in [block_I, num_stages, threads]:
-        block_I, threads, num_stages, num_split, num_split_tail, batch_head = get_best_config(batch, seq_len)
+        block_I, threads, num_stages, num_split, num_split_tail, batch_head = get_best_config(batch, seq_len, heads)
  
     if num_split_tail > 0:
-        assert batch_head <= batch and batch_head > 0, "batch_head must be less than to batch and greater than 0 if num_split_tail > 0"
-        if batch_head == batch:
-            num_split = num_split_tail
-            num_split_tail = 0
+        assert batch_head < batch and batch_head > 0, "batch_head must be less than to batch and greater than 0 if num_split_tail > 0"
+
     if num_split is None:
         num_split = 1
     if batch_head is None:

@@ -19,6 +19,7 @@ def matmul(
     num_stages,
     threads,
     k_pack=1,
+    policy=None,
 ):
     A_shape = (K, M) if trans_A else (M, K)
     B_shape = (N, K) if trans_B else (K, N)
@@ -43,7 +44,13 @@ def matmul(
                     T.copy(B[bx * block_N, k * block_K], B_shared, coalesced_width=vec_size)
                 else:
                     T.copy(B[k * block_K, bx * block_N], B_shared, coalesced_width=vec_size)
-                T.gemm(A_shared, B_shared, C_local, trans_A, trans_B, k_pack=k_pack)
+                if policy is not None:
+                    T.gemm(A_shared, B_shared, C_local, trans_A, trans_B, k_pack=k_pack, policy=policy)
+                else:
+                    T.gemm(A_shared, B_shared, C_local, trans_A, trans_B, k_pack=k_pack)
+            # If using FullColK policy, need to reduce sum across k_warps
+            if policy == T.GemmWarpPolicy.FullColK:
+                T.reduce_sum_warp(C_local, C_local, clear=False)
             T.copy(C_local, C[by * block_M, bx * block_N])
 
     return main
@@ -64,6 +71,7 @@ def run_gemm(
     num_stages=0,
     num_threads=128,
     k_pack=1,
+    policy=None,
 ):
     program = matmul(
         M,
@@ -80,6 +88,7 @@ def run_gemm(
         num_stages,
         num_threads,
         k_pack=k_pack,
+        policy=policy,
     )
     kernel = tl.compile(program, out_idx=[2])
     profiler = kernel.get_profiler()
@@ -95,8 +104,6 @@ def run_gemm(
 
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
-
-@tilelang.testing.requires_rocm
 def test_gemm_f16f32f32_nt():
     run_gemm(1024, 1024, 1024, False, False, "float16", "float32", "float32", 128, 128, 32)
     run_gemm(1024, 1024, 1024, False, True, "float16", "float32", "float32", 128, 128, 32)
@@ -104,8 +111,6 @@ def test_gemm_f16f32f32_nt():
     run_gemm(1024, 1024, 1024, True, False, "float16", "float32", "float32", 128, 128, 32)
     run_gemm(1024, 1024, 1024, False, True, "float16", "float32", "float32", 128, 128, 32, k_pack=2)
 
-
-@tilelang.testing.requires_rocm
 def test_gemm_bf16f32f32_nt():
     run_gemm(1024, 1024, 1024, False, False, "bfloat16", "float32", "float32", 128, 128, 32)
     run_gemm(1024, 1024, 1024, False, True, "bfloat16", "float32", "float32", 128, 128, 32)
@@ -114,8 +119,6 @@ def test_gemm_bf16f32f32_nt():
     run_gemm(
         1024, 1024, 1024, False, True, "bfloat16", "float32", "float32", 128, 128, 32, k_pack=2)
 
-
-@tilelang.testing.requires_rocm
 def test_gemm_bf16bf16f32():
     run_gemm(1024, 1024, 1024, False, False, "bfloat16", "bfloat16", "float32", 128, 128, 32)
     run_gemm(1024, 1024, 1024, False, True, "bfloat16", "bfloat16", "float32", 128, 128, 32)
@@ -123,6 +126,39 @@ def test_gemm_bf16bf16f32():
     run_gemm(1024, 1024, 1024, True, False, "bfloat16", "bfloat16", "float32", 128, 128, 32)
     run_gemm(
         1024, 1024, 1024, False, True, "bfloat16", "bfloat16", "float32", 128, 128, 32, k_pack=2)
+
+def test_gemm_f16f32f32_nt_FullColK():
+    """Test gemm_ss with FullColK policy (warp partitioning on K dimension)"""
+    run_gemm(1024, 1024, 1024, False, False, "float16", "float32", "float32", 128, 64, 32, k_pack=2, num_threads=256,
+             policy=T.GemmWarpPolicy.FullColK)
+    run_gemm(1024, 1024, 1024, False, True, "float16", "float32", "float32", 128, 32, 32, num_threads=256,
+             policy=T.GemmWarpPolicy.FullColK)
+    run_gemm(1024, 1024, 1024, True, True, "float16", "float32", "float32", 128, 32, 64, num_threads=256,
+             policy=T.GemmWarpPolicy.FullColK)
+    run_gemm(1024, 1024, 1024, True, False, "float16", "float32", "float32", 128, 16, 128, k_pack=2, num_threads=256,
+             policy=T.GemmWarpPolicy.FullColK)
+
+def test_gemm_bf16f32f32_nt_FullColK():
+    """Test gemm_ss with FullColK policy (warp partitioning on K dimension)"""
+    run_gemm(1024, 1024, 1024, False, False, "bfloat16", "float32", "float32", 128, 32, 32, num_threads=256,
+             policy=T.GemmWarpPolicy.FullColK)
+    run_gemm(1024, 1024, 1024, False, True, "bfloat16", "float32", "float32", 128, 32, 32, num_threads=256,
+             policy=T.GemmWarpPolicy.FullColK)
+    run_gemm(1024, 1024, 1024, True, True, "bfloat16", "float32", "float32", 128, 32, 32, num_threads=256,
+             policy=T.GemmWarpPolicy.FullColK)
+    run_gemm(1024, 1024, 1024, True, False, "bfloat16", "float32", "float32", 128, 32, 64, k_pack=2, num_threads=256,
+             policy=T.GemmWarpPolicy.FullColK)
+
+def test_gemm_bf16bf16f32_FullColK():
+    """Test gemm_ss with FullColK policy (warp partitioning on K dimension)"""
+    run_gemm(1024, 1024, 1024, False, False, "bfloat16", "bfloat16", "float32", 128, 32, 32, num_threads=256,
+             policy=T.GemmWarpPolicy.FullColK)
+    run_gemm(1024, 1024, 1024, False, True, "bfloat16", "bfloat16", "float32", 128, 32, 64, k_pack=2, num_threads=256,
+             policy=T.GemmWarpPolicy.FullColK)
+    run_gemm(1024, 1024, 1024, True, True, "bfloat16", "bfloat16", "float32", 128, 32, 32, num_threads=256,
+             policy=T.GemmWarpPolicy.FullColK)
+    run_gemm(1024, 1024, 1024, True, False, "bfloat16", "bfloat16", "float32", 128, 32, 32, num_threads=256,
+             policy=T.GemmWarpPolicy.FullColK)
 
 
 def matmul_rs(
@@ -140,6 +176,7 @@ def matmul_rs(
     num_stages,
     threads,
     k_pack=1,
+    policy=None,
 ):
     A_shape = (K, M) if trans_A else (M, K)
     B_shape = (N, K) if trans_B else (K, N)
@@ -170,7 +207,13 @@ def matmul_rs(
                     T.copy(B[bx * block_N, k * block_K], B_shared, coalesced_width=vec_size)
                 else:
                     T.copy(B[k * block_K, bx * block_N], B_shared, coalesced_width=vec_size)
-                T.gemm(A_local, B_shared, C_local, trans_A, trans_B, k_pack=k_pack)
+                if policy is not None:
+                    T.gemm(A_local, B_shared, C_local, trans_A, trans_B, k_pack=k_pack, policy=policy)
+                else:
+                    T.gemm(A_local, B_shared, C_local, trans_A, trans_B, k_pack=k_pack)
+            # If using FullColK policy, need to reduce sum across k_warps
+            if policy == T.GemmWarpPolicy.FullColK:
+                T.reduce_sum_warp(C_local, C_local, clear=False)
             T.copy(C_local, C[by * block_M, bx * block_N])
 
     return main
@@ -191,6 +234,7 @@ def run_gemm_rs(
     num_stages=0,
     num_threads=128,
     k_pack=1,
+    policy=None,
 ):
     program = matmul_rs(
         M,
@@ -207,6 +251,7 @@ def run_gemm_rs(
         num_stages,
         num_threads,
         k_pack=k_pack,
+        policy=policy,
     )
     kernel = tl.compile(program, out_idx=[2])
     profiler = kernel.get_profiler()
@@ -222,30 +267,56 @@ def run_gemm_rs(
 
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
-
-@tilelang.testing.requires_rocm
 def test_gemm_rs_f16f32f32_nt():
     run_gemm_rs(1024, 1024, 1024, False, False, "float16", "float32", "float32", 128, 128, 32)
     run_gemm_rs(1024, 1024, 1024, False, True, "float16", "float32", "float32", 128, 128, 32)
     run_gemm_rs(1024, 1024, 1024, True, True, "float16", "float32", "float32", 128, 128, 32)
     run_gemm_rs(1024, 1024, 1024, True, False, "float16", "float32", "float32", 128, 128, 32)
 
-
-@tilelang.testing.requires_rocm
 def test_gemm_rs_bf16f32f32_nt():
     run_gemm_rs(1024, 1024, 1024, False, False, "bfloat16", "float32", "float32", 128, 128, 32)
     run_gemm_rs(1024, 1024, 1024, False, True, "bfloat16", "float32", "float32", 128, 128, 32)
     run_gemm_rs(1024, 1024, 1024, True, True, "bfloat16", "float32", "float32", 128, 128, 32)
     run_gemm_rs(1024, 1024, 1024, True, False, "bfloat16", "float32", "float32", 128, 128, 32)
 
-
-@tilelang.testing.requires_rocm
 def test_gemm_rs_bf16bf16f32_nt():
     run_gemm_rs(1024, 1024, 1024, False, False, "bfloat16", "bfloat16", "float32", 128, 128, 32)
     run_gemm_rs(1024, 1024, 1024, False, True, "bfloat16", "bfloat16", "float32", 128, 128, 32)
     run_gemm_rs(1024, 1024, 1024, True, True, "bfloat16", "bfloat16", "float32", 128, 128, 32)
     run_gemm_rs(1024, 1024, 1024, True, False, "bfloat16", "bfloat16", "float32", 128, 128, 32)
 
+def test_gemm_rs_f16f32f32_nt_FullColK():
+    """Test gemm_rs with FullColK policy (warp partitioning on K dimension)"""
+    run_gemm_rs(1024, 1024, 1024, False, False, "float16", "float32", "float32", 128, 32, 32, num_threads=256,
+                policy=T.GemmWarpPolicy.FullColK)
+    run_gemm_rs(1024, 1024, 1024, False, True, "float16", "float32", "float32", 128, 32, 32, num_threads=256,
+                policy=T.GemmWarpPolicy.FullColK)
+    run_gemm_rs(1024, 1024, 1024, True, True, "float16", "float32", "float32", 128, 32, 32, num_threads=256,
+                policy=T.GemmWarpPolicy.FullColK)
+    run_gemm_rs(1024, 1024, 1024, True, False, "float16", "float32", "float32", 128, 16, 128, k_pack=2, num_threads=256,
+                policy=T.GemmWarpPolicy.FullColK)
+
+def test_gemm_rs_bf16f32f32_nt_FullColK():
+    """Test gemm_rs with FullColK policy (warp partitioning on K dimension)"""
+    run_gemm_rs(1024, 1024, 1024, False, False, "bfloat16", "float32", "float32", 128, 32, 32, num_threads=256,
+                policy=T.GemmWarpPolicy.FullColK)
+    run_gemm_rs(1024, 1024, 1024, False, True, "bfloat16", "float32", "float32", 128, 32, 32, num_threads=256,
+                policy=T.GemmWarpPolicy.FullColK)
+    run_gemm_rs(1024, 1024, 1024, True, True, "bfloat16", "float32", "float32", 128, 32, 32, num_threads=256,
+                policy=T.GemmWarpPolicy.FullColK)
+    run_gemm_rs(1024, 1024, 1024, True, False, "bfloat16", "float32", "float32", 128, 32, 32, num_threads=256,
+                policy=T.GemmWarpPolicy.FullColK)
+
+def test_gemm_rs_bf16bf16f32_nt_FullColK():
+    """Test gemm_rs with FullColK policy (warp partitioning on K dimension)"""
+    run_gemm_rs(1024, 1024, 1024, False, False, "bfloat16", "bfloat16", "float32", 128, 32, 32, num_threads=256,
+                policy=T.GemmWarpPolicy.FullColK)
+    run_gemm_rs(1024, 1024, 1024, False, True, "bfloat16", "bfloat16", "float32", 128, 32, 32, num_threads=256,
+                policy=T.GemmWarpPolicy.FullColK)
+    run_gemm_rs(1024, 1024, 1024, True, True, "bfloat16", "bfloat16", "float32", 128, 32, 32, num_threads=256,
+                policy=T.GemmWarpPolicy.FullColK)
+    run_gemm_rs(1024, 1024, 1024, True, False, "bfloat16", "bfloat16", "float32", 128, 32, 32, num_threads=256,
+                policy=T.GemmWarpPolicy.FullColK)
 
 if __name__ == "__main__":
     tilelang.testing.main()
