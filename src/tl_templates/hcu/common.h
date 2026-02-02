@@ -85,20 +85,40 @@ struct __align__(2) bf16_cvt_t {
   TL_DEVICE constexpr bf16_cvt_t() : data() {}
 
   // Construct from float - use ck_tile's conversion function
+  #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
+  TL_DEVICE explicit bf16_cvt_t(const float& x)
+    : data(__builtin_hcu_cvt_bf16_f32(x, false/*clamp*/, 0/*dst_sel:WORD_1*/)) {}
+  #else
   TL_DEVICE explicit constexpr bf16_cvt_t(const float& x)
-    : data(ck_tile::float_to_bf16_raw(x)) {}
+    : data(ck_tile::float_to_bf16_raw<ck_tile::bf16_rounding_mode::standard_asm>(x)) {}
+  #endif
 
   // Construct from double - use ck_tile's conversion function
+  #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
+  TL_DEVICE explicit bf16_cvt_t(const double& x)
+    : data(__builtin_hcu_cvt_bf16_f32(static_cast<float>(x), false/*clamp*/, 0/*dst_sel:WORD_1*/)) {}
+  #else
   TL_DEVICE explicit constexpr bf16_cvt_t(const double& x)
-    : data(ck_tile::double_to_bf16_raw(x)) {}
+    : data(ck_tile::float_to_bf16_raw<ck_tile::bf16_rounding_mode::standard_asm>(static_cast<float>(x))) {}
+  #endif
 
   // Construct from int
+  #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
+  TL_DEVICE explicit bf16_cvt_t(const int& x)
+    : data(__builtin_hcu_cvt_bf16_f32(static_cast<float>(x), false/*clamp*/, 0/*dst_sel:WORD_1*/)) {}
+  #else
   TL_DEVICE explicit constexpr bf16_cvt_t(const int& x)
-    : data(ck_tile::float_to_bf16_raw(static_cast<float>(x))) {}
+    : data(ck_tile::float_to_bf16_raw<ck_tile::bf16_rounding_mode::standard_asm>(static_cast<float>(x))) {}
+  #endif
 
   // Construct from unsigned int
+  #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
+  TL_DEVICE explicit bf16_cvt_t(const unsigned int& x)
+    : data(__builtin_hcu_cvt_bf16_f32(static_cast<float>(x), false/*clamp*/, 0/*dst_sel:WORD_1*/)) {}
+  #else
   TL_DEVICE explicit constexpr bf16_cvt_t(const unsigned int& x)
-    : data(ck_tile::float_to_bf16_raw(static_cast<float>(x))) {}
+    : data(ck_tile::float_to_bf16_raw<ck_tile::bf16_rounding_mode::standard_asm>(static_cast<float>(x))) {}
+  #endif
 
   // Construct from ck_tile::bf16_t (which is ushort when CK_TILE_USE_CUSTOM_DATA_TYPE is off)
   // Direct bit_cast since ck_tile::bf16_t is just ushort in that case
@@ -106,19 +126,37 @@ struct __align__(2) bf16_cvt_t {
     : data(ck_tile::bit_cast<uint16_t>(v)) {}
 
   // Cast to float - use ck_tile's conversion function
+  #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
+  TL_DEVICE explicit operator float() const {
+    return __builtin_hcu_cvt_f32_bf16(data, false/*clamp*/, 0/*omod*/, 0/*src0_sel:WORD_1*/);
+  }
+  #else
   TL_DEVICE explicit constexpr operator float() const {
     return ck_tile::bf16_to_float_raw(data);
   }
+  #endif
 
   // Cast to double - use ck_tile's conversion function
-  TL_DEVICE explicit constexpr operator double() const {
-    return ck_tile::bf16_to_double_raw(data);
+  #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
+  TL_DEVICE explicit operator double() const {
+    return static_cast<double>(__builtin_hcu_cvt_f32_bf16(data, false/*clamp*/, 0/*omod*/, 0/*src0_sel:WORD_1*/));
   }
+  #else
+  TL_DEVICE explicit constexpr operator double() const {
+    return static_cast<double>(ck_tile::bf16_to_float_raw(data));
+  }
+  #endif
 
   // Cast to int
+  #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
+  TL_DEVICE explicit operator int() const {
+    return static_cast<int>(__builtin_hcu_cvt_f32_bf16(data, false/*clamp*/, 0/*omod*/, 0/*src0_sel:WORD_1*/));
+  }
+  #else
   TL_DEVICE explicit constexpr operator int() const {
     return static_cast<int>(ck_tile::bf16_to_float_raw(data));
   }
+  #endif
 
   // Conversion to ck_tile::bf16_t (ushort when CK_TILE_USE_CUSTOM_DATA_TYPE is off)
   // This allows seamless interoperability with ck_tile
