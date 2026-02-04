@@ -772,7 +772,7 @@ std::string CodeGenTileLangHCU::CastFromTo(std::string value, DataType from,
     os << "int)";
   } else if (from.is_bfloat16() || target.is_bfloat16()) {
     os << "(bf16_cvt_t)";
-  } else if (from.is_float8_e4m3fn() || target.is_float8_e4m3fn()) {
+  } else if (from.is_float8_e4m3fn() || from.is_float8_e4m3() || target.is_float8_e4m3fn() || target.is_float8_e4m3()) {
     os << "(fp8_cvt_t)";
   } else if (from.is_float8_e5m2() || target.is_float8_e5m2()) {
     os << "(bf8_cvt_t)";
