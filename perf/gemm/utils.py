@@ -11,6 +11,16 @@ from tilelang.carver.arch import CUDA
 from tilelang.carver.arch import CDNA
 from tilelang.carver.roller.rasterization import NoRasterization
 
+from aiter.ops.triton.gemm_unquantized import gemm_unquantized
+
+def triton_gemm(A, B):
+    """
+    Compute the matrix product of A and the transpose of B.
+
+    A and B are expected to be 2-D tensors where A has shape (M, K) and B has shape (N, K).
+    The result is a tensor with shape (M, N) equal to A @ B.T, using the inputs' dtypes.
+    """
+    return  gemm_unquantized(A, B, torch.float16)
 
 def ref_program(A, B):
     """
@@ -130,7 +140,7 @@ def get_configs(M, N, K, with_roller=False, topk=20):
         return _generate_configs_from_product(param_dict)
 
 
-def _create_autotuner(kernel, configs):
+def _create_autotuner(kernel, configs, pass_configs=None):
     """
     Create and configure an AutoTuner instance with common settings.
 
@@ -147,6 +157,7 @@ def _create_autotuner(kernel, configs):
         out_idx=[-1],
         target="auto",
         verbose=True,
+        pass_configs=pass_configs,
     ).set_profile_args(
         supply_type=tl.TensorSupplyType.Integer,
         ref_prog=ref_program,
@@ -154,7 +165,7 @@ def _create_autotuner(kernel, configs):
     )
 
 
-def _run_autotuner(kernel, configs, warmup=3, rep=20):
+def _run_autotuner(kernel, configs, warmup=3, rep=20, pass_configs=None):
     """
     Run autotuning with common settings.
 
@@ -167,7 +178,7 @@ def _run_autotuner(kernel, configs, warmup=3, rep=20):
     Returns:
         Best configuration result from autotuner
     """
-    autotuner = _create_autotuner(kernel, configs)
+    autotuner = _create_autotuner(kernel, configs, pass_configs=pass_configs)
     return autotuner.run(warmup=warmup, rep=rep)
 
 
@@ -178,11 +189,12 @@ def get_heuristic_config() -> dict:
         #"block_N": 256,
         #"block_K": 32,
         "block_M": 128,
-        "block_N": 128,
+        "block_N": 256,
         "block_K": 64,
         "num_stages": 0,
         #"thread_num": 128,
         "thread_num": 256,
-        #"group_size": 8,  # Enable group swizzling optimization
+        "group_size": 1,  # Enable group swizzling optimization
         #"enable_rasteration": True,
+        "wgs_per_cu": 2,
     }
