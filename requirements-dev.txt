@@ -2,12 +2,11 @@
 
 build
 cmake>=3.26
-cython>=3.0.0
+cython>=3.2.4
 ninja
 packaging
 scikit-build-core
 setuptools>=61
-torch
 wheel
 
 auditwheel; platform_system == 'Linux'
