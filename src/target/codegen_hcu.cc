@@ -5,6 +5,7 @@
 #include "codegen_hcu.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
+#include <tvm/node/structural_equal.h>
 #include <tvm/tir/index_map.h>
 #include <tvm/tir/op.h>
 #include "arith/pattern_match.h"
@@ -192,6 +193,198 @@ std::string CodeGenTileLangHCU::Finish() {
   return CodeGenC::Finish();
 }
 
+namespace {
+
+bool IsZeroValue(const PrimExpr &expr) {
+  if (const auto *int_imm = expr.as<IntImmNode>()) {
+    return int_imm->value == 0;
+  }
+  if (const auto *float_imm = expr.as<FloatImmNode>()) {
+    return float_imm->value == 0.0;
+  }
+  if (const auto *broadcast = expr.as<BroadcastNode>()) {
+    return IsZeroValue(broadcast->value);
+  }
+  return tir::is_zero(expr);
+}
+
+const BufferLoadNode *ExtractBufferLoad(const PrimExpr &value) {
+  if (const auto *load = value.as<BufferLoadNode>()) {
+    return load;
+  }
+  if (const auto *cast = value.as<CastNode>()) {
+    return cast->value.as<BufferLoadNode>();
+  }
+  return nullptr;
+}
+
+// Only allow: BufferLoad, Cast(BufferLoad), Broadcast(const), IntImm, FloatImm.
+bool IsSafeValueExpr(const PrimExpr &expr) {
+  if (expr.as<tir::BufferLoadNode>()) {
+    return true;
+  }
+  if (expr.as<tir::IntImmNode>() || expr.as<tir::FloatImmNode>()) {
+    return true;
+  }
+  if (const auto *cast = expr.as<tir::CastNode>()) {
+    return IsSafeValueExpr(cast->value);
+  }
+  if (const auto *broadcast = expr.as<tir::BroadcastNode>()) {
+    return broadcast->value.as<tir::IntImmNode>() ||
+           broadcast->value.as<tir::FloatImmNode>();
+  }
+  return false;
+}
+
+// Extract conditions from a chain of if(cond){body} with no else, ending in store.
+// Returns (conditions, store) or (empty, nullptr) if not matching.
+struct NestedFoldableResult {
+  Array<PrimExpr> conditions;
+  const BufferStoreNode *store{nullptr};
+  bool ok{false};
+};
+
+NestedFoldableResult ExtractNestedFoldableConditions(const Stmt &stmt) {
+  if (const auto *store = stmt.as<BufferStoreNode>()) {
+    return {{}, store, true};
+  }
+  if (const auto *iff = stmt.as<IfThenElseNode>()) {
+    if (iff->else_case) {
+      return {{}, nullptr, false};
+    }
+    auto inner = ExtractNestedFoldableConditions(iff->then_case);
+    if (!inner.ok) {
+      return {{}, nullptr, false};
+    }
+    Array<PrimExpr> conds = {iff->condition};
+    for (const auto &c : inner.conditions) {
+      conds.push_back(c);
+    }
+    return {conds, inner.store, true};
+  }
+  return {{}, nullptr, false};
+}
+
+}  // namespace
+
+std::string CodeGenTileLangHCU::GetCurrentPredicate() const {
+  if (predicate_stack_.empty())
+    return "true";
+  std::string result = predicate_stack_[0];
+  for (size_t i = 1; i < predicate_stack_.size(); ++i) {
+    result += " && (" + predicate_stack_[i] + ")";
+  }
+  return result;
+}
+
+bool CodeGenTileLangHCU::IsFoldableIfThenElse(const IfThenElseNode *op) const {
+  const auto *then_store = op->then_case.as<BufferStoreNode>();
+  if (!then_store) {
+    if (const auto *inner = op->then_case.as<IfThenElseNode>()) {
+      return !op->else_case && IsFoldableIfThenElse(inner);
+    }
+    return false;
+  }
+
+  if (!IsSafeValueExpr(then_store->value))
+    return false;
+
+  if (!op->else_case) {
+    const BufferNode *buf = then_store->buffer.get();
+    DataType value_dtype = then_store->value.dtype();
+    DataType element_dtype = buf->dtype;
+    if (value_dtype.lanes() != element_dtype.lanes() ||
+        !CanUseVMBufferOps(buf, value_dtype.lanes()))
+      return false;
+    if (value_dtype.lanes() == 1)
+      return true;
+    arith::PVar<PrimExpr> base;
+    return arith::ramp(base, 1, value_dtype.lanes()).Match(then_store->indices[0]);
+  }
+
+  const auto *else_store = op->else_case.value().as<BufferStoreNode>();
+  if (!else_store || !then_store->buffer.same_as(else_store->buffer) ||
+      then_store->indices.size() != else_store->indices.size())
+    return false;
+  for (size_t i = 0; i < then_store->indices.size(); i++) {
+    if (!StructuralEqual()(then_store->indices[i], else_store->indices[i]))
+      return false;
+  }
+  if (!IsZeroValue(else_store->value))
+    return false;
+  const BufferLoadNode *load = ExtractBufferLoad(then_store->value);
+  if (!load || !CanUseVMBufferOps(load->buffer.get(), load->dtype.lanes()))
+    return false;
+  arith::PVar<PrimExpr> base;
+  return arith::ramp(base, 1, load->dtype.lanes()).Match(load->indices[0]);
+}
+
+// Check if if(cond){store} else {if(c0){if(c1){store}}} with cond == c0 && c1.
+// When true, we can collapse to a single store with predicate cond (else is dead).
+bool CodeGenTileLangHCU::IsCollapsibleRedundantIfElse(const IfThenElseNode *op) const {
+  if (!op->else_case)
+    return false;
+  const auto *then_store = op->then_case.as<BufferStoreNode>();
+  if (!then_store || !IsSafeValueExpr(then_store->value))
+    return false;
+
+  auto else_result = ExtractNestedFoldableConditions(op->else_case.value());
+  if (!else_result.ok || else_result.conditions.empty())
+    return false;
+
+  if (!then_store->buffer.same_as(else_result.store->buffer) ||
+      then_store->indices.size() != else_result.store->indices.size())
+    return false;
+  for (size_t i = 0; i < then_store->indices.size(); i++) {
+    if (!StructuralEqual()(then_store->indices[i], else_result.store->indices[i]))
+      return false;
+  }
+  if (!StructuralEqual()(then_store->value, else_result.store->value))
+    return false;
+
+  const BufferNode *buf = then_store->buffer.get();
+  DataType value_dtype = then_store->value.dtype();
+  DataType element_dtype = buf->dtype;
+  if (value_dtype.lanes() != element_dtype.lanes() ||
+      !CanUseVMBufferOps(buf, value_dtype.lanes()))
+    return false;
+  if (value_dtype.lanes() != 1) {
+    arith::PVar<PrimExpr> base;
+    if (!arith::ramp(base, 1, value_dtype.lanes()).Match(then_store->indices[0]))
+      return false;
+  }
+
+  PrimExpr combined = else_result.conditions[0];
+  for (size_t i = 1; i < else_result.conditions.size(); i++) {
+    combined = tir::And(combined, else_result.conditions[i]);
+  }
+  return arith::Analyzer().CanProveEqual(op->condition, combined);
+}
+
+void CodeGenTileLangHCU::VisitStmt_(const IfThenElseNode *op) {
+  if (IsCollapsibleRedundantIfElse(op)) {
+    std::string cond_str = PrintExpr(op->condition);
+    std::string pred_var = name_supply_->FreshName("pred");
+    PrintIndent();
+    stream << "bool " << pred_var << " = " << cond_str << ";\n";
+    predicate_stack_.push_back(pred_var);
+    PrintStmt(op->then_case);
+    predicate_stack_.pop_back();
+    return;
+  }
+  if (IsFoldableIfThenElse(op)) {
+    std::string cond_str = PrintExpr(op->condition);
+    std::string pred_var = name_supply_->FreshName("pred");
+    PrintIndent();
+    stream << "bool " << pred_var << " = " << cond_str << ";\n";
+    predicate_stack_.push_back(pred_var);
+    PrintStmt(op->then_case);
+    predicate_stack_.pop_back();
+    return;
+  }
+  CodeGenC::VisitStmt_(op);
+}
+
 void CodeGenTileLangHCU::VisitStmt_(const tir::ForNode *op) {
   if (op->kind == tir::ForKind::kUnrolled) {
     PrintIndent();
@@ -242,7 +435,7 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
              << src_thread_buffer << ", "
              << desc.wave_ptr << ", "
              << desc.offset << ", "
-             << "true, "  // dst_thread_element_valid - always true for now
+             << GetCurrentPredicate() << ", "
              << desc.element_space_size << ");\n";
 
       return;
@@ -583,6 +776,13 @@ std::string CodeGenTileLangHCU::GetVecLoad(DataType t, const BufferNode *buffer,
                                            PrimExpr base) {
   // Generate CK buffer load for global memory accesses
   // FIXME: Should we check if the offset is not negative?
+  return GetVecLoadWithPredicate(t, buffer, base, GetCurrentPredicate());
+}
+
+std::string CodeGenTileLangHCU::GetVecLoadWithPredicate(DataType t,
+                                                        const BufferNode *buffer,
+                                                        PrimExpr base,
+                                                        const std::string &pred) {
   if (CanUseVMBufferOps(buffer, t.lanes())) {
     auto desc = GetBufferDesc(t, buffer, base);
     std::ostringstream os;
@@ -590,8 +790,8 @@ std::string CodeGenTileLangHCU::GetVecLoad(DataType t, const BufferNode *buffer,
     PrintType(t, os);
     os << "*)&(ck_tile::amd_buffer_load_invalid_element_return_zero<"
        << desc.data_type << ", " << desc.num_elements << ">("
-       << desc.wave_ptr << ", " << desc.offset << ", true, " << desc.element_space_size
-       << ").get())";
+       << desc.wave_ptr << ", " << desc.offset << ", " << pred << ", "
+       << desc.element_space_size << ").get())";
 
     return os.str();
   }
@@ -602,7 +802,13 @@ std::string CodeGenTileLangHCU::GetVecLoad(DataType t, const BufferNode *buffer,
 
 void CodeGenTileLangHCU::PrintVecStore(const BufferNode* buffer, DataType t,
                                        PrimExpr base, const std::string& value) {
-  // If not using buffer store, use the base class implementation
+  PrintVecStoreWithPredicate(buffer, t, base, value, GetCurrentPredicate());
+}
+
+void CodeGenTileLangHCU::PrintVecStoreWithPredicate(const BufferNode* buffer,
+                                                    DataType t, PrimExpr base,
+                                                    const std::string& value,
+                                                    const std::string& pred) {
   if (!CanUseVMBufferOps(buffer, t.lanes())) {
     CodeGenC::PrintVecStore(buffer, t, base, value);
     return;
@@ -618,17 +824,14 @@ void CodeGenTileLangHCU::PrintVecStore(const BufferNode* buffer, DataType t,
                                   desc.data_type + ", " +
                                   std::to_string(desc.num_elements) + ">>(" + value + ")";
 
-  // Generate the buffer store call
   this->PrintIndent();
   this->stream << "ck_tile::amd_buffer_store<"
                << desc.data_type << ", " << desc.num_elements << ">("
                << src_thread_buffer << ", "
                << desc.wave_ptr << ", "
                << desc.offset << ", "
-               << "true, "  // dst_thread_element_valid - always true for now
+               << pred << ", "
                << desc.element_space_size << ");\n";
-
-  return;
 }
 
 void CodeGenTileLangHCU::PrintVecElemLoad(const std::string &vec, DataType t,
@@ -938,6 +1141,26 @@ std::string CodeGenTileLangHCU::GetBufferRef(DataType t,
 }
 
 void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
+  // Optimize if_then_else(cond, BufferLoad/Cast(BufferLoad), zeros) to use
+  // amd_buffer_load_invalid_element_return_zero with predicate instead of if-else.
+  if (op->op.same_as(builtin::if_then_else()) && op->args.size() == 3) {
+    const BufferLoadNode *load = ExtractBufferLoad(op->args[1]);
+    if (load && IsZeroValue(op->args[2]) &&
+        CanUseVMBufferOps(load->buffer.get(), load->dtype.lanes())) {
+      arith::PVar<PrimExpr> base;
+      if (arith::ramp(base, 1, load->dtype.lanes()).Match(load->indices[0])) {
+        std::string cond_str = PrintExpr(op->args[0]);
+        std::string pred_var = name_supply_->FreshName("pred");
+        PrintIndent();
+        stream << "bool " << pred_var << " = " << cond_str << ";\n";
+        predicate_stack_.push_back(pred_var);
+        os << PrintExpr(op->args[1]);
+        predicate_stack_.pop_back();
+        return;
+      }
+    }
+  }
+
   auto print_extern_call_stmt = [&](std::string name, size_t offset = 0) {
     this->PrintIndent();
     this->stream << name << "(";

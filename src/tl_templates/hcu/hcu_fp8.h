@@ -194,3 +194,52 @@ TL_DEVICE fp8_e4_8_t make_fp8_e4_8_t(fp8_e4_t x, fp8_e4_t y, fp8_e4_t z,
   // Reinterpret as fp8_e4_8_t (ck_tile::fp8x8_t)
   return ck_tile::bit_cast<fp8_e4_8_t>(packed);
 }
+
+// Pack sixteen fp8_e4_t values into fp8_e4_16_t
+TL_DEVICE fp8_e4_16_t make_fp8_e4_16_t(fp8_e4_t x, fp8_e4_t y, fp8_e4_t z,
+                                        fp8_e4_t w, fp8_e4_t v, fp8_e4_t u,
+                                        fp8_e4_t t, fp8_e4_t s, fp8_e4_t r,
+                                        fp8_e4_t q, fp8_e4_t p, fp8_e4_t o,
+                                        fp8_e4_t n, fp8_e4_t m, fp8_e4_t l,
+                                        fp8_e4_t k) {
+  // Reinterpret the 16 fp8_e4_t values to uint8_t for bit manipulation
+  uint8_t x_val = ck_tile::bit_cast<uint8_t>(x);
+  uint8_t y_val = ck_tile::bit_cast<uint8_t>(y);
+  uint8_t z_val = ck_tile::bit_cast<uint8_t>(z);
+  uint8_t w_val = ck_tile::bit_cast<uint8_t>(w);
+  uint8_t v_val = ck_tile::bit_cast<uint8_t>(v);
+  uint8_t u_val = ck_tile::bit_cast<uint8_t>(u);
+  uint8_t t_val = ck_tile::bit_cast<uint8_t>(t);
+  uint8_t s_val = ck_tile::bit_cast<uint8_t>(s);
+  uint8_t r_val = ck_tile::bit_cast<uint8_t>(r);
+  uint8_t q_val = ck_tile::bit_cast<uint8_t>(q);
+  uint8_t p_val = ck_tile::bit_cast<uint8_t>(p);
+  uint8_t o_val = ck_tile::bit_cast<uint8_t>(o);
+  uint8_t n_val = ck_tile::bit_cast<uint8_t>(n);
+  uint8_t m_val = ck_tile::bit_cast<uint8_t>(m);
+  uint8_t l_val = ck_tile::bit_cast<uint8_t>(l);
+  uint8_t k_val = ck_tile::bit_cast<uint8_t>(k);
+
+  // Pack into 4 ints (matching the pattern of make_fp8_e4_4_t and make_fp8_e4_8_t)
+  int a = (static_cast<int>(w_val) << 24) |
+          (static_cast<int>(z_val) << 16) |
+          (static_cast<int>(y_val) << 8) |
+          static_cast<int>(x_val);
+  int b = (static_cast<int>(s_val) << 24) |
+          (static_cast<int>(t_val) << 16) |
+          (static_cast<int>(u_val) << 8) |
+          static_cast<int>(v_val);
+  int c = (static_cast<int>(o_val) << 24) |
+          (static_cast<int>(p_val) << 16) |
+          (static_cast<int>(q_val) << 8) |
+          static_cast<int>(r_val);
+  int d = (static_cast<int>(k_val) << 24) |
+          (static_cast<int>(l_val) << 16) |
+          (static_cast<int>(m_val) << 8) |
+          static_cast<int>(n_val);
+
+  ck_tile::int32x4_t packed = {a, b, c, d};
+
+  // Reinterpret as fp8_e4_16_t (ck_tile::fp8x16_t)
+  return ck_tile::bit_cast<fp8_e4_16_t>(packed);
+}

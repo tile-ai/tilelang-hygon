@@ -11,6 +11,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "target/source/codegen_c.h"
 
@@ -45,6 +46,10 @@ public:
                             std::ostream &os) final;
   std::string CastFromTo(std::string value, DataType from,
                          DataType target) final;
+  // Override IfThenElse to fold amd_buffer_load/store with predicate when
+  // if-else contains only buffer load/store and zeros.
+  void VisitStmt_(const IfThenElseNode *op) final;
+
   // overload visitor
   void VisitExpr_(const RampNode *op, std::ostream &os) final;      // NOLINT(*)
   void VisitExpr_(const BroadcastNode *op, std::ostream &os) final; // NOLINT(*)
@@ -88,7 +93,15 @@ private:
   bool IsScopePartOfType() const final { return false; }
 
   BufferDesc GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr base);
-  bool CanUseVMBufferOps(const BufferNode *buffer, int num_elements) {
+  std::string GetVecLoadWithPredicate(DataType t, const BufferNode *buffer,
+                                     PrimExpr base, const std::string &pred);
+  void PrintVecStoreWithPredicate(const BufferNode *buffer, DataType t,
+                                 PrimExpr base, const std::string &value,
+                                 const std::string &pred);
+  std::string GetCurrentPredicate() const;
+  bool IsFoldableIfThenElse(const IfThenElseNode *op) const;
+  bool IsCollapsibleRedundantIfElse(const IfThenElseNode *op) const;
+  bool CanUseVMBufferOps(const BufferNode *buffer, int num_elements) const {
     auto value = std::getenv("HCU_USE_BUFFER_OPS");
     auto scope = GetPtrStorageScope(buffer->data);
     return (value == nullptr || std::atoi(value) != 0) && scope == "global" &&
@@ -133,6 +146,7 @@ private:
   // Set to 16 to maintain minimum alignment requirements for async bulk copy
   const int barrier_alignment_bytes_ = 16;
   std::unordered_map<const VarNode*, bool> direct_to_lds_map_;
+  std::vector<std::string> predicate_stack_;
 };
 
 } // namespace codegen
