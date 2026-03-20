@@ -27,6 +27,7 @@
 
 #include <utility>
 
+#include "../op/builtin.h"
 #include "tir/transforms/ir_utils.h"
 
 namespace tvm {
@@ -84,6 +85,13 @@ private:
     HandleAnnotations(new_block->annotations, &pragma_attrs, /*is_block=*/true);
     for (auto it = pragma_attrs.rbegin(); it != pragma_attrs.rend(); ++it) {
       body = AttrStmt(Integer(0), it->first, it->second, std::move(body));
+    }
+    // Step 4b. disable_buffer_ops_map: store Map in AttrStmt.node (not
+    // convertible to PrimExpr)
+    if (auto opt = new_block->annotations.Get(tl::attr::kDisableBufferOpsMap)) {
+      body = AttrStmt(Downcast<Map<String, PrimExpr>>(opt.value()),
+                      tl::attr::kDisableBufferOpsMap, Integer(0),
+                      std::move(body));
     }
     return body;
   }

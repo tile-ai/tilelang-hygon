@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include <ck_tile/core/arch/amd_buffer_addressing.hpp>
 
 using f32 = float;
 // using f16 = _Float16;
@@ -105,6 +106,51 @@ TL_DEVICE void cp_async_gs_conditional(void *lds_base_ptr,
       *(uint4 *)lds_base_ptr = make_uint4(0, 0, 0, 0);
     }
   }
+}
+
+// amd_buffer_load for tilelang
+template <typename T,
+          ck_tile::index_t N,
+          bool oob_conditional_check = true>
+CK_TILE_DEVICE ck_tile::thread_buffer<T, N>
+amd_buffer_load(const T *p_src_wave,
+                ck_tile::index_t src_thread_element_offset,
+                bool src_thread_element_valid,
+                ck_tile::index_t src_element_space_size) {
+  const int32x4_t src_wave_buffer_resource = make_wave_buffer_resource(p_src_wave);
+
+    ck_tile::index_t src_thread_addr_offset = [&]() {
+      if constexpr (oob_conditional_check)
+        return src_thread_element_valid ? src_thread_element_offset * sizeof(T) : 0xffffffff;
+      else
+        return src_thread_element_offset * sizeof(T);
+    }();
+  return ck_tile::amd_buffer_load_impl<T, N>(
+      src_wave_buffer_resource, src_thread_addr_offset, 0);
+
+}
+
+// amd_buffer_store for tilelang
+template <typename T,
+          ck_tile::index_t N,
+          bool oob_conditional_check = true>
+CK_TILE_DEVICE void amd_buffer_store(
+    const ck_tile::thread_buffer<T, N> &src_thread_data, T *p_dst_wave,
+    const ck_tile::index_t dst_thread_element_offset,
+    const bool dst_thread_element_valid,
+    const ck_tile::index_t dst_element_space_size) {
+  const int32x4_t dst_wave_buffer_resource =
+      make_wave_buffer_resource(p_dst_wave);
+
+  ck_tile::index_t dst_thread_addr_offset = [&]() {
+    if constexpr (oob_conditional_check)
+      return dst_thread_element_valid ? dst_thread_element_offset * sizeof(T)
+                                      : 0xffffffff;
+    else
+      return dst_thread_element_offset * sizeof(T);
+  }();
+  ck_tile::amd_buffer_store_impl<T, N>(
+      src_thread_data, dst_wave_buffer_resource, dst_thread_addr_offset, 0);
 }
 
 } // namespace tl

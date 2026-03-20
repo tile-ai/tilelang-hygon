@@ -429,13 +429,15 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
                                       std::to_string(desc.num_elements) + ">>(" +
                                       value + ")";
 
+      std::string pred = GetCurrentPredicate();
       PrintIndent();
-      stream << "ck_tile::amd_buffer_store<"
-             << desc.data_type << ", " << desc.num_elements << ">("
+      stream << "tl::amd_buffer_store<"
+             << desc.data_type << ", " << desc.num_elements << ", "
+             << (pred == "true" ? "false" : "true") << ">("
              << src_thread_buffer << ", "
              << desc.wave_ptr << ", "
              << desc.offset << ", "
-             << GetCurrentPredicate() << ", "
+             << pred << ", "
              << desc.element_space_size << ");\n";
 
       return;
@@ -788,8 +790,9 @@ std::string CodeGenTileLangHCU::GetVecLoadWithPredicate(DataType t,
     std::ostringstream os;
     os << "*(";
     PrintType(t, os);
-    os << "*)&(ck_tile::amd_buffer_load_invalid_element_return_zero<"
-       << desc.data_type << ", " << desc.num_elements << ">("
+    os << "*)&(tl::amd_buffer_load<"
+       << desc.data_type << ", " << desc.num_elements << ", "
+       << (pred == "true" ? "false" : "true") << ">("
        << desc.wave_ptr << ", " << desc.offset << ", " << pred << ", "
        << desc.element_space_size << ").get())";
 
@@ -825,8 +828,9 @@ void CodeGenTileLangHCU::PrintVecStoreWithPredicate(const BufferNode* buffer,
                                   std::to_string(desc.num_elements) + ">>(" + value + ")";
 
   this->PrintIndent();
-  this->stream << "ck_tile::amd_buffer_store<"
-               << desc.data_type << ", " << desc.num_elements << ">("
+  this->stream << "tl::amd_buffer_store<"
+               << desc.data_type << ", " << desc.num_elements << ", "
+               << (pred == "true" ? "false" : "true") << ">("
                << src_thread_buffer << ", "
                << desc.wave_ptr << ", "
                << desc.offset << ", "
@@ -1142,7 +1146,7 @@ std::string CodeGenTileLangHCU::GetBufferRef(DataType t,
 
 void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
   // Optimize if_then_else(cond, BufferLoad/Cast(BufferLoad), zeros) to use
-  // amd_buffer_load_invalid_element_return_zero with predicate instead of if-else.
+  // amd_buffer_load with predicate instead of if-else.
   if (op->op.same_as(builtin::if_then_else()) && op->args.size() == 3) {
     const BufferLoadNode *load = ExtractBufferLoad(op->args[1]);
     if (load && IsZeroValue(op->args[2]) &&
@@ -1428,6 +1432,16 @@ void CodeGenTileLangHCU::VisitStmt_(const AttrStmtNode *op) {
     this->stream << "const dim3 blockIdx = " << pattern->value << "();\n";
     this->VisitStmt(op->body);
     return;
+  } else if (op->attr_key == tl::attr::kDisableBufferOpsMap) {
+    if (auto map = op->node.as<Map<String, PrimExpr>>()) {
+      for (const auto &[var, enabled] : map.value()) {
+        if (auto int_val = enabled.as<IntImmNode>()) {
+          if (int_val->value != 0) {
+            buffer_ops_disable_param_names_.insert(var);
+          }
+        }
+      }
+    }
   }
   CodeGenC::VisitStmt_(op);
 }
@@ -1744,6 +1758,7 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   this->InitFuncState(f);
   // reserve keywords
   ReserveKeywordsAsUnique();
+  buffer_ops_disable_param_names_.clear();
 
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol.defined())

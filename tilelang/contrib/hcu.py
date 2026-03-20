@@ -3,7 +3,7 @@
 def get_hcu_compile_flags(arch: str):
     if arch in ["gfx928", "gfx936", "gfx938"]:
         return [
-            #"-mllvm=-support-768-vgprs=true",
+            # "-mllvm=-support-768-vgprs=true",
             "-mllvm=-enable-latency-hack=true",
             "-mllvm=-mmac-latency=5",
             "-mllvm=-ds-load-store-latency=6",

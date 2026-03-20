@@ -206,6 +206,45 @@ def annotate_direct_to_lds(buffers):
     return block_attr({"direct_to_lds": _direct_to_lds_map})
 
 
+def disable_buffer_ops(*buffers):
+    """Disable amd_buffer_load/amd_buffer_store for specified global buffers.
+
+    Use when offset may exceed 2G (int32 limit). Applies to all accesses
+    (T.copy, BufferLoad, BufferStore) in the entire kernel.
+
+    Call inside a block (e.g. at the start of T.Kernel body) to annotate.
+
+    Args:
+        *buffers: One or more tir.Buffer to disable buffer ops for.
+
+    Example:
+        @T.prim_func
+        def main(q: T.Tensor[...], k: T.Tensor[...], ...):
+            with T.Kernel(...) as (...):
+                T.disable_buffer_ops(q, k)
+                # ... kernel body
+    """
+    from tvm.tir import IntImm
+
+    # Use param name for robust matching across passes (Var may be renamed)
+    # Support both Buffer (buf.data) and Var (e.g. param in T.Kernel block)
+    _disable_map = {}
+    for buf in buffers:
+        if hasattr(buf, "data") and buf.data is not None:
+            # Buffer: use data Var's name
+            data_var = buf.data
+            name = getattr(data_var, "name_hint", None) or getattr(data_var, "name", str(data_var))
+        else:
+            # Var (param): use name directly
+            name = getattr(buf, "name_hint", None) or getattr(buf, "name", None)
+            if name is None:
+                raise TypeError(
+                    f"disable_buffer_ops expects Buffer or Var, got {type(buf).__name__}"
+                )
+        _disable_map[name] = IntImm("int32", 1)
+    return block_attr({"disable_buffer_ops_map": _disable_map})
+
+
 def annotate_padding(padding_map: Dict):
     """Annotate the padding of the buffer
 

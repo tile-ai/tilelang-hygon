@@ -11,6 +11,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "target/source/codegen_c.h"
@@ -102,6 +103,11 @@ private:
   bool IsFoldableIfThenElse(const IfThenElseNode *op) const;
   bool IsCollapsibleRedundantIfElse(const IfThenElseNode *op) const;
   bool CanUseVMBufferOps(const BufferNode *buffer, int num_elements) const {
+    // Match by param name (robust across Var renaming in later passes)
+    for (const auto &p : buffer_ops_disable_param_names_) {
+      if (buffer->data->name_hint == p)
+        return false;
+    }
     auto value = std::getenv("HCU_USE_BUFFER_OPS");
     auto scope = GetPtrStorageScope(buffer->data);
     return (value == nullptr || std::atoi(value) != 0) && scope == "global" &&
@@ -146,6 +152,7 @@ private:
   // Set to 16 to maintain minimum alignment requirements for async bulk copy
   const int barrier_alignment_bytes_ = 16;
   std::unordered_map<const VarNode*, bool> direct_to_lds_map_;
+  std::unordered_set<std::string> buffer_ops_disable_param_names_;
   std::vector<std::string> predicate_stack_;
 };
 
