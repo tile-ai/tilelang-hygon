@@ -241,8 +241,16 @@ def get_rocm_arch(rocm_path="/opt/rocm"):
         The AMD GPU architecture
     """
     gpu_arch = "gfx900"
-    # check if rocm is installed
-    if not os.path.exists(rocm_path):
+    # check if rocm is installed (path exists and rocminfo is present)
+    rocm_valid = os.path.exists(rocm_path) and os.path.exists(
+        os.path.join(rocm_path, "bin", "rocminfo")
+    )
+    if not rocm_valid and os.environ.get("ROCM_PATH"):
+        rocm_path = os.environ["ROCM_PATH"]
+        rocm_valid = os.path.exists(rocm_path) and os.path.exists(
+            os.path.join(rocm_path, "bin", "rocminfo")
+        )
+    if not rocm_valid:
         print("ROCm not detected, using default gfx900")
         return gpu_arch
     try:
