@@ -278,9 +278,15 @@ std::string CodeGenTileLangHCU::GetCurrentPredicate() const {
 }
 
 bool CodeGenTileLangHCU::IsFoldableIfThenElse(const IfThenElseNode *op) const {
-  const auto *then_store = op->then_case.as<BufferStoreNode>();
+  Stmt then_body = op->then_case;
+  if (const auto *seq = then_body.as<tir::SeqStmtNode>()) {
+    if (seq->size() == 1) {
+      then_body = seq->seq[0];
+    }
+  }
+  const auto *then_store = then_body.as<BufferStoreNode>();
   if (!then_store) {
-    if (const auto *inner = op->then_case.as<IfThenElseNode>()) {
+    if (const auto *inner = then_body.as<IfThenElseNode>()) {
       return !op->else_case && IsFoldableIfThenElse(inner);
     }
     return false;
@@ -293,13 +299,20 @@ bool CodeGenTileLangHCU::IsFoldableIfThenElse(const IfThenElseNode *op) const {
     const BufferNode *buf = then_store->buffer.get();
     DataType value_dtype = then_store->value.dtype();
     DataType element_dtype = buf->dtype;
-    if (value_dtype.lanes() != element_dtype.lanes() ||
-        !CanUseVMBufferOps(buf, value_dtype.lanes()))
+    // Allow vectorized store to scalar-element buffer (element_dtype.lanes()==1).
+    bool lanes_ok = (element_dtype.lanes() == 1)
+                        ? (value_dtype.element_of() == element_dtype.element_of())
+                        : (value_dtype.lanes() == element_dtype.lanes());
+    if (!lanes_ok || !CanUseVMBufferOps(buf, value_dtype.lanes()))
       return false;
     if (value_dtype.lanes() == 1)
       return true;
     arith::PVar<PrimExpr> base;
-    return arith::ramp(base, 1, value_dtype.lanes()).Match(then_store->indices[0]);
+    if (arith::ramp(base, 1, value_dtype.lanes()).Match(then_store->indices[0]))
+      return true;
+    // Scalar base index with vector value: contiguous store [base, base+1, ...],
+    // same semantics as Ramp. Accept to allow pred folding for common IR patterns.
+    return then_store->indices[0].as<RampNode>() == nullptr;
   }
 
   const auto *else_store = op->else_case.value().as<BufferStoreNode>();
@@ -316,7 +329,9 @@ bool CodeGenTileLangHCU::IsFoldableIfThenElse(const IfThenElseNode *op) const {
   if (!load || !CanUseVMBufferOps(load->buffer.get(), load->dtype.lanes()))
     return false;
   arith::PVar<PrimExpr> base;
-  return arith::ramp(base, 1, load->dtype.lanes()).Match(load->indices[0]);
+  if (arith::ramp(base, 1, load->dtype.lanes()).Match(load->indices[0]))
+    return true;
+  return load->indices[0].as<RampNode>() == nullptr;
 }
 
 // Check if if(cond){store} else {if(c0){if(c1){store}}} with cond == c0 && c1.
@@ -345,13 +360,16 @@ bool CodeGenTileLangHCU::IsCollapsibleRedundantIfElse(const IfThenElseNode *op) 
   const BufferNode *buf = then_store->buffer.get();
   DataType value_dtype = then_store->value.dtype();
   DataType element_dtype = buf->dtype;
-  if (value_dtype.lanes() != element_dtype.lanes() ||
-      !CanUseVMBufferOps(buf, value_dtype.lanes()))
+  bool lanes_ok = (element_dtype.lanes() == 1)
+                      ? (value_dtype.element_of() == element_dtype.element_of())
+                      : (value_dtype.lanes() == element_dtype.lanes());
+  if (!lanes_ok || !CanUseVMBufferOps(buf, value_dtype.lanes()))
     return false;
   if (value_dtype.lanes() != 1) {
     arith::PVar<PrimExpr> base;
-    if (!arith::ramp(base, 1, value_dtype.lanes()).Match(then_store->indices[0]))
-      return false;
+    if (!arith::ramp(base, 1, value_dtype.lanes()).Match(then_store->indices[0]) &&
+        then_store->indices[0].as<RampNode>() != nullptr)
+      return false;  // Ramp with stride!=1 not supported
   }
 
   PrimExpr combined = else_result.conditions[0];
@@ -1152,7 +1170,10 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     if (load && IsZeroValue(op->args[2]) &&
         CanUseVMBufferOps(load->buffer.get(), load->dtype.lanes())) {
       arith::PVar<PrimExpr> base;
-      if (arith::ramp(base, 1, load->dtype.lanes()).Match(load->indices[0])) {
+      bool contiguous =
+          arith::ramp(base, 1, load->dtype.lanes()).Match(load->indices[0]) ||
+          load->indices[0].as<RampNode>() == nullptr;
+      if (contiguous) {
         std::string cond_str = PrintExpr(op->args[0]);
         std::string pred_var = name_supply_->FreshName("pred");
         PrintIndent();
