@@ -275,8 +275,8 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   }
 
   // src shape: mls_trans => K at shape[1], !mls_trans => K at shape[0]
-  PrimExpr mn_length_raw = mls_trans ? src->shape[0] : src->shape[1];
-  PrimExpr k_length_raw = mls_trans ? src->shape[1] : src->shape[0];
+  PrimExpr mn_length_raw = mls_trans ? src->shape[nr - 2] : src->shape[nr - 1];
+  PrimExpr k_length_raw = mls_trans ? src->shape[nr - 1] : src->shape[nr - 2];
   PrimExpr mls_stride = mls_trans ? k_length_raw : mn_length_raw;
 
   std::string dtype_str;
@@ -304,7 +304,29 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
 
   Buffer src_buf = T.buffer_remap.count(src) ? T.buffer_remap[src] : src;
   Buffer dst_buf = T.buffer_remap.count(dst) ? T.buffer_remap[dst] : dst;
-  auto src_ptr = src_buf.access_ptr(1);
+
+  // Flat element offset from leading dimensions (all dims before the last two). The
+  // extern mls_load_tile uses block_mn_base / block_k_base for the MN×K tile within
+  // the trailing 2D slice; src_ptr must point to the slice origin at (r0..r_{n-3}, 0, 0).
+  PrimExpr leading_elem_offset = IntImm(DataType::Int(32), 0);
+  if (nr > 2) {
+    ICHECK_EQ(src_buf->shape.size(), nr)
+        << "matrix_load src buffer rank must match src region rank, got shape.size()="
+        << src_buf->shape.size() << " vs region rank=" << nr;
+    Array<PrimExpr> idx_leading;
+    DataType idx_dtype = src_buf->DefaultIndexType();
+    for (size_t j = 0; j + 2 < nr; ++j) {
+      idx_leading.push_back(this->src_ranges[j]->min);
+    }
+    idx_leading.push_back(make_const(idx_dtype, 0));
+    idx_leading.push_back(make_const(idx_dtype, 0));
+    Array<PrimExpr> offs = src_buf.OffsetOf(idx_leading);
+    ICHECK_EQ(offs.size(), 1u)
+        << "matrix_load src OffsetOf expects a single flat offset, got size=" << offs.size();
+    leading_elem_offset = offs[0];
+  }
+
+  auto src_ptr = src_buf.access_ptr(1, DataType::Handle(), 1, leading_elem_offset);
   auto dst_ptr = dst_buf.access_ptr(2);
 
   Array<PrimExpr> call_args;
