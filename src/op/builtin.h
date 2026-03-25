@@ -8,7 +8,10 @@
 #define TVM_TL_OP_BUILTIN_H_
 
 #include "operator.h"
+#include <tvm/tir/builtin.h>
+#include <tvm/tir/op.h>
 #include <tvm/ir/transform.h>
+#include <string>
 
 namespace tvm {
 /*!
@@ -20,6 +23,25 @@ namespace tvm {
  *
  */
 namespace tl {
+
+inline bool IsCallExternWithPrefix(const tir::CallNode *call,
+                                   const char *prefix) {
+  if (!call->op.same_as(tir::builtin::call_extern()) || call->args.empty()) {
+    return false;
+  }
+  if (const auto *name = call->args[0].as<tir::StringImmNode>()) {
+    return std::string(name->value).find(prefix) == 0;
+  }
+  return false;
+}
+
+inline bool IsMlsLoadTileExternCall(const tir::CallNode *call) {
+  return IsCallExternWithPrefix(call, "tl::mls::mls_load_tile");
+}
+
+inline bool IsDsReadFormatExternCall(const tir::CallNode *call) {
+  return IsCallExternWithPrefix(call, "tl::mls::ds_read_format_tensor");
+}
 
 namespace attr {
 static constexpr const char *kPaddingMap = "padding_map";

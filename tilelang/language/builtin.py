@@ -5,7 +5,7 @@ from tilelang.language import ptx_arrive_barrier, evaluate
 from tilelang.language.kernel import get_thread_bindings, get_block_extents
 from tilelang.utils.target import check_hip_availability
 from tvm import tir
-from typing import Union, Any, Optional
+from typing import Union, Any, Optional, Literal
 from tvm.tir import PrimExpr, Var, Call, Buffer, BufferLoad
 
 _IS_HIP_AVAILABLE = check_hip_availability()
@@ -628,3 +628,47 @@ def cp_async_barrier_noinc(barrier_id: Union[int, PrimExpr, tir.Call]):
     """Perform a ptx async copy barrier using cp.async.mbarrier.arrive.noinc.
     """
     return tir.call_intrin("handle", tir.op.Op.get("tl.ptx_cp_async_barrier_noinc"), barrier_id)
+
+
+def _pack_s_waitcnt_imm(cnt: int, flag: Literal["vmcnt", "lgkmcnt", "expcnt"]) -> int:
+    """Pack a named wait counter into the AMD s_waitcnt immediate encoding."""
+    if not isinstance(cnt, int):
+        raise TypeError(f"Expect cnt to be int, but got {type(cnt)}.")
+
+    if flag == "vmcnt":
+        if not 0 <= cnt <= 63:
+            raise ValueError(f"vmcnt must be in [0, 63], but got {cnt}.")
+        return ((cnt & 0xF) | (7 << 4) | (1 << 7) | (15 << 8) | (3 << 12) |
+                ((cnt & 0x30) << 10))
+
+    if flag == "lgkmcnt":
+        if not 0 <= cnt <= 15:
+            raise ValueError(f"lgkmcnt must be in [0, 15], but got {cnt}.")
+        return (0xF | (7 << 4) | (1 << 7) | (cnt << 8) | (3 << 12))
+
+    if flag == "expcnt":
+        if not 0 <= cnt <= 7:
+            raise ValueError(f"expcnt must be in [0, 7], but got {cnt}.")
+        return (0xF | (cnt << 4) | (1 << 7) | (15 << 8) | (3 << 12))
+
+    raise ValueError(f"Unsupported s_waitcnt flag: {flag}. Expected one of vmcnt, lgkmcnt, expcnt.")
+
+
+def s_waitcnt(cnt: int = 0, flag: Literal["vmcnt", "lgkmcnt", "expcnt"] = "vmcnt"):
+    """Wait for AMD HCU operations tracked by a specific wait counter.
+
+    This helper packs the requested counter into the immediate expected by
+    ``__builtin_amdgcn_s_waitcnt``. By default, ``T.s_waitcnt(cnt)`` is treated
+    as ``vmcnt(cnt)`` for backward compatibility.
+
+    Args:
+        cnt: Counter value to wait for.
+        flag: Which counter field to update in the s_waitcnt immediate. Must be
+            one of ``"vmcnt"``, ``"lgkmcnt"``, or ``"expcnt"``.
+
+    Returns:
+        tir.Call: call_extern to ``__builtin_amdgcn_s_waitcnt`` with the packed
+        immediate.
+    """
+    imm = _pack_s_waitcnt_imm(cnt, flag)
+    return tir.call_extern("int32", "__builtin_amdgcn_s_waitcnt", tir.IntImm("int32", imm))

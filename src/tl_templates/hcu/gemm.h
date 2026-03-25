@@ -107,7 +107,8 @@ template <> struct MmacTraits<fp8_e5_t> {
 // ref to bitblas/tl/mfma_macro_generator.py::kPack
 template <int M, int N, int K, int num_warp_m, int num_warp_n, bool TransposeA,
           bool TransposeB, bool clear_accum, int kPack, typename A_type,
-          typename B_type, typename C_type, typename AccDataType = float>
+          typename B_type, typename C_type, typename AccDataType = float,
+          int min_n_per_warp = 16>
 class GemmTensorOp {
 public:
   // Note: clear_accum=true is not fully supported in HIP implementation
@@ -126,7 +127,8 @@ public:
 
   static constexpr int block_row_warps = num_warp_m;
   static constexpr int block_col_warps = num_warp_n;
-  static constexpr int block_col_warps_no_recompute = std::min(num_warp_n, N_Tile / micro_size_y);
+  static constexpr int block_col_warps_no_recompute =
+      std::min(num_warp_n, N_Tile / min_n_per_warp);
 
   static constexpr int inner_k = K_Tile / (micro_size_k * kPack);
   static constexpr int warp_rows = M_Tile / (block_row_warps * micro_size_x);
@@ -696,51 +698,61 @@ public:
 
 namespace tl {
 
+// Type tag for warp_k partitioning: distinguishes from bool (trans_A) to avoid overload ambiguity
+template <int N>
+struct WarpKParam { static constexpr int value = N; };
+
 template <int M, int N, int K, int num_warp_m, int num_warp_n, bool trans_A,
-          bool trans_B, bool clear_accum, int kPack, typename A_type,
-          typename B_type, typename C_type>
+          bool trans_B, bool clear_accum, int kPack, int min_n_per_warp = 16,
+          typename A_type, typename B_type, typename C_type>
 TL_DEVICE void gemm_ss(A_type *pA, B_type *pB, C_type *accum) {
   using Compute =
       GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A, trans_B,
-                   clear_accum, kPack, A_type, B_type, C_type>;
+                   clear_accum, kPack, A_type, B_type, C_type, float,
+                   min_n_per_warp>;
   Compute::body(pA, pB, accum);
 }
 
 template <int M, int N, int K, int num_warp_m, int num_warp_n, bool trans_A,
-          bool trans_B, bool clear_accum, int kPack, typename A_type,
-          typename B_type, typename C_type>
+          bool trans_B, bool clear_accum, int kPack, int min_n_per_warp = 16,
+          typename A_type, typename B_type, typename C_type>
 TL_DEVICE void gemm_rs(A_type *pA, B_type *pB, C_type *accum) {
   using Compute =
       GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A, trans_B,
-                   clear_accum, kPack, A_type, B_type, C_type>;
+                   clear_accum, kPack, A_type, B_type, C_type, float,
+                   min_n_per_warp>;
   Compute::body_rs(pA, pB, accum);
 }
 
 template <int M, int N, int K, int num_warp_m, int num_warp_n, bool trans_A,
-          bool trans_B, bool clear_accum, int kPack, typename A_type,
-          typename B_type, typename C_type>
+          bool trans_B, bool clear_accum, int kPack, int min_n_per_warp = 16,
+          typename A_type, typename B_type, typename C_type>
 TL_DEVICE void gemm_rr(A_type *pA, B_type *pB, C_type *accum) {
   using Compute =
       GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A, trans_B,
-                   clear_accum, kPack, A_type, B_type, C_type>;
+                   clear_accum, kPack, A_type, B_type, C_type, float,
+                   min_n_per_warp>;
   Compute::body_rr(pA, pB, accum);
 }
 
 template <int M, int N, int K, int num_warp_m, int num_warp_n, bool trans_A,
-          bool trans_B, bool clear_accum, int kPack, typename A_type,
-          typename B_type, typename C_type>
+          bool trans_B, bool clear_accum, int kPack, int min_n_per_warp = 16,
+          typename A_type, typename B_type, typename C_type>
 TL_DEVICE void gemm_sr(A_type *pA, B_type *pB, C_type *accum) {
   using Compute =
       GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A, trans_B,
-                   clear_accum, kPack, A_type, B_type, C_type>;
+                   clear_accum, kPack, A_type, B_type, C_type, float,
+                   min_n_per_warp>;
   Compute::body_sr(pA, pB, accum);
 }
 
-// gemm_rs with warp_k partitioning
-template <int M, int N, int K, int num_warp_m, int num_warp_n, int num_warp_k,
+// gemm_rs with warp_k partitioning (WarpKParam<N> as 6th param distinguishes from bool trans_A in gemm_rs no k partition)
+template <int M, int N, int K, int num_warp_m, int num_warp_n,
+          typename WarpKTag,  // WarpKParam<num_warp_k>
           bool trans_A, bool trans_B, bool clear_accum, int kPack, typename A_type,
           typename B_type, typename C_type>
 TL_DEVICE void gemm_rs(A_type *pA, B_type *pB, C_type *accum) {
+  constexpr int num_warp_k = WarpKTag::value;
   using Compute =
       GemmTensorOpKPartition<M, N, K, num_warp_m, num_warp_n, num_warp_k, trans_A, trans_B,
                    clear_accum, kPack, A_type, B_type, C_type>;
@@ -748,10 +760,12 @@ TL_DEVICE void gemm_rs(A_type *pA, B_type *pB, C_type *accum) {
 }
 
 // gemm_ss with warp_k partitioning
-template <int M, int N, int K, int num_warp_m, int num_warp_n, int num_warp_k,
+template <int M, int N, int K, int num_warp_m, int num_warp_n,
+          typename WarpKTag,
           bool trans_A, bool trans_B, bool clear_accum, int kPack, typename A_type,
           typename B_type, typename C_type>
 TL_DEVICE void gemm_ss(A_type *pA, B_type *pB, C_type *accum) {
+  constexpr int num_warp_k = WarpKTag::value;
   using Compute =
       GemmTensorOpKPartition<M, N, K, num_warp_m, num_warp_n, num_warp_k, trans_A, trans_B,
                    clear_accum, kPack, A_type, B_type, C_type>;
@@ -759,10 +773,12 @@ TL_DEVICE void gemm_ss(A_type *pA, B_type *pB, C_type *accum) {
 }
 
 // gemm_rr with warp_k partitioning
-template <int M, int N, int K, int num_warp_m, int num_warp_n, int num_warp_k,
+template <int M, int N, int K, int num_warp_m, int num_warp_n,
+          typename WarpKTag,
           bool trans_A, bool trans_B, bool clear_accum, int kPack, typename A_type,
           typename B_type, typename C_type>
 TL_DEVICE void gemm_rr(A_type *pA, B_type *pB, C_type *accum) {
+  constexpr int num_warp_k = WarpKTag::value;
   using Compute =
       GemmTensorOpKPartition<M, N, K, num_warp_m, num_warp_n, num_warp_k, trans_A, trans_B,
                    clear_accum, kPack, A_type, B_type, C_type>;

@@ -27,6 +27,9 @@ public:
   static constexpr const char *_type_key = "tl.AtomicAdd";
   TVM_DECLARE_FINAL_OBJECT_INFO(AtomicAddNode, TileOperatorNode);
 
+  Array<Buffer> GetOutBuffers() const override { return {dst}; }
+  Array<Buffer> GetInBuffers() const override { return {src}; }
+
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const;
   LayoutMap InferLayout(const LayoutInferArgs &T, InferLevel level) const;
 

@@ -47,7 +47,7 @@ from .allocate import (
     alloc_reducer,  # noqa: F401
     alloc_descriptor,  # noqa: F401
 )
-from .copy import copy, c2d_im2col  # noqa: F401
+from .copy import copy, c2d_im2col, matrix_load, ds_read_format  # noqa: F401
 from .gemm import GemmWarpPolicy, gemm, gemm_v2  # noqa: F401
 from .experimental.gemm_sp import gemm_sp  # noqa: F401
 from .fill import fill, clear  # noqa: F401

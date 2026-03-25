@@ -16,6 +16,7 @@
 #include <tvm/tir/stmt.h>
 
 #include "../layout/layout.h"
+#include "propagation_tir_collector.h"
 
 namespace tvm {
 namespace tl {
@@ -32,25 +33,8 @@ enum class InferLevel : uint8_t {
   kStrict = 2,
 };
 
-struct LowerArgs {
-  Target target;
-  Range thread_bounds;
-  Var thread_var;
-  AddWorkspaceCallback AddWorkspace;
-  LayoutMap layout_map;
-  Map<Buffer, Buffer> buffer_remap;
-  Array<Var> buffer_var_gemm;
-};
-
-struct LayoutInferArgs {
-  Target target;
-  Range thread_bounds;
-  LayoutMap layout_map;
-  arith::Analyzer *analyzer;
-  bool buffer_oob = false;
-  Map<Buffer, Buffer> buffer_remap;
-};
-
+struct LowerArgs;
+struct LayoutInferArgs;
 class TileOperator;
 
 class TileOperatorNode : public Object {
@@ -62,6 +46,11 @@ public:
 
   virtual TileOperator Clone() const = 0;
 
+  /// Buffers this op writes to (outputs). Default empty.
+  virtual Array<Buffer> GetOutBuffers() const { return {}; }
+  /// Buffers this op reads from (inputs). Default empty.
+  virtual Array<Buffer> GetInBuffers() const { return {}; }
+
   static constexpr const char *_type_key = "tl.TileOperator";
 
   TVM_DECLARE_BASE_OBJECT_INFO(TileOperatorNode, Object);
@@ -70,6 +59,27 @@ public:
 class TileOperator : public ObjectRef {
 public:
   TVM_DEFINE_OBJECT_REF_METHODS(TileOperator, ObjectRef, TileOperatorNode);
+};
+
+struct LowerArgs {
+  Target target;
+  Range thread_bounds;
+  Var thread_var;
+  AddWorkspaceCallback AddWorkspace;
+  LayoutMap layout_map;
+  Map<Buffer, Buffer> buffer_remap;
+  Array<Var> buffer_var_gemm;
+  const PropagationTirCollector *tir_collector = nullptr;
+};
+
+struct LayoutInferArgs {
+  Target target;
+  Range thread_bounds;
+  LayoutMap layout_map;
+  arith::Analyzer *analyzer;
+  bool buffer_oob = false;
+  Map<Buffer, Buffer> buffer_remap;
+  const PropagationTirCollector *tir_collector = nullptr;
 };
 
 Var GetVarFromAccessPtr(const PrimExpr &expr);

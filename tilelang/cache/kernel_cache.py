@@ -449,10 +449,16 @@ class KernelCache:
                 kernel_global_source = f.read()
 
             if env.TILELANG_SOURCE_RECOMPILE.lower() in ("1", "true", "yes", "on"):
-                self.logger.debug(f"Recompiling {WRAPPED_KERNEL_PATH} from disk cache.")
+                self.logger.debug(f"Recompiling {wrapped_kernel_path} from disk cache.")
                  # Re-generate assembly & shared library code from source
                 KernelCache._safe_write_file(kernel_lib_path, "wb",
                                              lambda file: file.write(_make_obj(wrapped_kernel_path,"so", "rb")))
+                asm_kernel_path = os.path.join(cache_path, ASM_KERNEL_PATH)
+                llir_kernel_path = os.path.join(cache_path, LLIR_KERNEL_PATH)
+                KernelCache._safe_write_file(asm_kernel_path, "w",
+                                            lambda file: file.write(_make_obj(wrapped_kernel_path, "asm", "r")))
+                KernelCache._safe_write_file(llir_kernel_path, "w",
+                                            lambda file: file.write(_make_obj(wrapped_kernel_path, "llir", "r")))
         except Exception as e:
             self.logger.error(f"Error loading wrapped kernel source code from disk: {e}")
 

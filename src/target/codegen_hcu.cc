@@ -183,7 +183,12 @@ std::string CodeGenTileLangHCU::Finish() {
   }
 
   decl_stream << "#include <tl_templates/hcu/atomic.h>\n";
-  decl_stream << "#include <tl_templates/hcu/gemm.h>\n";
+  if (enable_gemm_mls_) {
+    decl_stream << "#include <tl_templates/hcu/mls/tilelang_mls_base.hpp>\n";
+    decl_stream << "#include <tl_templates/hcu/gemm_mls.h>\n";
+  } else {
+    decl_stream << "#include <tl_templates/hcu/gemm.h>\n";
+  }
   decl_stream << "#include <tl_templates/hcu/copy.h>\n";
   decl_stream << "#include <tl_templates/hcu/reduce.h>\n";
   decl_stream << "#include <tl_templates/hcu/ldsm.h>\n";
@@ -1048,6 +1053,12 @@ void CodeGenTileLangHCU::PrintCallExtern(Type ret_type, String global_symbol,
                                          const Array<PrimExpr> &args,
                                          bool skip_first_arg,
                                          std::ostream &os) { // NOLINT(*)
+  std::string sym = global_symbol.operator std::string();
+  if (sym.find("tl::mls::") != std::string::npos ||
+      sym.find("tl::gemm_mls") != std::string::npos ||
+      sym.find("tl::gemm_r_mls") != std::string::npos) {
+    enable_gemm_mls_ = true;
+  }
   DataType ret_dtype = GetRuntimeDataType(ret_type);
   if (ret_dtype.is_vector()) {
     //

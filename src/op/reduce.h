@@ -86,6 +86,9 @@ public:
   static constexpr const char *_type_key = "tl.ReduceOp";
   TVM_DECLARE_FINAL_OBJECT_INFO(ReduceOpNode, TileOperatorNode);
 
+  Array<Buffer> GetOutBuffers() const override { return {dst}; }
+  Array<Buffer> GetInBuffers() const override { return {src}; }
+
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
     refl::ObjectDef<ReduceOpNode>()
@@ -148,6 +151,9 @@ public:
   bool reverse;         ///< Whether to compute in reverse order
   static constexpr const char *_type_key = "tl.CumSumOp";
   TVM_DECLARE_FINAL_OBJECT_INFO(CumSumOpNode, TileOperatorNode);
+
+  Array<Buffer> GetOutBuffers() const override { return {dst}; }
+  Array<Buffer> GetInBuffers() const override { return {src}; }
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
   LayoutMap InferLayout(const LayoutInferArgs &T,

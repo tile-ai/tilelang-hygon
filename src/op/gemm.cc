@@ -4,6 +4,7 @@
  */
 
 #include "gemm.h"
+#include "propagation_util.h"
 
 #include "builtin.h"
 #include <tvm/tir/builtin.h>
@@ -22,6 +23,14 @@ using namespace tir;
 struct TCGEN5MMAMeta {
   int atom_m, atom_n, atom_k;
 };
+
+static inline bool IsFloat8E4Family(DataType dtype) {
+  return dtype.is_float8_e4m3fn() || dtype.is_float8_e4m3();
+}
+
+static inline bool IsFloat8E5Family(DataType dtype) {
+  return dtype.is_float8_e5m2() || dtype.is_float8_e5m2fnuz();
+}
 
 // Return {is_success, meta}
 static inline std::pair<bool, TCGEN5MMAMeta>
@@ -203,13 +212,24 @@ GemmInst GemmNode::GetGemmInst(int block_size, Target target) const {
 }
 
 std::tuple<int, int, int> GemmWarpPolicyNode::ComputeWarpPartitionHCU(
-  int M, int N, int K, int k_pack, int element_byte_size, int block_size,
-  Target target, GemmInst gemm_inst) const {
+    int M, int N, int K, int k_pack, int element_byte_size, int block_size,
+    Target target, GemmInst gemm_inst, bool A_from_mls, bool B_from_mls,
+    bool A_mls_trans, bool B_mls_trans) const {
+  bool use_mls = A_from_mls || B_from_mls;
+  if (use_mls) {
+    ICHECK(k_pack == 1) << "gemm_mls does not support kPack > 1";
+  }
 
   int num_warps = block_size / TargetGetWarpSize(target);
   int m_warp = 1, n_warp = 1, k_warp = 1;
-  constexpr int kMPerWarp = 16; // Rows processed by a single warp
-  constexpr int kNPerWarp = 16;  // Columns processed by a single warp
+  int kMPerWarp = 16;  // Rows processed by a single warp
+  int kNPerWarp = 16;   // Columns processed by a single warp
+  if (A_from_mls && !A_mls_trans) {
+    kMPerWarp = 32;  // min ds_read_format tilesize
+  }
+  if (B_from_mls && !B_mls_trans) {
+    kNPerWarp = 32;  // min ds_read_format tilesize
+  }
   ICHECK(element_byte_size == 1 || element_byte_size == 2)
       << "element bitwidth=" << element_byte_size;
   int kKPerWarp = k_pack * (32 / element_byte_size);
@@ -300,6 +320,7 @@ std::tuple<int, int, int> GemmWarpPolicyNode::ComputeWarpPartitionHCU(
     m_warp = best_m;
     n_warp = best_n * recompute;
   } else if (this->isFullColK()) {
+    ICHECK(!use_mls) << "gemm_mls does not support warp partitioning on K (FullColK policy)";
     // Try to partition N first
     n_warp = num_warps;
     k_warp = 1;
@@ -638,9 +659,15 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   auto warp_m = 1, warp_n = 1, warp_k = 1;
   if (TargetIsHCU(T.target)) {
     int element_byte_size = A->dtype.bits() / 8;
+    bool A_from_mls = IsFromMls(A, T.tir_collector);
+    bool B_from_mls = IsFromMls(B, T.tir_collector);
+    bool A_mls_trans = !trans_A;
+    bool B_mls_trans = trans_B;
     auto [warp_m_tmp, warp_n_tmp, warp_k_tmp] =
         policy->ComputeWarpPartitionHCU(M, N, K, kPack, element_byte_size,
-                                         block_size, T.target, gemm_inst);
+                                         block_size, T.target, gemm_inst,
+                                         A_from_mls, B_from_mls,
+                                         A_mls_trans, B_mls_trans);
     warp_m = warp_m_tmp;
     warp_n = warp_n_tmp;
     warp_k = warp_k_tmp;
@@ -721,7 +748,28 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     }
   }
 
-  if (A.scope() == "local.fragment") {
+  bool A_from_mls = IsFromMls(A, T.tir_collector);
+  bool B_from_mls = IsFromMls(B, T.tir_collector);
+  bool A_mls_trans = !trans_A;
+  bool B_mls_trans = trans_B;
+  bool use_gemm_mls =
+      TargetIsHCU(T.target) &&
+      ((A_from_mls && A.scope() != "local.fragment") ||
+       (B_from_mls && B.scope() != "local.fragment"));
+
+  if (use_gemm_mls) {
+    ICHECK(kPack == 1) << "gemm_mls does not support kPack > 1";
+    ICHECK(warp_k == 1) << "gemm_mls does not support warp on K";
+    if (A_from_mls && B_from_mls) {
+      op_name = "tl::gemm_mls_mls";
+    } else if (B_from_mls) {
+      op_name = (A.scope() == "local.fragment") ? "tl::gemm_r_mls"
+                                                 : "tl::gemm_s_mls";
+    } else {
+      ICHECK(A_from_mls);
+      LOG(FATAL) << "gemm_mls_s (A mls, B r or s) not implemented";
+    }
+  } else if (A.scope() == "local.fragment") {
     if (B.scope() == "local.fragment") {
       op_name = "tl::gemm_rr";
     } else {
@@ -736,39 +784,92 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
   ss << op_name << "<" << M << ", " << N << ", " << K << ", ";
   ss << warp_m << ", " << warp_n << ", ";
-  if (warp_k > 1) {
-    ss << warp_k << ", ";
+  bool has_warp_k = (warp_k > 1);
+  if (has_warp_k) {
+    ss << "tl::WarpKParam<" << warp_k << ">, ";
   }
   ss << trans_A << ", " << trans_B;
-  auto clear_accum_bool = clear_accum.as<Bool>();
-  ICHECK(clear_accum_bool.has_value())
-      << "clear_accum must be a constant Bool type, got " << clear_accum;
-  ss << ", " << bool(clear_accum_bool.value());
-  if (TargetIsCuda(T.target) && (GetArchInt(T.target) >= 75)) {
-    ss << ", " << stride_A << ", " << stride_B;
-    ss << ", " << offset_A << ", " << offset_B;
-  }
-  if (TargetIsCDNA(T.target)) {
-    // for cdna gemm, we need to specify kPack
-    ss << ", " << kPack;
-  } else if (TargetIsHopper(T.target)) {
-    ss << ", " << (gemm_inst == GemmInst::kWGMMA ? "true" : "false");
-  }
 
-  // Emit wg_wait if necessary
-  if (TargetIsHopper(T.target)) {
-    if (wg_wait != 0) {
-      ss << ", " << wg_wait;
+  if (use_gemm_mls) {
+    int mls_tile_m = 0, mls_tile_ka = 0, mls_tile_n = 0, mls_tile_kb = 0;
+    if (A_from_mls) {
+      auto tile_a = GetMlsTileFromProducerChain(A, T.tir_collector);
+      ICHECK(tile_a) << "MatrixLoad/DsReadFormat A tile must be set in InferLayout";
+      mls_tile_m = tile_a->first;
+      mls_tile_ka = tile_a->second;
     }
-  } else if (TargetIsSm100(T.target)) {
-    // NOTE On sm100, only the leading thread issues the TCGEN5MMA instruction
-    // but all threads need to wait, so we emit another statement for cases
-    // where wg_wait == 0.
-    ICHECK(wg_wait == 0 || wg_wait == -1)
-        << "wg_wait must be 0 or -1 for Sm100";
+    if (B_from_mls) {
+      auto tile_b = GetMlsTileFromProducerChain(B, T.tir_collector);
+      ICHECK(tile_b) << "MatrixLoad/DsReadFormat B tile must be set in InferLayout";
+      mls_tile_n = tile_b->first;
+      mls_tile_kb = tile_b->second;
+    }
+    ss << ", " << kPack;
+    if (A_from_mls && B_from_mls) {
+      ss << ", ck_tile::sequence<" << mls_tile_m << ", " << mls_tile_ka
+         << ">, ck_tile::sequence<" << mls_tile_n << ", " << mls_tile_kb
+         << ">, 1, 1";
+    } else if (B_from_mls) {
+      ss << ", ck_tile::sequence<" << mls_tile_n << ", " << mls_tile_kb
+         << ">, 1";
+    } else {
+      ICHECK(A_from_mls);
+      ss << ", ck_tile::sequence<" << mls_tile_m << ", " << mls_tile_ka
+         << ">, ck_tile::sequence<0, 0>, 1";
+    }
+    ss << ", ";
+    if (A->dtype.is_bfloat16())
+      ss << "ck_tile::bfloat16_t";
+    else if (A->dtype.is_float16())
+      ss << "half_t";
+    else if (IsFloat8E4Family(A->dtype))
+      ss << "fp8_e4_t";
+    else if (IsFloat8E5Family(A->dtype))
+      ss << "fp8_e5_t";
+    else
+      LOG(FATAL) << "gemm_mls unsupported A dtype: " << A->dtype;
+    ss << ", ";
+    if (B->dtype.is_bfloat16())
+      ss << "ck_tile::bfloat16_t";
+    else if (B->dtype.is_float16())
+      ss << "half_t";
+    else if (IsFloat8E4Family(B->dtype))
+      ss << "fp8_e4_t";
+    else if (IsFloat8E5Family(B->dtype))
+      ss << "fp8_e5_t";
+    else
+      LOG(FATAL) << "gemm_mls unsupported B dtype: " << B->dtype;
+    ss << ", float, float, ck_tile::hcu_target_enum::" << GetHcuArchString(T.target);
   } else {
-    ICHECK(wg_wait == 0)
-        << "wg_wait must be 0 for non-Hopper and non-Sm100 targets";
+    auto clear_accum_bool = clear_accum.as<Bool>();
+    ICHECK(clear_accum_bool.has_value())
+        << "clear_accum must be a constant Bool type, got " << clear_accum;
+    ss << ", " << bool(clear_accum_bool.value());
+    if (TargetIsCuda(T.target) && (GetArchInt(T.target) >= 75)) {
+      ss << ", " << stride_A << ", " << stride_B;
+      ss << ", " << offset_A << ", " << offset_B;
+    }
+    if (TargetIsHCU(T.target)) {
+      ss << ", " << kPack;
+      if (B_from_mls && !B_mls_trans) {
+        ss << ", 32";
+      }
+    } else if (TargetIsCDNA(T.target)) {
+      ss << ", " << kPack;
+    } else if (TargetIsHopper(T.target)) {
+      ss << ", " << (gemm_inst == GemmInst::kWGMMA ? "true" : "false");
+    }
+    if (TargetIsHopper(T.target)) {
+      if (wg_wait != 0) {
+        ss << ", " << wg_wait;
+      }
+    } else if (TargetIsSm100(T.target)) {
+      ICHECK(wg_wait == 0 || wg_wait == -1)
+          << "wg_wait must be 0 or -1 for Sm100";
+    } else {
+      ICHECK(wg_wait == 0)
+          << "wg_wait must be 0 for non-Hopper and non-Sm100 targets";
+    }
   }
   ss << ">";
 
@@ -806,11 +907,19 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
   GemmInst gemm_inst = GetGemmInst(block_size, T.target);
 
   auto warp_m = 1, warp_n = 1, warp_k = 1;
+  bool B_from_mls = false;
+  bool B_mls_trans = false;
   if (TargetIsHCU(T.target)) {
     int element_byte_size = A->dtype.bits() / 8;
+    bool A_from_mls = IsFromMls(A, T.tir_collector);
+    B_from_mls = IsFromMls(B, T.tir_collector);
+    bool A_mls_trans = !trans_A;
+    B_mls_trans = trans_B;
     auto [warp_m_tmp, warp_n_tmp, warp_k_tmp] =
         policy->ComputeWarpPartitionHCU(M, N, K, kPack, element_byte_size,
-                                         block_size, T.target, gemm_inst);
+                                         block_size, T.target, gemm_inst,
+                                         A_from_mls, B_from_mls,
+                                         A_mls_trans, B_mls_trans);
     warp_m = warp_m_tmp;
     warp_n = warp_n_tmp;
     warp_k = warp_k_tmp;
@@ -994,10 +1103,13 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
     ICHECK(C.scope() == "local.fragment")
         << "hcu gemm (mmac) only supports C in local.fragment scope, got "
         << C.scope();
+    const int min_n_per_warp = (B_from_mls && !B_mls_trans) ? 32 : 16;
     auto fragment =
-        makeGemmFragmentHCU(M, N, warp_m, warp_n, warp_k, C->dtype.bits());
+        makeGemmFragmentHCU(M, N, warp_m, warp_n, warp_k, C->dtype.bits(),
+                            min_n_per_warp);
     if (TargetHasMmacLitLts(T.target)) {
-      fragment = makeGemmFragmentHCULit(M, N, warp_m, warp_n, warp_k, C->dtype.bits());
+      fragment = makeGemmFragmentHCULit(M, N, warp_m, warp_n, warp_k,
+                                         C->dtype.bits(), min_n_per_warp);
     }
     results.Set(C, fragment->BindThreadRange(thread_range));
 
@@ -1023,7 +1135,8 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
       results.Set(B, shared_layout);
     } else if (B.scope() == "local.fragment") {
       auto fragment = makeGemmFragmentBHCU(M, N, K, warp_m, warp_n, warp_k,
-                                           B->dtype.bits(), kPack, trans_B);
+                                           B->dtype.bits(), kPack, trans_B,
+                                           min_n_per_warp);
       results.Set(B, fragment->BindThreadRange(thread_range));
     } else {
       ICHECK(0);

@@ -7,6 +7,7 @@
 #include <tvm/tir/transform.h>
 
 #include "../op/builtin.h"
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -163,6 +164,21 @@ public:
   bool GetGlobalCopyPattern() const { return is_global_copy_pattern_; }
 
 private:
+  std::optional<BufferRegion>
+  GetBufferRegionFromAccessPtr(const PrimExpr &expr) const {
+    if (const auto *call = expr.as<CallNode>()) {
+      if (call->op.same_as(builtin::tvm_access_ptr()) && call->args.size() >= 5) {
+        if (const auto *var = call->args[1].as<VarNode>()) {
+          auto it = buffer_data_to_buffer_.find(GetRef<Var>(var));
+          if (it != buffer_data_to_buffer_.end()) {
+            return BufferRegion::FullRegion((*it).second);
+          }
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
   void VisitStmt_(const BufferStoreNode *op) final {
     Buffer store_buffer = op->buffer;
     Array<PrimExpr> indices = op->indices;
@@ -229,6 +245,21 @@ private:
         const BufferRegion buffer_region = BufferRegion::FullRegion(buffer);
         // because we only care about the buffer itself instead of indices
         reads_.push_back(buffer_region);
+      }
+    } else if (IsMlsLoadTileExternCall(op)) {
+      ICHECK_GE(op->args.size(), 8U);
+      auto src_region = GetBufferRegionFromAccessPtr(op->args[1]);
+      auto dst_region = GetBufferRegionFromAccessPtr(op->args[7]);
+      if (src_region) {
+        reads_.push_back(*src_region);
+      }
+      if (dst_region) {
+        writes_.push_back(*dst_region);
+      }
+      if (src_region && dst_region && (*src_region)->buffer.scope() == "global" &&
+          ((*dst_region)->buffer.scope() == "shared" ||
+           (*dst_region)->buffer.scope() == "shared.dyn")) {
+        is_global_copy_pattern_ = true;
       }
     } else if (op->op.same_as(builtin::if_then_else())) {
       within_condition_expr_ = true;

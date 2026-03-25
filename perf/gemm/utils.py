@@ -11,6 +11,7 @@ from tilelang.carver.arch import CUDA
 from tilelang.carver.arch import CDNA
 from tilelang.carver.roller.rasterization import NoRasterization
 
+'''
 from aiter.ops.triton.gemm_unquantized import gemm_unquantized
 
 def triton_gemm(A, B):
@@ -21,6 +22,7 @@ def triton_gemm(A, B):
     The result is a tensor with shape (M, N) equal to A @ B.T, using the inputs' dtypes.
     """
     return  gemm_unquantized(A, B, torch.float16)
+'''
 
 def ref_program(A, B):
     """
@@ -197,4 +199,5 @@ def get_heuristic_config() -> dict:
         "group_size": 1,  # Enable group swizzling optimization
         #"enable_rasteration": True,
         "wgs_per_cu": 2,
+        "use_mls": True,
     }

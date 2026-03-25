@@ -5,7 +5,7 @@ Benchmark script for all GEMM implementations.
 import argparse
 import torch
 import tilelang as tl
-from perf.gemm.utils import ref_program, get_heuristic_config, triton_gemm
+from perf.gemm.utils import ref_program, get_heuristic_config#, triton_gemm
 from perf.gemm.vanilla_gemm import (
     gemm_vanilla,
     get_best_vanilla_config,
@@ -123,8 +123,8 @@ def main(M: int = 4096,
     def ref_run():
         ref_program(*inputs)
 
-    def triton_run():
-        triton_gemm(*inputs)
+    # def triton_run():
+    #     triton_gemm(*inputs)
 
     # tilelang_latency = profiler.do_bench()
     # ref_latency = profiler.do_bench(ref_program)

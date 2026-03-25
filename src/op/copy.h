@@ -104,6 +104,9 @@ public:
   static constexpr const char *_type_key = "tl.Copy";
   TVM_DECLARE_FINAL_OBJECT_INFO(CopyNode, TileOperatorNode);
 
+  Array<Buffer> GetOutBuffers() const override { return {dst}; }
+  Array<Buffer> GetInBuffers() const override { return {src}; }
+
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
     refl::ObjectDef<CopyNode>()
@@ -325,6 +328,9 @@ public:
 
   static constexpr const char *_type_key = "tl.Conv2DIm2Col";
   TVM_DECLARE_FINAL_OBJECT_INFO(Conv2DIm2ColOpNode, TileOperatorNode);
+
+  Array<Buffer> GetOutBuffers() const override { return {dst}; }
+  Array<Buffer> GetInBuffers() const override { return {src}; }
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;

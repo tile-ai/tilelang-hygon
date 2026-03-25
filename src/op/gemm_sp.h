@@ -64,6 +64,10 @@ public:
 
   static constexpr const char *_type_key = "tl.GemmSP";
   TVM_DECLARE_FINAL_OBJECT_INFO(GemmSPNode, TileOperatorNode);
+
+  Array<Buffer> GetOutBuffers() const override { return {C}; }
+  Array<Buffer> GetInBuffers() const override { return {A, B, E}; }
+
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
   LayoutMap InferLayout(const LayoutInferArgs &T,
                         InferLevel level) const override;

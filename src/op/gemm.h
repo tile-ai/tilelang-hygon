@@ -64,12 +64,11 @@ public:
                                            Target target,
                                            GemmInst gemm_inst) const;
 
-  std::tuple<int, int, int> ComputeWarpPartitionHCU(int M, int N, int K,
-                                                     int k_pack,
-                                                     int element_byte_size,
-                                                     int block_size,
-                                                     Target target,
-                                                     GemmInst gemm_inst) const;
+  std::tuple<int, int, int> ComputeWarpPartitionHCU(
+      int M, int N, int K, int k_pack, int element_byte_size, int block_size,
+      Target target, GemmInst gemm_inst,
+      bool A_from_mls = false, bool B_from_mls = false,
+      bool A_mls_trans = true, bool B_mls_trans = true) const;
 
   bool isSquare() const {
     return policy_type == int(GemmWarpPolicyType::kSquare);
@@ -134,6 +133,9 @@ public:
 
   static constexpr const char *_type_key = "tl.Gemm";
   TVM_DECLARE_FINAL_OBJECT_INFO(GemmNode, TileOperatorNode);
+
+  Array<Buffer> GetOutBuffers() const override { return {C}; }
+  Array<Buffer> GetInBuffers() const override { return {A, B}; }
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -204,8 +206,9 @@ public:
 
   TileOperator Clone() const;
 
-private:
   GemmInst GetGemmInst(int block_size, Target target) const;
+
+private:
   bool AllowTCGEN5MMA(Target target) const;
   bool AllowWGMMA(int block_size, Target target) const;
 

@@ -141,6 +141,20 @@ def ThreadSync(storage_scope: str):
     return _ffi_api.ThreadSync(storage_scope)  # type: ignore
 
 
+def InsertMatrixLoadWaitcnt():
+    """Insert __builtin_amdgcn_s_waitcnt(0) before consumers of mls_load_tile.
+
+    matrix_load (mls_load_tile) is async; its consumers (tl_gemm) must wait
+    via s_waitcnt before using the loaded data. Only applies to HCU target.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.InsertMatrixLoadWaitcnt()  # type: ignore
+
+
 def ThreadPartialSync(storage_scope: str):
     """Insert partial sync.
 

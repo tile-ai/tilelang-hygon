@@ -9,8 +9,8 @@ from perf.gemm.utils import get_configs, _run_autotuner
 
 @tl.jit(out_idx=[-1])
 def gemm_vanilla(M, N, K, block_M, block_N, block_K,
-           num_stages, thread_num, enable_rasteration=True, group_size=8,
-           dtype="float16", accum_dtype="float"):
+           num_stages, thread_num, enable_rasteration=True, group_size=8, wgs_per_cu=1,
+           dtype="float16", accum_dtype="float", use_mls=False):
     """
     Vanilla GEMM kernel with optional group swizzling optimization.
 
@@ -42,9 +42,14 @@ def gemm_vanilla(M, N, K, block_M, block_N, block_K,
                 by = (tile_id % group_size) + (tile_id // group_size) // m_blocks * group_size
                 if bx * block_M < M and by * block_N < N:
                     for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
-                        T.copy(A[bx * block_M, k * block_K], A_shared, coalesced_width=8)
-                        T.copy(B[by * block_N, k * block_K], B_shared, coalesced_width=8)
-                        T.gemm(A_shared, B_shared, C_local, k_pack=2, transpose_B=True)
+                        if use_mls:
+                            T.matrix_load(A[bx * block_M, k * block_K], A_shared)
+                            T.matrix_load(B[by * block_N, k * block_K], B_shared)
+                            T.gemm(A_shared, B_shared, C_local, k_pack=1, transpose_B=True)
+                        else:
+                            T.copy(A[bx * block_M, k * block_K], A_shared, coalesced_width=8)
+                            T.copy(B[by * block_N, k * block_K], B_shared, coalesced_width=8)
+                            T.gemm(A_shared, B_shared, C_local, k_pack=2, transpose_B=True)
                     T.copy(C_local, C[bx * block_M, by * block_N])
         else:
             # Standard 2D grid with simple swizzle
@@ -56,17 +61,22 @@ def gemm_vanilla(M, N, K, block_M, block_N, block_K,
                 T.use_swizzle(panel_size=10, enable=enable_rasteration)
                 T.clear(C_local)
                 for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
-                    T.copy(A[by * block_M, k * block_K], A_shared, coalesced_width=8)
-                    T.copy(B[bx * block_N, k * block_K], B_shared, coalesced_width=8)
-                    T.gemm(A_shared, B_shared, C_local, k_pack=2, transpose_B=True)
+                    if use_mls:
+                        T.matrix_load(A[by * block_M, k * block_K], A_shared)
+                        T.matrix_load(B[bx * block_N, k * block_K], B_shared)
+                        T.gemm(A_shared, B_shared, C_local, k_pack=1, transpose_B=True)
+                    else:
+                        T.copy(A[by * block_M, k * block_K], A_shared, coalesced_width=8)
+                        T.copy(B[bx * block_N, k * block_K], B_shared, coalesced_width=8)
+                        T.gemm(A_shared, B_shared, C_local, k_pack=2, transpose_B=True)
                 T.copy(C_local, C[by * block_M, bx * block_N])
 
     return _gemm_vanilla
 
-@tl.jit(out_idx=[-1])
+@tl.jit(out_idx=[-1], pass_configs={"tl.disable_thread_storage_sync": False,})
 def gemm_vanilla_v1(M, N, K, block_M, block_N, block_K,
            num_stages, thread_num, enable_rasteration=True, group_size=8, wgs_per_cu=1,
-           dtype="float16", accum_dtype="float"):
+           dtype="float16", accum_dtype="float", use_mls=False):
     """
     Vanilla GEMM kernel with optional group swizzling optimization.
 
@@ -96,6 +106,7 @@ def gemm_vanilla_v1(M, N, K, block_M, block_N, block_K,
             
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared_0 = T.alloc_shared((sub_block_N, block_K), dtype)
+            # B_shared_1 = T.alloc_shared((sub_block_N, block_K), dtype)
             
             A_local_0 = T.alloc_fragment((block_M, block_K), dtype)
             A_local_0_ = T.alloc_fragment((block_M, block_K), dtype)
@@ -120,29 +131,57 @@ def gemm_vanilla_v1(M, N, K, block_M, block_N, block_K,
             T.clear(C_local_0)
             T.clear(C_local_1)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
-                # T.copy(A[bx * block_M, k * block_K], A_shared, coalesced_width=8)
-                T.copy(A[by * block_M, k * block_K], A_local_0, coalesced_width=8)
-                # A Block swizzle
-                T.copy(A_local_0, A_shared)
+                if not use_mls:
+                    T.copy(A[by * block_M, k * block_K], A_local_0, coalesced_width=8)
+                    # A Block swizzle
+                    T.copy(A_local_0, A_shared)
 
-                # preload B Block N_0
-                T.copy(B[bx * block_N, k * block_K], B_local_0, coalesced_width=8)
-                # preload B Block N_1
-                T.copy(B[bx * block_N + sub_block_N, k * block_K], B_local_1, coalesced_width=8)
-                
-                # B Block N_0 swizzle
-                T.copy(B_local_0, B_shared_0)
-                T.copy(B_shared_0, B_local_0_)
-                
-                # B Block N_1 swizzle
-                T.copy(B_local_1, B_shared_0)
-                T.copy(B_shared_0, B_local_1_)
-                
-                # A local
-                T.copy(A_shared, A_local_0_)
-                
-                T.gemm(A_local_0_, B_local_0_, C_local_0, k_pack=2, transpose_B=True)
-                T.gemm(A_local_0_, B_local_1_, C_local_1, k_pack=2, transpose_B=True)
+                    # preload B Block N_0
+                    T.copy(B[bx * block_N, k * block_K], B_local_0, coalesced_width=8)
+                    # preload B Block N_1
+                    T.copy(B[bx * block_N + sub_block_N, k * block_K], B_local_1, coalesced_width=8)
+                    
+                    # B Block N_0 swizzle
+                    T.copy(B_local_0, B_shared_0)
+                    T.copy(B_shared_0, B_local_0_)
+                    
+                    # B Block N_1 swizzle
+                    T.copy(B_local_1, B_shared_0)
+                    T.copy(B_shared_0, B_local_1_)
+                    
+                    # A local
+                    T.copy(A_shared, A_local_0_)
+                    
+                    T.gemm(A_local_0_, B_local_0_, C_local_0, k_pack=2, transpose_B=True)
+                    T.gemm(A_local_0_, B_local_1_, C_local_1, k_pack=2, transpose_B=True)
+                else:
+                    # A -> A_shared
+                    T.matrix_load(A[by * block_M, k * block_K], A_shared)
+                    
+                    # preload B Block N_0
+                    T.matrix_load(B[bx * block_N, k * block_K], B_shared_0)
+                    
+                    # A_shared -> A_local_0_
+                    T.s_waitcnt(1)
+                    T.sync_threads()
+                    T.ds_read_format(A_shared, A_local_0_)
+                    
+                    # B_shared_0 -> B_local_0_
+                    T.s_waitcnt(0)
+                    T.sync_threads()
+                    T.ds_read_format(B_shared_0, B_local_0_)
+
+                    # preload B Block N_1
+                    T.matrix_load(B[bx * block_N + sub_block_N, k * block_K], B_shared_0)
+                    
+                    # B_shared_0 -> B_local_1_
+                    T.s_waitcnt(0)
+                    T.sync_threads()
+                    T.ds_read_format(B_shared_0, B_local_1_)
+                    
+                    T.gemm(A_local_0_, B_local_0_, C_local_0, k_pack=1, transpose_B=True)
+                    T.gemm(A_local_0_, B_local_1_, C_local_1, k_pack=1, transpose_B=True)
+                    
 
             T.copy(C_local_0, C_shared_0)
             T.copy(C_shared_0, C[by * block_M, bx * block_N])

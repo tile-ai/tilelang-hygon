@@ -107,6 +107,17 @@ bool TargetHasMmacLitLts(Target target) {
   return false;
 }
 
+std::string GetHcuArchString(Target target) {
+  ICHECK(TargetIsHCU(target)) << "GetHcuArchString requires HCU target";
+  ICHECK(target->attrs.count("mcpu")) << "HCU target must have mcpu attribute";
+  std::string mcpu = Downcast<String>(target->attrs.at("mcpu"));
+  static const std::set<std::string> supported = {"gfx938", "gfx92a", "gfx946"};
+  ICHECK(supported.count(mcpu))
+      << "HCU arch " << mcpu
+      << " not supported for MLS/GEMM_MLS; supported: gfx938, gfx92a, gfx946";
+  return mcpu;
+}
+
 bool TargetHasAsyncCopy(Target target) {
   if (TargetIsCuda(target)) {
     int arch = GetArchInt(target);

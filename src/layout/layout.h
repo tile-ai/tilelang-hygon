@@ -149,11 +149,13 @@ Fragment makeGemmFragmentCCDNA(const int block_m, const int block_n,
 Fragment makeGemmFragmentHCU(const int block_m, const int block_n,
                                const int num_warp_m, const int num_warp_n,
                                const int num_warp_k,
-                               const int element_size);
+                               const int element_size,
+                               const int min_n_per_warp = 16);
 Fragment makeGemmFragmentHCULit(const int block_m, const int block_n,
                                const int num_warp_m, const int num_warp_n,
                                const int num_warp_k,
-                               const int element_size);
+                               const int element_size,
+                               const int min_n_per_warp = 16);
 Fragment makeGemmFragmentCHopper(const int block_m, const int block_n,
                                  const int warp_m, const int warp_n,
                                  const int element_size);
@@ -180,7 +182,13 @@ Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
                                const int block_k, const int num_warp_m,
                                const int num_warp_n, const int num_warp_k,
                                const int element_size,
-                               const int k_pack, bool transposed = false);
+                               const int k_pack, bool transposed = false,
+                               const int min_n_per_warp = 16);
+
+Fragment makeDsReadFormatFragmentHCU(const int block_mn, const int block_k,
+                                     const int num_warp_mn, const int num_warp_k,
+                                     const int element_size,
+                                     const int num_warp_mn_no_recompute, bool trans);
 
 // Default Memory Layout
 Layout makeGemmLayoutLinear(int stride, int continuous);

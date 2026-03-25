@@ -140,6 +140,8 @@ private:
   bool need_wmma_h_{false};
   // whether need fp8.h
   bool enable_fp8_{false};
+  // whether need gemm_mls.h (when gemm uses MLS or matrix_load exists)
+  bool enable_gemm_mls_{false};
   // The size of the barrier array in shared memory
   int barrier_count_ = -1;
   // whether need mma.h

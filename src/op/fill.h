@@ -23,6 +23,9 @@ public:
   static constexpr const char *_type_key = "tl.Fill";
   TVM_DECLARE_FINAL_OBJECT_INFO(FillNode, TileOperatorNode);
 
+  Array<Buffer> GetOutBuffers() const override { return {dst}; }
+  Array<Buffer> GetInBuffers() const override { return {}; }
+
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const;
   LayoutMap InferLayout(const LayoutInferArgs &T, InferLevel level) const;
   static const Op &Get();

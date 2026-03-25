@@ -9,14 +9,17 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 #include <tvm/tir/utils.h>
+#include <memory>
 #include <unordered_map>
 
 #include "../layout/layout.h"
 #include "../layout/utils.h"
 #include "../op/builtin.h"
+#include "../op/copy.h"
 #include "../op/gemm.h"
 #include "../op/gemm_sp.h"
 #include "../op/operator.h"
+#include "../op/propagation_tir_collector.h"
 
 #include "arith/ir_mutator_with_analyzer.h"
 #include "loop_partition.h"
@@ -153,6 +156,28 @@ private:
   Array<Var> buffer_var_gemm_;
 };
 
+/// Collects alloc_buffers from all blocks to build buffer_data_to_buffer_ before
+/// the main substituter runs.
+class AllocBufferCollector : public StmtVisitor {
+public:
+  Map<Var, Buffer> &buffer_data_to_buffer;
+
+  explicit AllocBufferCollector(Map<Var, Buffer> &out) : buffer_data_to_buffer(out) {}
+
+  void Collect(const Stmt &stmt) { VisitStmt(stmt); }
+
+private:
+  void VisitStmt_(const BlockNode *op) final {
+    for (const Buffer &b : op->alloc_buffers) {
+      buffer_data_to_buffer.Set(b->data, b);
+    }
+    for (const MatchBufferRegion &m : op->match_buffers) {
+      buffer_data_to_buffer.Set(m->buffer->data, m->buffer);
+    }
+    StmtVisitor::VisitStmt_(op);
+  }
+};
+
 /*!
  * \brief A class that rewrites buffer references in a statement based on a
  * given buffer remapping.
@@ -250,6 +275,13 @@ public:
     for (const auto &[_, buffer] : f->buffer_map) {
       substituter.buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
+    // Pre-collect alloc_buffers from blocks so buffer_data_to_buffer_ is
+    // complete before lowering.
+    AllocBufferCollector alloc_collector(substituter.buffer_data_to_buffer_);
+    alloc_collector.Collect(f->body);
+    substituter.propagation_tir_collector_ =
+        std::make_unique<PropagationTirCollector>(substituter.buffer_data_to_buffer_);
+    substituter.propagation_tir_collector_->Collect(f->body);
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
     ICHECK(target.defined()) << "LowerTileOpPass: Require the target attribute";
     substituter.target_ = target.value();
@@ -286,9 +318,6 @@ private:
     }
     for (auto match_buffer : op->match_buffers) {
       buffer_map_.insert({match_buffer->buffer->data, match_buffer->buffer});
-    }
-    for (auto buffer : op->alloc_buffers) {
-      buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
     Map<Var, Layout> vmap;
     if (op->annotations.count(attr::kLayoutMap)) {
@@ -678,7 +707,9 @@ private:
 
     auto lowered = tile_op->Lower(
         LowerArgs{target_, thread_bounds, thread_var_->var, callback,
-                  layout_map_, buffer_remap_, buffer_var_gemm_},
+                 layout_map_, buffer_remap_, buffer_var_gemm_,
+                 propagation_tir_collector_ ? propagation_tir_collector_.get()
+                                           : nullptr},
         analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }
@@ -717,6 +748,7 @@ private:
   Map<Var, Var> var_remap_;
   bool has_tma_{false};
   Array<Var> buffer_var_gemm_;
+  std::unique_ptr<PropagationTirCollector> propagation_tir_collector_;
 };
 
 namespace transform {

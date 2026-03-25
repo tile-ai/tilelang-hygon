@@ -197,11 +197,11 @@ Fragment makeGemmFragmentCCDNA(const int block_m, const int block_n,
 Fragment makeGemmFragmentHCU(const int block_m, const int block_n,
   const int num_warp_m, const int num_warp_n,
   const int num_warp_k,
-  const int element_size) {
+  const int element_size,
+  const int min_n_per_warp) {
 if (element_size == 64)
   LOG(FATAL) << "Not supported";
 
-auto min_n_per_warp = 16;
 auto warp_m = block_m / num_warp_m;
 auto num_warp_n_no_recompute = std::min(num_warp_n, block_n / min_n_per_warp);
 auto warp_n = block_n / num_warp_n_no_recompute;
@@ -230,11 +230,11 @@ return block_layout;
 Fragment makeGemmFragmentHCULit(const int block_m, const int block_n,
   const int num_warp_m, const int num_warp_n,
   const int num_warp_k,
-  const int element_size) {
+  const int element_size,
+  const int min_n_per_warp) {
 if (element_size == 64)
   LOG(FATAL) << "Not supported";
 
-auto min_n_per_warp = 16;
 auto warp_m = block_m / num_warp_m;
 auto num_warp_n_no_recompute = std::min(num_warp_n, block_n / min_n_per_warp);
 auto warp_n = block_n / num_warp_n_no_recompute;
@@ -430,10 +430,11 @@ Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
                                const int block_k, const int num_warp_m,
                                const int num_warp_n, const int num_warp_k,
                                const int element_size,
-                               const int k_pack, bool transposed) {
-  ICHECK(block_n % 16 == 0);
+                               const int k_pack, bool transposed,
+                               const int min_n_per_warp) {
+  ICHECK(block_n % min_n_per_warp == 0);
   // for now we only support recompute for N dimension
-  auto warp_n_no_recompute = std::min(num_warp_n, block_n / 16);
+  auto warp_n_no_recompute = std::min(num_warp_n, block_n / min_n_per_warp);
   auto warp_n = block_n / warp_n_no_recompute;
   auto n_recompute = num_warp_n / warp_n_no_recompute;
   auto warp_k = block_k / num_warp_k;
@@ -442,7 +443,7 @@ Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
   }
 
   ICHECK(block_n % warp_n == 0);
-  ICHECK(warp_n % 16 == 0);
+  ICHECK(warp_n % min_n_per_warp == 0);
   const int mfma_k = k_pack * (element_size == 16 ? 16 : 32);
   ICHECK(warp_k % mfma_k == 0);
   ICHECK(element_size == 8 || element_size == 16)
@@ -478,6 +479,40 @@ Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
     }
     return block_layout;
   }
+}
+
+Fragment makeDsReadFormatFragmentHCU(const int block_mn, const int block_k,
+                                     const int num_warp_mn, const int num_warp_k,
+                                     const int element_size,
+                                     const int num_warp_mn_no_recompute, bool trans) {
+  // trans=true: dst shape (mn, k), layout dims (MN, K).
+  // trans=false: dst shape (k, mn), layout dims (K, MN).
+  int n = num_warp_mn_no_recompute;
+  if (n < 1) n = 1;
+  auto warp_mn = block_mn / n;
+  auto mn_recompute = num_warp_mn / n;
+  auto warp_k = block_k / num_warp_k;
+
+  const int k_pack = 1;
+  const int mfma_k = k_pack * (element_size == 16 ? 16 : 32);
+
+  auto base_layout =
+      element_size == 16
+          ? (trans ? makeGemmFragmentAB16x16CDNA(k_pack)->Repeat({1, 1}, false, false)
+                   : makeGemmFragmentAB16x16CDNATransposed(k_pack)->Repeat(
+                         {1, 1}, false, false))
+          : (trans ? makeGemmFragmentAB16x32CDNA(k_pack)->Repeat({1, 1}, false, false)
+                   : makeGemmFragmentAB16x32CDNATransposed(k_pack)->Repeat(
+                         {1, 1}, false, false));
+  auto warp_layout = trans
+                         ? base_layout->Repeat({warp_mn / 16, warp_k / mfma_k}, false, false)
+                         : base_layout->Repeat({warp_k / mfma_k, warp_mn / 16}, false, true);
+  auto block_layout = trans ? warp_layout->Repeat({n, num_warp_k}, true, false)
+                            : warp_layout->Repeat({num_warp_k, n}, true, true);
+  if (mn_recompute > 1) {
+    block_layout = block_layout->Replicate(mn_recompute);
+  }
+  return block_layout;
 }
 
 Fragment makeGemmFragment32x32(int element_size) {

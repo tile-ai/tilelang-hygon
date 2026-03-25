@@ -7,6 +7,7 @@
 #ifndef TVM_TL_TARGET_UTILS_H_
 #define TVM_TL_TARGET_UTILS_H_
 
+#include <string>
 #include <tvm/target/target.h>
 
 namespace tvm {
@@ -24,6 +25,8 @@ bool TargetIsSM120(Target target);
 bool TargetIsCDNA(Target target);
 bool TargetIsHCU(Target target);
 bool TargetHasMmacLitLts(Target target);
+/// Return mcpu string for HCU target (e.g. "gfx938"). Caller adds prefix as needed.
+std::string GetHcuArchString(Target target);
 bool TargetHasAsyncCopy(Target target);
 bool TargetHasLdmatrix(Target target);
 bool TargetHasStmatrix(Target target);
