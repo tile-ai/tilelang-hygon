@@ -1,3 +1,4 @@
+from __future__ import annotations
 import sys
 import os
 import pathlib
@@ -5,7 +6,6 @@ import logging
 import shutil
 import glob
 from dataclasses import dataclass
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ TL_TEMPLATE_NOT_FOUND_MESSAGE = ("TileLang is not installed or found in the expe
 TVM_LIBRARY_NOT_FOUND_MESSAGE = ("TVM is not installed or found in the expected path")
 
 TL_ROOT = os.path.dirname(os.path.abspath(__file__))
-TL_LIBS = [os.path.join(i, 'lib') for i in [TL_ROOT]]
+TL_LIBS = [TL_ROOT, os.path.join(TL_ROOT, 'lib')]
 TL_LIBS = [i for i in TL_LIBS if os.path.exists(i)]
 
 DEV = False
@@ -36,6 +36,10 @@ if not os.path.exists(THIRD_PARTY_ROOT):
 
 assert TL_LIBS and all(
     os.path.exists(i) for i in TL_LIBS), f'tilelang lib root do not exists: {TL_LIBS}'
+
+for lib in TL_LIBS:
+    if lib not in sys.path:
+        sys.path.insert(0, lib)
 
 
 def _find_cuda_home() -> str:
@@ -166,7 +170,7 @@ class EnvVar:
 
     key: str  # Environment variable name (e.g. "TILELANG_PRINT_ON_COMPILATION")
     default: str  # Default value if the environment variable is not set
-    _forced_value: Optional[str] = None  # Temporary runtime override (mainly for tests/debugging)
+    _forced_value: str | None = None  # Temporary runtime override (mainly for tests/debugging)
 
     def get(self):
         if self._forced_value is not None:
@@ -190,12 +194,6 @@ class EnvVar:
         self._forced_value = value
         # Uncomment the following line if you want the override to persist globally:
         # os.environ[self.key] = value
-
-
-# Cache control API (wrap CacheState)
-enable_cache = CacheState.enable
-disable_cache = CacheState.disable
-is_cache_enabled = CacheState.is_enabled
 
 
 # Utility function for environment variables with defaults
@@ -230,10 +228,18 @@ class Environment:
     # Kernel Build options
     TILELANG_PRINT_ON_COMPILATION = EnvVar("TILELANG_PRINT_ON_COMPILATION",
                                            "1")  # print kernel name on compile
-    TILELANG_CLEAR_CACHE = EnvVar("TILELANG_CLEAR_CACHE", "0")  # clear cache automatically if set
+    TILELANG_DISABLE_CACHE = EnvVar(
+        "TILELANG_DISABLE_CACHE",
+        "0")  # disable kernel cache, usually for unit testing / debugging, high priority
+    TILELANG_CLEAR_CACHE = EnvVar("TILELANG_CLEAR_CACHE",
+                                  "0")  # DEPRECATED! clear cache automatically if set
+
+    # GEMM v1 (C++ `tl.tileop.gemm`) vs v2 (`tl.tileop.gemm_py`); default on until HCU/gemm_v2 is ready.
+    TILELANG_USE_GEMM_V1 = EnvVar("TILELANG_USE_GEMM_V1", "1")
     TILELANG_SOURCE_RECOMPILE = EnvVar("TILELANG_SOURCE_RECOMPILE", "0")  # cuda source aware recompilation
 
     # Auto-tuning settings
+    TILELANG_AUTO_TUNING_DISABLE_CACHE = EnvVar("TILELANG_AUTO_TUNING_DISABLE_CACHE", "0")
     TILELANG_AUTO_TUNING_CPU_UTILITIES = EnvVar("TILELANG_AUTO_TUNING_CPU_UTILITIES",
                                                 "0.9")  # percent of CPUs used
     TILELANG_AUTO_TUNING_CPU_COUNTS = EnvVar("TILELANG_AUTO_TUNING_CPU_COUNTS",
@@ -260,7 +266,7 @@ class Environment:
 
     # Cache control API (wrap CacheState)
     def is_cache_enabled(self) -> bool:
-        return CacheState.is_enabled()
+        return not self.is_cache_globally_disabled() and CacheState.is_enabled()
 
     def enable_cache(self) -> None:
         CacheState.enable()
@@ -268,12 +274,31 @@ class Environment:
     def disable_cache(self) -> None:
         CacheState.disable()
 
+    def is_cache_globally_disabled(self) -> bool:
+        return self.TILELANG_DISABLE_CACHE.lower() in ("1", "true", "yes", "on")
+
+    def is_autotune_cache_disabled(self) -> bool:
+        return self.TILELANG_AUTO_TUNING_DISABLE_CACHE.lower() in ("1", "true", "yes", "on")
+
     def is_print_on_compilation_enabled(self) -> bool:
         return self.TILELANG_PRINT_ON_COMPILATION.lower() in ("1", "true", "yes", "on")
+
+    def use_gemm_v1(self) -> bool:
+        """Return True if GEMM v1 should be used based on env.
+
+        Controlled by `TILELANG_USE_GEMM_V1`. Truthy values are one of
+        {"1", "true", "yes", "on"} (case-insensitive).
+        """
+        return str(self.TILELANG_USE_GEMM_V1).lower() in ("1", "true", "yes", "on")
 
 
 # Instantiate as a global configuration object
 env = Environment()
+
+# Cache control API (wrap env, which is managed by CacheState and Environment Variables jointly)
+enable_cache = env.enable_cache  # CacheState.enable
+disable_cache = env.disable_cache  # CacheState.disable
+is_cache_enabled = env.is_cache_enabled  # CacheState.is_enabled
 
 # Export CUDA_HOME and ROCM_HOME, both are static variables
 # after initialization.
@@ -294,15 +319,14 @@ def prepend_pythonpath(path):
 if env.TVM_IMPORT_PYTHON_PATH is not None:
     prepend_pythonpath(env.TVM_IMPORT_PYTHON_PATH)
 else:
-    tvm_path = os.path.join(THIRD_PARTY_ROOT, "tvm")
+    tvm_path = os.path.join(THIRD_PARTY_ROOT, 'tvm', 'python')
     assert os.path.exists(tvm_path), tvm_path
     if tvm_path not in sys.path:
-        tvm_python_binding = os.path.join(tvm_path, 'python')
-        prepend_pythonpath(tvm_python_binding)
-        env.TVM_IMPORT_PYTHON_PATH = tvm_python_binding
-
-    if os.environ.get("TVM_LIBRARY_PATH") is None:
-        os.environ['TVM_LIBRARY_PATH'] = env.TVM_LIBRARY_PATH = os.pathsep.join(TL_LIBS)
+        prepend_pythonpath(tvm_path)
+        env.TVM_IMPORT_PYTHON_PATH = tvm_path
+# By default, the built TVM-related libraries are stored in TL_LIBS.
+if os.environ.get("TVM_LIBRARY_PATH") is None:
+    os.environ['TVM_LIBRARY_PATH'] = env.TVM_LIBRARY_PATH = os.pathsep.join(TL_LIBS)
 
 # Initialize CUTLASS paths
 if os.environ.get("TL_CUTLASS_PATH", None) is None:

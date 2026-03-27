@@ -26,8 +26,8 @@ class DsReadFormatNode : public TileOperatorNode {
   mutable int warp_k = 0;
   mutable bool completed_ = false;
 
-  static constexpr const char *_type_key = "tl.DsReadFormat";
-  TVM_DECLARE_FINAL_OBJECT_INFO(DsReadFormatNode, TileOperatorNode);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.DsReadFormat", DsReadFormatNode,
+                                    TileOperatorNode);
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
   LayoutMap InferLayout(const LayoutInferArgs &T,
@@ -39,8 +39,9 @@ class DsReadFormatNode : public TileOperatorNode {
 
 class DsReadFormat : public TileOperator {
  public:
-  TVM_DEFINE_OBJECT_REF_METHODS(DsReadFormat, TileOperator, DsReadFormatNode);
-  TVM_DLL DsReadFormat(Array<PrimExpr> args, BufferMap vmap);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(DsReadFormat, TileOperator,
+                                             DsReadFormatNode);
+  TVM_DLL DsReadFormat(Array<PrimExpr> args);
   static const Op &Get();
 };
 

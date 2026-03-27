@@ -33,6 +33,9 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kEnablePTXASVerboseOutput, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableVectorize256, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableWGMMA, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableShuffleElect, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kStorageRewriteDetectInplace, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kLayoutVisualizationEnable, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kLayoutVisualizationFormats, String);
 
 DataType cuTensorMapType() { return DataType::UInt(8, 128); }
 
@@ -154,6 +157,16 @@ TIR_DEFINE_TL_BUILTIN(ptx_wgmma_rs)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ptx_tcgen05_mma_ss)
+    .set_num_inputs(14)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ptx_tcgen05_mma_ts)
+    .set_num_inputs(13)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ptx_init_tensor_memory)
     .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind",
@@ -161,6 +174,11 @@ TIR_DEFINE_TL_BUILTIN(ptx_init_tensor_memory)
 
 TIR_DEFINE_TL_BUILTIN(ptx_deallocate_tensor_memory)
     .set_num_inputs(2)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ptx_mma_sm70)
+    .set_num_inputs(13)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
@@ -215,6 +233,11 @@ TIR_DEFINE_TL_BUILTIN(warpgroup_commit_batch)
 
 TIR_DEFINE_TL_BUILTIN(warpgroup_wait)
     .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(warpgroup_fence_operand)
+    .set_num_inputs(4)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
@@ -285,8 +308,13 @@ TIR_DEFINE_TL_BUILTIN(tl_shuffle_elect)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kPure));
 
-TIR_DEFINE_TL_BUILTIN(initialize_descriptor)
+TIR_DEFINE_TL_BUILTIN(initialize_wgmma_descriptor)
     .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(initialize_tcgen05_descriptor)
+    .set_num_inputs(7)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
@@ -296,7 +324,47 @@ TIR_DEFINE_TL_BUILTIN(increase_descriptor_offset)
                                Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_BUILTIN(atomicadd_elem_op)
+    .set_num_inputs(3)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(device_assert)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(device_assert_with_msg)
     .set_num_inputs(2)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(tcgen05_mma_arrive)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(warp_reduce_sum)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(warp_reduce_max)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(warp_reduce_min)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(warp_reduce_bitand)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(warp_reduce_bitor)
+    .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 

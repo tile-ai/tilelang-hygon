@@ -1,10 +1,8 @@
 """The language interface for tl programs."""
-
 from tvm.script.ir_builder.tir.frame import TIRFrame
 from tvm.ffi import register_object
 from tilelang import _ffi_api
 from .kernel import get_thread_bindings, get_thread_extents
-from typing import List
 
 
 @register_object("tl.WarpSpecializeFrame")
@@ -45,7 +43,7 @@ def WarpSpecialize(*warp_group_idx):
     # only available for nvidia gpus.
     warp_group_size = 128
 
-    warp_group_ids: List[int] = []
+    warp_group_ids: list[int] = []
     for warp_group_id in warp_group_idx:
         warp_group_ids.append(warp_group_id)
 

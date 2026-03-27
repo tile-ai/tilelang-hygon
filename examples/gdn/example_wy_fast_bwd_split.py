@@ -22,8 +22,6 @@ import torch.nn.functional as F
 torch.random.manual_seed(0)
 torch.set_printoptions(profile="full")
 
-tilelang.disable_cache()
-
 
 def prepare_input_fake(
     B,
@@ -503,7 +501,7 @@ def run_test(
     dg_tilelang = dg_tilelang + dg_tilelang_A_positive.sum(dim=-1) - dg_tilelang_A_negative.sum(
         dim=-1)
 
-    from utils import assert_similar
+    from test_utils import assert_similar
     assert_similar(dk_ref, dk_tilelang, eps=1e-5, name="dk", raise_assert=False)
     assert_similar(dv_ref, dv_tilelang, eps=1e-5, name="dv", raise_assert=False)
     assert_similar(dbeta_ref, dbeta_tilelang, eps=1e-5, name="dbeta", raise_assert=False)

@@ -2,6 +2,7 @@
 #include "runtime/cuda/cuda_module.h"
 #include "runtime/pack_args.h"
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/transform.h>
 
 namespace tvm {
 namespace codegen {
@@ -24,20 +25,25 @@ ExtractFuncInfo(const IRModule &mod) {
           continue;
         }
       }
-      info.arg_types.push_back(f->params[i].dtype());
+      DataType dtype = f->params[i].dtype();
+      // Device runtime cannot directly take bool arguments, map to int32.
+      if (dtype.is_bool())
+        dtype = DataType::Int(32);
+      info.arg_types.push_back(dtype);
     }
-    if (auto opt = f->GetAttr<Array<String>>(tir::attr::kKernelLaunchParams)) {
+    if (auto opt = f->GetAttr<ffi::Array<ffi::String>>(
+            tir::attr::kKernelLaunchParams)) {
       for (const auto &tag : opt.value()) {
         info.launch_param_tags.push_back(tag);
       }
     }
-    auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
+    auto global_symbol = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
     fmap[static_cast<std::string>(global_symbol.value())] = info;
   }
   return fmap;
 }
 
-runtime::Module BuildTileLangCUDA(IRModule mod, Target target) {
+ffi::Module BuildTileLangCUDA(IRModule mod, Target target) {
   bool output_ssa = false;
   CodeGenTileLangCUDA cg;
   cg.Init(output_ssa);
@@ -61,7 +67,10 @@ runtime::Module BuildTileLangCUDA(IRModule mod, Target target) {
   std::string ptx;
   if (const auto f =
           ffi::Function::GetGlobal("tilelang_callback_cuda_compile")) {
-    ptx = (*f)(code, target).cast<std::string>();
+    // Fetch current pass context config and pass into the compile callback
+    tvm::transform::PassContext pass_ctx =
+        tvm::transform::PassContext::Current();
+    ptx = (*f)(code, target, pass_ctx->config).cast<std::string>();
     if (ptx[0] != '/')
       fmt = "cubin";
   } else {
@@ -70,7 +79,7 @@ runtime::Module BuildTileLangCUDA(IRModule mod, Target target) {
   return runtime::CUDAModuleCreate(ptx, fmt, ExtractFuncInfo(mod), code);
 }
 
-runtime::Module BuildTileLangCUDAWithoutCompile(IRModule mod, Target target) {
+ffi::Module BuildTileLangCUDAWithoutCompile(IRModule mod, Target target) {
   bool output_ssa = false;
   CodeGenTileLangCUDA cg;
   cg.Init(output_ssa);
@@ -93,13 +102,13 @@ runtime::Module BuildTileLangCUDAWithoutCompile(IRModule mod, Target target) {
   return runtime::CUDAModuleCreate("ptx", "ptx", ExtractFuncInfo(mod), code);
 }
 
-TVM_FFI_STATIC_INIT_BLOCK({
+TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
       .def("target.build.tilelang_cuda", BuildTileLangCUDA)
       .def("target.build.tilelang_cuda_without_compile",
            BuildTileLangCUDAWithoutCompile);
-});
+}
 
 } // namespace codegen
 } // namespace tvm

@@ -37,9 +37,9 @@ def sparse_mla_fwd(
     else:
         sm_scale = sm_scale * 1.44269504  # log2(e)
 
-    batch = T.symbolic("batch")
-    seq_len = T.symbolic("seq_len")
-    seq_len_kv = T.symbolic("seq_len_kv")
+    batch = T.dynamic("batch")
+    seq_len = T.dynamic("seq_len")
+    seq_len_kv = T.dynamic("seq_len_kv")
 
     head_kv = heads // kv_group
     q_shape = [batch, seq_len, heads, dim + tail_dim]
@@ -147,6 +147,8 @@ def sparse_mla_fwd(
                 )
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                for h_i in T.Parallel(H_per_block):
+                    m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
                 for h_i in T.Parallel(H_per_block):
                     alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                 for h_i, bi_i in T.Parallel(H_per_block, BI):

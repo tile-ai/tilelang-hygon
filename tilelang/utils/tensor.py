@@ -1,11 +1,24 @@
-from __future__ import annotations
 """The profiler and convert to torch utils"""
 from enum import Enum
 import torch
-from tvm.runtime import ndarray
 from tvm import tir
-from torch.utils.dlpack import to_dlpack
 import numpy as np
+
+
+def is_float8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in {
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    }
+
+
+def fp8_remove_negative_zeros_(tensor: torch.Tensor):
+    assert is_float8_dtype(tensor.dtype), "Input tensor must be of float8 dtype"
+    bits = tensor.view(torch.uint8)
+    zeros_mask = (tensor == 0)
+    bits[zeros_mask] = 0x00
 
 
 class TensorSupplyType(Enum):
@@ -36,23 +49,6 @@ def map_torch_type(intype: str) -> torch.dtype:
         return torch.float8_e4m3fnuz
     else:
         return getattr(torch, intype)
-
-
-def adapt_torch2tvm(arg):
-    float8_dtype_map = {
-        torch.float8_e4m3fn: "float8_e4m3",
-        torch.float8_e4m3fnuz: "float8_e4m3",
-        torch.float8_e5m2: "float8_e5m2",
-        torch.float8_e5m2fnuz: "float8_e5m2",
-    }
-    if isinstance(arg, torch.Tensor):
-        if arg.dtype in {
-                torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz
-        }:
-            return ndarray.from_dlpack(to_dlpack(arg.view(torch.int8)))._create_view(
-                shape=arg.shape, dtype=float8_dtype_map[arg.dtype])
-        return ndarray.from_dlpack(to_dlpack(arg))
-    return arg
 
 
 def get_tensor_supply(supply_type: TensorSupplyType = TensorSupplyType.Integer):

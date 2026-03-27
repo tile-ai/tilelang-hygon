@@ -178,7 +178,7 @@ ParallelOpNode::ParallelOpNode(For root) : root_(root), V(this) {
 }
 
 TileOperator ParallelOpNode::Clone() const {
-  auto op = make_object<ParallelOpNode>(*this);
+  auto op = tvm::ffi::make_object<ParallelOpNode>(*this);
   return ParallelOp(op);
 }
 
@@ -214,6 +214,7 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
                                       InferLevel level) const {
   if (loop_layout_.defined())
     return {};
+
   if (level == InferLevel::kStrict) {
     LayoutMap results;
     // Deduce buffers that should be complicated replicated.
@@ -252,17 +253,18 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
           forward_vars.push_back(
               IterVar(Range(0, s), Var(), IterVarType::kDataPar));
         }
-        Array<PrimExpr> forward_index;
-        for (const auto &iv : forward_vars) {
-          forward_index.push_back(iv->var);
-        }
         Var rep;
         auto rep_iter =
             IterVar({0, T.thread_bounds->extent}, rep, IterVarType::kDataPar);
 
+        // Use default fragment indexing (single output dim) to
+        // stay consistent with other ops (e.g., ReduceOp), and
+        // bind the thread range for comparability.
         const PrimExpr &forward_thread = rep;
-        results.Set(buffer, Fragment(forward_vars, forward_index,
-                                     forward_thread, rep_iter));
+        auto frag = Fragment(forward_vars, /*forward_index=*/{}, forward_thread,
+                             rep_iter)
+                        ->BindThreadRange(T.thread_bounds);
+        results.Set(buffer, frag);
       }
     }
     return results;
@@ -373,8 +375,21 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
           throw LayoutConflictException(oss.str());
         }
       });
-      result = Fragment(loop_vars_, {}, loop_var_to_thread, rep_iter)
-                   ->BindThreadRange(T.thread_bounds);
+
+      try {
+        result = Fragment(loop_vars_, {}, loop_var_to_thread, rep_iter)
+                     ->BindThreadRange(T.thread_bounds);
+      } catch (const tvm::runtime::Error &err) {
+        std::ostringstream msg;
+        msg << "Layout inference for buffer `" << buffer->name
+            << "` failed inside `T.parallel` loop.";
+
+        msg << "\nUnderlying TVM error: " << err.what();
+        msg << "\nProblematic loop AST:\n " << root_;
+        msg << "\nHint: ensure the loop extent divides the thread binding or "
+               "adjust the fragment mapping.";
+        LOG(FATAL) << msg.str();
+      }
     }
     DLOG(INFO) << "[compute_loop_layout_from_buffer] ... and get "
                << result->DebugOutput() << '\n';
@@ -429,7 +444,6 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
         }
       }
     });
-
     if (read_source_buffer.defined() && allow_layout_propgate) {
       loop_layout_ = compute_loop_layout_from_buffer(read_source_buffer);
     }
@@ -440,8 +454,7 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
       // As the pass will do post processing to the layout
       auto maybe_remapped_root_ =
           IfBufferRemapLoopGenerator::run(root_, T.buffer_remap, T.layout_map);
-      int vector_size = GetVectorizeSize(maybe_remapped_root_);
-
+      int vector_size = GetVectorizeSize(maybe_remapped_root_, T.analyzer);
       DLOG(INFO) << "[PlanLoopPartition] vector_size = " << vector_size << '\n';
 
       PrimExpr loop_total_size = 1;
@@ -550,6 +563,16 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
   } else {
     return {};
   }
+  // check loop_layout_ is injective
+  auto injective_res = loop_layout_->DetectInjective();
+  if (!injective_res->errors.empty()) {
+    std::ostringstream oss;
+    oss << "Loop layout is not injective: " << loop_layout_->DebugOutput()
+        << '\n'
+        << "  errors: " << injective_res->errors << '\n'
+        << "  loop AST: " << root_;
+    throw LoopLayoutInjectiveException(oss.str());
+  }
 
   PrimExpr loop_thread_extent = loop_layout_->ThreadExtent();
 
@@ -608,11 +631,37 @@ Fragment ParallelOpNode::CompleteBufferFragment(const Buffer &buffer) const {
   if (IsCommonAccessIndice(buffer)) {
     return loop_layout_;
   }
+  // Prefer a simple path: if original 2D indices form a bijective map, invert
+  // them directly and avoid introducing a synthetic replicate dimension.
+  {
+    auto res2d =
+        arith::DetectIterMap(indice_map_[buffer], ToVMap(loop_vars_), 1,
+                             arith::IterMapLevel::Bijective,
+                             const_cast<arith::Analyzer *>(&analyzer_));
+    if (res2d->errors.empty()) {
+      Layout ind_inv2d = Layout(loop_vars_, indice_map_[buffer])->Inverse();
+      PrimExpr indice_rep_extent = 1;
+      PrimExpr loop_rep_extent = loop_layout_->ReplicateExtent();
+      PrimExpr dest_buffer_rep_extent = indice_rep_extent * loop_rep_extent;
+      Array<PrimExpr> fwd2;
+      for (size_t i = 0; i < buffer->shape.size(); i++) {
+        fwd2.push_back(InputPlaceholder(i));
+      }
+      PrimExpr thd_b2 =
+          loop_layout_->ForwardThread(ind_inv2d->Forward(fwd2), std::nullopt);
+      return Fragment(buffer->shape, {}, thd_b2, dest_buffer_rep_extent,
+                      std::nullopt)
+          ->CondenseReplicateVar();
+    }
+  }
+  // Otherwise, infer an extra flattened iterator that captures truly-unused
+  // pieces of the loop space (if any), then try inversion with it.
   PrimExpr rep_b = MakeFlattenedExpression(
       DivideUnusedIterators(indice_map_[buffer], loop_vars_, &analyzer_));
   auto bijective_indice = indice_map_[buffer];
   bijective_indice.push_back(rep_b);
   Layout ind_inv = Layout(loop_vars_, bijective_indice)->Inverse();
+
   PrimExpr indice_rep_extent =
       ind_inv->InputShape().back(); // this is the size of rep_b
   PrimExpr loop_rep_extent = loop_layout_->ReplicateExtent();
@@ -630,7 +679,7 @@ Fragment ParallelOpNode::CompleteBufferFragment(const Buffer &buffer) const {
       ->CondenseReplicateVar();
 }
 
-TVM_FFI_STATIC_INIT_BLOCK({ ParallelOpNode::RegisterReflection(); });
+TVM_FFI_STATIC_INIT_BLOCK() { ParallelOpNode::RegisterReflection(); }
 
 } // namespace tl
 } // namespace tvm

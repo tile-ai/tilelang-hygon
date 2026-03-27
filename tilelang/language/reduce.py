@@ -1,14 +1,19 @@
 """The language interface for tl programs."""
-
+from __future__ import annotations
 from tvm import tir
-from typing import Optional
-from tilelang.language import copy, macro, alloc_shared
+from tilelang.language import copy, macro, alloc_shared, alloc_fragment
+from tilelang.utils.language import to_buffer_region
+from tilelang.utils.language import is_shared, is_fragment
+from tvm.script.ir_builder import IRBuilder
 
 
 def _legalize_dim(buffer: tir.Buffer, dim: int):
     if dim < 0:
         dim = len(buffer.shape) + dim
     return dim
+
+
+_REDUCE_OP_KEY = "tl.tileop.reduce"
 
 
 def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clear: bool):
@@ -34,17 +39,70 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clea
         raise ValueError(
             f"Invalid reduce output shape, buffer shape is {buffer.shape}, dim is {dim}, "
             f"output shape is {out.shape}, expected shapes are {expected_shapes_str}")
-    buffer = buffer.access_ptr("r")
-    out = out.access_ptr("w")
-    return tir.call_intrin(
-        "handle",
-        tir.op.Op.get("tl.reduce"),
-        buffer,
-        out,
-        reduce_type,
-        dim,
-        clear,
-    )
+
+    @macro
+    def reduce_macro(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clear: bool):
+        if is_shared(buffer) and is_shared(out):
+            red_frag_in = alloc_fragment(buffer.shape, buffer.dtype)
+            red_frag_out = alloc_fragment(out.shape, out.dtype)
+
+            # rename buffers
+            IRBuilder.name(buffer.name + "_frag", red_frag_in)
+            IRBuilder.name(out.name + "_frag", red_frag_out)
+
+            copy(buffer, red_frag_in)
+            tir.call_intrin(
+                "handle",
+                tir.op.Op.get(_REDUCE_OP_KEY),
+                to_buffer_region(red_frag_in, access_type="r"),
+                to_buffer_region(red_frag_out, access_type="w"),
+                reduce_type,
+                dim,
+                clear,
+            )
+            copy(red_frag_out, out)
+        elif is_shared(buffer) and is_fragment(out):
+            red_frag_in = alloc_fragment(buffer.shape, buffer.dtype)
+            IRBuilder.name(buffer.name + "_frag", red_frag_in)
+
+            copy(buffer, red_frag_in)
+            tir.call_intrin(
+                "handle",
+                tir.op.Op.get(_REDUCE_OP_KEY),
+                to_buffer_region(red_frag_in, access_type="r"),
+                to_buffer_region(out, access_type="w"),
+                reduce_type,
+                dim,
+                clear,
+            )
+        elif is_fragment(buffer) and is_shared(out):
+            red_frag_out = alloc_fragment(out.shape, out.dtype)
+            IRBuilder.name(out.name + "_frag", red_frag_out)
+
+            tir.call_intrin(
+                "handle",
+                tir.op.Op.get(_REDUCE_OP_KEY),
+                to_buffer_region(buffer, access_type="r"),
+                to_buffer_region(red_frag_out, access_type="w"),
+                reduce_type,
+                dim,
+                clear,
+            )
+            copy(red_frag_out, out)
+        elif is_fragment(buffer) and is_fragment(out):
+            tir.call_intrin(
+                "handle",
+                tir.op.Op.get(_REDUCE_OP_KEY),
+                to_buffer_region(buffer, access_type="r"),
+                to_buffer_region(out, access_type="w"),
+                reduce_type,
+                dim,
+                clear,
+            )
+        else:
+            raise ValueError(f"Invalid buffer scopes: {buffer.scope()} and {out.scope()}")
+
+    return reduce_macro(buffer, out, reduce_type, dim, clear)
 
 
 def reduce_warp(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, clear: bool = True):
@@ -72,14 +130,14 @@ def reduce_warp(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, clear: bo
         raise ValueError(
             f"Invalid warp reduce output shape, buffer shape is {buffer.shape}, "
             f"output shape is {out.shape}, they must be the same for warp reduce.")
-    buffer = buffer.access_ptr("r")
-    out = out.access_ptr("w")
+    # Use tl.region (same as reduce) — access_ptr/tvm_access_ptr is not accepted by
+    # NormalizeToBufferRegion in ReduceOp::ReduceOp.
     # Use dim = -1 as special marker for warp reduce (not legalized)
     return tir.call_intrin(
         "handle",
-        tir.op.Op.get("tl.reduce"),
-        buffer,
-        out,
+        tir.op.Op.get(_REDUCE_OP_KEY),
+        to_buffer_region(buffer, access_type="r"),
+        to_buffer_region(out, access_type="w"),
         reduce_type,
         -1,
         clear,
@@ -198,22 +256,67 @@ def reduce_absmax(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: boo
     return reduce(buffer, out, "absmax", dim, clear)
 
 
+def reduce_bitand(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True):
+    """Perform reduce bitwise-and on input buffer, store the result to output buffer.
+
+    Args:
+        buffer (tir.Buffer): The input buffer
+        out (tir.Buffer): The output buffer
+        dim (int): The dimension to perform reduce on
+
+    Returns:
+        tir.Call: Handle to the reduction operation
+    """
+    dim = _legalize_dim(buffer, dim)
+    return reduce(buffer, out, "bitand", dim, clear)
+
+
+def reduce_bitor(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True):
+    """Perform reduce bitwise-or on input buffer, store the result to output buffer.
+
+    Args:
+        buffer (tir.Buffer): The input buffer
+        out (tir.Buffer): The output buffer
+        dim (int): The dimension to perform reduce on
+
+    Returns:
+        tir.Call: Handle to the reduction operation
+    """
+    dim = _legalize_dim(buffer, dim)
+    return reduce(buffer, out, "bitor", dim, clear)
+
+
+def reduce_bitxor(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True):
+    """Perform reduce bitwise-xor on input buffer, store the result to output buffer.
+
+    Args:
+        buffer (tir.Buffer): The input buffer
+        out (tir.Buffer): The output buffer
+        dim (int): The dimension to perform reduce on
+
+    Returns:
+        tir.Call: Handle to the reduction operation
+    """
+    dim = _legalize_dim(buffer, dim)
+    return reduce(buffer, out, "bitxor", dim, clear)
+
+
 @macro
 def cumsum_fragment(src: tir.Buffer, dst: tir.Buffer, dim: int, reverse: bool) -> tir.PrimExpr:
     cumsum_smem = alloc_shared(src.shape, src.dtype, "shared.dyn")
     copy(src, cumsum_smem)
     tir.call_intrin(
         "handle",
-        tir.op.Op.get("tl.cumsum"),
-        cumsum_smem.access_ptr("r"),
-        cumsum_smem.access_ptr("w"),
+        tir.op.Op.get("tl.tileop.cumsum"),
+        to_buffer_region(cumsum_smem, access_type="r"),
+        to_buffer_region(cumsum_smem, access_type="w"),
         dim,
         reverse,
     )
     copy(cumsum_smem, dst)
 
 
-def cumsum(src: tir.Buffer, dst: Optional[tir.Buffer] = None, dim: int = 0, reverse: bool = False):
+def cumsum(src: tir.Buffer, dst: tir.Buffer | None = None, dim: int = 0, reverse: bool = False):
     """
     Compute the cumulative sum of `src` along `dim`, writing results to `dst`.
 
@@ -258,9 +361,9 @@ def cumsum(src: tir.Buffer, dst: Optional[tir.Buffer] = None, dim: int = 0, reve
         return cumsum_fragment(src, dst, dim, reverse)
     return tir.call_intrin(
         "handle",
-        tir.op.Op.get("tl.cumsum"),
-        src.access_ptr("r"),
-        dst.access_ptr("w"),
+        tir.op.Op.get("tl.tileop.cumsum"),
+        to_buffer_region(src, access_type="r"),
+        to_buffer_region(dst, access_type="w"),
         dim,
         reverse,
     )
@@ -268,7 +371,7 @@ def cumsum(src: tir.Buffer, dst: Optional[tir.Buffer] = None, dim: int = 0, reve
 
 def finalize_reducer(reducer: tir.Buffer):
     """
-    Finalize a reducer buffer by emitting the `tl.finalize_reducer` intrinsic.
+    Finalize a reducer buffer by emitting the `tl.tileop.finalize_reducer` intrinsic.
 
     This returns a TVM `tir.Call` handle that finalizes the given reducer using its writable pointer.
     The call does not modify Python objects directly; it produces the low-level intrinsic call used by the IR.
@@ -281,6 +384,86 @@ def finalize_reducer(reducer: tir.Buffer):
     """
     return tir.call_intrin(
         "handle",
-        tir.op.Op.get("tl.finalize_reducer"),
-        reducer.access_ptr("w"),
+        tir.op.Op.get("tl.tileop.finalize_reducer"),
+        to_buffer_region(reducer, access_type="w"),
     )
+
+
+def warp_reduce_sum(value: tir.PrimExpr):
+    """Perform warp reduction sum on a register value.
+
+    This function reduces a value across all threads in a warp using shuffle operations.
+    Each thread provides a  register `value`, and after the reduction, all threads
+    will have the sum of all values across the warp.
+
+    Args:
+        value (tir.PrimExpr): The input register value to reduce
+
+    Returns:
+        tir.PrimExpr: The reduced sum value (same on all threads in the warp)
+    """
+    return tir.call_intrin(value.dtype, tir.op.Op.get("tl.warp_reduce_sum"), value)
+
+
+def warp_reduce_max(value: tir.PrimExpr):
+    """Perform warp reduction max on a register value.
+
+    This function reduces a value across all threads in a warp using shuffle operations.
+    Each thread provides a  register `value`, and after the reduction, all threads
+    will have the max of all values across the warp.
+
+    Args:
+        value (tir.PrimExpr): The input register value to reduce
+
+    Returns:
+        tir.PrimExpr: The reduced max value (same on all threads in the warp)
+    """
+    return tir.call_intrin(value.dtype, tir.op.Op.get("tl.warp_reduce_max"), value)
+
+
+def warp_reduce_min(value: tir.PrimExpr):
+    """Perform warp reduction min on a register value.
+
+    This function reduces a value across all threads in a warp using shuffle operations.
+    Each thread provides a  register `value`, and after the reduction, all threads
+    will have the min of all values across the warp.
+
+    Args:
+        value (tir.PrimExpr): The input register value to reduce
+
+    Returns:
+        tir.PrimExpr: The reduced min value (same on all threads in the warp)
+    """
+    return tir.call_intrin(value.dtype, tir.op.Op.get("tl.warp_reduce_min"), value)
+
+
+def warp_reduce_bitand(value: tir.PrimExpr):
+    """Perform warp reduction bitwise-and on a register value.
+
+    This function reduces a value across all threads in a warp using shuffle operations.
+    Each thread provides a  register `value`, and after the reduction, all threads
+    will have the bitwise-and of all values across the warp.
+
+    Args:
+        value (tir.PrimExpr): The input register value to reduce
+
+    Returns:
+        tir.PrimExpr: The reduced bitwise-and value (same on all threads in the warp)
+    """
+    return tir.call_intrin(value.dtype, tir.op.Op.get("tl.warp_reduce_bitand"), value)
+
+
+def warp_reduce_bitor(value: tir.PrimExpr):
+    """Perform warp reduction bitwise-or on a register value.
+
+    This function reduces a value across all threads in a warp using shuffle operations.
+    Each thread provides a  register `value`, and after the reduction, all threads
+    will have the bitwise-or of all values across the warp.
+
+    Args:
+        value (tir.PrimExpr): The input register value to reduce
+
+    Returns:
+        tir.PrimExpr: The reduced bitwise-or value (same on all threads in the warp)
+    """
+    return tir.call_intrin(value.dtype, tir.op.Op.get("tl.warp_reduce_bitor"), value)

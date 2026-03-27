@@ -1049,8 +1049,8 @@ void CodeGenTileLangHCU::VisitExpr_(const CastNode *op, std::ostream &os) {
   os << sret;
 }
 
-void CodeGenTileLangHCU::PrintCallExtern(Type ret_type, String global_symbol,
-                                         const Array<PrimExpr> &args,
+void CodeGenTileLangHCU::PrintCallExtern(Type ret_type, ffi::String global_symbol,
+                                         const ffi::Array<PrimExpr> &args,
                                          bool skip_first_arg,
                                          std::ostream &os) { // NOLINT(*)
   std::string sym = global_symbol.operator std::string();
@@ -1419,8 +1419,8 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
                                     "A_ptr, B_ptr, C_ptr>, but got "
                                  << op->args.size();
     auto op_instance = Downcast<StringImm>(op->args[0]);
-    this->PrintCallExtern(GetType(GetRef<PrimExpr>(op)), op_instance->value,
-                          op->args, true, os);
+    this->PrintCallExtern(GetType(tvm::ffi::GetRef<PrimExpr>(op)),
+                          op_instance->value, op->args, true, os);
   } else if (op->op.same_as(tl::tl_gemm_sp())) {
     LOG(FATAL) << "tl_gemm_sp is not supported on HCU";
   } else if (op->op.same_as(tl::loop_break())) {
@@ -1793,7 +1793,7 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   buffer_ops_disable_param_names_.clear();
 
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
-  ICHECK(global_symbol.defined())
+  ICHECK(global_symbol.has_value())
       << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
   bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
 

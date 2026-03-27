@@ -1,7 +1,8 @@
 import argparse
 import itertools
+import torch
 import logging
-
+import tilelang
 import tilelang.language as T
 from tilelang.autotuner import autotune
 from tilelang import jit
@@ -99,6 +100,7 @@ def get_configs(args, kwargs):
             block_K=[64, 128],
             num_stages=[0, 1, 2, 3],
             thread_num=[128, 256],
+            k_pack=[1, 2],
             policy=[T.GemmWarpPolicy.Square],
             enable_rasteration=[True, False],
         )
@@ -125,6 +127,7 @@ def matmul(
     block_K=None,
     num_stages=None,
     thread_num=None,
+    k_pack=None,
     policy=None,
     enable_rasteration=None,
 ):
@@ -156,7 +159,7 @@ def matmul(
 
     # Use half-precision for input data to reduce memory bandwidth,
     # accumulate in float for better numerical accuracy
-    dtype = "float8_e4m3"
+    dtype = "float8_e4m3fnuz" if torch.version.hip is not None else "float8_e4m3"
     accum_dtype = "float"
 
     @T.prim_func
@@ -190,6 +193,8 @@ def matmul(
 
             # Enable (or disable) swizzling optimization
             T.use_swizzle(panel_size=10, enable=enable_rasteration)
+            # to utilize swizzle tma layout
+            T.annotate_layout({C_shared: tilelang.layout.make_swizzled_layout(C_shared)})
 
             # Clear out the accumulation buffer
             T.clear(C_local)
@@ -208,6 +213,7 @@ def matmul(
                     C_local,
                     transpose_B=True,
                     policy=policy,
+                    k_pack=k_pack,
                 )
             # Write back the results from C_local to the global memory C
             T.copy(C_local, C_shared)
@@ -239,11 +245,8 @@ if __name__ == "__main__":
     best_result = matmul(M, N, K, with_roller)
     best_latency = best_result.latency
     best_config = best_result.config
-    ref_latency = best_result.ref_latency
 
     # Print out the benchmark results
     print(f"Best latency (s): {best_latency}")
     print(f"Best TFlops: {total_flops / best_latency * 1e-9:.3f}")
     print(f"Best config: {best_config}")
-
-    print(f"Reference TFlops: {total_flops / ref_latency * 1e-9:.3f}")

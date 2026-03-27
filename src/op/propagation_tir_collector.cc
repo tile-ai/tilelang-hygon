@@ -21,13 +21,13 @@ namespace {
 static bool IsMatrixLoadCall(const CallNode *call) {
   if (!call->op.as<OpNode>()) return false;
   std::string name = call->op.as<OpNode>()->name;
-  return name == "tl.matrix_load";
+  return name == "tl.tileop.matrix_load";
 }
 
 static bool IsDsReadFormatCall(const CallNode *call) {
   if (!call->op.as<OpNode>()) return false;
   std::string name = call->op.as<OpNode>()->name;
-  return name == "tl.ds_read_format";
+  return name == "tl.tileop.ds_read_format";
 }
 
 static bool IsGemmCall(const CallNode *call) {
@@ -54,7 +54,7 @@ static Optional<BufferAndMask> GetBufferAndMaskFromExpr(
   if (const auto *call = expr.as<CallNode>()) {
     if (call->op.same_as(builtin::tvm_access_ptr()) && call->args.size() >= 5) {
       if (const auto *var = call->args[1].as<VarNode>()) {
-        auto it = vmap.find(GetRef<Var>(var));
+        auto it = vmap.find(tvm::ffi::GetRef<Var>(var));
         if (it != vmap.end()) {
           BufferAndMask r;
           r.buffer = (*it).second;
@@ -128,7 +128,8 @@ class PropagationTirCollector::Visitor : public StmtExprVisitor {
   void VisitExpr_(const CallNode *op) final {
     if (op->op.same_as(builtin::tvm_access_ptr()) && op->args.size() >= 5) {
       if (const auto *var = op->args[1].as<VarNode>()) {
-        auto it = collector_->buffer_data_to_buffer_.find(GetRef<Var>(var));
+        auto it =
+            collector_->buffer_data_to_buffer_.find(tvm::ffi::GetRef<Var>(var));
         if (it != collector_->buffer_data_to_buffer_.end()) {
           Buffer b = (*it).second;
           int mask = 0;
@@ -245,7 +246,7 @@ bool PropagationTirCollector::ConsumerIsGemm(const Buffer &buffer) const {
 Optional<Call> PropagationTirCollector::GetProducerCall(const Buffer &buffer) const {
   auto it = producer_call_map_.find(buffer);
   if (it == producer_call_map_.end()) return Optional<Call>();
-  return GetRef<Call>(it->second);
+  return tvm::ffi::GetRef<Call>(it->second);
 }
 
 }  // namespace tl

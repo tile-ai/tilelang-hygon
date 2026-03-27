@@ -13,6 +13,7 @@ Tile Language (**tile-lang**) is a concise domain-specific language designed to 
 <img src=./images/MatmulExample.png />
 
 ## Latest News
+- 10/30/2025 📦: We have released v0.1.6.post2, which is the last version compatible with Python 3.8.
 - 10/07/2025 🍎: Added Apple Metal Device support, check out [Pull Request #799](https://github.com/tile-ai/tilelang/pull/799) for details.
 - 09/29/2025  🎉: Thrilled to announce that ​​AscendC​​ and ​Ascend​NPU IR​​ backends targeting Huawei Ascend chips are now supported!
 Check out the preview here:
@@ -178,7 +179,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
     return matmul_relu_kernel
 
 
-M = 1024  # M = T.symbolic("m") if you want to use dynamic shape
+M = 1024  # M = T.dynamic("m") if you want to use dynamic shape
 N = 1024
 K = 1024
 block_M = 128
@@ -208,7 +209,7 @@ torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
 print("Kernel output matches PyTorch reference.")
 
 # 4. Retrieve and inspect the generated CUDA source (optional)
-# cuda_source = jit_kernel.get_kernel_source()
+# cuda_source = matmul_relu_kernel.get_kernel_source()
 # print("Generated CUDA kernel:\n", cuda_source)
 
 # 5.Profile latency with kernel

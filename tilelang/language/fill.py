@@ -1,12 +1,11 @@
 """The language interface for tl programs."""
-
+from __future__ import annotations
 from tvm import tir
-from typing import Union
 from tilelang.language import has_let_value, get_let_value
-from tilelang.utils.language import get_buffer_region_from_load
+from tilelang.utils.language import get_buffer_region_from_load, to_buffer_region
 
 
-def fill(buffer: Union[tir.Buffer, tir.BufferRegion], value: tir.PrimExpr):
+def fill(buffer: tir.Buffer | tir.BufferRegion | tir.BufferLoad, value: tir.PrimExpr):
     """Fill a buffer or buffer region with a specified value.
 
     Args:
@@ -16,12 +15,28 @@ def fill(buffer: Union[tir.Buffer, tir.BufferRegion], value: tir.PrimExpr):
     Returns:
         A TVM intrinsic call that performs the fill operation
     """
+    # Normalize Var with let value to its underlying object
+    if isinstance(buffer, tir.Var) and has_let_value(buffer):
+        buffer = get_let_value(buffer)
+
+    # Build tl.region as argument
     if isinstance(buffer, tir.Buffer):
-        buffer = buffer.access_ptr("w")  # Get write pointer if input is a Buffer
-    return tir.call_intrin("handle", tir.op.Op.get("tl.fill"), buffer, value)
+        extents = list(buffer.shape)
+    elif isinstance(buffer, tir.BufferRegion):
+        extents = [r.extent for r in buffer.region]
+    elif isinstance(buffer, tir.BufferLoad):
+        region = get_buffer_region_from_load(buffer)
+        if region is not None:
+            extents = [r.extent for r in region.region]
+        else:
+            extents = [tir.IntImm("int32", 1) for _ in buffer.indices]
+    else:
+        extents = []
+    return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.fill"),
+                           to_buffer_region(buffer, access_type="w", extents=extents), value)
 
 
-def clear(buffer: Union[tir.Buffer, tir.Var]):
+def clear(buffer: tir.Buffer | tir.Var):
     """Clear a buffer by filling it with zeros.
 
     Args:

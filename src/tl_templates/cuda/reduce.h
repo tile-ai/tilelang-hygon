@@ -2,7 +2,24 @@
 
 #include "common.h"
 
+#ifndef __CUDACC_RTC__
+#include <cstdint>
+#include <type_traits>
+#endif
+
 namespace tl {
+
+// Select a wider accumulator type for improved numerical accuracy.
+// Default: accumulate in the same type. Specialize FP16/BF16 to float.
+template <typename T> struct AccType {
+  using type = T;
+};
+template <> struct AccType<half_t> {
+  using type = float;
+};
+template <> struct AccType<bfloat16_t> {
+  using type = float;
+};
 
 struct SumOp {
   template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
@@ -22,6 +39,24 @@ struct MinOp {
   }
 };
 
+struct BitAndOp {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return x & y;
+  }
+};
+
+struct BitOrOp {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return x | y;
+  }
+};
+
+struct BitXorOp {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return x ^ y;
+  }
+};
+
 template <class Reducer, int threads, int scale, int thread_offset = 0,
           int all_threads = threads>
 struct AllReduce {
@@ -37,7 +72,7 @@ struct AllReduce {
       __syncthreads();
       x = Reducer()(x, red_buf[(threadIdx.x - thread_offset) ^ offset]);
     } else {
-      x = Reducer()(x, T(__shfl_xor_sync(uint32_t(-1), x, offset)));
+      x = Reducer()(x, tl::shfl_xor_sync(uint32_t(-1), x, offset));
     }
     if constexpr (offset == scale) {
       return x;
@@ -57,7 +92,7 @@ struct AllReduce {
       asm volatile("bar.sync %0, %1;" : : "r"(2), "r"(all_threads));
       x = Reducer()(x, red_buf[(threadIdx.x - thread_offset) ^ offset]);
     } else {
-      x = Reducer()(x, T(__shfl_xor_sync(uint32_t(-1), x, offset)));
+      x = Reducer()(x, tl::shfl_xor_sync(uint32_t(-1), x, offset));
     }
     if constexpr (offset == scale) {
       return x;
@@ -94,7 +129,7 @@ template <int threads, bool reverse = false> struct CumSum1D {
 
 #pragma unroll
         for (int off = 1; off < SEG; off <<= 1) {
-          T n = (T)__shfl_down_sync(MASK, val, off);
+          T n = (T)tl::shfl_down_sync(MASK, val, off);
           if (lane < SEG - off)
             val += n;
         }
@@ -169,7 +204,7 @@ template <int threads, int Axis = 0, bool reverse = false> struct CumSum2D {
 
 #pragma unroll
           for (int off = 1; off < SEG; off <<= 1) {
-            T n = (T)__shfl_down_sync(MASK, val, off);
+            T n = tl::shfl_down_sync(MASK, val, off);
             if (lane < SEG - off)
               val += n;
           }
@@ -179,10 +214,10 @@ template <int threads, int Axis = 0, bool reverse = false> struct CumSum2D {
           if (real_col < W)
             dst[real_row * W + real_col] = val;
 
-          T segSum = (T)__shfl_sync(MASK, val, (T)0);
+          T segSum = tl::shfl_sync(MASK, val, 0);
           if (lane == 0)
             carry = segSum;
-          carry = (T)__shfl_sync(MASK, carry, (T)0);
+          carry = tl::shfl_sync(MASK, carry, 0);
         }
       } else {
         for (int seg = 0; seg * SEG < W; ++seg) {
@@ -195,7 +230,7 @@ template <int threads, int Axis = 0, bool reverse = false> struct CumSum2D {
 
 #pragma unroll
           for (int off = 1; off < SEG; off <<= 1) {
-            T n = (T)__shfl_up_sync(MASK, val, off);
+            T n = tl::shfl_up_sync(MASK, val, off);
             if (lane >= off)
               val += n;
           }
@@ -205,14 +240,45 @@ template <int threads, int Axis = 0, bool reverse = false> struct CumSum2D {
           if (real_col < W)
             dst[real_row * W + real_col] = val;
 
-          T segSum = (T)__shfl_sync(MASK, val, SEG - 1);
+          T segSum = tl::shfl_sync(MASK, val, SEG - 1);
           if (lane == SEG - 1)
             carry = segSum;
-          carry = (T)__shfl_sync(MASK, carry, SEG - 1);
+          carry = tl::shfl_sync(MASK, carry, SEG - 1);
         }
       }
     }
   }
 };
+
+template <typename T, typename ReduceOp>
+TL_DEVICE T warp_reduce(T value, ReduceOp op) {
+  constexpr uint32_t mask = 0xffffffff;
+  value = op(value, __shfl_xor_sync(mask, value, 16));
+  value = op(value, __shfl_xor_sync(mask, value, 8));
+  value = op(value, __shfl_xor_sync(mask, value, 4));
+  value = op(value, __shfl_xor_sync(mask, value, 2));
+  value = op(value, __shfl_xor_sync(mask, value, 1));
+  return value;
+}
+
+template <typename T> TL_DEVICE T warp_reduce_sum(T value) {
+  return warp_reduce<T>(value, SumOp());
+}
+
+template <typename T> TL_DEVICE T warp_reduce_max(T value) {
+  return warp_reduce<T>(value, MaxOp());
+}
+
+template <typename T> TL_DEVICE T warp_reduce_min(T value) {
+  return warp_reduce<T>(value, MinOp());
+}
+
+template <typename T> TL_DEVICE T warp_reduce_bitand(T value) {
+  return warp_reduce<T>(value, BitAndOp());
+}
+
+template <typename T> TL_DEVICE T warp_reduce_bitor(T value) {
+  return warp_reduce<T>(value, BitOrOp());
+}
 
 } // namespace tl

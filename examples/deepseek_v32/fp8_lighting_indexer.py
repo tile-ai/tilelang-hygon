@@ -103,8 +103,8 @@ def mqa_attn_return_logits(
     accum_dtype = "float"
     index_dtype = "int32"
 
-    seq_len = T.symbolic("seq_len")
-    seq_len_kv = T.symbolic("seq_len_kv")
+    seq_len = T.dynamic("seq_len")
+    seq_len_kv = T.dynamic("seq_len_kv")
 
     index_q_shape = [seq_len * heads, index_dim]
     index_k_shape = [seq_len_kv, index_dim]
@@ -127,7 +127,7 @@ def mqa_attn_return_logits(
             index_k_shared = T.alloc_shared([block_N, index_dim], dtype)
             index_k_scale_fragment = T.alloc_fragment([block_N], accum_dtype)
             s = T.alloc_fragment([block_N, block_Q * heads], accum_dtype)
-            s_reshaped = T.alloc_fragment([block_N, block_Q, heads], accum_dtype)
+            s_reshaped = T.reshape(s, (block_N, block_Q, heads))
             logits = T.alloc_fragment([block_N, block_Q], accum_dtype)
             weights = T.alloc_fragment([block_Q, heads], accum_dtype)
 
@@ -165,7 +165,7 @@ def mqa_attn_return_logits(
 
                 for bn_i, bq_i, h_i in T.Parallel(block_N, block_Q, heads):
                     s_reshaped[bn_i, bq_i,
-                               h_i] = (T.max(s[bn_i, bq_i * heads + h_i], 0) *
+                               h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i], 0) *
                                        weights[bq_i, h_i]) * index_k_scale_fragment[bn_i]
 
                 T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
@@ -182,8 +182,8 @@ def clean_logits_(
     threads: int = 512,
     block_K: int = 4096,
 ):
-    seq_len = T.symbolic("seq_len")
-    seq_len_kv = T.symbolic("seq_len_kv")
+    seq_len = T.dynamic("seq_len")
+    seq_len_kv = T.dynamic("seq_len_kv")
 
     dtype = "float"
     indices_dtype = "int32"
@@ -258,6 +258,8 @@ def ref_fp8_mqa_logits(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor,
 
 
 def test_fp8_lighting_indexer(S=4096, SKV=8192, H=32, HKV=1, D=64, kv_stride=1):
+    # initial random seed to make the performance reproducible
+    torch.manual_seed(0)
     q = torch.randn(S, H, D, device="cuda", dtype=torch.bfloat16).to(torch.bfloat16)
     kv = torch.randn(SKV, D, device="cuda", dtype=torch.bfloat16).to(torch.bfloat16)
     weights = torch.randn(S, H, device="cuda", dtype=torch.float32)

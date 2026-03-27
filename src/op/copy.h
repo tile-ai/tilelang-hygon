@@ -101,8 +101,7 @@ public:
   };
 
   uint8_t eviction_policy; // Policy for cache eviction
-  static constexpr const char *_type_key = "tl.Copy";
-  TVM_DECLARE_FINAL_OBJECT_INFO(CopyNode, TileOperatorNode);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Copy", CopyNode, TileOperatorNode);
 
   Array<Buffer> GetOutBuffers() const override { return {dst}; }
   Array<Buffer> GetInBuffers() const override { return {src}; }
@@ -116,23 +115,6 @@ public:
         .def_ro("dst_range", &CopyNode::dst_range)
         .def_ro("coalesced_width", &CopyNode::coalesced_width);
   }
-
-  bool SEqualReduce(const CopyNode *other, SEqualReducer equal) const {
-    return equal(src, other->src) && equal(dst, other->dst) &&
-           equal(src_range, other->src_range) &&
-           equal(dst_range, other->dst_range) &&
-           equal(coalesced_width, other->coalesced_width);
-  }
-
-  void SHashReduce(SHashReducer hash_reduce) const {
-    hash_reduce(src);
-    hash_reduce(dst);
-    hash_reduce(src_range);
-    hash_reduce(dst_range);
-    hash_reduce(coalesced_width);
-  }
-  static constexpr bool _type_has_method_sequal_reduce = true;
-  static constexpr bool _type_has_method_shash_reduce = true;
 
   /*!
    * \brief Lower the copy operator to a TIR statement.
@@ -294,14 +276,14 @@ protected:
 
 class Copy : public TileOperator {
 public:
-  TVM_DEFINE_OBJECT_REF_METHODS(Copy, TileOperator, CopyNode);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Copy, TileOperator, CopyNode);
 
   /*!
    * \brief Constructor.
    * \param args  Expression arguments for the copy.
    * \param vmap  Buffer variable mapping.
    */
-  TVM_DLL Copy(Array<PrimExpr> args, BufferMap vmap);
+  TVM_DLL Copy(Array<PrimExpr> args);
 
   /*!
    * \brief Get the TVM Op handle corresponding to this Copy op.
@@ -317,52 +299,36 @@ public:
  */
 class Conv2DIm2ColOpNode : public TileOperatorNode {
 public:
-  Buffer src, dst; // Source (input feature map) and destination (im2col matrix)
-  int stride;      // Stride for convolution
-  int padding;     // Padding amount
-  int dilation;    // Dilation factor
-  int kernel;      // Kernel size
-  int eviction_policy; // Cache eviction policy
-  PrimExpr nhw_step;   // Step size in NHW dimensions
-  PrimExpr c_step;     // Step size in channel dimension
+  BufferRegion srcRegion_, dstRegion_;
+  Buffer src_,
+      dst_;      // Source (input feature map) and destination (im2col matrix)
+  int stride_;   // Stride for convolution
+  int padding_;  // Padding amount
+  int dilation_; // Dilation factor
+  int kernel_;   // Kernel size
+  int eviction_policy_; // Cache eviction policy
+  PrimExpr nhw_step_;   // Step size in NHW dimensions
+  PrimExpr c_step_;     // Step size in channel dimension
 
-  static constexpr const char *_type_key = "tl.Conv2DIm2Col";
-  TVM_DECLARE_FINAL_OBJECT_INFO(Conv2DIm2ColOpNode, TileOperatorNode);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Conv2DIm2Col", Conv2DIm2ColOpNode,
+                                    TileOperatorNode);
 
-  Array<Buffer> GetOutBuffers() const override { return {dst}; }
-  Array<Buffer> GetInBuffers() const override { return {src}; }
+  Array<Buffer> GetOutBuffers() const override { return {dst_}; }
+  Array<Buffer> GetInBuffers() const override { return {src_}; }
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
     refl::ObjectDef<Conv2DIm2ColOpNode>()
-        .def_ro("src", &Conv2DIm2ColOpNode::src)
-        .def_ro("dst", &Conv2DIm2ColOpNode::dst)
-        .def_ro("stride", &Conv2DIm2ColOpNode::stride)
-        .def_ro("padding", &Conv2DIm2ColOpNode::padding)
-        .def_ro("dilation", &Conv2DIm2ColOpNode::dilation)
-        .def_ro("kernel", &Conv2DIm2ColOpNode::kernel)
-        .def_ro("eviction_policy", &Conv2DIm2ColOpNode::eviction_policy);
+        .def_ro("srcRegion", &Conv2DIm2ColOpNode::srcRegion_)
+        .def_ro("dstRegion", &Conv2DIm2ColOpNode::dstRegion_)
+        .def_ro("src", &Conv2DIm2ColOpNode::src_)
+        .def_ro("dst", &Conv2DIm2ColOpNode::dst_)
+        .def_ro("stride", &Conv2DIm2ColOpNode::stride_)
+        .def_ro("padding", &Conv2DIm2ColOpNode::padding_)
+        .def_ro("dilation", &Conv2DIm2ColOpNode::dilation_)
+        .def_ro("kernel", &Conv2DIm2ColOpNode::kernel_)
+        .def_ro("eviction_policy", &Conv2DIm2ColOpNode::eviction_policy_);
   }
-
-  bool SEqualReduce(const Conv2DIm2ColOpNode *other,
-                    SEqualReducer equal) const {
-    return equal(src, other->src) && equal(dst, other->dst) &&
-           equal(stride, other->stride) && equal(padding, other->padding) &&
-           equal(dilation, other->dilation) && equal(kernel, other->kernel) &&
-           equal(eviction_policy, other->eviction_policy);
-  }
-
-  void SHashReduce(SHashReducer hash_reduce) const {
-    hash_reduce(src);
-    hash_reduce(dst);
-    hash_reduce(stride);
-    hash_reduce(padding);
-    hash_reduce(dilation);
-    hash_reduce(kernel);
-    hash_reduce(eviction_policy);
-  }
-  static constexpr bool _type_has_method_sequal_reduce = true;
-  static constexpr bool _type_has_method_shash_reduce = true;
 
   /*!
    * \brief Lower to TIR statement.
@@ -384,9 +350,9 @@ public:
 
 class Conv2DIm2ColOp : public TileOperator {
 public:
-  TVM_DEFINE_OBJECT_REF_METHODS(Conv2DIm2ColOp, TileOperator,
-                                Conv2DIm2ColOpNode);
-  TVM_DLL Conv2DIm2ColOp(Array<PrimExpr> args, BufferMap vmap);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Conv2DIm2ColOp, TileOperator,
+                                             Conv2DIm2ColOpNode);
+  TVM_DLL Conv2DIm2ColOp(Array<PrimExpr> args);
   static const Op &Get();
 };
 

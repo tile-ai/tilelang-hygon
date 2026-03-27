@@ -32,8 +32,8 @@ public:
   mutable bool trans = true;  // K-major (true) or MN-major (false), from consumer gemm or default
   mutable bool completed_ = false;  // InferLayout done, skip re-run
 
-  static constexpr const char *_type_key = "tl.MatrixLoad";
-  TVM_DECLARE_FINAL_OBJECT_INFO(MatrixLoadNode, TileOperatorNode);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.MatrixLoad", MatrixLoadNode,
+                                    TileOperatorNode);
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
   LayoutMap InferLayout(const LayoutInferArgs &T,
@@ -45,8 +45,9 @@ public:
 
 class MatrixLoad : public TileOperator {
 public:
-  TVM_DEFINE_OBJECT_REF_METHODS(MatrixLoad, TileOperator, MatrixLoadNode);
-  TVM_DLL MatrixLoad(Array<PrimExpr> args, BufferMap vmap);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(MatrixLoad, TileOperator,
+                                             MatrixLoadNode);
+  TVM_DLL MatrixLoad(Array<PrimExpr> args);
   static const Op &Get();
 };
 

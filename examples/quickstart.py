@@ -48,17 +48,16 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
     return matmul_relu_kernel
 
 
-M = 1024  # M = T.symbolic("m") if you want to use dynamic shape
+M = 1024  # M = T.dynamic("m") if you want to use dynamic shape
 N = 1024
 K = 1024
 block_M = 128
 block_N = 128
 block_K = 32
 
-# 1. Define the kernel (matmul) and compile/lower it into an executable module
+# Define the kernel (matmul) and compile/lower it into an executable module
 matmul_relu_kernel = matmul(M, N, K, block_M, block_N, block_K)
-
-# 3. Test the kernel in Python with PyTorch data
+# Test the kernel in Python with PyTorch data
 import torch
 
 # Create random input tensors on the GPU
@@ -78,7 +77,7 @@ torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
 print("Kernel output matches PyTorch reference.")
 
 # 4. Retrieve and inspect the generated CUDA source (optional)
-# cuda_source = jit_kernel.get_kernel_source()
+# cuda_source = matmul_relu_kernel.get_kernel_source()
 # print("Generated CUDA kernel:\n", cuda_source)
 
 # 5.Profile latency with kernel

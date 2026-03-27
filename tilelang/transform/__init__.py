@@ -80,6 +80,17 @@ def FrontendLegalize():
     return _ffi_api.FrontendLegalize()  # type: ignore
 
 
+def LegalizeNegativeIndex():
+    """Legalize negative indices in buffer loads.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LegalizeNegativeIndex()  # type: ignore
+
+
 def InjectAssumes():
     """Inject Assumes
 
@@ -344,18 +355,6 @@ def LowerDeviceStorageAccessInfo():
     return _ffi_api.LowerDeviceStorageAccessInfo()  # type: ignore
 
 
-def LoopVectorizeDynamic():
-    """Try to vectorize loop with dynamic shape.
-
-    Returns
-    -------
-    fpass : tvm.transform.Pass
-        The result pass
-    ----
-    """
-    return _ffi_api.LoopVectorizeDynamic()  # type: ignore
-
-
 def ConfigIndexBitwidth():
     """Config index bitwidth.
 
@@ -427,6 +426,17 @@ def LowerSharedBarrier():
     """LowerSharedBarrier
     """
     return _ffi_api.LowerSharedBarrier()  # type: ignore
+
+
+def PlanAndUpdateBufferAllocationLocation():
+    """Plan and update buffer allocation locations within PrimFuncs.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.PlanAndUpdateBufferAllocationLocation()  # type: ignore
 
 
 def StorageRewrite():

@@ -81,15 +81,15 @@ void ComputeDsReadFormatWarpPartition(bool trans, int block_mn, int block_k,
 
 }  // namespace
 
-DsReadFormat::DsReadFormat(Array<PrimExpr> args, BufferMap vmap) {
+DsReadFormat::DsReadFormat(Array<PrimExpr> args) {
   ICHECK(args.size() >= 2) << "ds_read_format expects at least 2 args: src_region, dst_region";
   auto src_call = args[0].as<CallNode>();
   auto dst_call = args[1].as<CallNode>();
   ICHECK(src_call) << "ds_read_format args[0] must be region call (src)";
   ICHECK(dst_call) << "ds_read_format args[1] must be region call (dst)";
 
-  auto src_region = RegionOp(src_call->args, vmap);
-  auto dst_region = RegionOp(dst_call->args, vmap);
+  auto src_region = RegionOp(src_call->args);
+  auto dst_region = RegionOp(dst_call->args);
   auto src_ranges = src_region->GetRanges();
   auto dst_ranges = dst_region->GetRanges();
 
@@ -103,7 +103,7 @@ DsReadFormat::DsReadFormat(Array<PrimExpr> args, BufferMap vmap) {
   ICHECK(dst_buf.scope() == "local.fragment")
       << "ds_read_format dst must be register (local.fragment), got scope=" << dst_buf.scope();
 
-  ObjectPtr<DsReadFormatNode> node = make_object<DsReadFormatNode>();
+  ObjectPtr<DsReadFormatNode> node = tvm::ffi::make_object<DsReadFormatNode>();
   node->src = src_buf;
   node->dst = dst_buf;
   node->src_ranges = src_ranges;
@@ -119,7 +119,7 @@ DsReadFormat::DsReadFormat(Array<PrimExpr> args, BufferMap vmap) {
 }
 
 TileOperator DsReadFormatNode::Clone() const {
-  auto op = make_object<DsReadFormatNode>(*this);
+  auto op = tvm::ffi::make_object<DsReadFormatNode>(*this);
   return DsReadFormat(op);
 }
 
@@ -136,13 +136,13 @@ LayoutMap DsReadFormatNode::InferLayout(const LayoutInferArgs &T,
   if (gemm_with_input) {
     auto gemm = gemm_with_input->gemm;
     auto input_buf = gemm_with_input->input;
-    ICHECK(input_buf->dtype.bits() == gemm->A->dtype.bits() ||
-           input_buf->dtype.bits() == gemm->B->dtype.bits())
+    ICHECK(input_buf->dtype.bits() == gemm->a_->dtype.bits() ||
+           input_buf->dtype.bits() == gemm->b_->dtype.bits())
         << "ds_read_format output dtype must match gemm input when feeding gemm";
-    if (input_buf.same_as(gemm->A)) {
-      this->trans = !gemm->trans_A;
-    } else if (input_buf.same_as(gemm->B)) {
-      this->trans = gemm->trans_B;
+    if (input_buf.same_as(gemm->a_)) {
+      this->trans = !gemm->transA_;
+    } else if (input_buf.same_as(gemm->b_)) {
+      this->trans = gemm->transB_;
     } else {
       ICHECK(false) << "ds_read_format dst must feed Gemm A or B";
     }
@@ -154,19 +154,19 @@ LayoutMap DsReadFormatNode::InferLayout(const LayoutInferArgs &T,
                             block_size, T.target, src->dtype.bits(), w_mn, w_k, t_mn, t_k);
     this->mls_tile_mn = t_mn;
     this->mls_tile_k = t_k;
-    GemmInst gemm_inst = gemm->GetGemmInst(block_size, T.target);
-    int element_byte_size = gemm->A->dtype.bits() / 8;
-    bool A_from_mls = IsFromMls(gemm->A, T.tir_collector);
-    bool B_from_mls = IsFromMls(gemm->B, T.tir_collector);
-    bool A_mls_trans = !gemm->trans_A;
-    bool B_mls_trans = gemm->trans_B;
-    auto [warp_m, warp_n, warp_k] = gemm->policy->ComputeWarpPartitionHCU(
-        gemm->M, gemm->N, gemm->K, gemm->kPack, element_byte_size, block_size,
+    GemmInst gemm_inst = gemm->getGemmInst(block_size, T.target);
+    int element_byte_size = gemm->a_->dtype.bits() / 8;
+    bool A_from_mls = IsFromMls(gemm->a_, T.tir_collector);
+    bool B_from_mls = IsFromMls(gemm->b_, T.tir_collector);
+    bool A_mls_trans = !gemm->transA_;
+    bool B_mls_trans = gemm->transB_;
+    auto [warp_m, warp_n, warp_k] = gemm->policy_->computeWarpPartitionHCU(
+        gemm->m_, gemm->n_, gemm->k_, gemm->kPack_, element_byte_size, block_size,
         T.target, gemm_inst, A_from_mls, B_from_mls, A_mls_trans, B_mls_trans);
-    if (input_buf.same_as(gemm->A)) {
+    if (input_buf.same_as(gemm->a_)) {
       this->warp_mn = warp_m;
       this->warp_k = warp_k;
-    } else if (input_buf.same_as(gemm->B)) {
+    } else if (input_buf.same_as(gemm->b_)) {
       this->warp_mn = warp_n;
       this->warp_k = warp_k;
     } else {
@@ -174,12 +174,12 @@ LayoutMap DsReadFormatNode::InferLayout(const LayoutInferArgs &T,
     }
     // DsReadFormat must follow Gemm's warp partition when feeding Gemm.
     // MLS warp partition (w_mn, w_k) may differ; mls_tile_mn/k are used for tile shape only.
-    const int min_n_per_warp = (input_buf.same_as(gemm->B) && !B_mls_trans) ? 32 : 16;
-    auto fragment = input_buf.same_as(gemm->A)
-                        ? makeGemmFragmentAHCU(gemm->M, gemm->N, gemm->K, warp_m, warp_n, warp_k,
-                                               src->dtype.bits(), gemm->kPack, gemm->trans_A)
-                        : makeGemmFragmentBHCU(gemm->M, gemm->N, gemm->K, warp_m, warp_n, warp_k,
-                                               src->dtype.bits(), gemm->kPack, gemm->trans_B, min_n_per_warp);
+    const int min_n_per_warp = (input_buf.same_as(gemm->b_) && !B_mls_trans) ? 32 : 16;
+    auto fragment = input_buf.same_as(gemm->a_)
+                        ? makeGemmFragmentAHCU(gemm->m_, gemm->n_, gemm->k_, warp_m, warp_n, warp_k,
+                                               src->dtype.bits(), gemm->kPack_, gemm->transA_)
+                        : makeGemmFragmentBHCU(gemm->m_, gemm->n_, gemm->k_, warp_m, warp_n, warp_k,
+                                               src->dtype.bits(), gemm->kPack_, gemm->transB_, min_n_per_warp);
     auto layout = fragment->BindThreadRange(T.thread_bounds);
     if (T.layout_map.count(dst)) {
       if (!tvm::StructuralEqual()(layout, T.layout_map[dst])) {
@@ -260,14 +260,14 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   if (gemm_with_input) {
     auto gemm = gemm_with_input->gemm;
     auto input_buf = gemm_with_input->input;
-    if (input_buf.same_as(gemm->A)) {
+    if (input_buf.same_as(gemm->a_)) {
       ss << "tl::mls::ds_read_format_tensor_a<ck_tile::sequence<" << block_mn
          << ", " << block_k << ">, ck_tile::sequence<" << mls_tile_mn << ", "
          << mls_tile_k << ">, " << warp_mn << ", " << warp_k << ", "
          << dtype_str << ", 1, " << (trans ? "true" : "false")
          << ", ck_tile::hcu_target_enum::" << GetHcuArchString(T.target) << ">";
     } else {
-      ICHECK(input_buf.same_as(gemm->B));
+      ICHECK(input_buf.same_as(gemm->b_));
       int block_size = *as_const_int(T.thread_bounds->extent);
       int total_warp = block_size / TargetGetWarpSize(T.target);
       ss << "tl::mls::ds_read_format_tensor_b<ck_tile::sequence<" << block_mn
@@ -298,7 +298,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
       Call(DataType::Handle(), builtin::call_extern(), call_args));
 }
 
-TIR_REGISTER_TL_OP(DsReadFormat, ds_read_format)
+TIR_REGISTER_TL_TILE_OP(DsReadFormat, ds_read_format)
     .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                               Integer(CallEffectKind::kOpaque));

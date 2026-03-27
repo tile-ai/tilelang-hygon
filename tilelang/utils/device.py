@@ -3,9 +3,14 @@ import subprocess
 import re
 
 IS_CUDA = torch.cuda.is_available()
-# The correct way to check MPS availability is through torch.backends.mps.
-# IS_MPS = torch.mps.is_available()
-IS_MPS = torch.backends.mps.is_available()
+
+IS_MPS = False
+try:
+    IS_MPS = torch.backends.mps.is_available()
+except AttributeError:
+    print("MPS backend is not available in this PyTorch build.")
+except Exception as e:
+    print(f"An unexpected error occurred while checking MPS availability: {e}")
 
 
 def get_current_device():

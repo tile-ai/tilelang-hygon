@@ -35,6 +35,7 @@ enum class InferLevel : uint8_t {
 
 struct LowerArgs;
 struct LayoutInferArgs;
+
 class TileOperator;
 
 class TileOperatorNode : public Object {
@@ -51,14 +52,13 @@ public:
   /// Buffers this op reads from (inputs). Default empty.
   virtual Array<Buffer> GetInBuffers() const { return {}; }
 
-  static constexpr const char *_type_key = "tl.TileOperator";
-
-  TVM_DECLARE_BASE_OBJECT_INFO(TileOperatorNode, Object);
+  TVM_FFI_DECLARE_OBJECT_INFO("tl.TileOperator", TileOperatorNode, Object);
 };
 
 class TileOperator : public ObjectRef {
 public:
-  TVM_DEFINE_OBJECT_REF_METHODS(TileOperator, ObjectRef, TileOperatorNode);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(TileOperator, ObjectRef,
+                                             TileOperatorNode);
 };
 
 struct LowerArgs {
@@ -68,7 +68,6 @@ struct LowerArgs {
   AddWorkspaceCallback AddWorkspace;
   LayoutMap layout_map;
   Map<Buffer, Buffer> buffer_remap;
-  Array<Var> buffer_var_gemm;
   const PropagationTirCollector *tir_collector = nullptr;
 };
 
@@ -84,23 +83,20 @@ struct LayoutInferArgs {
 
 Var GetVarFromAccessPtr(const PrimExpr &expr);
 
-TileOperator ParseOperator(Call call, BufferMap vmap);
-TileOperator ParseOperator(Stmt stmt, BufferMap vmap);
+TileOperator ParseOperator(Call call);
+TileOperator ParseOperator(Stmt stmt);
 
-using OpBuilderFunc =
-    ffi::TypedFunction<TileOperator(Array<PrimExpr>, BufferMap)>;
+using OpBuilderFunc = ffi::TypedFunction<TileOperator(Array<PrimExpr>)>;
 
-#define TIR_REGISTER_TL_OP(Entry, OpName)                                      \
+#define TIR_REGISTER_TL_TILE_OP(Entry, OpName)                                 \
   const Op &Entry::Get() {                                                     \
-    static const Op &op = Op::Get("tl." #OpName);                              \
+    static const Op &op = Op::Get("tl.tileop." #OpName);                       \
     return op;                                                                 \
   }                                                                            \
-  TVM_REGISTER_OP("tl." #OpName)                                               \
+  TVM_REGISTER_OP("tl.tileop." #OpName)                                        \
       .set_attr<TScriptPrinterName>("TScriptPrinterName", #OpName)             \
-      .set_attr<OpBuilderFunc>("TLOpBuilder",                                  \
-                               [](Array<PrimExpr> args, BufferMap vmap) {      \
-                                 return Entry(args, vmap);                     \
-                               })
+      .set_attr<OpBuilderFunc>(                                                \
+          "TLOpBuilder", [](Array<PrimExpr> args) { return Entry(args); })
 
 } // namespace tl
 } // namespace tvm

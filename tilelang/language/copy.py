@@ -1,26 +1,42 @@
 """The language interface for tl programs."""
-
-from typing import Union, Optional, Literal
+from __future__ import annotations
+from typing import Literal
 from tilelang import language as T
-from tilelang.utils.language import get_buffer_region_from_load, is_shared
+from tilelang.utils.language import (
+    to_buffer_region,
+    get_buffer_region_from_load,
+    legalize_pairwise_extents,
+    is_shared,
+)
 from tvm import ir, tir
-from tilelang.language.utils import buffer_to_tile_region, buffer_region_to_tile_region, buffer_load_to_tile_region
+from tilelang.language.utils import (
+    buffer_region_to_tile_region,
+    buffer_load_to_tile_region,
+)
 
 
 def matrix_load(
-    src: Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion],
-    dst: Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion],
-    last_k_load: Optional[bool] = None,
+    src: tir.Buffer | tir.BufferLoad | tir.BufferRegion,
+    dst: tir.Buffer | tir.BufferLoad,
+    last_k_load: bool | None = None,
 ):
     """MLS (Matrix Load Store) load from global memory to shared memory.
 
     Args:
         src: Global source tensor. Buffer/BufferLoad/BufferRegion - offset (block_mn_base,
             block_k_base) is extracted from region in C++ (region[].min).
-        dst: Destination shared tensor (must be shared memory, must have extent).
+        dst: Destination shared tensor (``Buffer`` or ``BufferLoad`` only; must be shared
+            memory, must have extent).
         last_k_load: If None (default), check_last_k_load=true (boundary k check). If set,
             check_last_k_load=false and use given last_k_load value.
             boundary mn check is always true.
+
+    Note:
+        If ``src`` has more axes than ``dst`` (e.g. ``q[i_b, m_start, 0, 0]`` with a 2D
+        ``q_smem``), inferred tile extents are **right-aligned** to ``src``'s indices:
+        leading dimensions get extent 1, and the tile shape from ``dst`` applies to the
+        **last** ``len(dst_extent)`` dimensions of ``src``. Callers that need the MLS
+        tile on the trailing axes of ``q`` should order indices accordingly.
 
     Returns:
         tir.Call: A handle to the matrix_load operation.
@@ -53,22 +69,26 @@ def matrix_load(
             return data.buffer
         return None
 
+    assert not isinstance(dst, tir.BufferRegion), (
+        "matrix_load dst must be Buffer or BufferLoad, not BufferRegion"
+    )
     dst_buf = get_buffer(dst)
-    assert dst_buf is not None, "matrix_load dst must be Buffer, BufferLoad or BufferRegion"
+    assert dst_buf is not None, "matrix_load dst must be Buffer or BufferLoad"
     assert is_shared(dst_buf), f"matrix_load dst must be shared memory, got scope={dst_buf.scope()}"
 
     src_extent = get_extent(src)
     dst_extent = get_extent(dst)
-    assert dst_extent is not None, "matrix_load dst must have extent (use Buffer or BufferRegion)"
+    assert dst_extent is not None, "matrix_load dst must have extent (use Buffer or BufferLoad)"
     src_extent = list(src_extent) if src_extent else [1] * len(dst_extent)
     dst_extent = list(dst_extent)
-    extent = [max(a, b) for a, b in zip(src_extent, dst_extent)]
+    src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)
+    extent = [tir.max(a, b) for a, b in zip(src_extent, dst_extent)]
 
-    def _to_region(data, access_type):
+    def _to_region(data, access_type, per_buffer_extents):
         if isinstance(data, tir.Var) and T.has_let_value(data):
             data = T.get_let_value(data)
         if isinstance(data, tir.Buffer):
-            return buffer_to_tile_region(data, access_type)
+            return to_buffer_region(data, access_type=access_type, extents=per_buffer_extents)
         if isinstance(data, tir.BufferRegion):
             return buffer_region_to_tile_region(data, access_type, extent)
         if isinstance(data, tir.BufferLoad):
@@ -78,12 +98,12 @@ def matrix_load(
             return buffer_region_to_tile_region(region, access_type, extent)
         return buffer_load_to_tile_region(data, access_type, extent)
 
-    src_region = _to_region(src, "r")
-    dst_region = _to_region(dst, "w")
+    src_region = _to_region(src, "r", src_extent)
+    dst_region = _to_region(dst, "w", dst_extent)
 
     return tir.call_intrin(
         "handle",
-        tir.op.Op.get("tl.matrix_load"),
+        tir.op.Op.get("tl.tileop.matrix_load"),
         src_region,
         dst_region,
         tir.IntImm("int32", 1 if check_last_k_load else 0),
@@ -92,14 +112,14 @@ def matrix_load(
 
 
 def ds_read_format(
-    src: Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion],
-    dst: Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion],
+    src: tir.Buffer | tir.BufferLoad | tir.BufferRegion,
+    dst: tir.Buffer | tir.BufferLoad,
 ):
     """Read MLS-formatted shared memory into register with ds_read_format layout.
 
     Args:
         src: Source shared tensor (must be shared memory, must have extent).
-        dst: Destination register tensor (must have extent).
+        dst: Destination register tensor (``Buffer`` or ``BufferLoad`` only; must have extent).
         Input and output must have at least one with extent; both passed as
         buffer regions to C++.
 
@@ -128,9 +148,12 @@ def ds_read_format(
         return None
 
     src_buf = get_buffer(src)
+    assert not isinstance(dst, tir.BufferRegion), (
+        "ds_read_format dst must be Buffer or BufferLoad, not BufferRegion"
+    )
     dst_buf = get_buffer(dst)
     assert src_buf is not None, "ds_read_format src must be Buffer, BufferLoad or BufferRegion"
-    assert dst_buf is not None, "ds_read_format dst must be Buffer, BufferLoad or BufferRegion"
+    assert dst_buf is not None, "ds_read_format dst must be Buffer or BufferLoad"
     assert is_shared(src_buf), (
         f"ds_read_format src must be shared memory, got scope={src_buf.scope()}"
     )
@@ -142,13 +165,14 @@ def ds_read_format(
     )
     src_extent = list(src_extent) if src_extent else [1] * len(dst_extent)
     dst_extent = list(dst_extent) if dst_extent else [1] * len(src_extent)
-    extent = [max(a, b) for a, b in zip(src_extent, dst_extent)]
+    src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)
+    extent = [tir.max(a, b) for a, b in zip(src_extent, dst_extent)]
 
-    def _to_region(data, access_type):
+    def _to_region(data, access_type, per_buffer_extents):
         if isinstance(data, tir.Var) and T.has_let_value(data):
             data = T.get_let_value(data)
         if isinstance(data, tir.Buffer):
-            return buffer_to_tile_region(data, access_type)
+            return to_buffer_region(data, access_type=access_type, extents=per_buffer_extents)
         if isinstance(data, tir.BufferRegion):
             return buffer_region_to_tile_region(data, access_type, extent)
         if isinstance(data, tir.BufferLoad):
@@ -158,17 +182,17 @@ def ds_read_format(
             return buffer_region_to_tile_region(region, access_type, extent)
         return buffer_load_to_tile_region(data, access_type, extent)
 
-    src_region = _to_region(src, "r")
-    dst_region = _to_region(dst, "w")
+    src_region = _to_region(src, "r", src_extent)
+    dst_region = _to_region(dst, "w", dst_extent)
 
-    return tir.call_intrin("handle", tir.op.Op.get("tl.ds_read_format"), src_region, dst_region)
+    return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.ds_read_format"), src_region, dst_region)
 
 
-def copy(src: Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion],
-         dst: Union[tir.Buffer, tir.BufferLoad],
-         coalesced_width: Optional[int] = None,
+def copy(src: tir.Buffer | tir.BufferLoad | tir.BufferRegion,
+         dst: tir.Buffer | tir.BufferLoad,
+         coalesced_width: int | None = None,
          disable_tma: bool = False,
-         eviction_policy: Optional[Literal["evict_normal", "evict_first", "evict_last"]] = None):
+         eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None):
     """Copy data between memory regions.
 
     Args:
@@ -181,6 +205,22 @@ def copy(src: Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion],
 
     Returns:
         tir.Call: A handle to the copy operation
+
+    Range handling notes:
+    - Accepts `Buffer`/`BufferRegion`/`BufferLoad` on either side. Extents are
+      derived as follows: `Buffer -> shape`, `BufferRegion -> [r.extent]`,
+      `BufferLoad -> extents from its inferred/encoded region`.
+    - If both `src` and `dst` are scalar `BufferLoad` without region extents,
+      lowers to a direct store: `dst[...] = src`.
+    - If one side is missing extents, it is treated as all-ones with the other
+      side's rank to enable broadcasting.
+    - Extents are right-aligned and legalized via `legalize_pairwise_extents`:
+      per tail-dimension, equal keeps as-is, a `1` broadcasts to the other,
+      otherwise a conservative `tir.max` is used to remain safe for dynamic
+      shapes.
+    - The finalized extents are encoded with `tl.region` via `to_buffer_region`
+      and passed through to the backend; low-level loop construction and any
+      scope-specific decisions happen during lowering.
     """
     if isinstance(src, tir.Buffer) and isinstance(dst, tir.Buffer):
         ir.assert_structural_equal(src.shape, dst.shape)
@@ -211,27 +251,16 @@ def copy(src: Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion],
         return tir.BufferStore(dst.buffer, src, dst.indices)
 
     assert src_extent or dst_extent, "Can't deduce copy extents from args"
+    # Treat missing extent as length-matched ones to enable broadcasting.
     src_extent = list(src_extent) if src_extent else [1] * len(dst_extent)
     dst_extent = list(dst_extent) if dst_extent else [1] * len(src_extent)
-    extent = max(src_extent, dst_extent)
 
-    def _to_region(data, access_type):
-        if isinstance(data, tir.Var) and T.has_let_value(data):
-            data = T.get_let_value(data)
-        if isinstance(data, tir.Buffer):
-            return buffer_to_tile_region(data, access_type)
-        elif isinstance(data, tir.BufferRegion):
-            return buffer_region_to_tile_region(data, access_type, extent)
-        elif isinstance(data, tir.BufferLoad):
-            region = get_buffer_region_from_load(data)
-            if region is None:
-                return buffer_load_to_tile_region(data, access_type, extent)
-            return buffer_region_to_tile_region(region, access_type, extent)
-        else:
-            return buffer_load_to_tile_region(data, access_type, extent)
+    # Align and broadcast extents from the right (tail) side.
+    src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)
 
-    src = _to_region(src, "r")
-    dst = _to_region(dst, "w")
+    # Use legalized extents for src and dst respectively.
+    src = to_buffer_region(src, access_type="r", extents=src_extent)
+    dst = to_buffer_region(dst, access_type="w", extents=dst_extent)
 
     if coalesced_width is None:
         coalesced_width = -1  # PrimExpr can not be None
@@ -239,7 +268,7 @@ def copy(src: Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion],
         eviction_policy = 0
     else:
         eviction_policy = {"evict_normal": 0, "evict_first": 1, "evict_last": 2}[eviction_policy]
-    return tir.call_intrin("handle", tir.op.Op.get("tl.copy"), src, dst, coalesced_width,
+    return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.copy"), src, dst, coalesced_width,
                            disable_tma, eviction_policy)
 
 
@@ -251,8 +280,7 @@ def c2d_im2col(img: tir.Buffer,
                stride: int,
                dilation: int,
                pad: int,
-               eviction_policy: Optional[Literal["evict_normal", "evict_first",
-                                                 "evict_last"]] = None):
+               eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None):
     """Perform im2col transformation for 2D convolution.
 
     Args:
@@ -272,6 +300,7 @@ def c2d_im2col(img: tir.Buffer,
         eviction_policy = 0
     else:
         eviction_policy = {"evict_normal": 0, "evict_first": 1, "evict_last": 2}[eviction_policy]
-    return tir.call_intrin("handle", tir.op.Op.get("tl.c2d_im2col"), img.access_ptr("r"),
-                           col.access_ptr("w"), nhw_step, c_step, kernel, stride, dilation, pad,
-                           eviction_policy)
+    img_region = to_buffer_region(img, access_type="r")
+    col_region = to_buffer_region(col, access_type="w")
+    return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.c2d_im2col"), img_region, col_region,
+                           nhw_step, c_step, kernel, stride, dilation, pad, eviction_policy)

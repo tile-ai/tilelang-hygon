@@ -29,7 +29,7 @@ static Optional<TileOperator> PropagateToFindGemmConsumerOpTir(
     if (out_buf.scope() != "local.fragment") continue;
     auto call_opt = tir->GetProducerCall(out_buf);
     if (call_opt.defined()) {
-      auto op = ParseOperator(call_opt.value(), tir->GetBufferDataToBuffer());
+      auto op = ParseOperator(call_opt.value());
       if (op.defined() && IsGemm(op)) return op;
     }
     // Recurse even when no producer call (e.g. BufferStore from mul/add)
@@ -46,7 +46,7 @@ static std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInputTir(
     if (out_buf.scope() != "local.fragment") continue;
     auto call_opt = tir->GetProducerCall(out_buf);
     if (call_opt.defined()) {
-      auto op = ParseOperator(call_opt.value(), tir->GetBufferDataToBuffer());
+      auto op = ParseOperator(call_opt.value());
       if (op.defined() && IsGemm(op)) {
         GemmWithInput r;
         r.gemm = Downcast<Gemm>(op);
@@ -103,7 +103,7 @@ Array<TileOperator> GetConsumerOpsFromTir(Buffer buffer,
   for (const Buffer &out_buf : tir_collector->GetConsumerOutputs(buffer)) {
     auto call_opt = tir_collector->GetProducerCall(out_buf);
     if (!call_opt.defined()) continue;
-    auto op = ParseOperator(call_opt.value(), tir_collector->GetBufferDataToBuffer());
+    auto op = ParseOperator(call_opt.value());
     if (op.defined()) result.push_back(op);
   }
   return result;
@@ -115,7 +115,7 @@ static std::optional<std::pair<int, int>> GetMlsTileFromProducerChainTir(
   if (tir->ProducerIsMatrixLoad(buffer)) {
     auto call_opt = tir->GetProducerCall(buffer);
     if (!call_opt.defined()) return std::nullopt;
-    auto op = ParseOperator(call_opt.value(), tir->GetBufferDataToBuffer());
+    auto op = ParseOperator(call_opt.value());
     if (auto mls = op.as<MatrixLoadNode>()) {
       if (mls->mls_tile_mn > 0 && mls->mls_tile_k > 0) {
         return std::make_pair(mls->mls_tile_mn, mls->mls_tile_k);

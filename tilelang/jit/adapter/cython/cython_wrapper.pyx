@@ -107,9 +107,19 @@ cdef class CythonKernelWrapper:
             if not isinstance(tensor, torch.Tensor):
                 # otherwise, maybe torch.data_ptr() for T.ptr inputs
                 continue
+
+            # Check ndim
+            if tensor.dim() != len(shape_list):
+                raise ValueError(
+                    f"Static shape mismatch for parameter {param}: "
+                    f"expected {len(shape_list)} dimensions, "
+                    f"got {tensor.dim()}"
+                )
+                
+            # Check each dimension
             for shape_idx, expected_shape in shape_list:
                 actual_shape = tensor.shape[shape_idx]
-                if actual_shape != expected_shape:
+                if expected_shape != -1 and actual_shape != expected_shape:
                     raise ValueError(
                         f"Static shape mismatch for parameter {param}: "
                         f"expected {expected_shape} at index {shape_idx}, "
@@ -241,6 +251,8 @@ cdef class CythonKernelWrapper:
                     if dtype not in dtype_to_ctype:
                         raise ValueError(f"Unsupported tensor dtype: {dtype}")
                     call_args.append(dtype_to_ctype[dtype](tensor))
+            elif tensor is None:
+                call_args.append(ctypes.c_void_p(0))
             else:
                 raise ValueError(f"Unsupported tensor type: {type(tensor)}")
 
@@ -255,9 +267,9 @@ cdef class CythonKernelWrapper:
         # Add dynamic dimension values to kernel arguments
         for _, (ref_id, buffer_idx, shape_idx) in self.dynamic_symbolic_map.items():
             if ref_id == 0:
-                call_args.append(tensor_list[buffer_idx].shape[shape_idx])
+                call_args.append(ctypes.c_int64(tensor_list[buffer_idx].shape[shape_idx]))
             else:
-                call_args.append(tensor_list[buffer_idx].stride(shape_idx))
+                call_args.append(ctypes.c_int64(tensor_list[buffer_idx].stride(shape_idx)))
 
         # Add CUDA stream to kernel arguments
         call_args.append(ctypes.c_void_p(stream))

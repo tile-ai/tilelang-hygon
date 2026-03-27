@@ -26,7 +26,7 @@ static PrimExpr ToInt64ConstOrVar(const PrimExpr &expr) {
   return expr;
 }
 
-MatrixLoad::MatrixLoad(Array<PrimExpr> args, BufferMap vmap) {
+MatrixLoad::MatrixLoad(Array<PrimExpr> args) {
   ICHECK(args.size() >= 4)
       << "matrix_load expects at least 4 args: src_region, dst_region, "
          "check_last_k_load, last_k_load";
@@ -35,8 +35,8 @@ MatrixLoad::MatrixLoad(Array<PrimExpr> args, BufferMap vmap) {
   ICHECK(src_call) << "matrix_load args[0] must be region call (src)";
   ICHECK(dst_call) << "matrix_load args[1] must be region call (dst)";
 
-  auto src_region = RegionOp(src_call->args, vmap);
-  auto dst_region = RegionOp(dst_call->args, vmap);
+  auto src_region = RegionOp(src_call->args);
+  auto dst_region = RegionOp(dst_call->args);
   auto src_ranges = src_region->GetRanges();
   auto dst_ranges = dst_region->GetRanges();
 
@@ -48,7 +48,7 @@ MatrixLoad::MatrixLoad(Array<PrimExpr> args, BufferMap vmap) {
   ICHECK(dst_buf.scope() == "shared" || dst_buf.scope() == "shared.dyn")
       << "matrix_load dst must be shared memory, got scope=" << dst_buf.scope();
 
-  ObjectPtr<MatrixLoadNode> node = make_object<MatrixLoadNode>();
+  ObjectPtr<MatrixLoadNode> node = tvm::ffi::make_object<MatrixLoadNode>();
   node->src = src_region->GetBuffer();
   node->dst = dst_buf;
   node->src_ranges = src_ranges;
@@ -66,7 +66,7 @@ MatrixLoad::MatrixLoad(Array<PrimExpr> args, BufferMap vmap) {
 }
 
 TileOperator MatrixLoadNode::Clone() const {
-  auto op = make_object<MatrixLoadNode>(*this);
+  auto op = tvm::ffi::make_object<MatrixLoadNode>(*this);
   return MatrixLoad(op);
 }
 
@@ -182,12 +182,13 @@ LayoutMap MatrixLoadNode::InferLayout(const LayoutInferArgs &T,
     if (c.as<GemmNode>()) {
       found_gemm = true;
       auto gemm = Downcast<Gemm>(c);
-      ICHECK(gemm->kPack == 1) << "MatrixLoad dst Gemm consumer must have kPack=1, got " << gemm->kPack;
+      ICHECK(gemm->kPack_ == 1) << "MatrixLoad dst Gemm consumer must have kPack=1, got "
+                                << gemm->kPack_;
       bool cur_trans = false;
-      if (gemm->A.same_as(dst)) {
-        cur_trans = !gemm->trans_A;
-      } else if (gemm->B.same_as(dst)) {
-        cur_trans = gemm->trans_B;
+      if (gemm->a_.same_as(dst)) {
+        cur_trans = !gemm->transA_;
+      } else if (gemm->b_.same_as(dst)) {
+        cur_trans = gemm->transB_;
       }
       if (mls_trans_set) {
         ICHECK(cur_trans == mls_trans) << "MatrixLoad dst Gemm consumers must have consistent mls_trans";
@@ -203,10 +204,10 @@ LayoutMap MatrixLoadNode::InferLayout(const LayoutInferArgs &T,
         auto gemm = gemm_with_input->gemm;
         auto input_buf = gemm_with_input->input;
         bool cur_trans = false;
-        if (input_buf.same_as(gemm->A)) {
-          cur_trans = !gemm->trans_A;
-        } else if (input_buf.same_as(gemm->B)) {
-          cur_trans = gemm->trans_B;
+        if (input_buf.same_as(gemm->a_)) {
+          cur_trans = !gemm->transA_;
+        } else if (input_buf.same_as(gemm->b_)) {
+          cur_trans = gemm->transB_;
         }
         if (mls_trans_set) {
           ICHECK(cur_trans == mls_trans) << "MatrixLoad dst Gemm consumers must have consistent mls_trans";
@@ -225,10 +226,14 @@ LayoutMap MatrixLoadNode::InferLayout(const LayoutInferArgs &T,
   }
   this->trans = mls_trans;
 
-  // mls_trans=true: K is major (dim_size-1), mls_trans=false: K is non-major (dim_size-2)
+  // mls_trans=true: K is major (dim_size-1), mls_trans=false: K is non-major (dim_size-2).
+  // Tile MN×K always uses the last two buffer dimensions (aligned with src trailing MN,K).
   ICHECK(dst->shape.size() >= 2);
-  int64_t block_mn = mls_trans ? *as_const_int(dst->shape[0]) : *as_const_int(dst->shape[1]);
-  int64_t block_k = mls_trans ? *as_const_int(dst->shape[1]) : *as_const_int(dst->shape[0]);
+  size_t dst_nd = dst->shape.size();
+  int64_t block_mn =
+      mls_trans ? *as_const_int(dst->shape[dst_nd - 2]) : *as_const_int(dst->shape[dst_nd - 1]);
+  int64_t block_k =
+      mls_trans ? *as_const_int(dst->shape[dst_nd - 1]) : *as_const_int(dst->shape[dst_nd - 2]);
   int64_t block_size = *as_const_int(T.thread_bounds->extent);
   int elem_bits = src->dtype.bits();
   int w_mn, w_k, t_mn, t_k;
@@ -248,7 +253,8 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
     LOG(FATAL) << "matrix_load is only supported on HCU target";
   }
 
-  ICHECK(dst->shape.size() >= 2) << "dst must be 2D (MN, K)";
+  ICHECK(dst->shape.size() >= 2)
+      << "dst must have rank >= 2; MN×K tile uses the last two dimensions";
 
   ICHECK(src->shape.size() >= 2) << "src must be 2D";
 
@@ -259,9 +265,13 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
 
   bool mls_trans = this->trans;
 
-  // mls_trans=true: K is major (dim_size-1), mls_trans=false: K is non-major (dim_size-2)
-  int64_t block_mn = mls_trans ? *as_const_int(dst->shape[0]) : *as_const_int(dst->shape[1]);
-  int64_t block_k = mls_trans ? *as_const_int(dst->shape[1]) : *as_const_int(dst->shape[0]);
+  // mls_trans=true: K is major (dim_size-1), mls_trans=false: K is non-major (dim_size-2).
+  // Tile MN×K uses the last two dimensions of dst (same convention as src_ranges tail).
+  size_t dst_nd = dst->shape.size();
+  int64_t block_mn =
+      mls_trans ? *as_const_int(dst->shape[dst_nd - 2]) : *as_const_int(dst->shape[dst_nd - 1]);
+  int64_t block_k =
+      mls_trans ? *as_const_int(dst->shape[dst_nd - 1]) : *as_const_int(dst->shape[dst_nd - 2]);
 
   size_t nr = this->src_ranges.size();
   ICHECK(nr >= 2);
@@ -343,7 +353,7 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
       Call(DataType::Handle(), builtin::call_extern(), call_args));
 }
 
-TIR_REGISTER_TL_OP(MatrixLoad, matrix_load)
+TIR_REGISTER_TL_TILE_OP(MatrixLoad, matrix_load)
     .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                               Integer(CallEffectKind::kOpaque));

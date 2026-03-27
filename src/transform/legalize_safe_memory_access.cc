@@ -24,34 +24,7 @@ namespace tl {
 using namespace tir;
 using arith::IRMutatorWithAnalyzer;
 
-// Helper class to find leaf For nodes in a given IR
-class LeafForFinder : public StmtVisitor {
-public:
-  std::vector<For> leaf_for_nodes;
-
-private:
-  void VisitStmt_(const ForNode *op) final {
-    has_child_for_ = false;
-    bool parent_has_child_for = parent_has_child_for_;
-    parent_has_child_for_ = false;
-
-    StmtVisitor::VisitStmt(op->body);
-
-    if (!has_child_for_) {
-      leaf_for_nodes.push_back(GetRef<For>(op));
-    }
-
-    parent_has_child_for_ = parent_has_child_for;
-    parent_has_child_for_ = true;
-  }
-
-private:
-  bool has_child_for_ = false;
-  bool parent_has_child_for_ = false;
-};
-
-// We will create a visitor to check BufferLoad and BufferStore nodes
-// within this loop body. This visitor will:
+// GlobalMemChecker for a BufferLoad/BufferStore node:
 // 1. Identify BufferLoad and BufferStore nodes.
 // 2. Check if the buffer is in global scope.
 // 3. For each index, compare against the buffer's shape.
@@ -59,13 +32,19 @@ private:
 //    log a warning or handle accordingly.
 struct GlobalMemChecker : public StmtExprVisitor {
 
-  GlobalMemChecker(arith::Analyzer *analyzer) : analyzer_(analyzer) {}
+  GlobalMemChecker(arith::Analyzer *analyzer, bool recursively_collect_conds)
+      : analyzer_(analyzer),
+        recursively_collect_conds_(recursively_collect_conds) {}
   void VisitExpr_(const BufferLoadNode *op) final {
     // Check if the buffer is in global scope
+    // This is because we are writing TilePrograms, where out of bounds
+    // accesses only happen in the global buffer.
     if (IsGlobalBuffer(op->buffer)) {
       CheckBufferIndices(op->buffer, op->indices, /*is_load=*/true);
     }
-    StmtExprVisitor::VisitExpr_(op);
+    if (recursively_collect_conds_) {
+      StmtExprVisitor::VisitExpr_(op);
+    }
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
@@ -73,7 +52,9 @@ struct GlobalMemChecker : public StmtExprVisitor {
     if (IsGlobalBuffer(op->buffer)) {
       CheckBufferIndices(op->buffer, op->indices, /*is_load=*/false);
     }
-    StmtExprVisitor::VisitStmt_(op);
+    if (recursively_collect_conds_) {
+      StmtExprVisitor::VisitStmt_(op);
+    }
   }
 
   // Helper function to determine if a buffer is global
@@ -102,13 +83,17 @@ struct GlobalMemChecker : public StmtExprVisitor {
       PrimExpr index = indices[i];
       PrimExpr shape_dim = buffer->shape[i];
 
-      bool has_variable = false;
+      bool is_index_constant = true;
       PostOrderVisit(index, [&](const ObjectRef &obj) {
         if (const VarNode *v = obj.as<VarNode>()) {
-          has_variable = true;
+          is_index_constant = false;
+        }
+        if (const BufferLoadNode *v = obj.as<BufferLoadNode>()) {
+          is_index_constant = false;
         }
       });
-      if (!has_variable) {
+      if (is_index_constant) {
+        // If index is a constant, we can skip the check
         continue;
       }
 
@@ -134,23 +119,61 @@ struct GlobalMemChecker : public StmtExprVisitor {
 private:
   Array<PrimExpr> _conditions;
   arith::Analyzer *analyzer_;
+  bool recursively_collect_conds_;
 };
 
-class SafeMemorysRewriter : public StmtExprMutator {
-  arith::Analyzer *analyzer_;
-
+class SafeMemorysRewriter : public IRMutatorWithAnalyzer {
 public:
-  explicit SafeMemorysRewriter(Map<Buffer, PrimExpr> annotated_padding_map,
-                               arith::Analyzer *analyzer)
-      : annotated_padding_map_(std::move(annotated_padding_map)),
-        analyzer_(analyzer) {}
+  // Static method to substitute and transform the given PrimFunc
+  static PrimFunc Substitute(PrimFunc f) {
+    arith::Analyzer analyzer;
+    // Create an instance of the legalizer with the analyzer
+    SafeMemorysRewriter substituter(&analyzer);
+    // Get a mutable copy of the function node
+    PrimFuncNode *fptr = f.CopyOnWrite();
+    for (const auto &[_, buffer] : f->buffer_map) {
+      substituter.buffer_data_to_buffer_.Set(buffer->data, buffer);
+    }
+    // Apply the legalizer to the function body
+    fptr->body = substituter.VisitStmt(f->body);
+    return f;
+  }
 
 private:
+  // Constructor initializing the base class with the analyzer
+  SafeMemorysRewriter(arith::Analyzer *analyzer)
+      : arith::IRMutatorWithAnalyzer(analyzer) {}
+  // Constructor initializing the base class with the analyzer
+
+  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    auto load = Downcast<BufferLoad>(IRMutatorWithAnalyzer::VisitExpr_(op));
+
+    // For Load/Store, we only check the current node, not its children.
+    // Since rewriter will recursively visit children.
+    GlobalMemChecker checker(analyzer_, /*recursively_collect_conds=*/false);
+    checker(load);
+    Array<PrimExpr> conditions = checker.GetConditions();
+
+    if (conditions.empty()) {
+      return load;
+    }
+
+    // For loading, we can always use safe value if the access is out of
+    // bounds
+    PrimExpr value = load;
+    for (auto cond : conditions) {
+      ICHECK(cond.dtype() == DataType::Bool(1))
+          << "condition is not a boolean: " << cond;
+      value = if_then_else(cond, value, GetSafeValue(load->buffer));
+    }
+    return value;
+  }
+
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     // Check if the buffer is in global scope
-    auto store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
+    auto store = Downcast<BufferStore>(IRMutatorWithAnalyzer::VisitStmt_(op));
 
-    GlobalMemChecker checker(analyzer_);
+    GlobalMemChecker checker(analyzer_, /*recursively_collect_conds=*/false);
     checker(store);
     Array<PrimExpr> conditions = checker.GetConditions();
 
@@ -172,49 +195,36 @@ private:
       return store;
     }
 
-    auto value = store->value;
-    if (IsGlobalBuffer(store->buffer)) {
-      Stmt store_with_conditions = store;
-      for (auto cond : conditions) {
-        store_with_conditions = IfThenElse(cond, store_with_conditions);
-      }
-      return store_with_conditions;
-    } else if (isSharedBuffer(store->buffer)) {
-      PrimExpr value = store->value;
-      for (auto cond : conditions) {
-        ICHECK(cond.dtype() == DataType::Bool(1))
-            << "condition is not a boolean: " << cond;
-        value = if_then_else(cond, value, GetPadding(store->buffer));
-      }
-      store.CopyOnWrite()->value = value;
-      return store;
-    } else if (IsLocalBuffer(store->buffer)) {
-      PrimExpr value = store->value;
-      for (auto cond : conditions) {
-        ICHECK(cond.dtype() == DataType::Bool(1))
-            << "condition is not a boolean: " << cond;
-        value = if_then_else(cond, value, GetPadding(store->buffer));
-      }
-      store.CopyOnWrite()->value = value;
-      return store;
-    } else {
-      LOG(FATAL) << "Check store buffer: " << store->buffer
-                 << " is not a global or shared or local buffer";
+    // If a store is out of bounds, we skip the corresponding stmt directly.
+    Stmt store_with_conditions = store;
+    for (auto cond : conditions) {
+      store_with_conditions = IfThenElse(cond, store_with_conditions);
     }
-
-    return store;
+    return store_with_conditions;
   }
 
-  // Handle Call Nodes
+  // Recursively check Load/Store in the call arguments.
   // For example
   // T.call_extern("handle", "atomicAddx2", T.address_of(C),
   // T.address_of(C_shared))
+
+  // NOTE(chaofan): This is currently not the most rigorous solution.
+  // The check here is primarily intended to handle extern functions like
+  // atomicAdd, which may involve memory access. Due to their special nature,
+  // the BufferLoad in their parameters might be used for boundary checks of the
+  // current statement. The current solution adopts a simplified approach:
+  // directly applying the boundary constraints of all parameters to the
+  // statement. While not entirely precise, it addresses most common scenarios.
   Stmt VisitStmt_(const EvaluateNode *op) final {
-    auto evaluate = Downcast<Evaluate>(StmtExprMutator::VisitStmt_(op));
+    auto evaluate = Downcast<Evaluate>(op);
+
     if (const CallNode *call_op = op->value.as<CallNode>()) {
-      auto call = Downcast<Call>(evaluate->value);
+      auto call = Downcast<Call>(op->value);
       if (call->op == builtin::call_extern()) {
-        GlobalMemChecker checker(analyzer_);
+        // For CallExtern, we recursively collect conditions from all children.
+        // Since we cannot rewrite any BufferLoad in its children (Rewrite will
+        // cause potential Nullptr exception).
+        GlobalMemChecker checker(analyzer_, /*recursively_collect_conds=*/true);
         checker(call);
         Array<PrimExpr> conditions = checker.GetConditions();
 
@@ -233,6 +243,25 @@ private:
     return evaluate;
   }
 
+  Stmt VisitStmt_(const BlockNode *op) final {
+    for (auto buffer : op->alloc_buffers) {
+      buffer_data_to_buffer_.Set(buffer->data, buffer);
+    }
+    if (op->annotations.count(attr::kSafeValueMap)) {
+      auto map = op->annotations.Get(attr::kSafeValueMap)
+                     ->as<Map<Var, PrimExpr>>()
+                     .value();
+      for (const auto &[var, safe_value] : map) {
+        ICHECK(buffer_data_to_buffer_.count(var))
+            << "buffer " << var << " is not found in the block "
+            << buffer_data_to_buffer_;
+        auto buffer = buffer_data_to_buffer_[var];
+        annotated_safe_value_map_.Set(buffer, safe_value);
+      }
+    }
+    return IRMutatorWithAnalyzer::VisitStmt_(op);
+  }
+
   bool IsLocalBuffer(const Buffer &buffer) {
     String scope = buffer.scope();
     return scope == "local" || scope == "local.fragment" ||
@@ -248,97 +277,16 @@ private:
     String scope = buffer.scope();
     return scope == "global";
   }
-  // Get the padding of the buffer
-  PrimExpr GetPadding(const Buffer &buffer) {
-    if (annotated_padding_map_.count(buffer)) {
-      return annotated_padding_map_[buffer];
+  // Get the safe value of the buffer
+  PrimExpr GetSafeValue(const Buffer &buffer) {
+    if (annotated_safe_value_map_.count(buffer)) {
+      return annotated_safe_value_map_[buffer];
     }
     return make_zero(buffer->dtype);
   }
 
-  Map<Buffer, PrimExpr> annotated_padding_map_;
-};
-
-// Class to legalize safe memory access by transforming them appropriately
-class SafeMemoryLegalizer : IRMutatorWithAnalyzer {
-public:
-  // Static method to substitute and transform the given PrimFunc
-  static PrimFunc Substitute(PrimFunc f) {
-    arith::Analyzer analyzer;
-    // Create an instance of the legalizer with the analyzer
-    SafeMemoryLegalizer substituter(&analyzer);
-    // Get a mutable copy of the function node
-    PrimFuncNode *fptr = f.CopyOnWrite();
-    for (const auto &[_, buffer] : f->buffer_map) {
-      substituter.buffer_data_to_buffer_.Set(buffer->data, buffer);
-    }
-    // Apply the legalizer to the function body
-    fptr->body = substituter.VisitStmt(f->body);
-    return f;
-  }
-
-private:
-  // Constructor initializing the base class with the analyzer
-  SafeMemoryLegalizer(arith::Analyzer *analyzer)
-      : arith::IRMutatorWithAnalyzer(analyzer) {}
-
-  // Override the VisitStmt_ method to handle ForNode (loop statements)
-  Stmt VisitStmt_(const ForNode *op) final {
-    // Visit and potentially modify the loop node
-    For for_node = Downcast<For>(IRMutatorWithAnalyzer::VisitStmt_(op));
-    auto has_inner_loop = HasInnerLoop(for_node->body);
-    if (!has_inner_loop) {
-      SafeMemorysRewriter rewriter(annotated_padding_map_, analyzer_);
-      for_node.CopyOnWrite()->body = rewriter(for_node->body);
-      // // Detect Buffer Load Node in the loop body, collect the indices and
-      // buffer size
-
-      // // Run the checker on the loop body
-      // GlobalMemChecker checker(analyzer_);
-      // checker(for_node->body);
-      // Array<PrimExpr> conditions = checker.GetConditions();
-      // auto body = for_node->body;
-      // // Note that we might have duplicate conditions
-      // // Which will be optimized by simplify pass
-      // // Replace the loop body with the new body
-      // for (auto cond : conditions) {
-      //   body = IfThenElse(cond, body);
-      // }
-      // for_node.CopyOnWrite()->body = body;
-      return std::move(for_node);
-    }
-
-    // Visit a For Node
-    return IRMutatorWithAnalyzer::VisitStmt_(op);
-  }
-
-  Stmt VisitStmt_(const BlockNode *op) final {
-    for (auto buffer : op->alloc_buffers) {
-      buffer_data_to_buffer_.Set(buffer->data, buffer);
-    }
-    if (op->annotations.count(attr::kPaddingMap)) {
-      auto map = op->annotations.Get(attr::kPaddingMap)
-                     ->as<Map<Var, PrimExpr>>()
-                     .value();
-      for (const auto &[var, padding] : map) {
-        ICHECK(buffer_data_to_buffer_.count(var))
-            << "buffer " << var << " is not found in the block "
-            << buffer_data_to_buffer_;
-        auto buffer = buffer_data_to_buffer_[var];
-        annotated_padding_map_.Set(buffer, padding);
-      }
-    }
-    return IRMutatorWithAnalyzer::VisitStmt_(op);
-  }
-
-  static bool HasInnerLoop(const Stmt &stmt) {
-    LeafForFinder finder;
-    finder(stmt);
-    return !finder.leaf_for_nodes.empty();
-  }
-
   Map<Var, Buffer> buffer_data_to_buffer_;
-  Map<Buffer, PrimExpr> annotated_padding_map_;
+  Map<Buffer, PrimExpr> annotated_safe_value_map_;
 };
 
 // Create a pass that legalizes vectorized loops in the IRModule
@@ -351,18 +299,18 @@ tvm::transform::Pass LegalizeSafeMemoryAccess() {
     if (disable_safe_memory_legalize) {
       return f;
     }
-    return SafeMemoryLegalizer::Substitute(std::move(f));
+    return SafeMemorysRewriter::Substitute(std::move(f));
   };
   // Create and return a PrimFunc pass with the transformation function
   return CreatePrimFuncPass(pass_func, 0, "tl.LegalizeSafeMemoryAccess", {});
 }
 
 // Register the pass globally so it can be used in the compilation pipeline
-TVM_FFI_STATIC_INIT_BLOCK({
+TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.transform.LegalizeSafeMemoryAccess",
                         LegalizeSafeMemoryAccess);
-});
+}
 
 } // namespace tl
 } // namespace tvm

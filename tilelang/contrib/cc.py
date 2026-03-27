@@ -23,7 +23,6 @@ import platform
 
 # pylint: disable=invalid-name
 import sys
-from typing import Dict
 
 from tvm.base import py_str
 from tvm.contrib import tar as _tar
@@ -64,7 +63,7 @@ def get_cc():
     return None
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def get_cplus_compiler():
     """Return the path to the default C/C++ compiler.
 
@@ -208,7 +207,7 @@ def create_executable(output, objects, options=None, cc=None, cwd=None, ccache_e
         raise ValueError("Unsupported platform")
 
 
-def get_global_symbol_section_map(path, *, nm=None) -> Dict[str, str]:
+def get_global_symbol_section_map(path, *, nm=None) -> dict[str, str]:
     """Get global symbols from a library via nm -g
 
     Parameters

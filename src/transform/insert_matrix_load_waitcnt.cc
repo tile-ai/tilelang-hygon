@@ -52,7 +52,7 @@ static std::optional<BufferRegion> GetBufferRegionFromAccessPtr(const PrimExpr &
     if (call->op.same_as(builtin::tvm_access_ptr()) && call->args.size() >= 5) {
       if (const auto *var = call->args[1].as<VarNode>()) {
         BufferRegion r;
-        r.buffer_var = GetRef<Var>(var);
+        r.buffer_var = tvm::ffi::GetRef<Var>(var);
         r.offset = call->args[2];
         r.extent = call->args[3];
         return r;
@@ -340,10 +340,10 @@ tvm::transform::Pass InsertMatrixLoadWaitcntPass() {
   return tir::transform::CreatePrimFuncPass(pass_func, 0, "tl.InsertMatrixLoadWaitcnt", {});
 }
 
-TVM_FFI_STATIC_INIT_BLOCK({
+TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.transform.InsertMatrixLoadWaitcnt", InsertMatrixLoadWaitcntPass);
-});
+}
 
 }  // namespace transform
 }  // namespace tl

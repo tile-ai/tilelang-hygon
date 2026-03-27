@@ -20,6 +20,7 @@
 debug/
 build/
 *dist/
+dist*/
 wheelhouse/
 __pycache__
 nnfusion.tar.gz
@@ -97,3 +98,16 @@ tilelang/jit/adapter/cython/.cycache
 
 # claude
 **/.claude
+
+# CMake
+cmake-build/
+cmake-build-*/
+
+# Git version for sdist
+.git_commit.txt
+
+# pre-commit cache
+.pre-commit-cache/*
+
+# host checks logs
+maint/host_checks/logs/*

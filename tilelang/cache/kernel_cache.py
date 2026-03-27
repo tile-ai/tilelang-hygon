@@ -1,4 +1,5 @@
 """The cache utils with class and database persistence - KernelCache Class"""
+from __future__ import annotations
 
 import json
 import logging
@@ -9,12 +10,12 @@ import uuid
 import subprocess
 import tempfile
 from hashlib import sha256
-from typing import Callable, List, Literal, Optional, Union
+from typing import Callable, Literal, Optional
 
 import cloudpickle
 from tvm.target import Target
 from tvm.tir import PrimFunc
-
+from tvm.runtime import Executable
 from tilelang.engine.param import KernelParam
 from tilelang import env
 from tilelang.jit import JITKernel
@@ -22,8 +23,9 @@ from tilelang import __version__
 from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
 from tilelang.contrib.hcu import get_hcu_compile_flags
 
-KERNEL_PATH = "kernel.cu"
-WRAPPED_KERNEL_PATH = "wrapped_kernel.cu"
+DEVICE_KERNEL_PATH = "device_kernel.cu"
+HOST_KERNEL_PATH = "host_kernel.cu"
+EXECUTABLE_PATH = "executable.so"
 ASM_KERNEL_PATH = "kernel.s"
 LLIR_KERNEL_PATH = "kernel.llir"
 TIR_KERNEL_PATH = "kernel.tir"
@@ -112,7 +114,7 @@ class KernelCache:
     _instance = None  # For implementing singleton pattern
     _lock = threading.Lock()  # For thread safety
     _memory_cache = {}  # In-memory cache dictionary
-    execution_backend: Literal["dlpack", "ctypes", "cython", "nvrtc"] = "cython"
+    execution_backend: Literal["tvm_ffi", "ctypes", "cython", "nvrtc", "torch"] = "tvm_ffi"
 
     def __new__(cls):
         """
@@ -140,13 +142,13 @@ class KernelCache:
     def _generate_key(
         self,
         func: Callable,
-        out_idx: List[int],
-        execution_backend: Literal["dlpack", "ctypes", "cython", "nvrtc"] = "cython",
+        out_idx: list[int],
+        execution_backend: Literal["tvm_ffi", "ctypes", "cython", "nvrtc", "torch"] = "tvm_ffi",
         args=None,
-        target: Union[str, Target] = "auto",
-        target_host: Union[str, Target] = None,
+        target: str | Target = "auto",
+        target_host: str | Target = None,
         pass_configs: dict = None,
-        compile_flags: Optional[Union[List[str], str]] = None,
+        compile_flags: list[str] | str | None = None,
     ) -> str:
         """
         Generates a unique hash key for caching compiled kernels.
@@ -185,14 +187,15 @@ class KernelCache:
     def cached(
         self,
         func: PrimFunc = None,
-        out_idx: List[int] = None,
+        out_idx: list[int] = None,
         *args,
-        target: Union[str, Target] = "auto",
-        target_host: Union[str, Target] = None,
-        execution_backend: Literal["dlpack", "ctypes", "cython", "nvrtc"] = "cython",
+        target: str | Target = "auto",
+        target_host: str | Target = None,
+        execution_backend: Literal["auto", "tvm_ffi", "ctypes", "cython", "nvrtc",
+                                   "torch"] = "auto",
         verbose: bool = False,
         pass_configs: dict = None,
-        compile_flags: Optional[Union[List[str], str]] = None,
+        compile_flags: list[str] | str | None = None,
     ) -> JITKernel:
         """
         Caches and reuses compiled kernels to avoid redundant compilation.
@@ -207,12 +210,30 @@ class KernelCache:
         Returns:
             JITKernel: The compiled kernel, either freshly compiled or from cache
         """
+        # Normalize target and resolve execution backend before proceeding
+        from tilelang.utils.target import determine_target as _determine_target
+        from tilelang.jit.execution_backend import resolve_execution_backend, allowed_backends_for_target
+        norm_target = Target(_determine_target(target)) if isinstance(target, str) else target
+        requested_backend = execution_backend
+        execution_backend = resolve_execution_backend(requested_backend, norm_target)
+        if verbose:
+            allowed_now = allowed_backends_for_target(norm_target, include_unavailable=False)
+            # Avoid duplicate logs when caller already resolved explicitly
+            if requested_backend in (None, "auto") or requested_backend != execution_backend:
+                self.logger.info(
+                    "Execution backend resolved -> '%s' (requested='%s', target='%s', allowed: %s)",
+                    execution_backend,
+                    requested_backend,
+                    norm_target.kind.name,
+                    ", ".join(sorted(allowed_now)),
+                )
+
         if not env.is_cache_enabled():
             return JITKernel(
                 func,
                 out_idx=out_idx,
                 execution_backend=execution_backend,
-                target=target,
+                target=norm_target,
                 target_host=target_host,
                 verbose=verbose,
                 pass_configs=pass_configs,
@@ -224,7 +245,7 @@ class KernelCache:
             out_idx=out_idx,
             execution_backend=execution_backend,
             args=args,
-            target=target,
+            target=norm_target,
             target_host=target_host,
             pass_configs=pass_configs,
             compile_flags=compile_flags,
@@ -240,7 +261,7 @@ class KernelCache:
                 self.logger.debug(f"Checking disk cache for kernel {func.attrs['global_symbol']}")
 
             # Then check disk cache
-            kernel = self._load_kernel_from_disk(key, target, target_host, out_idx,
+            kernel = self._load_kernel_from_disk(key, norm_target, target_host, out_idx,
                                                  execution_backend, pass_configs, compile_flags,
                                                  func, verbose)
             if kernel is not None:
@@ -258,18 +279,15 @@ class KernelCache:
             func,
             out_idx=out_idx,
             execution_backend=execution_backend,
-            target=target,
+            target=norm_target,
             target_host=target_host,
             verbose=verbose,
             pass_configs=pass_configs,
             compile_flags=compile_flags,
         )
-        if execution_backend in ("dlpack", "torch"):
-            self.logger.warning("DLPack or torch backend does not support cache saving to disk.")
-        else:
-            with self._lock:
-                if env.is_cache_enabled():
-                    self._save_kernel_to_disk(key, kernel, func, verbose)
+        with self._lock:
+            if env.is_cache_enabled():
+                self._save_kernel_to_disk(key, kernel, func, verbose)
 
         # Store in memory cache after compilation
         self._memory_cache[key] = kernel
@@ -311,6 +329,12 @@ class KernelCache:
         # Use atomic POSIX replace, so other processes cannot see a partial write
         os.replace(temp_path, path)
 
+    @staticmethod
+    def _safe_write_executable(executable: Executable, path: str):
+        temp_path = os.path.join(env.TILELANG_TMP_DIR, f"{os.getpid()}_{uuid.uuid4()}.so")
+        executable.export_library(temp_path)
+        os.replace(temp_path, path)
+
     def _save_kernel_to_disk(self,
                              key: str,
                              kernel: JITKernel,
@@ -337,19 +361,19 @@ class KernelCache:
 
         # Save kernel source code
         try:
-            kernel_path = os.path.join(cache_path, KERNEL_PATH)
-            asm_kernel_path = os.path.join(cache_path, ASM_KERNEL_PATH)
-            llir_kernel_path = os.path.join(cache_path, LLIR_KERNEL_PATH)
-            tir_kernel_path = os.path.join(cache_path, TIR_KERNEL_PATH)
+            device_kernel_path = os.path.join(cache_path, DEVICE_KERNEL_PATH)
             if verbose:
-                self.logger.debug(f"Saving kernel source code to file: {kernel_path}")
+                self.logger.debug(f"Saving kernel source code to file: {device_kernel_path}")
             if kernel.kernel_source is not None:
-                KernelCache._safe_write_file(kernel_path, "w",
+                KernelCache._safe_write_file(device_kernel_path, "w",
                                              lambda file: file.write(kernel.kernel_source))
+                asm_kernel_path = os.path.join(cache_path, ASM_KERNEL_PATH)
+                llir_kernel_path = os.path.join(cache_path, LLIR_KERNEL_PATH)
+                tir_kernel_path = os.path.join(cache_path, TIR_KERNEL_PATH)
                 KernelCache._safe_write_file(asm_kernel_path, "w",
-                                             lambda file: file.write(_make_obj(kernel_path, "asm", "r")))
+                                             lambda file: file.write(_make_obj(device_kernel_path, "asm", "r")))
                 KernelCache._safe_write_file(llir_kernel_path, "w",
-                                             lambda file: file.write(_make_obj(kernel_path, "llir", "r")))
+                                             lambda file: file.write(_make_obj(device_kernel_path, "llir", "r")))
                 KernelCache._safe_write_file(tir_kernel_path, "w",
                                              lambda file: file.write(kernel.prim_func.script(show_meta=True)))
         except Exception as e:
@@ -357,30 +381,35 @@ class KernelCache:
 
         # Save wrapped kernel source code
         try:
-            wrapped_kernel_path = os.path.join(cache_path, WRAPPED_KERNEL_PATH)
+            host_kernel_path = os.path.join(cache_path, HOST_KERNEL_PATH)
             if verbose:
-                self.logger.debug(
-                    f"Saving wrapped kernel source code to file: {wrapped_kernel_path}")
-            KernelCache._safe_write_file(
-                wrapped_kernel_path, "w",
-                lambda file: file.write(kernel.adapter.get_kernel_source()))
+                self.logger.debug(f"Saving wrapped kernel source code to file: {host_kernel_path}")
+            if self.execution_backend == "tvm_ffi":
+                KernelCache._safe_write_file(
+                    host_kernel_path, "w",
+                    lambda file: file.write(kernel.adapter.get_host_source()))
+            else:
+                KernelCache._safe_write_file(
+                    host_kernel_path, "w",
+                    lambda file: file.write(kernel.adapter.get_kernel_source()))
         except Exception as e:
-            self.logger.error(f"Error saving wrapped kernel source code to disk: {e}")
+            self.logger.error(f"Error saving host kernel source code to disk: {e}")
 
         # Save the kernel library
         try:
             # Save CUBIN or SO file
-            kernel_lib_path = KERNEL_CUBIN_PATH if self.execution_backend == "nvrtc" else KERNEL_LIB_PATH
+            if self.execution_backend == "nvrtc":
+                kernel_lib_path = KERNEL_CUBIN_PATH
+            elif self.execution_backend == "tvm_ffi":
+                kernel_lib_path = EXECUTABLE_PATH
+            else:
+                kernel_lib_path = KERNEL_LIB_PATH
+
             kernel_lib_path = os.path.join(cache_path, kernel_lib_path)
-            src_lib_path = kernel.adapter.libpath
-            if verbose:
-                self.logger.debug(f"Saving kernel library to file: {kernel_lib_path}")
-            KernelCache._safe_write_file(
-                kernel_lib_path, "wb",
-                lambda file: file.write(KernelCache._load_binary(src_lib_path)))
 
             # Save an extra Python file for NVRTC
             if self.execution_backend == "nvrtc":
+                src_lib_path = kernel.adapter.libpath
                 kernel_py_path = os.path.join(cache_path, KERNEL_PY_PATH)
                 src_lib_path = src_lib_path.replace(".cubin", ".py")
                 if verbose:
@@ -388,6 +417,19 @@ class KernelCache:
                 KernelCache._safe_write_file(
                     kernel_py_path, "wb",
                     lambda file: file.write(KernelCache._load_binary(src_lib_path)))
+            elif self.execution_backend == "tvm_ffi":
+                executable = kernel.adapter.executable
+                if verbose:
+                    self.logger.debug(f"Saving kernel executable to file: {executable}")
+                KernelCache._safe_write_executable(executable, kernel_lib_path)
+            else:
+                src_lib_path = kernel.adapter.libpath
+                if verbose:
+                    self.logger.debug(f"Saving kernel library to file: {kernel_lib_path}")
+                KernelCache._safe_write_file(
+                    kernel_lib_path, "wb",
+                    lambda file: file.write(KernelCache._load_binary(src_lib_path)))
+
         except Exception as e:
             self.logger.error(f"Error saving kernel library to disk: {e}")
 
@@ -404,15 +446,15 @@ class KernelCache:
     def _load_kernel_from_disk(
         self,
         key: str,
-        target: Union[str, Target] = "auto",
-        target_host: Union[str, Target] = None,
-        out_idx: List[int] = None,
-        execution_backend: Literal["dlpack", "ctypes", "cython", "nvrtc"] = "cython",
+        target: str | Target = "auto",
+        target_host: str | Target = None,
+        out_idx: list[int] = None,
+        execution_backend: Literal["tvm_ffi", "ctypes", "cython", "nvrtc", "torch"] = "tvm_ffi",
         pass_configs: dict = None,
-        compile_flags: Optional[Union[List[str], str]] = None,
+        compile_flags: list[str] | str | None = None,
         func: Callable = None,
         verbose: bool = False,
-    ) -> Optional[JITKernel]:
+    ) -> JITKernel | None:
         """
         Loads a previously compiled kernel from disk cache.
 
@@ -430,37 +472,54 @@ class KernelCache:
             JITKernel: The loaded kernel if found, None otherwise.
         """
         cache_path = self._get_cache_path(key)
-        wrapped_kernel_path = os.path.join(cache_path, WRAPPED_KERNEL_PATH)
-        kernel_lib_path = os.path.join(
-            cache_path, KERNEL_CUBIN_PATH if self.execution_backend == "nvrtc" else KERNEL_LIB_PATH)
+        device_kernel_path = os.path.join(cache_path, DEVICE_KERNEL_PATH)
+        host_kernel_path = os.path.join(cache_path, HOST_KERNEL_PATH)
+        if self.execution_backend == "nvrtc":
+            kernel_lib_path = KERNEL_CUBIN_PATH
+        elif self.execution_backend == "tvm_ffi":
+            kernel_lib_path = EXECUTABLE_PATH
+        else:
+            kernel_lib_path = KERNEL_LIB_PATH
+        kernel_lib_path = os.path.join(cache_path, kernel_lib_path)
         params_path = os.path.join(cache_path, PARAMS_PATH)
         if not all([os.path.exists(file) for file in (kernel_lib_path, params_path)]):
             return None
 
-        kernel_global_source: Optional[str] = None
-        kernel_params: Optional[List[KernelParam]] = None
+        device_kernel_source: str | None = None
+        host_kernel_source: str | None = None
+        kernel_params: list[KernelParam] | None = None
 
         # Load the kernel source file (optional)
         try:
             if verbose:
-                self.logger.debug(
-                    f"Loading wrapped kernel source code from file: {wrapped_kernel_path}")
-            with open(wrapped_kernel_path, "r") as f:
-                kernel_global_source = f.read()
+                self.logger.debug(f"Loading kernel source code from file: {device_kernel_path}")
+            with open(device_kernel_path) as f:
+                device_kernel_source = f.read()
 
             if env.TILELANG_SOURCE_RECOMPILE.lower() in ("1", "true", "yes", "on"):
-                self.logger.debug(f"Recompiling {wrapped_kernel_path} from disk cache.")
-                 # Re-generate assembly & shared library code from source
-                KernelCache._safe_write_file(kernel_lib_path, "wb",
-                                             lambda file: file.write(_make_obj(wrapped_kernel_path,"so", "rb")))
+                self.logger.debug(f"Recompiling {host_kernel_path} from disk cache.")
+                # Re-generate assembly & shared library code from source
+                KernelCache._safe_write_file(
+                    kernel_lib_path, "wb",
+                    lambda file: file.write(_make_obj(host_kernel_path, "so", "rb")))
                 asm_kernel_path = os.path.join(cache_path, ASM_KERNEL_PATH)
                 llir_kernel_path = os.path.join(cache_path, LLIR_KERNEL_PATH)
-                KernelCache._safe_write_file(asm_kernel_path, "w",
-                                            lambda file: file.write(_make_obj(wrapped_kernel_path, "asm", "r")))
-                KernelCache._safe_write_file(llir_kernel_path, "w",
-                                            lambda file: file.write(_make_obj(wrapped_kernel_path, "llir", "r")))
+                KernelCache._safe_write_file(
+                    asm_kernel_path, "w",
+                    lambda file: file.write(_make_obj(device_kernel_path, "asm", "r")))
+                KernelCache._safe_write_file(
+                    llir_kernel_path, "w",
+                    lambda file: file.write(_make_obj(device_kernel_path, "llir", "r")))
         except Exception as e:
-            self.logger.error(f"Error loading wrapped kernel source code from disk: {e}")
+            self.logger.error(f"Error loading kernel source code from disk: {e}")
+        try:
+            if verbose:
+                self.logger.debug(
+                    f"Loading wrapped kernel source code from file: {host_kernel_path}")
+            with open(host_kernel_path) as f:
+                host_kernel_source = f.read()
+        except Exception as e:
+            self.logger.error(f"Error loading host kernel source code from disk: {e}")
 
         # Load kernel parameters
         try:
@@ -471,10 +530,11 @@ class KernelCache:
         except Exception as e:
             self.logger.error(f"Error loading kernel parameters from disk: {e}")
 
-        if kernel_global_source and kernel_params:
+        if host_kernel_source and device_kernel_source and kernel_params:
             return JITKernel.from_database(
                 func=func,
-                kernel_global_source=kernel_global_source,
+                host_kernel_source=host_kernel_source,
+                device_kernel_source=device_kernel_source,
                 kernel_lib_path=kernel_lib_path,
                 params=kernel_params,
                 target=target,
@@ -485,6 +545,7 @@ class KernelCache:
                 compile_flags=compile_flags,
             )
         else:
+            # TODO(lei): report what the reason is.
             return None
 
     def _clear_disk_cache(self):

@@ -11,6 +11,7 @@
 #include <tvm/tir/utils.h>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include "../layout/layout.h"
 #include "../layout/utils.h"
@@ -106,55 +107,6 @@ private:
 
   Map<Buffer, Layout> layout_remap_;
 };
-class BufferGemmCollector : public StmtExprVisitor {
-public:
-  BufferGemmCollector() { Clear(); }
-
-  void Clear() { buffer_var_gemm_.clear(); }
-
-  void Collect(const Stmt &stmt) { VisitStmt(stmt); }
-
-  Array<Var> GetBufferVarGemm() { return buffer_var_gemm_; }
-
-private:
-  void VisitStmt_(const EvaluateNode *op) {
-    const CallNode *call_node = op->value.as<CallNode>();
-    // Value of EvaluateNode may not be a call
-    if (!call_node) {
-      return;
-    }
-    auto call = Downcast<Call>(call_node);
-    if (call->op.same_as(Gemm::Get())) {
-      auto srcA_buffer_access_ptr = Downcast<Call>(call->args[0]);
-      ICHECK(srcA_buffer_access_ptr->op.same_as(builtin::tvm_access_ptr()));
-      auto srcA_buffer_var = Downcast<Var>(srcA_buffer_access_ptr->args[1]);
-      auto srcB_buffer_access_ptr = Downcast<Call>(call->args[1]);
-      ICHECK(srcB_buffer_access_ptr->op.same_as(builtin::tvm_access_ptr()));
-      auto srcB_buffer_var = Downcast<Var>(srcB_buffer_access_ptr->args[1]);
-      auto dst_buffer_access_ptr = Downcast<Call>(call->args[2]);
-      ICHECK(dst_buffer_access_ptr->op.same_as(builtin::tvm_access_ptr()));
-      auto dst_buffer_var = Downcast<Var>(dst_buffer_access_ptr->args[1]);
-      buffer_var_gemm_.push_back(srcA_buffer_var);
-      buffer_var_gemm_.push_back(srcB_buffer_var);
-      buffer_var_gemm_.push_back(dst_buffer_var);
-    } else if (call->op.same_as(GemmSP::Get())) {
-      auto srcA_buffer_access_ptr = Downcast<Call>(call->args[0]);
-      ICHECK(srcA_buffer_access_ptr->op.same_as(builtin::tvm_access_ptr()));
-      auto srcA_buffer_var = Downcast<Var>(srcA_buffer_access_ptr->args[1]);
-      auto srcB_buffer_access_ptr = Downcast<Call>(call->args[1]);
-      ICHECK(srcB_buffer_access_ptr->op.same_as(builtin::tvm_access_ptr()));
-      auto srcB_buffer_var = Downcast<Var>(srcB_buffer_access_ptr->args[1]);
-      auto dst_buffer_access_ptr = Downcast<Call>(call->args[2]);
-      ICHECK(dst_buffer_access_ptr->op.same_as(builtin::tvm_access_ptr()));
-      auto dst_buffer_var = Downcast<Var>(dst_buffer_access_ptr->args[1]);
-      buffer_var_gemm_.push_back(srcA_buffer_var);
-      buffer_var_gemm_.push_back(srcB_buffer_var);
-      buffer_var_gemm_.push_back(dst_buffer_var);
-    }
-  }
-
-  Array<Var> buffer_var_gemm_;
-};
 
 /// Collects alloc_buffers from all blocks to build buffer_data_to_buffer_ before
 /// the main substituter runs.
@@ -204,7 +156,7 @@ private:
   using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
 
   Stmt VisitStmt_(const BlockNode *op) final {
-    if (op->annotations.count(attr::kPaddingMap)) {
+    if (op->annotations.count(attr::kSafeValueMap)) {
       return RewritePaddingMap(op);
     }
     return IRMutatorWithAnalyzer::VisitStmt_(op);
@@ -216,18 +168,18 @@ private:
    * \return The rewritten block.
    */
   Stmt RewritePaddingMap(const BlockNode *op) {
-    auto padding_map = op->annotations.Get(attr::kPaddingMap);
-    if (!padding_map) {
+    auto safe_value_map = op->annotations.Get(attr::kSafeValueMap);
+    if (!safe_value_map) {
       LOG(FATAL) << "Padding map annotation is missing";
     }
 
     Map<Var, Var> var_remap = CreateVarRemap();
-    Map<Var, PrimExpr> new_padding_map = RemapPaddingMap(
-        Downcast<Map<Var, PrimExpr>>(padding_map.value()), var_remap);
+    Map<Var, PrimExpr> new_safe_value_map = RemapPaddingMap(
+        Downcast<Map<Var, PrimExpr>>(safe_value_map.value()), var_remap);
 
     auto block = Downcast<Block>(IRMutatorWithAnalyzer::VisitStmt_(op));
     auto block_ptr = block.CopyOnWrite();
-    block_ptr->annotations.Set(attr::kPaddingMap, new_padding_map);
+    block_ptr->annotations.Set(attr::kSafeValueMap, new_safe_value_map);
     return block;
   }
 
@@ -245,21 +197,21 @@ private:
 
   /*!
    * \brief Remap the padding map using the variable remapping.
-   * \param padding_map The original padding map.
+   * \param safe_value_map The original padding map.
    * \param var_remap The variable remapping.
    * \return The remapped padding map.
    */
-  Map<Var, PrimExpr> RemapPaddingMap(const Map<Var, PrimExpr> &padding_map,
+  Map<Var, PrimExpr> RemapPaddingMap(const Map<Var, PrimExpr> &safe_value_map,
                                      const Map<Var, Var> &var_remap) const {
-    Map<Var, PrimExpr> new_padding_map;
-    for (const auto &[var, padding] : padding_map) {
+    Map<Var, PrimExpr> new_safe_value_map;
+    for (const auto &[var, padding] : safe_value_map) {
       if (var_remap.count(var)) {
-        new_padding_map.Set(var_remap.at(var), padding);
+        new_safe_value_map.Set(var_remap.at(var), padding);
       } else {
-        new_padding_map.Set(var, padding);
+        new_safe_value_map.Set(var, padding);
       }
     }
-    return new_padding_map;
+    return new_safe_value_map;
   }
 
   Map<Buffer, Buffer> buffer_remap_;
@@ -285,11 +237,6 @@ public:
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
     ICHECK(target.defined()) << "LowerTileOpPass: Require the target attribute";
     substituter.target_ = target.value();
-    // For TMA 1D, we should collect the buffers which are not used in GEMM and
-    // do not need swizzle
-    BufferGemmCollector collector;
-    collector.Collect(f->body);
-    substituter.buffer_var_gemm_ = collector.GetBufferVarGemm();
     PrimFuncNode *fptr = f.CopyOnWrite();
     fptr->body = substituter.VisitStmt(f->body);
     fptr->body =
@@ -330,6 +277,9 @@ private:
         layout_map_.Set(buffer, layout);
       }
     }
+    // Begin a new workspace collection frame for this block scope
+    workspace_stack_.emplace_back();
+
     auto block = Downcast<Block>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
     auto block_ptr = block.CopyOnWrite();
     for (size_t i = 0; i < block->alloc_buffers.size(); i++) {
@@ -338,9 +288,13 @@ private:
         block_ptr->alloc_buffers.Set(i, buffer_remap_[buffer]);
       }
     }
-    for (const auto &buffer : workspaces_)
-      block_ptr->alloc_buffers.push_back(buffer);
-    workspaces_.clear();
+    // Attach any workspaces requested within this block to its alloc_buffers
+    if (!workspace_stack_.empty()) {
+      for (const auto &buffer : workspace_stack_.back()) {
+        block_ptr->alloc_buffers.push_back(buffer);
+      }
+      workspace_stack_.pop_back();
+    }
     return block;
   }
 
@@ -464,7 +418,7 @@ private:
       return expr;
     }
     if (const auto *var_node = expr.as<VarNode>()) {
-      Var var = GetRef<Var>(var_node);
+      Var var = tvm::ffi::GetRef<Var>(var_node);
       auto it = let_bindings_.find(var);
       if (it != let_bindings_.end()) {
         return it->second;
@@ -640,7 +594,7 @@ private:
       let_bindings_.erase(op->var);
     }
     if (value.same_as(op->value) && body.same_as(op->body)) {
-      return GetRef<Stmt>(op);
+      return tvm::ffi::GetRef<Stmt>(op);
     } else {
       auto n = this->CopyOnWrite(op);
       n->value = value;
@@ -681,13 +635,21 @@ private:
     if (call && call->op.as<GlobalVarNode>())
       return Downcast<Evaluate>(IRMutatorWithAnalyzer::VisitStmt_(op));
 
-    auto tile_op = ParseOperator(GetRef<Stmt>(op), buffer_data_to_buffer_);
+    auto tile_op = ParseOperator(tvm::ffi::GetRef<Stmt>(op));
     if (!tile_op.defined())
       return IRMutatorWithAnalyzer::VisitStmt_(op);
     AddWorkspaceCallback callback = [this](int num_elem, DataType dtype) {
       auto workspace =
           decl_buffer({PrimExpr(num_elem)}, dtype, "workspace", "shared.dyn");
-      workspaces_.push_back(workspace);
+      // Record workspace under the innermost block scope so its lifetime
+      // covers the statements that requested it and does not sink into
+      // subsequently created inner blocks (e.g., GEMM macro blocks).
+      if (!workspace_stack_.empty()) {
+        workspace_stack_.back().push_back(workspace);
+      } else {
+        // Fallback: create a temporary frame (should be rare)
+        workspace_stack_.emplace_back(Array<Buffer>{workspace});
+      }
       return workspace.access_ptr(2); // write
     };
 
@@ -707,9 +669,9 @@ private:
 
     auto lowered = tile_op->Lower(
         LowerArgs{target_, thread_bounds, thread_var_->var, callback,
-                 layout_map_, buffer_remap_, buffer_var_gemm_,
-                 propagation_tir_collector_ ? propagation_tir_collector_.get()
-                                           : nullptr},
+                  layout_map_, buffer_remap_,
+                  propagation_tir_collector_ ? propagation_tir_collector_.get()
+                                             : nullptr},
         analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }
@@ -737,7 +699,8 @@ private:
   IterVar thread_var_ = IterVar(Range::FromMinExtent(0, 1), Var("v_thread"),
                                 IterVarType::kDataPar);
   size_t thread_block_size_ = 0;
-  Array<Buffer> workspaces_;
+  // Stack of per-Block workspace buffers gathered while visiting children
+  std::vector<Array<Buffer>> workspace_stack_;
   // For ptx Node, we need to remap the buffer and indices
   // By access CallNode instead of BufferLoad Node.
   bool is_ptx_{false};
@@ -747,7 +710,6 @@ private:
   std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> buffer_map_;
   Map<Var, Var> var_remap_;
   bool has_tma_{false};
-  Array<Var> buffer_var_gemm_;
   std::unique_ptr<PropagationTirCollector> propagation_tir_collector_;
 };
 
@@ -762,10 +724,10 @@ tvm::transform::Pass LowerTileOp() {
   return CreatePrimFuncPass(pass_func, 0, "tl.LowerTileOp", {});
 }
 
-TVM_FFI_STATIC_INIT_BLOCK({
+TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.transform.LowerTileOp", LowerTileOp);
-});
+}
 } // namespace transform
 
 } // namespace tl

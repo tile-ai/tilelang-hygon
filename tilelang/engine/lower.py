@@ -1,17 +1,22 @@
 """The compiler for TL programs."""
+from __future__ import annotations
 
 import os
 import os.path as osp
-from typing import Union, Optional, Callable, List
+from typing import Callable
 import tilelang.transform
 from tilelang import tvm as tvm
 from tvm import tir
+import tvm_ffi
 from tvm.ir import CallingConv
 from tvm.target import Target
 from tilelang.contrib import hipcc, nvcc
+from tilelang.transform import PassConfigKey
+from tilelang.utils.deprecated import deprecated_warning
 from tilelang.engine.param import KernelParam, CompiledArtifact
 from tilelang.utils.target import determine_target
 from tilelang.engine.phase import (
+    PreLowerSemanticCheck,
     LowerAndLegalize,
     OptimizeForTarget,
 )
@@ -51,8 +56,8 @@ def get_host_call(is_device_c: bool = False) -> Callable[[tir.PrimFunc], bool]:
     return lambda func: not get_device_call(is_device_c)(func)
 
 
-@tvm.register_func("tilelang_callback_cuda_compile", override=True)
-def tilelang_callback_cuda_compile(code, target):
+@tvm_ffi.register_global_func("tilelang_callback_cuda_compile", override=True)
+def tilelang_callback_cuda_compile(code, target, pass_config=None):
     project_root = osp.join(osp.dirname(__file__), "../..")
     if "TL_TEMPLATE_PATH" in os.environ:
         tl_template_path = os.environ["TL_TEMPLATE_PATH"]
@@ -67,28 +72,44 @@ def tilelang_callback_cuda_compile(code, target):
     target_arch = nvcc.get_target_arch(nvcc.get_target_compute_version(target))
 
     arch = [f"-arch=sm_{target_arch}"]
-    format = "cubin"
+    compile_format = "cubin"
 
-    # printing out number of registers
-    debug_option = "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
+    # Read pass-config keys (string-valued) like in jit.adapter.libgen.compile_lib
+    cfg = pass_config or {}
+    if cfg.get(PassConfigKey.TL_DISABLE_FAST_MATH.value, False):
+        deprecated_warning("TL_DISABLE_FAST_MATH", "TL_ENABLE_FAST_MATH", "0.1.7")
+        disable_fast_math = bool(cfg.get(PassConfigKey.TL_DISABLE_FAST_MATH.value, True))
+        enable_fast_math = not disable_fast_math
+    else:
+        enable_fast_math = bool(cfg.get(PassConfigKey.TL_ENABLE_FAST_MATH.value, False))
+
+    ptxas_usage_level = cfg.get(PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL.value, None)
+    verbose_ptxas_output = bool(cfg.get(PassConfigKey.TL_ENABLE_PTXAS_VERBOSE_OUTPUT.value, False))
+
+    options = [
+        "-std=c++17",
+        "-I" + tl_template_path,
+        "-I" + cutlass_path,
+    ]
+    if enable_fast_math:
+        options.append("--use_fast_math")
+    if ptxas_usage_level is not None:
+        options.append(f"--ptxas-options=--register-usage-level={ptxas_usage_level}")
+    if verbose_ptxas_output:
+        options.append("--ptxas-options=--verbose")
+
     ptx = nvcc.compile_cuda(
         code,
-        format,
+        compile_format,
         arch,
-        options=[
-            "-std=c++17",
-            debug_option,
-            "--use_fast_math",
-            "-I" + tl_template_path,
-            "-I" + cutlass_path,
-        ],
+        options=options,
         verbose=False,
     )
 
     return ptx
 
 
-@tvm.register_func("tilelang_callback_hip_compile", override=True)
+@tvm_ffi.register_global_func("tilelang_callback_hip_compile", override=True)
 def tilelang_callback_hip_compile(code, target):
     project_root = osp.join(osp.dirname(__file__), "../..")
     tl_template_path = osp.abspath(osp.join(project_root, "src"))
@@ -114,17 +135,21 @@ def tilelang_callback_hip_compile(code, target):
     return hsaco
 
 
-def extrac_params(func: tir.PrimFunc) -> List[KernelParam]:
+def extrac_params(func: tir.PrimFunc) -> list[KernelParam]:
     tensor_types = []
     for var in func.params:
         if var in func.buffer_map:
             tensor_types.append(KernelParam.from_buffer(func.buffer_map[var]))
         else:
+            if var.dtype == 'handle':
+                raise ValueError(
+                    f'Handle parameter {var} must be mapped to a buffer.\n'
+                    f'Please use T.tensor({var.name}, shape=..., dtype=...) to map it to a buffer.')
             tensor_types.append(KernelParam.from_var(var))
     return tensor_types
 
 
-def canon_target_host(target: Union[str, Target], target_host: Optional[Union[str, Target]]):
+def canon_target_host(target: str | Target, target_host: str | Target | None):
 
     if not target_host:
         target_host = "llvm" if tvm.runtime.enabled("llvm") else "c"
@@ -144,7 +169,7 @@ def host_codegen(host_mod: tvm.IRModule, target_host: Target) -> tvm.IRModule:
     if target_host.kind.name == "llvm":
         host_mod = tvm.ffi.get_global_func("target.build.llvm")(host_mod, target_host)
     elif target_host.kind.name == "c":
-        host_mod = tvm.ffi.get_global_func("target.build.c")(host_mod, target_host)
+        host_mod = tvm.ffi.get_global_func("target.build.tilelang_c")(host_mod, target_host)
     else:
         raise ValueError(f"Target host {target_host.kind.name} is not supported")
     return host_mod
@@ -180,7 +205,7 @@ def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> 
     elif target.kind.name == "llvm":
         device_mod = tvm.ffi.get_global_func("target.build.llvm")(device_mod, target)
     elif target.kind.name == "webgpu":
-        device_mod = tvm.ffi.get_global_func("target.build.tilelang_webgpu")(device_mod, target)
+        device_mod = tvm.ffi.get_global_func("target.build.webgpu")(device_mod, target)
     elif target.kind.name == "metal":
         device_mod = tvm.ffi.get_global_func("target.build.metal")(device_mod, target)
     else:
@@ -190,9 +215,9 @@ def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> 
 
 
 def lower(
-    func_or_mod: Union[tir.PrimFunc, tvm.IRModule],
-    target: Union[str, Target] = "auto",
-    target_host: Optional[Union[str, Target]] = None,
+    func_or_mod: tir.PrimFunc | tvm.IRModule,
+    target: str | Target = "auto",
+    target_host: str | Target | None = None,
     runtime_only=False,
     enable_host_codegen=False,
     enable_device_compile=False,
@@ -222,6 +247,9 @@ def lower(
     _is_host_call = get_host_call(is_device_c=is_cpu_device_backend(target))
     _is_device_call = get_device_call(is_device_c=is_cpu_device_backend(target))
 
+    # Before lowering, do semantic check
+    PreLowerSemanticCheck(mod)
+
     # Phase 1: Lower and legalize the IR
     mod = LowerAndLegalize(mod, target)
 
@@ -239,6 +267,6 @@ def lower(
         host_mod = host_codegen(host_mod, target_host)
         host_mod.import_module(codegen_mod)
         return CompiledArtifact(
-            host_mod, device_mod, params, codegen_mod.get_source(), rt_mod=host_mod)
+            host_mod, device_mod, params, codegen_mod.inspect_source(), rt_mod=host_mod)
 
-    return CompiledArtifact(host_mod, device_mod, params, codegen_mod.get_source())
+    return CompiledArtifact(host_mod, device_mod, params, codegen_mod.inspect_source())

@@ -1,9 +1,9 @@
 """The profiler and convert to torch utils"""
-
+from __future__ import annotations
 import torch
 from ..base import BaseKernelAdapter
 import ctypes
-from typing import List, Optional, Union, Callable, Dict, Tuple, Any
+from typing import Callable, Any
 from tilelang import tvm as tvm
 from tvm.target import Target
 from tvm.relax import TensorType
@@ -14,6 +14,7 @@ from tilelang.utils.target import determine_target
 from tilelang.utils.language import retrieve_func_from_module
 
 
+# TODO(lei): remove ctypes adapter.
 class CtypesKernelAdapter(BaseKernelAdapter):
     """Adapter class that converts TVM/TIR functions to callable CUDA kernels using ctypes.
 
@@ -25,32 +26,33 @@ class CtypesKernelAdapter(BaseKernelAdapter):
 
     # Class attributes to store compiled kernel information
     target = "cuda"
-    ir_module: Optional[tvm.IRModule] = None
+    ir_module: tvm.IRModule | None = None
     # The global source code of the kernel -> global means the source code of the kernel
     # that is not wrapped by the wrapper code
-    kernel_global_source: Optional[str] = None
-    lib: Optional[ctypes.CDLL] = None  # Compiled library handle
-    wrapped_source: Optional[str] = None  # Generated C++ wrapper code
+    host_kernel_source: str | None = None
+    device_kernel_source: str | None = None
+    lib: ctypes.CDLL | None = None  # Compiled library handle
     # Maps symbolic variables to their corresponding buffer and shape indices
-    dynamic_symbolic_map: Optional[Dict[tir.Var, Tuple[int, int]]] = None
+    dynamic_symbolic_map: dict[tir.Var, tuple[int, int]] | None = None
     # Pass configs for the compiler
-    pass_configs: Optional[Dict[str, Any]] = None
+    pass_configs: dict[str, Any] | None = None
 
     # Add new cache attributes
-    param_dtypes: Optional[List[torch.dtype]] = None  # Cache for parameter dtypes
-    param_shapes: Optional[List[List]] = None  # Cache for parameter shapes
+    param_dtypes: list[torch.dtype] | None = None  # Cache for parameter dtypes
+    param_shapes: list[list] | None = None  # Cache for parameter shapes
 
     def __init__(self,
-                 params: List[TensorType],
-                 result_idx: List[int],
+                 params: list[TensorType],
+                 result_idx: list[int],
                  target: str,
-                 func_or_mod: Union[tir.PrimFunc, tvm.IRModule],
-                 host_mod: Optional[tvm.IRModule] = None,
-                 device_mod: Optional[tvm.IRModule] = None,
-                 kernel_global_source: Optional[str] = None,
+                 func_or_mod: tir.PrimFunc | tvm.IRModule,
+                 host_mod: tvm.IRModule | None = None,
+                 device_mod: tvm.IRModule | None = None,
+                 host_kernel_source: str | None = None,
+                 device_kernel_source: str | None = None,
                  verbose: bool = False,
-                 pass_configs: Optional[Dict[str, Any]] = None,
-                 compile_flags: Optional[List[str]] = None):
+                 pass_configs: dict[str, Any] | None = None,
+                 compile_flags: list[str] | None = None):
         """Initialize the adapter with the given TIR function or module.
 
         Args:
@@ -62,7 +64,8 @@ class CtypesKernelAdapter(BaseKernelAdapter):
         """
         self.params = params
         self.result_idx = self._legalize_result_idx(result_idx)
-        self.kernel_global_source = kernel_global_source
+        self.host_kernel_source = host_kernel_source
+        self.device_kernel_source = device_kernel_source
 
         if isinstance(func_or_mod, tir.PrimFunc):
             self.ir_module = tvm.IRModule({func_or_mod.attrs["global_symbol"]: func_or_mod})
@@ -107,20 +110,22 @@ class CtypesKernelAdapter(BaseKernelAdapter):
 
     @classmethod
     def from_database(cls,
-                      params: List[TensorType],
-                      result_idx: List[int],
+                      params: list[TensorType],
+                      result_idx: list[int],
                       target: str,
-                      func_or_mod: Union[tir.PrimFunc, tvm.IRModule],
-                      kernel_global_source: str,
+                      func_or_mod: tir.PrimFunc | tvm.IRModule,
+                      host_kernel_source: str,
+                      device_kernel_source: str,
                       kernel_lib_path: str,
                       verbose: bool = False,
-                      pass_configs: Optional[Dict[str, Any]] = None,
-                      compile_flags: Optional[List[str]] = None):
+                      pass_configs: dict[str, Any] | None = None,
+                      compile_flags: list[str] | None = None):
         adapter = cls.__new__(cls)
         adapter.params = params
         adapter.result_idx = adapter._legalize_result_idx(result_idx)
-        adapter.kernel_global_source = kernel_global_source
-        adapter.wrapped_source = kernel_global_source
+        adapter.host_kernel_source = host_kernel_source
+        adapter.device_kernel_source = device_kernel_source
+        adapter.wrapped_source = device_kernel_source + "\n\n" + host_kernel_source
         adapter.pass_configs = pass_configs
 
         if isinstance(func_or_mod, tir.PrimFunc):
@@ -155,7 +160,7 @@ class CtypesKernelAdapter(BaseKernelAdapter):
         adapter._post_init()
         return adapter
 
-    def _process_dynamic_symbolic(self) -> Dict[tir.Var, Tuple[int, int, int]]:
+    def _process_dynamic_symbolic(self) -> dict[tir.Var, tuple[int, int, int]]:
         """Extract information about dynamic shapes from the TIR function.
 
         Maps symbolic variables to their corresponding (id, buffer_index, dimension)
@@ -182,7 +187,7 @@ class CtypesKernelAdapter(BaseKernelAdapter):
                         dynamic_symbolic_map[stride] = (1, i, j)
         return dynamic_symbolic_map
 
-    def _forward_from_prebuild_lib(self, *args, stream: Optional[int] = None):
+    def _forward_from_prebuild_lib(self, *args, stream: int | None = None):
         """Low-level function to call the compiled CUDA kernel.
 
         Converts PyTorch tensor pointers to C void pointers for ctypes interface.
@@ -193,9 +198,7 @@ class CtypesKernelAdapter(BaseKernelAdapter):
         ctypes_args.append(ctypes.c_void_p(stream))
         self.lib.call(*ctypes_args)
 
-    def _wrap_forward_from_prebuild_lib(self,
-                                        *ins: List[torch.Tensor],
-                                        stream: Optional[int] = None):
+    def _wrap_forward_from_prebuild_lib(self, *ins: list[torch.Tensor], stream: int | None = None):
         """High-level wrapper for kernel execution.
 
         Handles:
@@ -290,7 +293,7 @@ class CtypesKernelAdapter(BaseKernelAdapter):
     def get_kernel_source(self, kernel_only: bool = False):
         """Returns the source code of the compiled kernel."""
         if kernel_only:
-            return self.kernel_global_source
+            return self.device_kernel_source
         else:
-            assert self.wrapped_source is not None, "Wrapped source is not available"
-            return self.wrapped_source
+            # Wrapper only has host kernel source
+            return self.host_kernel_source

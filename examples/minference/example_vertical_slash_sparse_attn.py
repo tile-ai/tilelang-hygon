@@ -12,8 +12,6 @@ import tilelang
 import tilelang.language as T
 from tilelang.profiler import do_bench
 
-tilelang.disable_cache()
-
 
 @tilelang.jit(out_idx=[3])
 def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, vertical_size, slash_size):
@@ -89,6 +87,8 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, vertical_size, slash_siz
 
             T.copy(scores_max, scores_max_prev)
             T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+            for i in T.Parallel(block_M):
+                scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
 
             for i in T.Parallel(block_M):
                 scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
@@ -196,6 +196,8 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, vertical_size, slash_siz
                         T.copy(scores_max, scores_max_prev)
 
                         T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+                        for i in T.Parallel(block_M):
+                            scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
 
                         for i in T.Parallel(block_M):
                             scores_scale[i] = T.exp2(scores_max_prev[i] * scale -

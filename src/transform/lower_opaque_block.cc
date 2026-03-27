@@ -22,9 +22,11 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/attrs.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <string>
 #include <utility>
 
 #include "../op/builtin.h"
@@ -40,10 +42,20 @@ using namespace tir::attr;
  */
 class OpaqueBlockLower : public StmtExprMutator {
 public:
-  static Stmt Rewrite(Stmt body) {
+  static PrimFunc Rewrite(PrimFunc f) {
+    auto fptr = f.CopyOnWrite();
     OpaqueBlockLower lower;
-    lower.storage_align_ = CollectStorageAlignAnnotation(body);
-    return lower(std::move(body));
+    if (auto existing =
+            fptr->attrs.GetAttr<Map<Var, PrimExpr>>(tl::attr::kLocalVarInit)) {
+      lower.local_var_init_map_ = existing.value();
+    }
+    lower.storage_align_ = CollectStorageAlignAnnotation(fptr->body);
+    fptr->body = lower(std::move(fptr->body));
+    if (!lower.local_var_init_map_.empty()) {
+      f = WithAttr(std::move(f), tl::attr::kLocalVarInit,
+                   lower.local_var_init_map_);
+    }
+    return f;
   }
 
 private:
@@ -60,7 +72,13 @@ private:
     if (!is_one(predicate)) {
       body = IfThenElse(predicate, std::move(body));
     }
-    // Step 3. Handle allocations in reverse order
+    // Step 3. Handle annotations, block annotations are not preserved by
+    // default.
+    std::vector<std::pair<std::string, PrimExpr>> pragma_attrs;
+    HandleAnnotations(new_block->annotations, &pragma_attrs, /*is_block=*/true,
+                      new_block->alloc_buffers);
+
+    // Step 4. Handle allocations in reverse order
     for (size_t i = new_block->alloc_buffers.size(); i > 0; --i) {
       const Buffer &buffer = new_block->alloc_buffers[i - 1];
       Array<PrimExpr> allocation_shape = GetBufferAllocationShape(buffer);
@@ -75,14 +93,15 @@ private:
         }
         allocate_annotations.Set(tir::attr::buffer_dim_align, allocate_aligns);
       }
-
+      auto init_it = local_var_init_map_.find(buffer->data);
+      if (init_it != local_var_init_map_.end()) {
+        const PrimExpr &init = (*init_it).second;
+        allocate_annotations.Set(tl::attr::kLocalVarInit, init);
+      }
       body = Allocate(buffer->data, buffer->dtype, allocation_shape,
                       const_true(), std::move(body), allocate_annotations);
     }
-    // Step 4. Handle annotations, block annotations are not preserved by
-    // default.
-    std::vector<std::pair<std::string, PrimExpr>> pragma_attrs;
-    HandleAnnotations(new_block->annotations, &pragma_attrs, /*is_block=*/true);
+    // Step 5. Insert attribute statements converted from pragmas
     for (auto it = pragma_attrs.rbegin(); it != pragma_attrs.rend(); ++it) {
       body = AttrStmt(Integer(0), it->first, it->second, std::move(body));
     }
@@ -107,7 +126,7 @@ private:
     // Step 1. Update unit loop info.
     PrimExpr min = this->VisitExpr(op->min);
     PrimExpr extent = this->VisitExpr(op->extent);
-    if (is_one(extent) && op->annotations.empty()) {
+    if (is_one(extent) && IsEffectivelyEmptyAnnotation(op->annotations)) {
       // handling unit loop
       unit_loop_vars_[op->loop_var] = min;
     }
@@ -123,7 +142,8 @@ private:
       ICHECK(op->thread_binding.defined());
       String thread_tag = op->thread_binding.value()->thread_tag;
       body = MakeLaunchThread(min, extent, op->loop_var, thread_tag, body);
-    } else if (is_one(extent) && op->annotations.empty()) {
+    } else if (is_one(extent) &&
+               IsEffectivelyEmptyAnnotation(op->annotations)) {
       // Case 2. Unit loop
       return body;
     } else {
@@ -138,8 +158,25 @@ private:
     return body;
   }
 
+  // Treat annotations as empty if they are truly empty or contain only
+  // the unroll hint `pragma_unroll_explicit`. This allows unit-length
+  // loops produced by unroll pragmas to be simplified away.
+  bool
+  IsEffectivelyEmptyAnnotation(const Map<String, ffi::Any> &annotations) const {
+    if (annotations.empty()) {
+      return true;
+    }
+    if (annotations.size() == 1) {
+      auto it = annotations.find(tir::attr::pragma_unroll_explicit);
+      if (it != annotations.end()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   PrimExpr VisitExpr_(const VarNode *op) final {
-    Var var = GetRef<Var>(op);
+    Var var = tvm::ffi::GetRef<Var>(op);
     auto it = unit_loop_vars_.find(var);
     if (it == unit_loop_vars_.end()) {
       return var;
@@ -196,13 +233,34 @@ private:
   Map<String, ffi::Any>
   HandleAnnotations(const Map<String, ffi::Any> &annotations,
                     std::vector<std::pair<std::string, PrimExpr>> *pragma_attrs,
-                    bool is_block) {
+                    bool is_block,
+                    const Array<Buffer> &alloc_buffers = Array<Buffer>()) {
     Map<String, ffi::Any> preserved_annotations;
     pragma_attrs->clear();
     for (const auto &kv : annotations) {
       const String &key = kv.first;
       if (tir::attr::IsPragmaKey(key)) {
         pragma_attrs->emplace_back(key, ConvertAttrValue(key, kv.second));
+      } else if (key == tl::attr::kLocalVarInit) {
+        if (auto local_init_map = kv.second.try_cast<Map<Var, PrimExpr>>()) {
+          for (const auto &pair : local_init_map.value()) {
+            local_var_init_map_.Set(pair.first, pair.second);
+          }
+        } else if (auto init_expr = kv.second.try_cast<PrimExpr>()) {
+          ICHECK(is_block) << "`" << tl::attr::kLocalVarInit
+                           << "` on non-block annotations is not supported";
+          Buffer target = ResolveLocalVarBuffer(alloc_buffers);
+          if (!target.defined()) {
+            LOG(WARNING) << "Failed to resolve buffer for `"
+                         << tl::attr::kLocalVarInit << "` annotation";
+            continue;
+          }
+          local_var_init_map_.Set(target->data, init_expr.value());
+        } else {
+          LOG(FATAL) << "Expected `" << tl::attr::kLocalVarInit
+                     << "` to be a PrimExpr or Map<Var, PrimExpr>, but got "
+                     << kv.second.GetTypeKey();
+        }
       } else if (!is_block) {
         // the loop annotation is preserved
         preserved_annotations.Set(key, kv.second);
@@ -214,6 +272,19 @@ private:
     return preserved_annotations;
   }
 
+  Buffer ResolveLocalVarBuffer(const Array<Buffer> &alloc_buffers) const {
+    for (const Buffer &buffer : alloc_buffers) {
+      std::string scope = buffer.scope();
+      if (scope.find("local.var") != std::string::npos) {
+        return buffer;
+      }
+    }
+    if (!alloc_buffers.empty()) {
+      return alloc_buffers.back();
+    }
+    return Buffer();
+  }
+
   /*! \brief Record the loop_var and loop start value of unit loops, whose
    * extent is one. */
   std::unordered_map<Var, PrimExpr> unit_loop_vars_;
@@ -223,12 +294,13 @@ private:
 
   /*! \brief The map from buffer var to its storage alignment information. */
   std::unordered_map<Var, StorageAlignAnnotation> storage_align_;
+
+  /*! \brief Local var initializers collected from block annotations. */
+  Map<Var, PrimExpr> local_var_init_map_;
 };
 
 PrimFunc TLLowerOpaqueBlock(PrimFunc f) {
-  auto fptr = f.CopyOnWrite();
-  fptr->body = OpaqueBlockLower::Rewrite(std::move(fptr->body));
-  return f;
+  return OpaqueBlockLower::Rewrite(std::move(f));
 }
 
 tir::transform::Pass LowerOpaqueBlock() {
@@ -239,10 +311,10 @@ tir::transform::Pass LowerOpaqueBlock() {
   return CreatePrimFuncPass(pass_func, 0, "tl.LowerOpaqueBlock", {});
 }
 
-TVM_FFI_STATIC_INIT_BLOCK({
+TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.transform.LowerOpaqueBlock", LowerOpaqueBlock);
-});
+}
 
 } // namespace tl
 } // namespace tvm
