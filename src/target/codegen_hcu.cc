@@ -121,22 +121,29 @@ public:
 
 // TODO: Add a optimization pass to identify eligible direct_to_lds buffer store
 //       patterns instead of performing check here.
-bool CodeGenTileLangHCU::TryToEmitLDSBufferOp(const BufferStoreNode *buffer_store) {
+bool CodeGenTileLangHCU::StoreWouldEmitLDSBufferOp(
+    const BufferStoreNode *buffer_store) const {
   const auto *buffer_load = buffer_store->value.as<BufferLoadNode>();
-  const auto* dst_var = buffer_store->buffer->data.get();
-  if (buffer_load == nullptr || !direct_to_lds_map_.count(dst_var) || !direct_to_lds_map_[dst_var])
+  const auto *dst_var = buffer_store->buffer->data.get();
+  // Same as TryToEmitLDSBufferOp: count + lookup. Use at() (const map has no []).
+  if (buffer_load == nullptr || !direct_to_lds_map_.count(dst_var) ||
+      !direct_to_lds_map_.at(dst_var))
     return false;
-
   auto src_scope = GetPtrStorageScope(buffer_load->buffer->data);
   auto dst_scope = GetPtrStorageScope(buffer_store->buffer->data);
   int read_bytes = buffer_load->dtype.bits() * buffer_load->dtype.lanes() / 8;
-  bool condition = src_scope == "global" && (dst_scope == "shared" || dst_scope == "shared.dyn") &&
-                   (read_bytes == 4 || read_bytes == 8 || read_bytes == 16);
-  if (!condition)
+  return src_scope == "global" &&
+         (dst_scope == "shared" || dst_scope == "shared.dyn") &&
+         (read_bytes == 4 || read_bytes == 8 || read_bytes == 16);
+}
+
+bool CodeGenTileLangHCU::TryToEmitLDSBufferOp(const BufferStoreNode *buffer_store) {
+  if (!StoreWouldEmitLDSBufferOp(buffer_store))
     return false;
+  const auto *buffer_load = buffer_store->value.as<BufferLoadNode>();
+  ICHECK(buffer_load != nullptr);
 
   DataType value_dtype = buffer_store->value.dtype();
-  DataType element_dtype = buffer_store->buffer->dtype;
   auto store_desc =
     GetBufferDesc(value_dtype, buffer_store->buffer.get(), buffer_store->indices[0]);
   auto load_desc =
@@ -282,6 +289,84 @@ std::string CodeGenTileLangHCU::GetCurrentPredicate() const {
   return result;
 }
 
+bool CodeGenTileLangHCU::LoadWillUseAmdBufferOpsWithPredicate(
+    const PrimExpr &value_expr) const {
+  const BufferLoadNode *load = ExtractBufferLoad(value_expr);
+  if (!load) {
+    return false;
+  }
+  if (!CanUseVMBufferOps(load->buffer.get(), load->dtype.lanes())) {
+    return false;
+  }
+  DataType outer_dtype = value_expr.dtype();
+  DataType element_dtype = load->buffer->dtype;
+  PrimExpr index = load->indices[0];
+  int lanes = load->dtype.lanes();
+
+  // Align with CodeGenC::VisitExpr_(BufferLoad): GetBufferRef when the *emitted*
+  // value lanes match buffer element lanes. Use outer dtype (e.g. Cast to scalar)
+  // so Cast(vector load)->scalar is not mistaken for GetVecLoad.
+  if (outer_dtype.lanes() == element_dtype.lanes()) {
+    return false;
+  }
+
+  bool can_vector_load = false;
+  arith::PVar<PrimExpr> base;
+  if (arith::ramp(base, 1, lanes).Match(index)) {
+    const RampNode *ramp = index.as<RampNode>();
+    ICHECK(ramp);
+    arith::ModularSet me = arith::Analyzer().modular_set(ramp->base);
+    if (me->coeff % lanes == 0 && me->base % lanes == 0) {
+      can_vector_load = true;
+    }
+  }
+  if (load->dtype.is_float4_e2m1fn() && lanes != 1) {
+    can_vector_load = false;
+  }
+  return can_vector_load;
+}
+
+bool CodeGenTileLangHCU::StoreWillUseAmdBufferOpsWithPredicate(
+    const BufferStoreNode *op) const {
+  // Predicate is only threaded into tl::amd_buffer_store when VisitStmt_(BufferStore)
+  // takes the direct path, or into PrintVecStoreWithPredicate when CodeGenC::VisitStmt_
+  // (BufferStore) calls PrintVecStore (unequal lanes + contiguous ramp, not float4).
+  // TryToEmitLDSBufferOp bypasses predicate_stack_ — gate with StoreWouldEmitLDSBufferOp.
+  if (StoreWouldEmitLDSBufferOp(op))
+    return false;
+
+  DataType value_dtype = op->value.dtype();
+  DataType element_dtype = op->buffer->dtype;
+  PrimExpr index_expr = op->indices[0];
+
+  bool lanes_ok = (element_dtype.lanes() == 1)
+                      ? (value_dtype.element_of() == element_dtype.element_of())
+                      : (value_dtype.lanes() == element_dtype.lanes());
+  if (!lanes_ok)
+    return false;
+  if (!CanUseVMBufferOps(op->buffer.get(), value_dtype.lanes()))
+    return false;
+
+  if (value_dtype.lanes() == element_dtype.lanes()) {
+    // Matches VisitStmt_(BufferStore) before CodeGenC fallback: GetBufferDesc requires
+    // stride-1 ramp when index is a Ramp (else codegen ICHECK).
+    if (index_expr.as<RampNode>()) {
+      arith::PVar<PrimExpr> base;
+      if (!arith::ramp(base, 1, value_dtype.lanes()).Match(index_expr))
+        return false;
+    }
+    return true;
+  }
+
+  // Unequal lanes: CodeGenC uses per-lane loop unless ramp(base,1,value_lanes).Match.
+  if (value_dtype.is_float4_e2m1fn())
+    return false;
+  arith::PVar<PrimExpr> base;
+  if (!arith::ramp(base, 1, value_dtype.lanes()).Match(index_expr))
+    return false;
+  return true;
+}
+
 bool CodeGenTileLangHCU::IsFoldableIfThenElse(const IfThenElseNode *op) const {
   Stmt then_body = op->then_case;
   if (const auto *seq = then_body.as<tir::SeqStmtNode>()) {
@@ -301,23 +386,7 @@ bool CodeGenTileLangHCU::IsFoldableIfThenElse(const IfThenElseNode *op) const {
     return false;
 
   if (!op->else_case) {
-    const BufferNode *buf = then_store->buffer.get();
-    DataType value_dtype = then_store->value.dtype();
-    DataType element_dtype = buf->dtype;
-    // Allow vectorized store to scalar-element buffer (element_dtype.lanes()==1).
-    bool lanes_ok = (element_dtype.lanes() == 1)
-                        ? (value_dtype.element_of() == element_dtype.element_of())
-                        : (value_dtype.lanes() == element_dtype.lanes());
-    if (!lanes_ok || !CanUseVMBufferOps(buf, value_dtype.lanes()))
-      return false;
-    if (value_dtype.lanes() == 1)
-      return true;
-    arith::PVar<PrimExpr> base;
-    if (arith::ramp(base, 1, value_dtype.lanes()).Match(then_store->indices[0]))
-      return true;
-    // Scalar base index with vector value: contiguous store [base, base+1, ...],
-    // same semantics as Ramp. Accept to allow pred folding for common IR patterns.
-    return then_store->indices[0].as<RampNode>() == nullptr;
+    return StoreWillUseAmdBufferOpsWithPredicate(then_store);
   }
 
   const auto *else_store = op->else_case.value().as<BufferStoreNode>();
@@ -330,13 +399,9 @@ bool CodeGenTileLangHCU::IsFoldableIfThenElse(const IfThenElseNode *op) const {
   }
   if (!IsZeroValue(else_store->value))
     return false;
-  const BufferLoadNode *load = ExtractBufferLoad(then_store->value);
-  if (!load || !CanUseVMBufferOps(load->buffer.get(), load->dtype.lanes()))
+  if (!LoadWillUseAmdBufferOpsWithPredicate(then_store->value))
     return false;
-  arith::PVar<PrimExpr> base;
-  if (arith::ramp(base, 1, load->dtype.lanes()).Match(load->indices[0]))
-    return true;
-  return load->indices[0].as<RampNode>() == nullptr;
+  return true;
 }
 
 // Check if if(cond){store} else {if(c0){if(c1){store}}} with cond == c0 && c1.
@@ -362,20 +427,8 @@ bool CodeGenTileLangHCU::IsCollapsibleRedundantIfElse(const IfThenElseNode *op) 
   if (!StructuralEqual()(then_store->value, else_result.store->value))
     return false;
 
-  const BufferNode *buf = then_store->buffer.get();
-  DataType value_dtype = then_store->value.dtype();
-  DataType element_dtype = buf->dtype;
-  bool lanes_ok = (element_dtype.lanes() == 1)
-                      ? (value_dtype.element_of() == element_dtype.element_of())
-                      : (value_dtype.lanes() == element_dtype.lanes());
-  if (!lanes_ok || !CanUseVMBufferOps(buf, value_dtype.lanes()))
+  if (!StoreWillUseAmdBufferOpsWithPredicate(then_store))
     return false;
-  if (value_dtype.lanes() != 1) {
-    arith::PVar<PrimExpr> base;
-    if (!arith::ramp(base, 1, value_dtype.lanes()).Match(then_store->indices[0]) &&
-        then_store->indices[0].as<RampNode>() != nullptr)
-      return false;  // Ramp with stride!=1 not supported
-  }
 
   PrimExpr combined = else_result.conditions[0];
   for (size_t i = 1; i < else_result.conditions.size(); i++) {
@@ -1179,21 +1232,15 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
   if (op->op.same_as(builtin::if_then_else()) && op->args.size() == 3) {
     const BufferLoadNode *load = ExtractBufferLoad(op->args[1]);
     if (load && IsZeroValue(op->args[2]) &&
-        CanUseVMBufferOps(load->buffer.get(), load->dtype.lanes())) {
-      arith::PVar<PrimExpr> base;
-      bool contiguous =
-          arith::ramp(base, 1, load->dtype.lanes()).Match(load->indices[0]) ||
-          load->indices[0].as<RampNode>() == nullptr;
-      if (contiguous) {
-        std::string cond_str = PrintExpr(op->args[0]);
-        std::string pred_var = name_supply_->FreshName("pred");
-        PrintIndent();
-        stream << "bool " << pred_var << " = " << cond_str << ";\n";
-        predicate_stack_.push_back(pred_var);
-        os << PrintExpr(op->args[1]);
-        predicate_stack_.pop_back();
-        return;
-      }
+        LoadWillUseAmdBufferOpsWithPredicate(op->args[1])) {
+      std::string cond_str = PrintExpr(op->args[0]);
+      std::string pred_var = name_supply_->FreshName("pred");
+      PrintIndent();
+      stream << "bool " << pred_var << " = " << cond_str << ";\n";
+      predicate_stack_.push_back(pred_var);
+      os << PrintExpr(op->args[1]);
+      predicate_stack_.pop_back();
+      return;
     }
   }
 

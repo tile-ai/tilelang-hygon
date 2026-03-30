@@ -113,6 +113,18 @@ private:
     return (value == nullptr || std::atoi(value) != 0) && scope == "global" &&
            (num_elements * buffer->dtype.bits() <= 128);
   }
+  /// True iff lowering consumes predicate_stack_ on this load. Must stay aligned
+  /// with CodeGenTileLangHCU::GetVecLoadWithPredicate / VisitExpr_(BufferLoad)
+  /// in codegen_hcu.cc and CodeGenC::VisitExpr_(BufferLoad) in tvm codegen_c.cc.
+  /// Pass the full RHS (e.g. Cast(BufferLoad)) so outer dtype matches lowering.
+  bool LoadWillUseAmdBufferOpsWithPredicate(const PrimExpr &value_expr) const;
+  /// True iff BufferStore lowering consumes predicate_stack_ (same conditions as
+  /// VisitStmt_(BufferStore) amd_buffer_store path + CodeGenC BufferStore →
+  /// PrintVecStore → PrintVecStoreWithPredicate). Keep in sync with those; see
+  /// comments on LoadWillUseAmdBufferOpsWithPredicate.
+  bool StoreWillUseAmdBufferOpsWithPredicate(const BufferStoreNode *op) const;
+  /// Same gating as TryToEmitLDSBufferOp (LDS emit bypasses predicate_stack_).
+  bool StoreWouldEmitLDSBufferOp(const BufferStoreNode *op) const;
   bool CanUseLDSBufferOps(const BufferStoreNode *buffer_store) {
     auto value = std::getenv("HCU_DIRECT_TO_LDS");
     if (value == nullptr || std::atoi(value) == 0)
