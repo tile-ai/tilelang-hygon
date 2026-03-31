@@ -75,9 +75,6 @@ public:
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.GemmSP", GemmSPNode, TileOperatorNode);
 
-  Array<Buffer> GetOutBuffers() const override { return {c_}; }
-  Array<Buffer> GetInBuffers() const override { return {a_, b_, e_}; }
-
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
   LayoutMap InferLayout(const LayoutInferArgs &T,
                         InferLevel level) const override;
@@ -113,7 +110,8 @@ private:
 class GemmSP : public TileOperator {
 public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(GemmSP, TileOperator, GemmSPNode);
-  TVM_DLL GemmSP(Array<PrimExpr> args);
+  TVM_DLL GemmSP(Array<PrimExpr> args,
+                 Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
   static const Op &Get();
 };
 

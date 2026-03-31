@@ -14,9 +14,6 @@
 #include <tvm/node/structural_equal.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
-#include <map>
-#include <tuple>
-
 namespace tvm {
 namespace tl {
 
@@ -81,7 +78,8 @@ void ComputeDsReadFormatWarpPartition(bool trans, int block_mn, int block_k,
 
 }  // namespace
 
-DsReadFormat::DsReadFormat(Array<PrimExpr> args) {
+DsReadFormat::DsReadFormat(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+  (void)annotations;
   ICHECK(args.size() >= 2) << "ds_read_format expects at least 2 args: src_region, dst_region";
   auto src_call = args[0].as<CallNode>();
   auto dst_call = args[1].as<CallNode>();

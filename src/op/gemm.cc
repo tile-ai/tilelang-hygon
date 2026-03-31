@@ -61,7 +61,7 @@ static inline bool IsFloat8E5Family(DataType dtype) {
 
 // MakeAccessPtrFromRegion moved to src/op/utils.{h,cc}
 
-Gemm::Gemm(Array<PrimExpr> args) {
+Gemm::Gemm(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   ObjectPtr<GemmNode> node = tvm::ffi::make_object<GemmNode>();
 
   node->aRegion_ = NormalizeToBufferRegion(args[0]);
@@ -303,6 +303,8 @@ std::pair<int, int> GemmWarpPolicyNode::computeWarpPartition(
   constexpr int kMPerWarp = 16; // Rows processed by a single warp
   int kNPerWarp = 8;            // Columns processed by a single warp
   if (TargetIsVolta(target)) {
+    kNPerWarp = 16;
+  } else if (TargetIsCDNA(target)) {
     kNPerWarp = 16;
   }
   ICHECK(M % kMPerWarp == 0)
@@ -696,8 +698,8 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   bool B_mls_trans = transB_;
   bool use_gemm_mls =
       TargetIsHCU(T.target) &&
-      ((A_from_mls && a_.scope() != "local.fragment") ||
-       (B_from_mls && b_.scope() != "local.fragment"));
+      ((A_from_mls && !IsFragmentBuffer(a_)) ||
+       (B_from_mls && !IsFragmentBuffer(b_)));
 
   if (use_gemm_mls) {
     ICHECK(kPack_ == 1) << "gemm_mls does not support kPack > 1";
@@ -705,24 +707,23 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     if (A_from_mls && B_from_mls) {
       op_name = "tl::gemm_mls_mls";
     } else if (B_from_mls) {
-      op_name = (a_.scope() == "local.fragment") ? "tl::gemm_r_mls"
-                                                 : "tl::gemm_s_mls";
+      op_name = IsFragmentBuffer(a_) ? "tl::gemm_r_mls" : "tl::gemm_s_mls";
     } else {
       ICHECK(A_from_mls);
       LOG(FATAL) << "gemm_mls_s (A mls, B r or s) not implemented";
     }
-  } else if (a_.scope() == "local.fragment") {
-    if (b_.scope() == "local.fragment") {
+  } else if (IsFragmentBuffer(a_)) {
+    if (IsFragmentBuffer(b_)) {
       op_name = "tl::gemm_rr";
     } else {
       op_name = "tl::gemm_rs";
     }
-  } else if (b_.scope() == "local.fragment") {
+  } else if (IsFragmentBuffer(b_)) {
     op_name = "tl::gemm_sr";
   } else {
     op_name = "tl::gemm_ss";
   }
-  ICHECK(c_.scope() == "local.fragment");
+  ICHECK(IsFragmentBuffer(c_));
 
   ss << op_name << "<" << m_ << ", " << n_ << ", " << k_ << ", ";
   ss << warp_m << ", " << warp_n << ", ";
@@ -873,7 +874,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
   }
 
   if (TargetIsVolta(T.target)) {
-    ICHECK(c_.scope() == "local.fragment")
+    ICHECK(IsFragmentBuffer(c_))
         << "Volta gemm only supports C in local.fragment scope, got "
         << c_.scope();
     auto fragment = makeGemmVoltaFragmentC(m_, n_, m_ / warp_m, n_ / warp_n,
@@ -884,7 +885,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
       results.Set(a_, makeGemmVoltaABLayout(*as_const_int(a_->shape[dim_A - 2]),
                                             *as_const_int(a_->shape[dim_A - 1]),
                                             true, !transA_));
-    } else if (a_.scope() == "local.fragment") {
+    } else if (IsFragmentBuffer(a_)) {
       ICHECK(transA_ == false);
       auto fragment =
           makeGemmVoltaFragmentA(m_, n_, k_, m_ / warp_m, n_ / warp_n);
@@ -901,7 +902,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
   } else if (TargetIsAmpere(T.target) || TargetIsTuring(T.target) ||
              TargetIsSM120(T.target) ||
              (TargetIsSm100(T.target) && gemm_inst == GemmInst::kMMA)) {
-    ICHECK(c_.scope() == "local.fragment")
+    ICHECK(IsFragmentBuffer(c_))
         << "MMA only supports C in local.fragment scope, got " << c_.scope();
 
     auto fragment =
@@ -915,7 +916,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
       results.Set(a_,
                   makeGemmABLayout(mat_stride, mat_continuous, mat_continuous,
                                    a_->dtype.bits(), !transA_));
-    } else if (a_.scope() == "local.fragment") {
+    } else if (IsFragmentBuffer(a_)) {
       auto fragment = makeGemmFragmentA(m_, n_, k_, m_ / warp_m, n_ / warp_n,
                                         a_->dtype.bits(), transA_);
       results.Set(a_, fragment->BindThreadRange(thread_range));
@@ -929,7 +930,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
       results.Set(b_,
                   makeGemmABLayout(mat_stride, mat_continuous, mat_continuous,
                                    b_->dtype.bits(), transB_));
-    } else if (b_.scope() == "local.fragment") {
+    } else if (IsFragmentBuffer(b_)) {
       auto fragment =
           makeGemmFragmentB(m_, n_, k_, m_ / warp_m, n_ / warp_n, transB_);
       results.Set(b_, fragment->BindThreadRange(thread_range));
@@ -937,7 +938,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
       ICHECK(0);
     }
   } else if (TargetIsHopper(T.target)) {
-    ICHECK(c_.scope() == "local.fragment")
+    ICHECK(IsFragmentBuffer(c_))
         << (gemm_inst == GemmInst::kWGMMA ? "WGMMA " : "MMA ")
         << "only supports C in local.fragment scope, got " << c_.scope();
     auto fragment = gemm_inst == GemmInst::kWGMMA
@@ -1085,7 +1086,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
       ICHECK(0);
     }
   } else if (TargetIsCDNA(T.target)) {
-    ICHECK(c_.scope() == "local.fragment")
+    ICHECK(IsFragmentBuffer(c_))
         << "CDNA gemm (FMMA) only supports C in local.fragment scope, got "
         << c_.scope();
     auto fragment = makeGemmFragmentCCDNA(m_, n_, m_ / warp_m, n_ / warp_n,
@@ -1098,7 +1099,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
           *as_const_int(a_->shape[dim_A - 2]),
           *as_const_int(a_->shape[dim_A - 1]), a_->dtype.bits(), kPack_);
       results.Set(a_, shared_layout);
-    } else if (a_.scope() == "local.fragment") {
+    } else if (IsFragmentBuffer(a_)) {
       auto fragment =
           makeGemmFragmentACDNA(m_, n_, k_, m_ / warp_m, n_ / warp_n,
                                 a_->dtype.bits(), kPack_, transA_);
@@ -1113,7 +1114,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
           *as_const_int(b_->shape[dim_B - 1]), b_->dtype.bits(), kPack_);
 
       results.Set(b_, shared_layout);
-    } else if (b_.scope() == "local.fragment") {
+    } else if (IsFragmentBuffer(b_)) {
       auto fragment =
           makeGemmFragmentB(m_, n_, k_, m_ / warp_m, n_ / warp_n, transB_);
       results.Set(b_, fragment->BindThreadRange(thread_range));

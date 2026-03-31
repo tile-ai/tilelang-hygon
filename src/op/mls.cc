@@ -5,6 +5,7 @@
 
 #include "mls.h"
 #include "gemm.h"
+#include "ds_read_format.h"
 #include "propagation_util.h"
 #include "region.h"
 #include "../target/utils.h"
@@ -26,7 +27,8 @@ static PrimExpr ToInt64ConstOrVar(const PrimExpr &expr) {
   return expr;
 }
 
-MatrixLoad::MatrixLoad(Array<PrimExpr> args) {
+MatrixLoad::MatrixLoad(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+  (void)annotations;
   ICHECK(args.size() >= 4)
       << "matrix_load expects at least 4 args: src_region, dst_region, "
          "check_last_k_load, last_k_load";
@@ -198,7 +200,7 @@ LayoutMap MatrixLoadNode::InferLayout(const LayoutInferArgs &T,
       }
     } else if (c->GetTypeKey() == std::string("tl.DsReadFormat")) {
       auto gemm_with_input = PropagateToFindGemmConsumerOpWithInput(
-          c->GetOutBuffers()[0], T.tir_collector);
+          Downcast<DsReadFormat>(c)->dst, T.tir_collector);
       if (gemm_with_input) {
         found_gemm = true;
         auto gemm = gemm_with_input->gemm;

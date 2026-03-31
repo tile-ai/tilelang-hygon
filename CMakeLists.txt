@@ -156,6 +156,7 @@ file(GLOB TILE_LANG_SRCS
   src/*.cc
   src/layout/*.cc
   src/transform/*.cc
+  src/transform/common/*.cc
   src/op/*.cc
   src/target/utils.cc
   src/target/codegen_c_host.cc
@@ -242,15 +243,53 @@ elseif(USE_CUDA)
   # Set `USE_CUDA=/usr/local/cuda-x.y`
   cmake_path(GET CUDAToolkit_BIN_DIR PARENT_PATH USE_CUDA)
 
+  # ============================================================================
+  # CUDA Driver Stub Library (libcuda_stub.so)
+  # ============================================================================
+  # This library provides drop-in replacements for CUDA driver API functions.
+  # Instead of linking directly against libcuda.so (which would fail on
+  # CPU-only machines), we link against this stub which loads libcuda.so
+  # lazily at runtime on first API call.
+  #
+  # The stub exports global C functions matching the CUDA driver API:
+  #   - cuModuleLoadData, cuLaunchKernel, cuMemsetD32_v2, etc.
+  # These can be called directly without any wrapper macros.
+  # ============================================================================
+  add_library(cuda_stub SHARED src/target/stubs/cuda.cc)
+  target_include_directories(cuda_stub PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  # Export symbols with visibility="default" when building
+  target_compile_definitions(cuda_stub PRIVATE TILELANG_CUDA_STUB_EXPORTS)
+  # Use dlopen/dlsym for runtime library loading
+  target_link_libraries(cuda_stub PRIVATE ${CMAKE_DL_LIBS})
+  set_target_properties(cuda_stub PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    # Use consistent naming
+    OUTPUT_NAME "cuda_stub"
+  )
+
   file(GLOB TILE_LANG_CUDA_SRCS
     src/runtime/runtime.cc
     src/target/ptx.cc
     src/target/codegen_cuda.cc
+    src/target/codegen_py.cc
+    src/target/codegen_utils.cc
+    src/target/codegen_cutedsl.cc
     src/target/rt_mod_cuda.cc
+    src/target/rt_mod_cutedsl.cc
   )
   list(APPEND TILE_LANG_SRCS ${TILE_LANG_CUDA_SRCS})
 
   list(APPEND TILE_LANG_INCLUDES ${CUDAToolkit_INCLUDE_DIRS})
+endif()
+
+set(USE_Z3      ON CACHE STRING "Use Z3 SMT solver for TileLang optimizations")
+set(USE_PYPI_Z3 ON CACHE BOOL   "Use Z3 provided by PyPI z3-solver package")
+
+if(USE_Z3 AND USE_PYPI_Z3)
+  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/pypi-z3")
+  find_package(Z3 REQUIRED)
 endif()
 
 # Include tvm after configs have been populated
@@ -260,7 +299,11 @@ add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)
 add_compile_definitions(DMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>)
 
 add_library(tilelang_objs OBJECT ${TILE_LANG_SRCS})
+
+# Set debug mode compile definitions
+# Enable the TVM debug option, i.e., TVM_LOG_DEBUG
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  message(STATUS "Building TileLang with DEBUG mode")
   target_compile_definitions(tilelang_objs PRIVATE "TVM_LOG_DEBUG")
 endif()
 
@@ -270,6 +313,18 @@ add_library(tilelang SHARED $<TARGET_OBJECTS:tilelang_objs>)
 add_library(tilelang_module SHARED $<TARGET_OBJECTS:tilelang_objs>)
 target_link_libraries(tilelang PUBLIC tvm_runtime tvm)
 target_link_libraries(tilelang_module PUBLIC tvm)
+
+# Place dev build outputs under build/lib for consistency
+set_target_properties(tilelang PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+)
+set_target_properties(tilelang_module PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+)
 # Build cython extension
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT})
 
@@ -289,26 +344,105 @@ if(NOT "${SKBUILD_SABI_VERSION}" STREQUAL "")
 endif()
 
 python_add_library(tilelang_cython_wrapper MODULE "${CMAKE_BINARY_DIR}/tilelang_cython_wrapper.cpp" ${USE_SABI} WITH_SOABI)
-# Install extension into the tilelang package directory
-install(TARGETS tilelang_cython_wrapper
-        LIBRARY DESTINATION tilelang
-        RUNTIME DESTINATION tilelang
-        ARCHIVE DESTINATION tilelang)
 
-# let libtilelang to search tvm/tvm_runtime in same dir
+# Ensure dev builds drop the extension into build/lib alongside other shared libs
+set_target_properties(tilelang_cython_wrapper PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+)
+
+# Install the extension into tilelang/lib inside the wheel
+install(TARGETS tilelang_cython_wrapper
+        LIBRARY DESTINATION tilelang/lib
+        RUNTIME DESTINATION tilelang/lib
+        ARCHIVE DESTINATION tilelang/lib)
+
+# Copy libz3.so to build folder to workaround isolated build env issue
+if(USE_Z3 AND USE_PYPI_Z3)
+  get_target_property(Z3_LIBRARY_PATH z3::libz3 IMPORTED_LOCATION)
+  install(FILES "${Z3_LIBRARY_PATH}" DESTINATION "${CMAKE_BINARY_DIR}/lib")
+  if(APPLE)
+    set_target_properties(tvm PROPERTIES BUILD_RPATH "@loader_path")
+  else()
+    set_target_properties(tvm PROPERTIES BUILD_RPATH "\$ORIGIN")
+  endif()
+endif()
+
+set(TILELANG_OUTPUT_TARGETS
+  tilelang
+  tilelang_module
+  tvm
+  tvm_runtime
+)
+
+if(USE_CUDA)
+  # Link against CUDA stub library instead of libcuda.so
+  # This enables lazy loading of libcuda.so at runtime, allowing
+  # `import tilelang` to succeed on CPU-only machines.
+  foreach(target IN LISTS TILELANG_OUTPUT_TARGETS)
+    target_link_libraries(${target} PUBLIC cuda_stub)
+  endforeach()
+  # Include CUDA stub in output targets for RPATH configuration
+  list(APPEND TILELANG_OUTPUT_TARGETS cuda_stub)
+endif()
+
+unset(PATCHELF_EXECUTABLE CACHE)
+
 if(APPLE)
-  set_target_properties(tilelang PROPERTIES INSTALL_RPATH "@loader_path;@loader_path/../../tvm_ffi/lib")
-  set_target_properties(tilelang_module PROPERTIES INSTALL_RPATH "@loader_path;@loader_path/../../tvm_ffi/lib")
-  set_target_properties(tvm PROPERTIES INSTALL_RPATH "@loader_path;@loader_path/../../tvm_ffi/lib")
-  set_target_properties(tvm_runtime PROPERTIES INSTALL_RPATH "@loader_path;@loader_path/../../tvm_ffi/lib")
+  set(TILELANG_INSTALL_RPATH "@loader_path;@loader_path/../../tvm_ffi/lib")
+  if(USE_Z3 AND USE_PYPI_Z3)
+    # Some z3 is placed in lib/ and some in bin/, we add both in rpath
+    string(APPEND TILELANG_INSTALL_RPATH ";@loader_path/../../z3/lib;@loader_path/../../z3/bin")
+  endif()
 elseif(UNIX)
-  set_target_properties(tilelang PROPERTIES INSTALL_RPATH "\$ORIGIN:\$ORIGIN/../../tvm_ffi/lib")
-  set_target_properties(tilelang_module PROPERTIES INSTALL_RPATH "\$ORIGIN:\$ORIGIN/../../tvm_ffi/lib")
-  set_target_properties(tvm PROPERTIES INSTALL_RPATH "\$ORIGIN:\$ORIGIN/../../tvm_ffi/lib")
-  set_target_properties(tvm_runtime PROPERTIES INSTALL_RPATH "\$ORIGIN:\$ORIGIN/../../tvm_ffi/lib")
+  set(TILELANG_INSTALL_RPATH "\$ORIGIN:\$ORIGIN/../../tvm_ffi/lib")
+  if(USE_Z3 AND USE_PYPI_Z3)
+    string(APPEND TILELANG_INSTALL_RPATH ":\$ORIGIN/../../z3/lib")
+  endif()
+  if(USE_CUDA)
+    string(APPEND TILELANG_INSTALL_RPATH ":\$ORIGIN/../../nvidia/cu${CUDAToolkit_VERSION_MAJOR}/lib")
+  endif()
+  find_program(PATCHELF_EXECUTABLE patchelf)
+  if (NOT PATCHELF_EXECUTABLE)
+    message(STATUS "`patchelf` not found.")
+  endif()
+endif()
+
+# Let libtilelang search for tvm/tvm_runtime in the same directory
+foreach(target IN LISTS TILELANG_OUTPUT_TARGETS)
+  set_target_properties(${target} PROPERTIES INSTALL_RPATH "${TILELANG_INSTALL_RPATH}")
+  set_target_properties(${target} PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  )
+endforeach()
+
+# Exclude libcuda.so to allow importing on a CPU-only machine
+if(USE_CUDA AND PATCHELF_EXECUTABLE)
+  # Run `patchelf` on built libraries to remove libcuda.so dependency.
+  # Use `install(CODE ...)` instead of `add_custom_command(... POST_BUILD ...)`
+  # to avoid race conditions during linking.
+  foreach(target IN LISTS TILELANG_OUTPUT_TARGETS)
+    install(CODE "
+      execute_process(
+        COMMAND ${PATCHELF_EXECUTABLE} --remove-needed libcuda.so.1 --remove-needed libcuda.so \"$<TARGET_FILE:${target}>\"
+        WORKING_DIRECTORY \"${CMAKE_INSTALL_PREFIX}\"
+        RESULT_VARIABLE patchelf_result
+      )
+      if(patchelf_result EQUAL 0)
+        message(STATUS \"`patchelf` successfully removed dependency `libcuda.so` from $<TARGET_FILE:${target}>\")
+      else()
+        message(WARNING \"`patchelf` failed to remove dependency `libcuda.so` from $<TARGET_FILE:${target}>\")
+      endif()
+    ")
+  endforeach()
 endif()
 
 install(
-  TARGETS tvm tvm_runtime tilelang_module tilelang
+  TARGETS ${TILELANG_OUTPUT_TARGETS}
   LIBRARY DESTINATION tilelang/lib
+  RUNTIME DESTINATION tilelang/lib
+  ARCHIVE DESTINATION tilelang/lib
 )

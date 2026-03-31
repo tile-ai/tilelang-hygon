@@ -52,6 +52,10 @@ static constexpr const char *kCustomWarpSpecialization =
 static constexpr const char *kDirectToLDSMap = "direct_to_lds_map";
 static constexpr const char *kDisableBufferOpsMap = "disable_buffer_ops_map";
 static constexpr const char *kLocalVarInit = "tl.local_var_init";
+// A PrimFunc-level attribute carrying a list of handle Vars
+// that must NOT be marked with the restrict qualifier in codegen.
+// Type: Array<tir::Var>
+static constexpr const char *kNonRestrictParams = "tl.non_restrict_params";
 } // namespace attr
 
 static constexpr const char *kDebugMergeSharedMemoryAllocations =
@@ -71,22 +75,20 @@ static constexpr const char *kPtxasRegisterUsageLevel =
 static constexpr const char *kEnablePTXASVerboseOutput =
     "tl.enable_ptxas_verbose_output";
 static constexpr const char *kDisableVectorize256 = "tl.disable_vectorize_256";
+static constexpr const char *kEnableVectorizePlannerVerbose =
+    "tl.enable_vectorize_planner_verbose";
 static constexpr const char *kDisableWGMMA = "tl.disable_wgmma";
 static constexpr const char *kDisableShuffleElect = "tl.disable_shuffle_elect";
 static constexpr const char *kStorageRewriteDetectInplace =
     "tl.storage_rewrite_detect_inplace";
+static constexpr const char *kASTPrintEnable = "tl.ast_print_enable";
 static constexpr const char *kLayoutVisualizationEnable =
     "tl.layout_visualization_enable";
 static constexpr const char *kLayoutVisualizationFormats =
     "tl.layout_visualization_formats";
-/*!
- * \brief Whether to disable dynamic tail split
- *
- * kDisableDynamicTailSplit = "tl.disable_dynamic_tail_split"
- *
- */
-static constexpr const char *kDisableDynamicTailSplit =
-    "tl.disable_dynamic_tail_split";
+static constexpr const char *kDeviceCompileFlags = "tl.device_compile_flags";
+static constexpr const char *kDisableDataRaceCheck =
+    "tl.disable_data_race_check";
 
 /*!
  * \brief Whether to disable thread storage synchronization
@@ -109,18 +111,6 @@ static constexpr const char *kDisableThreadStorageSync =
  *
  */
 static constexpr const char *kForceLetInline = "tl.force_let_inline";
-
-/*!
- * \brief The size of the vectorized dimension in buffer, designed by user
- *
- * For example, if the vectorized dimension is 128 bits and the dtype of buffer
- * A[m, k] is float16, the size of the vectorized dimension (i.e. k) in buffer A
- * should be divisible by 8 (8 = 128 / 16).
- *
- * kDynamicAlignment = "tl.dynamic_alignment"
- *
- */
-static constexpr const char *kDynamicAlignment = "tl.dynamic_alignment";
 
 /*!
  * \brief Get the type of the CUDA tensor map
@@ -165,6 +155,11 @@ TVM_DLL const Op &ieee_fsqrt();
 TVM_DLL const Op &ieee_frsqrt();
 // ieee_fdiv(x, y, rounding_mode) - IEEE-compliant division
 TVM_DLL const Op &ieee_fdiv();
+
+// random op
+TVM_DLL const Op &rng_init();
+TVM_DLL const Op &rng_rand();
+TVM_DLL const Op &rng_rand_float();
 
 /*!
  * \brief tvm intrinsics for TMADescriptor creation for tiled load
@@ -339,6 +334,15 @@ TVM_DLL const Op &ptx_stmatrix();
 TVM_DLL const Op &ptx_cp_async_barrier_noinc();
 
 /*!
+ * \brief TileLang intrinsic for PTX async copy from global to shared memory
+ *
+ * ptx_cp_async(dst_access_ptr, src_access_ptr, bytes)
+ * ptx_cp_async(dst_access_ptr, src_access_ptr, bytes, predicate)
+ *
+ */
+TVM_DLL const Op &ptx_cp_async();
+
+/*!
  * \brief Pack two b16 value into a b32 value
  *
  * int32 pack_b16(b16_value, b16_value)
@@ -467,6 +471,30 @@ TVM_DLL const Op &wait_wgmma();
 TVM_DLL const Op &sync_grid();
 
 /*!
+ * \brief Synchronize all threads in a warp
+ *
+ * sync_warp()
+ *
+ */
+TVM_DLL const Op &sync_warp();
+
+/*!
+ * \brief Programmatic dependency trigger.
+ *
+ * pdl_trigger()
+ *
+ */
+TVM_DLL const Op &pdl_trigger();
+
+/*!
+ * \brief Programmatic grid dependency synchronization.
+ *
+ * pdl_sync()
+ *
+ */
+TVM_DLL const Op &pdl_sync();
+
+/*!
  * \brief tvm intrinsic for loop continue
  *
  * loop_break()
@@ -583,7 +611,77 @@ TVM_DLL const Op &increase_descriptor_offset();
  *  This op is used to represent an element-wise atomic add operation in
  * tilelang.
  */
-TVM_DLL const Op &atomicadd_elem_op();
+TVM_DLL const Op &atomic_add_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic addition with return value.
+ *
+ *  This op is used to represent an element-wise atomic add operation in
+ * tilelang that returns the previous value.
+ */
+TVM_DLL const Op &atomic_add_ret_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for vectorized (x2) atomic addition.
+ *
+ *  This op is used to represent a vectorized atomic add operation (2 elements)
+ * in tilelang.
+ */
+TVM_DLL const Op &atomic_addx2_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for vectorized (x4) atomic addition.
+ *
+ *  This op is used to represent a vectorized atomic add operation (4 elements)
+ * in tilelang.
+ */
+TVM_DLL const Op &atomic_addx4_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for atomic load.
+ *
+ *  This op is used to represent an atomic load operation in tilelang.
+ */
+TVM_DLL const Op &atomic_load_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for atomic store.
+ *
+ *  This op is used to represent an atomic store operation in tilelang.
+ */
+TVM_DLL const Op &atomic_store_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic maximum.
+ *
+ *  This op is used to represent an element-wise atomic max operation in
+ * tilelang.
+ */
+TVM_DLL const Op &atomic_max_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic maximum with return value.
+ *
+ *  This op is used to represent an element-wise atomic max operation in
+ * tilelang that returns the previous value.
+ */
+TVM_DLL const Op &atomic_max_ret_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic minimum.
+ *
+ *  This op is used to represent an element-wise atomic min operation in
+ * tilelang.
+ */
+TVM_DLL const Op &atomic_min_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic minimum with return value.
+ *
+ *  This op is used to represent an element-wise atomic min operation in
+ * tilelang that returns the previous value.
+ */
+TVM_DLL const Op &atomic_min_ret_elem_op();
 
 /*!
  * \brief tilelang intrinsic for assert on device.
@@ -623,6 +721,24 @@ TVM_DLL const Op &warp_reduce_bitand();
  * \brief tilelang intrinsic for warp reduction bitor.
  */
 TVM_DLL const Op &warp_reduce_bitor();
+
+/*!
+ * \brief tilelang intrinsic for CUDA read-only cache load (__ldg).
+ *
+ *  This op allows users to explicitly request a non-coherent cached load
+ *  from global memory on CUDA by emitting `__ldg(&ptr[idx])` for 32-bit
+ *  element types on supported architectures. It provides a direct way to
+ *  leverage the read-only data cache for performance-sensitive loads when
+ *  the compiler cannot infer `const __restrict__` automatically.
+ *
+ *  Usage from TVMScript:
+ *    y[i] = T.__ldg(x[i])
+ *
+ *  The op takes one argument preferred as a BufferLoad identifying the
+ *  source element; alternatively, backends may support passing a Buffer and
+ *  index expression.
+ */
+TVM_DLL const Op &__ldg();
 
 } // namespace tl
 } // namespace tvm

@@ -1,11 +1,10 @@
 """The profiler and convert to torch utils"""
+
 from __future__ import annotations
 from typing import Callable, Any, Literal
 from functools import partial
 import torch
-from contextlib import suppress
 from dataclasses import dataclass
-import tvm
 from tilelang.utils.tensor import (
     get_tensor_supply,
     TensorSupplyType,
@@ -45,8 +44,7 @@ class Profiler:
             result_idx = []
         elif isinstance(result_idx, int):
             if result_idx > len(params) or result_idx < -len(params):
-                raise ValueError(
-                    f"result_idx should be an integer between {-len(params)} and {len(params) - 1}")
+                raise ValueError(f"result_idx should be an integer between {-len(params)} and {len(params) - 1}")
             if result_idx < 0:
                 result_idx = len(params) + result_idx
             result_idx = [result_idx]
@@ -113,8 +111,7 @@ class Profiler:
         ref_tensors = ins + ref_outs
         lib_tensors = ins + lib_outs
 
-        assert len(lib_tensors) == len(
-            ref_tensors), "len(lib_tensors) not equals to len(ref_tensors) !"
+        assert len(lib_tensors) == len(ref_tensors), "len(lib_tensors) not equals to len(ref_tensors) !"
         # torch.set_printoptions(edgeitems=torch.inf)
         for lhs, rhs in zip(lib_tensors, ref_tensors):
             # close_mask = torch.isclose(lhs, rhs, rtol=rtol, atol=atol)
@@ -192,21 +189,6 @@ class Profiler:
             func = self.__call__
         return func(*ins)
 
-    def determine_profiler(self, func: Callable | None = None):
-        """Determines which profiler backend to use based on function type.
-
-        Args:
-            func: Function to be profiled
-            profiler: Explicitly specified profiler type or "auto" for automatic detection
-
-        Returns:
-            str: The determined profiler type ("torch" or "tvm")
-        """
-        if isinstance(func, tvm.runtime.Module):
-            return "tvm"
-        else:
-            return "torch"
-
     def do_bench(
         self,
         func: Callable | None = None,
@@ -233,43 +215,21 @@ class Profiler:
         Returns:
             float: Average execution time in milliseconds
         """
-        profiler = self.determine_profiler(func)
-        if profiler == "torch":
-            if func is None:
-                assert self.adapter is not None, "benchmarking function should be provided"
-                func = self.adapter
-            ins = self._get_inputs() if input_tensors is None else input_tensors
-            bench_func = partial(func, *ins)
-            return do_bench(
-                bench_func,
-                warmup=warmup,
-                rep=rep,
-                _n_warmup=n_warmup,
-                _n_repeat=n_repeat,
-                quantiles=quantiles,
-                backend=backend,
-                return_mode=return_mode,
-            )
-        elif profiler == "tvm":
-            assert func is not None, "func should not be None"
-            assert isinstance(
-                func, tvm.runtime.Module), f"func should be a TVM module, but got {type(func)}"
-
-            ins = (self._get_inputs(with_output=True) if input_tensors is None else input_tensors)
-            target = "cuda"
-
-            with suppress(Exception):
-                target = self.mod.imported_modules[0].type_key
-
-            assert target in ["cuda", "hip"], f"Unknown target: {target}"
-
-            device = tvm.cuda(0) if target == "cuda" else tvm.rocm(0)
-            time_evaluator = self.mod.time_evaluator(
-                self.mod.entry_name, device, number=rep, repeat=n_repeat)
-            # Transform Latency to ms
-            return time_evaluator(*ins).mean * 1e3
-        else:
-            raise ValueError(f"Unknown profiler: {profiler}")
+        if func is None:
+            assert self.adapter is not None, "benchmarking function should be provided"
+            func = self.adapter
+        ins = self._get_inputs() if input_tensors is None else input_tensors
+        bench_func = partial(func, *ins)
+        return do_bench(
+            bench_func,
+            warmup=warmup,
+            rep=rep,
+            _n_warmup=n_warmup,
+            _n_repeat=n_repeat,
+            quantiles=quantiles,
+            backend=backend,
+            return_mode=return_mode,
+        )
 
     @property
     def func(self):

@@ -33,15 +33,14 @@ class DsReadFormatNode : public TileOperatorNode {
   LayoutMap InferLayout(const LayoutInferArgs &T,
                         InferLevel level) const override;
   TileOperator Clone() const override;
-  Array<Buffer> GetOutBuffers() const override { return {dst}; }
-  Array<Buffer> GetInBuffers() const override { return {src}; }
 };
 
 class DsReadFormat : public TileOperator {
  public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(DsReadFormat, TileOperator,
                                              DsReadFormatNode);
-  TVM_DLL DsReadFormat(Array<PrimExpr> args);
+  TVM_DLL DsReadFormat(Array<PrimExpr> args,
+                       Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
   static const Op &Get();
 };
 

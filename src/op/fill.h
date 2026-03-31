@@ -22,9 +22,6 @@ public:
   Array<Range> region; ///< Region to fill within the buffer
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Fill", FillNode, TileOperatorNode);
 
-  Array<Buffer> GetOutBuffers() const override { return {dst}; }
-  Array<Buffer> GetInBuffers() const override { return {}; }
-
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const;
   LayoutMap InferLayout(const LayoutInferArgs &T, InferLevel level) const;
   static const Op &Get();
@@ -48,7 +45,8 @@ private:
 class Fill : public TileOperator {
 public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Fill, TileOperator, FillNode);
-  TVM_DLL Fill(Array<PrimExpr> args);
+  TVM_DLL Fill(Array<PrimExpr> args,
+               Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
   static const Op &Get();
 };
 

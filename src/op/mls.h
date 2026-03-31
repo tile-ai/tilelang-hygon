@@ -39,15 +39,14 @@ public:
   LayoutMap InferLayout(const LayoutInferArgs &T,
                         InferLevel level) const override;
   TileOperator Clone() const override;
-  Array<Buffer> GetOutBuffers() const override { return {dst}; }
-  Array<Buffer> GetInBuffers() const override { return {src}; }
 };
 
 class MatrixLoad : public TileOperator {
 public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(MatrixLoad, TileOperator,
                                              MatrixLoadNode);
-  TVM_DLL MatrixLoad(Array<PrimExpr> args);
+  TVM_DLL MatrixLoad(Array<PrimExpr> args,
+                     Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
   static const Op &Get();
 };
 

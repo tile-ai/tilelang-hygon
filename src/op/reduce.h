@@ -91,8 +91,6 @@ public:
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.ReduceOp", ReduceOpNode,
                                     TileOperatorNode);
 
-  Array<Buffer> GetOutBuffers() const override { return {dst}; }
-  Array<Buffer> GetInBuffers() const override { return {src}; }
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -118,7 +116,7 @@ private:
   /// Generate initial value for reduction
   PrimExpr MakeInitValue() const;
   /// Generate reduction expression
-  PrimExpr MakeReduce(const PrimExpr &a, const PrimExpr &b) const;
+  PrimExpr MakeReduce(const PrimExpr &acc, const PrimExpr &b) const;
   /// Generate codegen reducer string
   std::string MakeCodegenReducer() const;
   /// Lower warp-level reduce (dim == -1)
@@ -130,7 +128,9 @@ class ReduceOp : public TileOperator {
 public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(ReduceOp, TileOperator,
                                              ReduceOpNode);
-  TVM_DLL ReduceOp(Array<PrimExpr> args);
+  TVM_DLL
+  ReduceOp(Array<PrimExpr> args,
+           Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
   static const Op &Get();
 };
 
@@ -156,9 +156,6 @@ public:
         .def_ro("reverse", &CumSumOpNode::reverse);
   }
 
-  Array<Buffer> GetOutBuffers() const override { return {dst}; }
-  Array<Buffer> GetInBuffers() const override { return {src}; }
-
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
   LayoutMap InferLayout(const LayoutInferArgs &T,
                         InferLevel level) const override;
@@ -171,7 +168,9 @@ class CumSumOp : public TileOperator {
 public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(CumSumOp, TileOperator,
                                              CumSumOpNode);
-  TVM_DLL CumSumOp(Array<PrimExpr> args);
+  TVM_DLL
+  CumSumOp(Array<PrimExpr> args,
+           Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
   static const Op &Get();
 };
 

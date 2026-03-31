@@ -60,7 +60,7 @@ bool TargetIsSm100(Target target) {
   if (!TargetIsCuda(target))
     return false;
   int arch = GetArchInt(target);
-  return arch >= 100 & arch <= 110;
+  return arch >= 100 && arch <= 110;
 }
 
 bool TargetIsSM120(Target target) {
@@ -167,11 +167,66 @@ bool TargetHasBulkCopy(Target target) {
   return arch >= 90;
 }
 
+bool TargetSupportVectorize256(Target target) {
+  if (!TargetIsCuda(target))
+    return false;
+  int arch = GetArchInt(target);
+  return arch >= 100;
+}
+
+bool TargetHasSMVersionGE(Target target, int version) {
+  if (!TargetIsCuda(target))
+    return false;
+  int arch = GetArchInt(target);
+  return arch >= version;
+}
+
 int TargetGetWarpSize(Target target) {
   int res = 32;
   if (TargetIsCDNA(target))
     res = 64;
   return res;
+}
+
+bool IsCudaVectorizableFP8(DataType dtype) {
+  return dtype.is_float8_e4m3() || dtype.is_float8_e4m3fn() ||
+         dtype.is_float8_e5m2();
+}
+
+bool IsCudaVectorizableCast(DataType from_ty, DataType target_ty) {
+  // float16 -> float32
+  if (from_ty.is_float16() && target_ty.is_float())
+    return true;
+
+  // float32 -> float16
+  if (from_ty.is_float() && target_ty.is_float16())
+    return true;
+
+  // bfloat16 -> float32
+  if (from_ty.is_bfloat16() && target_ty.is_float())
+    return true;
+
+  // float32 -> bfloat16
+  if (from_ty.is_float() && target_ty.is_bfloat16())
+    return true;
+
+  // float32 -> float8 (E4M3/E5M2)
+  if (from_ty.is_float() && IsCudaVectorizableFP8(target_ty))
+    return true;
+
+  // float8 (E4M3/E5M2) -> float32
+  if (IsCudaVectorizableFP8(from_ty) && target_ty.is_float())
+    return true;
+
+  // float4_e2m1fn -> float32
+  if (from_ty.is_float4_e2m1fn() && target_ty.is_float())
+    return true;
+
+  // float32 -> float4_e2m1fn
+  if (from_ty.is_float() && target_ty.is_float4_e2m1fn())
+    return true;
+
+  return false;
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
