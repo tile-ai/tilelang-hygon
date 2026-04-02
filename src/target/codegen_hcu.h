@@ -68,6 +68,7 @@ protected:
   // Override BufferStore lowering so we can emit CK buffer store ops for
   // global memory using amd_buffer_store.
   void VisitStmt_(const BufferStoreNode *op) final;
+  void VisitStmt_(const LetStmtNode *op) final;
 
   virtual std::string GetBufferRef(DataType t, const BufferNode *buffer,
                                    PrimExpr index) final;
@@ -102,6 +103,10 @@ private:
   std::string GetCurrentPredicate() const;
   bool IsFoldableIfThenElse(const IfThenElseNode *op) const;
   bool IsCollapsibleRedundantIfElse(const IfThenElseNode *op) const;
+  /// True if expr is literal zero, Cast(zero), Broadcast(zero), or Broadcast(Var)
+  /// where Var's LetStmt RHS was recorded in let_initializer_expr_for_predicate_.
+  /// Used so amd_buffer_load can fold outer if/else into a predicate.
+  bool IsProvablyZeroOrZeroBroadcast(const PrimExpr &expr) const;
   bool CanUseVMBufferOps(const BufferNode *buffer, int num_elements) const {
     // Match by param name (robust across Var renaming in later passes)
     for (const auto &p : buffer_ops_disable_param_names_) {
@@ -168,6 +173,9 @@ private:
   std::unordered_map<const VarNode*, bool> direct_to_lds_map_;
   std::unordered_set<std::string> buffer_ops_disable_param_names_;
   std::vector<std::string> predicate_stack_;
+  /// LetStmt RHS (PrimExpr); used only by IsProvablyZeroOrZeroBroadcast (IsZeroValue).
+  /// Kept separate from var_idmap_ so we never alter SSA / name resolution behavior.
+  std::unordered_map<const VarNode*, PrimExpr> let_initializer_expr_for_predicate_;
 };
 
 } // namespace codegen

@@ -11,7 +11,6 @@
 #include "arith/pattern_match.h"
 
 #include <cmath>
-#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
@@ -217,6 +216,9 @@ bool IsZeroValue(const PrimExpr &expr) {
   if (const auto *broadcast = expr.as<BroadcastNode>()) {
     return IsZeroValue(broadcast->value);
   }
+  if (const auto *cast = expr.as<CastNode>()) {
+    return IsZeroValue(cast->value);
+  }
   return tir::is_zero(expr);
 }
 
@@ -287,6 +289,29 @@ std::string CodeGenTileLangHCU::GetCurrentPredicate() const {
     result += " && (" + predicate_stack_[i] + ")";
   }
   return result;
+}
+
+bool CodeGenTileLangHCU::IsProvablyZeroOrZeroBroadcast(
+    const PrimExpr &expr) const {
+  if (IsZeroValue(expr)) {
+    return true;
+  }
+  if (const auto *cast = expr.as<CastNode>()) {
+    return IsProvablyZeroOrZeroBroadcast(cast->value);
+  }
+  if (const auto *broadcast = expr.as<BroadcastNode>()) {
+    if (IsZeroValue(broadcast->value)) {
+      return true;
+    }
+    if (const auto *v = broadcast->value.as<VarNode>()) {
+      auto it = let_initializer_expr_for_predicate_.find(v);
+      if (it != let_initializer_expr_for_predicate_.end() &&
+          IsZeroValue(it->second)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 bool CodeGenTileLangHCU::LoadWillUseAmdBufferOpsWithPredicate(
@@ -397,7 +422,7 @@ bool CodeGenTileLangHCU::IsFoldableIfThenElse(const IfThenElseNode *op) const {
     if (!StructuralEqual()(then_store->indices[i], else_store->indices[i]))
       return false;
   }
-  if (!IsZeroValue(else_store->value))
+  if (!IsProvablyZeroOrZeroBroadcast(else_store->value))
     return false;
   if (!LoadWillUseAmdBufferOpsWithPredicate(then_store->value))
     return false;
@@ -458,6 +483,12 @@ void CodeGenTileLangHCU::VisitStmt_(const IfThenElseNode *op) {
     predicate_stack_.pop_back();
     return;
   }
+  CodeGenC::VisitStmt_(op);
+}
+
+void CodeGenTileLangHCU::VisitStmt_(const LetStmtNode *op) {
+  // Record Let RHS for predicate folding (IsZeroValue); do not touch var_idmap_.
+  let_initializer_expr_for_predicate_[op->var.get()] = op->value;
   CodeGenC::VisitStmt_(op);
 }
 
@@ -1231,7 +1262,7 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
   // amd_buffer_load with predicate instead of if-else.
   if (op->op.same_as(builtin::if_then_else()) && op->args.size() == 3) {
     const BufferLoadNode *load = ExtractBufferLoad(op->args[1]);
-    if (load && IsZeroValue(op->args[2]) &&
+    if (load && IsProvablyZeroOrZeroBroadcast(op->args[2]) &&
         LoadWillUseAmdBufferOpsWithPredicate(op->args[1])) {
       std::string cond_str = PrintExpr(op->args[0]);
       std::string pred_var = name_supply_->FreshName("pred");

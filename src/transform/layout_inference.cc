@@ -12,6 +12,7 @@
 #include <tvm/tir/utils.h>
 
 #include <algorithm>
+#include <climits>
 #include <deque>
 #include <memory>
 #include <queue>
@@ -38,6 +39,39 @@
 
 namespace tvm {
 namespace tl {
+
+namespace {
+
+/*!
+ * \brief Z3 limits for arith::Analyzer during tl.LayoutInference (per-pass default
+ *        and optional TILELANG_Z3_RLIMIT / TILELANG_Z3_TIMEOUT_MS).
+ */
+void ApplyLayoutInferenceZ3ResourceLimits(arith::Analyzer *analyzer) {
+  if (!analyzer)
+    return;
+  constexpr unsigned kDefaultRlimit = 500000;
+  unsigned rlimit = kDefaultRlimit;
+  if (const char *rl = std::getenv("TILELANG_Z3_RLIMIT")) {
+    if (rl[0]) {
+      char *end = nullptr;
+      unsigned long v = std::strtoul(rl, &end, 10);
+      if (end != rl && v > 0)
+        rlimit = v > UINT_MAX ? UINT_MAX : static_cast<unsigned>(v);
+    }
+  }
+  analyzer->z3_prover.SetRLimit(rlimit);
+  if (const char *to = std::getenv("TILELANG_Z3_TIMEOUT_MS")) {
+    if (to[0]) {
+      char *end = nullptr;
+      unsigned long v = std::strtoul(to, &end, 10);
+      if (end != to) {
+        unsigned u = v > UINT_MAX ? UINT_MAX : static_cast<unsigned>(v);
+        analyzer->z3_prover.SetTimeoutMs(u);
+      }
+    }
+  }
+}
+} // namespace
 
 using namespace tir;
 
@@ -427,6 +461,7 @@ public:
   }
 
   void Collect(const PrimFunc &f) {
+    ApplyLayoutInferenceZ3ResourceLimits(&analyzer_);
     for (const auto &[_, buffer] : f->buffer_map) {
       if (buffer_data_to_buffers_.count(buffer->data)) {
         auto buffers = buffer_data_to_buffers_[buffer->data];
