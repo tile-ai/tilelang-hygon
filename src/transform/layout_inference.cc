@@ -49,7 +49,7 @@ namespace {
 void ApplyLayoutInferenceZ3ResourceLimits(arith::Analyzer *analyzer) {
   if (!analyzer)
     return;
-  constexpr unsigned kDefaultRlimit = 500000;
+  constexpr unsigned kDefaultRlimit = 10000;
   unsigned rlimit = kDefaultRlimit;
   if (const char *rl = std::getenv("TILELANG_Z3_RLIMIT")) {
     if (rl[0]) {
