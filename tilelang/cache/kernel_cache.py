@@ -505,29 +505,30 @@ class KernelCache:
             self.logger.debug(f"Saving kernel source code to file: {device_kernel_path}")
         if kernel.kernel_source is not None:
             KernelCache._safe_write_file(device_kernel_path, "w", lambda file: file.write(kernel.kernel_source))
-            # HCU: optional asm / LLVM IR / TIR dumps for debugging (hipcc)
-            try:
-                asm_path = os.path.join(cache_path, self.asm_kernel_path)
-                llir_path = os.path.join(cache_path, self.llir_kernel_path)
-                tir_path = os.path.join(cache_path, self.tir_kernel_path)
-                KernelCache._safe_write_file(
-                    asm_path,
-                    "w",
-                    lambda file: file.write(_make_obj(device_kernel_path, "asm", "r")),
-                )
-                KernelCache._safe_write_file(
-                    llir_path,
-                    "w",
-                    lambda file: file.write(_make_obj(device_kernel_path, "llir", "r")),
-                )
-                if kernel.prim_func is not None:
+            # HCU: optional asm / LLVM IR / TIR dumps for debugging (hipcc); see TILELANG_KERNEL_DUMP
+            if env.TILELANG_KERNEL_DUMP.lower() in ("1", "true", "yes", "on"):
+                try:
+                    asm_path = os.path.join(cache_path, self.asm_kernel_path)
+                    llir_path = os.path.join(cache_path, self.llir_kernel_path)
+                    tir_path = os.path.join(cache_path, self.tir_kernel_path)
                     KernelCache._safe_write_file(
-                        tir_path,
+                        asm_path,
                         "w",
-                        lambda file: file.write(kernel.prim_func.script(show_meta=True)),
+                        lambda file: file.write(_make_obj(device_kernel_path, "asm", "r")),
                     )
-            except Exception as e:
-                self.logger.error("Error saving asm/llir/tir debug artifacts: %s", e)
+                    KernelCache._safe_write_file(
+                        llir_path,
+                        "w",
+                        lambda file: file.write(_make_obj(device_kernel_path, "llir", "r")),
+                    )
+                    if kernel.prim_func is not None:
+                        KernelCache._safe_write_file(
+                            tir_path,
+                            "w",
+                            lambda file: file.write(kernel.prim_func.script(show_meta=True)),
+                        )
+                except Exception as e:
+                    self.logger.error("Error saving asm/llir/tir debug artifacts: %s", e)
 
     def _save_wrapper_kernel_code_to_disk(self, kernel: JITKernel, cache_path: str, verbose: bool = False):
         host_kernel_path = os.path.join(cache_path, self.host_kernel_path)

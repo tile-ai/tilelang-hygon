@@ -272,6 +272,8 @@ class Environment:
     # GEMM v1 (C++ `tl.tileop.gemm`) vs v2 (`tl.tileop.gemm_py`); default on until HCU/gemm_v2 is ready.
     TILELANG_USE_GEMM_V1 = EnvVar("TILELANG_USE_GEMM_V1", "1")
     TILELANG_SOURCE_RECOMPILE = EnvVar("TILELANG_SOURCE_RECOMPILE", "0")  # cuda source aware recompilation
+    # When saving kernel disk cache (HCU/ROCm): run hipcc to emit .asm / LLVM IR and dump TIR next to device_kernel.cu.
+    TILELANG_KERNEL_DUMP = EnvVar("TILELANG_KERNEL_DUMP", "0")
 
     # Auto-tuning settings
     TILELANG_AUTO_TUNING_DISABLE_CACHE = EnvVar("TILELANG_AUTO_TUNING_DISABLE_CACHE", "0")
