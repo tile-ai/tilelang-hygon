@@ -2,11 +2,14 @@
 
 import os
 
+from tilelang.env import get_hip_compiler
+
 
 def get_hcu_compile_flags(arch: str):
     # DTK toolchain (e.g. ROCM_PATH=/opt/dtk/...) uses its own defaults; do not inject LLVM hacks.
+    # If get_hip_compiler() resolves to aicc (on PATH), still apply the LLVM tuning flags below.
     rocm_path = os.environ.get("ROCM_PATH", "")
-    if "dtk" in rocm_path.lower() or os.path.isdir("/opt/dtk"):
+    if ("dtk" in rocm_path.lower() or os.path.isdir("/opt/dtk")) and get_hip_compiler() != "aicc":
         return []
     if arch in ["gfx928", "gfx936", "gfx938", "gfx92a", "gfx946"]:
         flags = [

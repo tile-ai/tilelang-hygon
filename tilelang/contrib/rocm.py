@@ -18,6 +18,7 @@
 
 # ruff: noqa
 import re
+import shutil
 import subprocess
 import os
 from os.path import join, exists
@@ -28,6 +29,8 @@ import tvm.runtime
 import tvm.target
 
 from tvm.contrib import utils
+
+from tilelang.env import get_hip_compiler
 
 
 def find_lld(required=True):
@@ -55,7 +58,8 @@ def find_lld(required=True):
         lld_list += [f"ld.lld-{major}.0"]
         lld_list += [f"ld.lld-{major}"]
     lld_list += ["ld.lld"]
-    lld_list += [f"/opt/rocm/llvm/bin/{x}" for x in lld_list]
+    _lld_basenames = list(lld_list)
+    lld_list += [os.path.join(get_rocm_llvm_bin_dir(), x) for x in _lld_basenames]
     valid_list = [utils.which(x) for x in lld_list]
     valid_list = [x for x in valid_list if x]
     if not valid_list and required:
@@ -282,13 +286,30 @@ def find_rocm_path():
     """
     if "ROCM_PATH" in os.environ:
         return os.environ["ROCM_PATH"]
-    cmd = ["which", "hipcc"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    (out, _) = proc.communicate()
-    out = out.decode("utf-8").strip()
-    if proc.returncode == 0:
-        return os.path.realpath(os.path.join(out, "../.."))
+    hip_exe = shutil.which(get_hip_compiler())
+    if hip_exe:
+        return os.path.realpath(os.path.join(hip_exe, "../.."))
     rocm_path = "/opt/rocm"
     if os.path.exists(os.path.join(rocm_path, "bin/hipcc")):
         return rocm_path
     raise RuntimeError("Cannot find ROCm path")
+
+
+def get_rocm_llvm_bin_dir() -> str:
+    """Directory containing ``ld.lld`` under the ROCm root.
+
+    Prefer ``<ROCM_PATH>/aillvm/bin`` (HCU / AICC toolchain layout) when that
+    directory exists; otherwise use ``<ROCM_PATH>/llvm/bin`` (standard ROCm).
+    Respects ``ROCM_PATH`` / ``ROCM_HOME`` when set.
+    """
+    if "ROCM_PATH" in os.environ:
+        rocm = os.environ["ROCM_PATH"]
+    else:
+        try:
+            rocm = find_rocm_path()
+        except RuntimeError:
+            rocm = "/opt/rocm"
+    aillvm_bin = os.path.join(rocm, "aillvm", "bin")
+    if os.path.isdir(aillvm_bin):
+        return aillvm_bin
+    return os.path.join(rocm, "llvm", "bin")

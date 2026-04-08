@@ -20,6 +20,7 @@ from tvm.runtime import Executable
 from tilelang.engine.param import KernelParam
 from tilelang.utils.language import get_prim_func_name
 from tilelang import env
+from tilelang.env import get_hip_compiler
 from tilelang.jit import JITKernel
 from tilelang import __version__
 from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
@@ -48,7 +49,7 @@ def _make_obj(src, fmt: Literal["asm", "llir", "so"], mode: str):
     obj_file.close()
 
     command = [
-        "hipcc",
+        get_hip_compiler(),
         "-std=c++17",
         f"--offload-arch={arch}",
         "-I" + env.COMPOSABLE_KERNEL_INCLUDE_DIR,
@@ -112,7 +113,7 @@ class KernelCache:
     host_kernel_path = "host_kernel.cu"
     kernel_lib_path = "kernel_lib.so"
     params_path = "params.pkl"
-    # HCU / hipcc debug dumps (asm, LLVM IR, TIR script)
+    # HCU / HIP compiler debug dumps (asm, LLVM IR, TIR script)
     asm_kernel_path = "kernel.s"
     llir_kernel_path = "kernel.llir"
     tir_kernel_path = "kernel.tir"
@@ -505,7 +506,7 @@ class KernelCache:
             self.logger.debug(f"Saving kernel source code to file: {device_kernel_path}")
         if kernel.kernel_source is not None:
             KernelCache._safe_write_file(device_kernel_path, "w", lambda file: file.write(kernel.kernel_source))
-            # HCU: optional asm / LLVM IR / TIR dumps for debugging (hipcc); see TILELANG_KERNEL_DUMP
+            # HCU: optional asm / LLVM IR / TIR dumps for debugging; see TILELANG_KERNEL_DUMP
             if env.TILELANG_KERNEL_DUMP.lower() in ("1", "true", "yes", "on"):
                 try:
                     asm_path = os.path.join(cache_path, self.asm_kernel_path)

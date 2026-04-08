@@ -13,7 +13,7 @@ from tilelang.transform import PassConfigKey
 from tilelang.contrib.nvcc import get_nvcc_compiler, get_target_arch, get_target_compute_version
 from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
 from tilelang.contrib.hcu import get_hcu_compile_flags
-from tilelang.env import TILELANG_TEMPLATE_PATH
+from tilelang.env import TILELANG_TEMPLATE_PATH, get_hip_compiler
 
 from .utils import is_cpu_target, is_cuda_target, is_hip_target
 
@@ -98,7 +98,7 @@ class LibraryGenerator:
             rocm_path = find_rocm_path()
             arch = get_rocm_arch(rocm_path)
             command = [
-                "hipcc",
+                get_hip_compiler(),
                 "-std=c++17",
                 "-fPIC",
                 f"--offload-arch={arch}",

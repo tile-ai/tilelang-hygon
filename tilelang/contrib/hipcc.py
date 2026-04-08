@@ -15,9 +15,11 @@ from tvm.contrib import utils
 from tvm.base import py_str
 from tvm.contrib.rocm import get_rocm_arch, find_rocm_path
 
+from tilelang.env import get_hip_compiler
+
 
 def compile_hip(code, target_format="hsaco", arch=None, options=None, path_target=None, verbose=False):
-    """Compile HIP code with hipcc.
+    """Compile HIP code with the active HIP compiler (aicc if on PATH, else hipcc).
 
     Parameters
     ----------
@@ -55,7 +57,7 @@ def compile_hip(code, target_format="hsaco", arch=None, options=None, path_targe
         out_file.write(code)
 
     file_target = path_target if path_target else temp_target
-    cmd = ["hipcc"]
+    cmd = [get_hip_compiler()]
     cmd += ["-O3", "-c"]
     if isinstance(arch, str):
         cmd += [f"--offload-arch={arch}"]
@@ -93,6 +95,6 @@ def compile_hip(code, target_format="hsaco", arch=None, options=None, path_targe
 
 @tvm_ffi.register_global_func("tilelang_callback_hip_compile", override=True)
 def tilelang_callback_hip_compile(code, target):
-    """use hipcc to generate fatbin code for better optimization"""
+    """use HIP compiler (aicc or hipcc) to generate hsaco for better optimization"""
     hsaco = compile_hip(code, target_format="hsaco")
     return hsaco

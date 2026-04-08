@@ -119,11 +119,21 @@ def _find_cuda_home() -> str:
     return cuda_home if cuda_home is not None else ""
 
 
+def get_hip_compiler() -> str:
+    """Resolve the HIP compiler executable name for this process.
+
+    Prefer ``aicc`` when it is on PATH (hipcc-compatible toolchain, e.g. HCU);
+    otherwise use ``hipcc``. Call sites should use this instead of hardcoding
+    ``\"hipcc\"`` so ROCm/HCU builds stay consistent.
+    """
+    return "aicc" if shutil.which("aicc") else "hipcc"
+
+
 def _find_rocm_home() -> str:
     """Find the ROCM install path."""
     rocm_home = os.environ.get("ROCM_PATH") or os.environ.get("ROCM_HOME")
     if rocm_home is None:
-        rocmcc_path = shutil.which("hipcc")
+        rocmcc_path = shutil.which(get_hip_compiler())
         if rocmcc_path is not None:
             rocm_home = os.path.dirname(os.path.dirname(rocmcc_path))
         else:
@@ -272,7 +282,7 @@ class Environment:
     # GEMM v1 (C++ `tl.tileop.gemm`) vs v2 (`tl.tileop.gemm_py`); default on until HCU/gemm_v2 is ready.
     TILELANG_USE_GEMM_V1 = EnvVar("TILELANG_USE_GEMM_V1", "1")
     TILELANG_SOURCE_RECOMPILE = EnvVar("TILELANG_SOURCE_RECOMPILE", "0")  # cuda source aware recompilation
-    # When saving kernel disk cache (HCU/ROCm): run hipcc to emit .asm / LLVM IR and dump TIR next to device_kernel.cu.
+    # When saving kernel disk cache (HCU/ROCm): run hip compiler (aicc if on PATH, else hipcc) for .asm / LLVM IR / TIR.
     TILELANG_KERNEL_DUMP = EnvVar("TILELANG_KERNEL_DUMP", "0")
 
     # Auto-tuning settings
