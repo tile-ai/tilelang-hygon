@@ -25,7 +25,7 @@ def matmul(
     B_shape = (N, K) if trans_B else (K, N)
     A_shared_shape = (block_K, block_M) if trans_A else (block_M, block_K)
     B_shared_shape = (block_N, block_K) if trans_B else (block_K, block_N)
-    vec_size = 4 * k_pack
+    vec_size = (2 if in_dtype == "float32" else 4) * k_pack
 
     @T.prim_func
     def main(A: T.Tensor(A_shape, in_dtype), B: T.Tensor(B_shape, in_dtype), C: T.Tensor(
@@ -161,6 +161,14 @@ def test_gemm_bf16bf16f32_FullColK():
              policy=T.GemmWarpPolicy.FullColK)
 
 
+def test_gemm_f32f32f32_nt():
+    """fp32 inputs; small shapes / blocks (HCU fp32 MMAC K-tile 8, keep block_K multiple of 8)."""
+    run_gemm(512, 512, 512, False, False, "float32", "float32", "float32", 64, 64, 64, num_threads=128)
+    run_gemm(512, 512, 512, False, True, "float32", "float32", "float32", 32, 32, 16, num_threads=128)
+    run_gemm(512, 512, 512, True, True, "float32", "float32", "float32", 32, 32, 32, num_threads=128)
+    run_gemm(512, 512, 512, True, False, "float32", "float32", "float32", 32, 32, 64, num_threads=128)
+
+
 def matmul_rs(
     M,
     N,
@@ -182,7 +190,7 @@ def matmul_rs(
     B_shape = (N, K) if trans_B else (K, N)
     A_shared_shape = (block_K, block_M) if trans_A else (block_M, block_K)
     B_shared_shape = (block_N, block_K) if trans_B else (block_K, block_N)
-    vec_size = 4 * k_pack
+    vec_size = (2 if in_dtype == "float32" else 4) * k_pack
 
     @T.prim_func
     def main(
@@ -317,6 +325,15 @@ def test_gemm_rs_bf16bf16f32_nt_FullColK():
                 policy=T.GemmWarpPolicy.FullColK)
     run_gemm_rs(1024, 1024, 1024, True, False, "bfloat16", "bfloat16", "float32", 128, 32, 32, num_threads=256,
                 policy=T.GemmWarpPolicy.FullColK)
+
+
+def test_gemm_rs_f32f32f32_nt():
+    """fp32 inputs with register-spill path (A_local); small shapes / blocks."""
+    run_gemm_rs(512, 512, 256, False, False, "float32", "float32", "float32", 32, 32, 64, num_threads=128)
+    run_gemm_rs(512, 512, 256, False, True, "float32", "float32", "float32", 32, 32, 16, num_threads=128)
+    run_gemm_rs(256, 512, 256, True, True, "float32", "float32", "float32", 32, 32, 32, num_threads=128)
+    run_gemm_rs(256, 256, 256, True, False, "float32", "float32", "float32", 32, 32, 64, num_threads=128)
+
 
 if __name__ == "__main__":
     tilelang.testing.main()

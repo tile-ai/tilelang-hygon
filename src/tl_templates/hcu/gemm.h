@@ -67,8 +67,14 @@ template <> struct MmacTraits<bfloat16_t> {
 template <> struct MmacTraits<float> {
   template <typename AccType>
   static TL_DEVICE void mmac_op(const float *b, const float *a, AccType *c) {
+#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
+    // default: lit en, lts disable (aligned with tvm_mfma f32_16x16x8_f32_lit_lts)
+    *c = __builtin_hcu_mmac_16x16x8_f32_lit_lts(*((float32x2 *)a),
+                                                   *((float32x2 *)b), *c, 1, 0);
+#else
     *c = __builtin_hcu_mmac_16x16x8_f32(*((float32x2 *)a),
                                         *((float32x2 *)b), *c);
+#endif
   }
 };
 
