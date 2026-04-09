@@ -171,7 +171,7 @@ std::tuple<int, int, int> GemmWarpPolicyNode::computeWarpPartitionHCU(
   if (B_from_mls && !B_mls_trans) {
     kNPerWarp = 32;  // min ds_read_format tilesize
   }
-  ICHECK(element_byte_size == 1 || element_byte_size == 2)
+  ICHECK(element_byte_size == 1 || element_byte_size == 2 || element_byte_size == 4)
       << "element bitwidth=" << element_byte_size;
   int kKPerWarp = k_pack * (32 / element_byte_size);
 
