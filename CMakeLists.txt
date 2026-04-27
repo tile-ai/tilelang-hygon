@@ -2,6 +2,12 @@
 # https://github.com/mlc-ai/mlc-llm/blob/main/CMakeLists.txt
 
 cmake_minimum_required(VERSION 3.26)
+
+# Detect CUDA toolkit: tries host installation first, then falls back to
+# pip-installed packages (env WITH_PIP_CUDA_TOOLCHAIN or auto-detect).
+# Must be included before project() so CMAKE_CUDA_COMPILER is set.
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/FindPipCUDAToolkit.cmake)
+
 project(TILE_LANG C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -130,6 +136,37 @@ foreach(BACKEND IN LISTS TILELANG_BACKENDS)
   tilelang_define_backend_option(${BACKEND})
 endforeach()
 set(PREBUILD_CYTHON ON)
+
+# CUDA stub libraries (cuda/cudart/nvrtc) are used to build wheels that can run
+# across different CUDA Toolkit major versions and/or on CPU-only machines by
+# avoiding hard DT_NEEDED dependencies on versioned CUDA SONAMEs.
+#
+# These stubs are currently POSIX-only (dlopen/dlsym via <dlfcn.h>).
+if(WIN32 AND NOT CYGWIN)
+  set(_TILELANG_USE_CUDA_STUBS_DEFAULT OFF)
+else()
+  set(_TILELANG_USE_CUDA_STUBS_DEFAULT ON)
+endif()
+option(TILELANG_USE_CUDA_STUBS
+       "Use POSIX dlopen-based CUDA stub libraries (cuda/cudart/nvrtc) for portable wheels"
+       ${_TILELANG_USE_CUDA_STUBS_DEFAULT})
+unset(_TILELANG_USE_CUDA_STUBS_DEFAULT)
+
+# HIP stub libraries (hip/hiprtc) are used to build wheels that can be imported
+# on machines without ROCm installed by avoiding hard DT_NEEDED dependencies on
+# libamdhip64.so / libhiprtc.so.
+#
+# These stubs are currently POSIX-only (dlopen/dlsym via <dlfcn.h>).
+if(WIN32 AND NOT CYGWIN)
+  set(_TILELANG_USE_HIP_STUBS_DEFAULT OFF)
+else()
+  # Only meaningful when USE_ROCM is enabled.
+  set(_TILELANG_USE_HIP_STUBS_DEFAULT ON)
+endif()
+option(TILELANG_USE_HIP_STUBS
+       "Use POSIX dlopen-based HIP stub libraries (hip/hiprtc) for portable wheels"
+       ${_TILELANG_USE_HIP_STUBS_DEFAULT})
+unset(_TILELANG_USE_HIP_STUBS_DEFAULT)
 # Configs end
 
 include(cmake/load_tvm.cmake)
@@ -147,6 +184,8 @@ foreach(BACKEND IN LISTS TILELANG_BACKENDS)
   set(${_backend_var} ${TILELANG_OPTION_${_backend_var}} CACHE STRING "${_doc}" FORCE)
   set(${_backend_var} ${TILELANG_OPTION_${_backend_var}})
 endforeach()
+# tvm tries to detect gtest by default, but may fail if its header is not installed.
+set(USE_GTEST OFF)
 
 # Include directories for TileLang
 set(TILE_LANG_INCLUDES ${TVM_INCLUDES})
@@ -212,6 +251,12 @@ if(NOT TILELANG_BACKEND_USER_SELECTED)
 endif()
 
 if(USE_METAL)
+  if(NOT APPLE)
+    # On non-Apple platforms USE_METAL=ON enables only codegen (Metal source
+    # generation) without requiring the Metal/Foundation frameworks.
+    message(STATUS "Metal backend on non-Apple: enabling codegen-only mode (no Metal runtime)")
+    set(USE_METAL OFF)
+  endif()
   file(GLOB TILE_LANG_METAL_SRCS
     src/target/rt_mod_metal.cc
   )
@@ -225,6 +270,63 @@ elseif(USE_ROCM)
   add_compile_definitions(__HIP_PLATFORM_AMD__ __HIP_PLATFORM_HCC__=1)
   if(USE_HCU)
     add_compile_definitions(USE_HCU=1)
+  endif()
+
+  if(TILELANG_USE_HIP_STUBS)
+    if(WIN32 AND NOT CYGWIN)
+      message(FATAL_ERROR "TILELANG_USE_HIP_STUBS=ON is not supported on Windows. "
+                          "Please configure with -DTILELANG_USE_HIP_STUBS=OFF.")
+    endif()
+
+    # ============================================================================
+    # HIP Stub Library (libhip_stub.so)
+    # ============================================================================
+    # This library provides drop-in replacements for HIP runtime/module APIs by
+    # lazily loading libamdhip64.so at runtime.
+    #
+    # It also provides minimal HSA wrappers (hsa_init / hsa_shut_down) to avoid a
+    # hard DT_NEEDED dependency on libhsa-runtime64 in ROCm-enabled wheels.
+    # ============================================================================
+    add_library(hip_stub SHARED src/target/stubs/hip.cc)
+    target_include_directories(hip_stub PRIVATE ${ROCM_INCLUDE_DIRS})
+    target_compile_definitions(hip_stub PRIVATE TILELANG_HIP_STUB_EXPORTS)
+    target_link_libraries(hip_stub PRIVATE ${CMAKE_DL_LIBS})
+    set_target_properties(hip_stub PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      OUTPUT_NAME "hip_stub"
+    )
+
+    # ============================================================================
+    # HIPRTC Stub Library (libhiprtc_stub.so)
+    # ============================================================================
+    # This library provides a minimal HIPRTC API surface and lazily loads
+    # libhiprtc.so at runtime.
+    # ============================================================================
+    add_library(hiprtc_stub SHARED src/target/stubs/hiprtc.cc)
+    target_include_directories(hiprtc_stub PRIVATE ${ROCM_INCLUDE_DIRS})
+    target_compile_definitions(hiprtc_stub PRIVATE TILELANG_HIPRTC_STUB_EXPORTS)
+    target_link_libraries(hiprtc_stub PRIVATE ${CMAKE_DL_LIBS})
+    set_target_properties(hiprtc_stub PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      OUTPUT_NAME "hiprtc_stub"
+    )
+
+    # Make TVM link against our HIP stub instead of the real libamdhip64.so.
+    #
+    # NOTE: TVM's `find_rocm()` calls `find_library(ROCM_HIPHCC_LIBRARY amdhip64 ...)`.
+    # `find_library()` will not override an already-cached variable, so setting it
+    # here ensures TVM doesn't record a DT_NEEDED on libamdhip64.
+    set(ROCM_HIPHCC_LIBRARY hip_stub CACHE STRING "HIP runtime library to link against" FORCE)
+
+    # Prevent TVM from recording a DT_NEEDED on libhsa-runtime64.
+    # The few HSA entrypoints used by TVM are stubbed by hip_stub and resolved
+    # lazily when available.
+    set(ROCM_HSA_LIBRARY ROCM_HSA_LIBRARY-NOTFOUND CACHE STRING
+        "HSA runtime library to link against" FORCE)
   endif()
 
   file(GLOB TILE_LANG_HIP_SRCS
@@ -243,31 +345,94 @@ elseif(USE_CUDA)
   # Set `USE_CUDA=/usr/local/cuda-x.y`
   cmake_path(GET CUDAToolkit_BIN_DIR PARENT_PATH USE_CUDA)
 
-  # ============================================================================
-  # CUDA Driver Stub Library (libcuda_stub.so)
-  # ============================================================================
-  # This library provides drop-in replacements for CUDA driver API functions.
-  # Instead of linking directly against libcuda.so (which would fail on
-  # CPU-only machines), we link against this stub which loads libcuda.so
-  # lazily at runtime on first API call.
-  #
-  # The stub exports global C functions matching the CUDA driver API:
-  #   - cuModuleLoadData, cuLaunchKernel, cuMemsetD32_v2, etc.
-  # These can be called directly without any wrapper macros.
-  # ============================================================================
-  add_library(cuda_stub SHARED src/target/stubs/cuda.cc)
-  target_include_directories(cuda_stub PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-  # Export symbols with visibility="default" when building
-  target_compile_definitions(cuda_stub PRIVATE TILELANG_CUDA_STUB_EXPORTS)
-  # Use dlopen/dlsym for runtime library loading
-  target_link_libraries(cuda_stub PRIVATE ${CMAKE_DL_LIBS})
-  set_target_properties(cuda_stub PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-    # Use consistent naming
-    OUTPUT_NAME "cuda_stub"
-  )
+  if(TILELANG_USE_CUDA_STUBS)
+    if(WIN32 AND NOT CYGWIN)
+      message(FATAL_ERROR "TILELANG_USE_CUDA_STUBS=ON is not supported on Windows. "
+                          "Please configure with -DTILELANG_USE_CUDA_STUBS=OFF.")
+    endif()
+
+    # ============================================================================
+    # CUDA Driver Stub Library (libcuda_stub.so)
+    # ============================================================================
+    # This library provides drop-in replacements for CUDA driver API functions.
+    # Instead of linking directly against libcuda.so (which would fail on
+    # CPU-only machines), we link against this stub which loads libcuda.so
+    # lazily at runtime on first API call.
+    #
+    # The stub exports global C functions matching the CUDA driver API:
+    #   - cuModuleLoadData, cuLaunchKernel, cuMemsetD32_v2, etc.
+    # These can be called directly without any wrapper macros.
+    # ============================================================================
+    add_library(cuda_stub SHARED src/target/stubs/cuda.cc)
+    target_include_directories(cuda_stub PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    # Export symbols with visibility="default" when building
+    target_compile_definitions(cuda_stub PRIVATE TILELANG_CUDA_STUB_EXPORTS)
+    # Use dlopen/dlsym for runtime library loading
+    target_link_libraries(cuda_stub PRIVATE ${CMAKE_DL_LIBS})
+    set_target_properties(cuda_stub PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      # Use consistent naming
+      OUTPUT_NAME "cuda_stub"
+    )
+
+    # ============================================================================
+    # CUDA Runtime Stub Library (libcudart_stub.so)
+    # ============================================================================
+    # libcudart's SONAME includes its major version (e.g. libcudart.so.11.0 / .12 / .13).
+    # Link against this stub instead of the real libcudart so a single wheel can
+    # run in environments that provide different libcudart major versions.
+    #
+    # The stub exports a minimal set of CUDA Runtime API entrypoints used by TVM
+    # and lazily loads libcudart at runtime on first API call.
+    # ============================================================================
+    add_library(cudart_stub SHARED src/target/stubs/cudart.cc)
+    target_include_directories(cudart_stub PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_compile_definitions(cudart_stub PRIVATE TILELANG_CUDART_STUB_EXPORTS)
+    target_link_libraries(cudart_stub PRIVATE ${CMAKE_DL_LIBS})
+    set_target_properties(cudart_stub PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      OUTPUT_NAME "cudart_stub"
+    )
+
+    # Make TVM link against our CUDA Runtime stub instead of the real libcudart.
+    #
+    # NOTE: TVM's `find_cuda()` calls `find_library(CUDA_CUDART_LIBRARY cudart ...)`.
+    # `find_library()` will not override an already-cached variable, so setting it
+    # here ensures TVM doesn't record a DT_NEEDED on `libcudart.so.<major>`.
+    set(CUDA_CUDART_LIBRARY cudart_stub CACHE STRING "CUDART library to link against" FORCE)
+
+    # ============================================================================
+    # NVRTC Stub Library (libnvrtc_stub.so)
+    # ============================================================================
+    # NVRTC's SONAME includes its major version (e.g. libnvrtc.so.11.2 / .12 / .13).
+    # Link against this stub instead of the real NVRTC library so a single wheel
+    # can run in environments that provide different NVRTC major versions.
+    #
+    # The stub exports a minimal set of NVRTC C API entrypoints used by TVM and
+    # lazily loads libnvrtc at runtime on first API call.
+    # ============================================================================
+    add_library(nvrtc_stub SHARED src/target/stubs/nvrtc.cc)
+    target_include_directories(nvrtc_stub PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_compile_definitions(nvrtc_stub PRIVATE TILELANG_NVRTC_STUB_EXPORTS)
+    target_link_libraries(nvrtc_stub PRIVATE ${CMAKE_DL_LIBS})
+    set_target_properties(nvrtc_stub PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      OUTPUT_NAME "nvrtc_stub"
+    )
+
+    # Make TVM link against our NVRTC stub instead of the real libnvrtc.
+    #
+    # NOTE: TVM's `find_cuda()` calls `find_library(CUDA_NVRTC_LIBRARY nvrtc ...)`.
+    # `find_library()` will not override an already-cached variable, so setting it
+    # here ensures TVM doesn't record a DT_NEEDED on `libnvrtc.so.<major>`.
+    set(CUDA_NVRTC_LIBRARY nvrtc_stub CACHE STRING "NVRTC library to link against" FORCE)
+  endif()
 
   file(GLOB TILE_LANG_CUDA_SRCS
     src/runtime/runtime.cc
@@ -282,18 +447,40 @@ elseif(USE_CUDA)
   list(APPEND TILE_LANG_SRCS ${TILE_LANG_CUDA_SRCS})
 
   list(APPEND TILE_LANG_INCLUDES ${CUDAToolkit_INCLUDE_DIRS})
+  link_directories(${CUDAToolkit_LIBRARY_DIR} ${CUDAToolkit_LIBRARY_DIR}/stubs)
 endif()
 
-set(USE_Z3      OFF CACHE STRING "Use Z3 SMT solver for TileLang optimizations")
-set(USE_PYPI_Z3 OFF CACHE BOOL   "Use Z3 provided by PyPI z3-solver package")
+set(USE_Z3      ON CACHE STRING "Use Z3 SMT solver for TileLang optimizations")
+set(USE_PYPI_Z3 ON CACHE BOOL   "Use Z3 provided by PyPI z3-solver package")
 
 if(USE_Z3 AND USE_PYPI_Z3)
   list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/pypi-z3")
   find_package(Z3 REQUIRED)
 endif()
 
+# Enable custom logging so we control the output format (e.g. strip build paths
+# from __FILE__ so wheel users don't see CI machine paths in warnings).
+set(USE_CUSTOM_LOGGING ON CACHE BOOL "Use custom logging implementation" FORCE)
+
+# Detect release (wheel) builds: in CI (cibuildwheel) or scikit-build-core wheel builds,
+# we strip source paths from LOG(WARNING) etc. for a cleaner user experience.
+# Local dev builds keep full paths for debugging.
+if(DEFINED ENV{CIBUILDWHEEL} OR "$ENV{SKBUILD_STATE}" STREQUAL "wheel")
+  set(TILELANG_RELEASE_BUILD_DEFAULT ON)
+else()
+  set(TILELANG_RELEASE_BUILD_DEFAULT OFF)
+endif()
+option(TILELANG_RELEASE_BUILD "Strip source paths from log messages (for wheel releases)" ${TILELANG_RELEASE_BUILD_DEFAULT})
+
 # Include tvm after configs have been populated
 add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)
+
+# Provide the custom LogMessageImpl / LogFatalImpl implementation to TVM,
+# since TVM_LOG_CUSTOMIZE=1 requires them to be supplied by the user.
+target_sources(tvm_objs PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/logging.cc")
+if(TILELANG_RELEASE_BUILD)
+  target_compile_definitions(tvm_objs PRIVATE TILELANG_RELEASE_BUILD=1)
+endif()
 
 # Resolve compile warnings in tvm
 add_compile_definitions(DMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>)
@@ -308,19 +495,16 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 target_include_directories(tilelang_objs PRIVATE ${TILE_LANG_INCLUDES})
+target_compile_definitions(tilelang_objs PRIVATE TVM_LOG_CUSTOMIZE=1)
+if(TILELANG_RELEASE_BUILD)
+  target_compile_definitions(tilelang_objs PRIVATE TILELANG_RELEASE_BUILD=1)
+endif()
 
 add_library(tilelang SHARED $<TARGET_OBJECTS:tilelang_objs>)
-add_library(tilelang_module SHARED $<TARGET_OBJECTS:tilelang_objs>)
-target_link_libraries(tilelang PUBLIC tvm_runtime tvm)
-target_link_libraries(tilelang_module PUBLIC tvm)
+target_link_libraries(tilelang PUBLIC tvm)
 
 # Place dev build outputs under build/lib for consistency
 set_target_properties(tilelang PROPERTIES
-  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-)
-set_target_properties(tilelang_module PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
   ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
@@ -369,22 +553,28 @@ if(USE_Z3 AND USE_PYPI_Z3)
   endif()
 endif()
 
-set(TILELANG_OUTPUT_TARGETS
-  tilelang
-  tilelang_module
-  tvm
-  tvm_runtime
-)
+set(TILELANG_OUTPUT_TARGETS tilelang tvm)
 
-if(USE_CUDA)
+if(USE_CUDA AND TILELANG_USE_CUDA_STUBS)
   # Link against CUDA stub library instead of libcuda.so
   # This enables lazy loading of libcuda.so at runtime, allowing
   # `import tilelang` to succeed on CPU-only machines.
   foreach(target IN LISTS TILELANG_OUTPUT_TARGETS)
     target_link_libraries(${target} PUBLIC cuda_stub)
   endforeach()
-  # Include CUDA stub in output targets for RPATH configuration
-  list(APPEND TILELANG_OUTPUT_TARGETS cuda_stub)
+  # Include CUDA stubs in output targets for RPATH configuration
+  list(APPEND TILELANG_OUTPUT_TARGETS cuda_stub cudart_stub nvrtc_stub)
+endif()
+
+if(USE_ROCM AND TILELANG_USE_HIP_STUBS)
+  # Link against HIP stub library instead of libamdhip64.so
+  # This enables lazy loading of libamdhip64.so at runtime, allowing
+  # `import tilelang` to succeed on CPU-only machines.
+  foreach(target IN LISTS TILELANG_OUTPUT_TARGETS)
+    target_link_libraries(${target} PUBLIC hip_stub)
+  endforeach()
+  # Include HIP stubs in output targets for RPATH configuration / installation
+  list(APPEND TILELANG_OUTPUT_TARGETS hip_stub hiprtc_stub)
 endif()
 
 unset(PATCHELF_EXECUTABLE CACHE)
@@ -409,7 +599,7 @@ elseif(UNIX)
   endif()
 endif()
 
-# Let libtilelang search for tvm/tvm_runtime in the same directory
+# Let libtilelang search for tvm in the same directory
 foreach(target IN LISTS TILELANG_OUTPUT_TARGETS)
   set_target_properties(${target} PROPERTIES INSTALL_RPATH "${TILELANG_INSTALL_RPATH}")
   set_target_properties(${target} PROPERTIES
@@ -420,14 +610,17 @@ foreach(target IN LISTS TILELANG_OUTPUT_TARGETS)
 endforeach()
 
 # Exclude libcuda.so to allow importing on a CPU-only machine
-if(USE_CUDA AND PATCHELF_EXECUTABLE)
+if(USE_CUDA AND TILELANG_USE_CUDA_STUBS AND PATCHELF_EXECUTABLE)
   # Run `patchelf` on built libraries to remove libcuda.so dependency.
   # Use `install(CODE ...)` instead of `add_custom_command(... POST_BUILD ...)`
   # to avoid race conditions during linking.
   foreach(target IN LISTS TILELANG_OUTPUT_TARGETS)
     install(CODE "
       execute_process(
-        COMMAND ${PATCHELF_EXECUTABLE} --remove-needed libcuda.so.1 --remove-needed libcuda.so \"$<TARGET_FILE:${target}>\"
+        COMMAND ${PATCHELF_EXECUTABLE}
+          --remove-needed libcuda.so.1
+          --remove-needed libcuda.so
+          \"$<TARGET_FILE:${target}>\"
         WORKING_DIRECTORY \"${CMAKE_INSTALL_PREFIX}\"
         RESULT_VARIABLE patchelf_result
       )

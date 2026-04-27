@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tilelang._typing import BufferLikeType, BufferLikeTypeTuple, BarrierType, DType
 from tilelang import tvm as tvm
 from tilelang.language import ptx_arrive_barrier, evaluate
 from tilelang.language.kernel import get_thread_bindings, get_block_extents
@@ -10,6 +11,7 @@ from tvm import DataType, tir
 from tvm.runtime import convert
 from typing import Any, Literal, Optional, Union
 from tvm.tir import PrimExpr, Var, Call, Buffer, BufferLoad, BufferRegion
+from tilelang.utils.language import retrieve_ptr
 
 _IS_HIP_AVAILABLE = check_hip_availability()
 
@@ -28,36 +30,23 @@ def _normalize_index_arg(value: int | PrimExpr | None) -> PrimExpr | None:
     raise TypeError(f"Expect warp sizing argument to be int or PrimExpr, but got {type(value)}.")
 
 
-def create_list_of_mbarrier(*args: Any) -> Call:
+def _mbar_to_buffer_load(mbar: BarrierType) -> BufferLoad:
+    """Convert a memory barrier to a buffer load.
+
+    Args:
+        mbar: BarrierType
+            The memory barrier to convert
+
+    Returns:
+        tir.BufferLoad: A buffer load of the memory barrier
     """
-    Create a list of memory barrier handles.
-
-    Parameters
-    ----------
-    *args : list or Any
-        Either a single list of arguments, or multiple arguments directly.
-
-    Returns
-    -------
-    tvm.tir.Call
-        Handle to the created list of memory barriers.
-
-    Raises
-    ------
-    TypeError
-        If the input is not a list or variadic arguments.
-
-    Examples
-    --------
-    >>> create_list_of_mbarrier([128, 128])
-    >>> create_list_of_mbarrier(128, 128)
-    """
-    if len(args) == 1 and isinstance(args[0], list):
-        return tir.call_intrin("handle", tir.op.Op.get("tl.create_list_of_mbarrier"), *args[0])
-    elif len(args) >= 1:
-        return tir.call_intrin("handle", tir.op.Op.get("tl.create_list_of_mbarrier"), *args)
+    if isinstance(mbar, tir.BufferLoad):
+        return mbar
+    elif isinstance(mbar, tir.Buffer):
+        assert len(mbar.shape) == 1, f"mbarrier must be a single element buffer, but got {mbar.shape}"
+        return tir.BufferLoad(mbar, [0])
     else:
-        raise TypeError("create_list_of_mbarrier expects a list or one or more arguments.")
+        raise TypeError(f"mbarrier must be an tir.BufferLoad or a tir.Buffer, but got {type(mbar)}")
 
 
 def __ldg(load_or_buf: BufferLoad | tir.Buffer, index: PrimExpr | int | None = None) -> PrimExpr:
@@ -89,23 +78,218 @@ def __ldg(load_or_buf: BufferLoad | tir.Buffer, index: PrimExpr | int | None = N
     raise TypeError("T.__ldg expects a BufferLoad or a Buffer.")
 
 
-def get_mbarrier(*args):
-    """Retrieve a memory barrier operation.
+def access_ptr(
+    base: BufferLikeType,
+    access_type: str | int = "r",
+    *extents: PrimExpr | int | tuple[PrimExpr | int, ...] | list[PrimExpr | int],
+    offset: PrimExpr | int = 0,
+    extent: PrimExpr | int | None = None,
+    ignore_last_ndim: int = 0,
+) -> PrimExpr:
+    """Create a TileLang `tl.access_ptr` from a buffer-like base location.
+
+    This is a frontend convenience wrapper that keeps a `BufferLoad` argument
+    in the resulting call so downstream passes can recover the referenced
+    `tir.Buffer` (including strides/storage scope) *and* the `rw_mask`
+    (read/write intent) required by synchronization and safety checks.
+
+    The returned `tl.access_ptr` is expected to be lowered to
+    `tir.builtin.tvm_access_ptr` later in the TileLang compilation pipeline.
+
+    Parameters
+    ----------
+    base : BufferLikeType
+        The base location to take the address of. Supported:
+        - `tir.BufferLoad` (e.g. `A[i, j]`): pointer to that element
+        - `tir.BufferRegion`: pointer to the region minima
+        - `tir.Buffer`: pointer to the beginning of the buffer
+        - `tir.Var` with let-binding to one of the above (inside TileLang frame)
+
+    access_type : str | int
+        Access mask for the pointer. Common string forms: `"r"`, `"w"`, `"rw"`.
+        Integer bitmask is also accepted (1=read, 2=write, 3=read-write).
+
+    *extents : PrimExpr | int
+        Optional per-axis extents. When provided and `extent` is not specified,
+        the 1D `extent` passed to `tvm_access_ptr` is computed as the product of
+        the provided extents (padding leading dimensions with 1 if needed).
+
+        For example:
+        - `T.access_ptr(A[i], "r")` -> extent defaults to 1 (element pointer)
+        - `T.access_ptr(A[i], "r", 16)` -> extent=16
+        - `T.access_ptr(A[i, j], "r", m, n)` -> extent=m*n
+
+    offset : PrimExpr | int
+        Additional element offset from the base location.
+
+    extent : PrimExpr | int | None
+        Optional explicit 1D extent override (in elements). If provided, it
+        takes precedence over `*extents`.
+
+    ignore_last_ndim : int
+        If non-zero, the base linear offset is computed only over the leading
+        dimensions, ignoring the last `ignore_last_ndim` axes. This is useful
+        when treating an N-D buffer as a view of its trailing sub-tensor.
+
+    Returns
+    -------
+    ptr : PrimExpr
+        A handle-typed `tir.Call` to `tl.access_ptr`.
+    """
+
+    from tilelang.language.frame import has_let_value, get_let_value
+    from tilelang.language.utils import get_buffer_region_from_load
+
+    if isinstance(base, tir.Var) and has_let_value(base):
+        base = get_let_value(base)
+
+    # Allow passing a single list/tuple as the extents argument.
+    if len(extents) == 1 and isinstance(extents[0], (list, tuple)):
+        extents = tuple(extents[0])
+
+    def _rw_mask(access_type: str | int) -> int:
+        if isinstance(access_type, int):
+            return int(access_type)
+        if isinstance(access_type, str):
+            table = {"r": 1, "w": 2, "rw": 3}
+            if access_type not in table:
+                raise ValueError(f'Invalid access_type="{access_type}", expected one of {sorted(table.keys())}.')
+            return table[access_type]
+        raise TypeError(f"T.access_ptr access_type must be str or int, but got {type(access_type)}.")
+
+    def _index_dtype(buf: tir.Buffer) -> str:
+        if len(buf.shape) > 0:
+            return str(buf.shape[0].dtype)
+        return "int32"
+
+    # Extract underlying buffer and per-axis minima (indices).
+    inferred_region_extents: list[PrimExpr] | None = None
+    is_buffer_load_base = False
+    if isinstance(base, BufferLoad):
+        is_buffer_load_base = True
+        buf = base.buffer
+        region = get_buffer_region_from_load(base)
+        if region is not None:
+            mins = [r.min for r in region.region]
+            inferred_region_extents = [r.extent for r in region.region]
+        else:
+            mins = list(base.indices)
+    elif isinstance(base, BufferRegion):
+        buf = base.buffer
+        mins = [r.min for r in base.region]
+        inferred_region_extents = [r.extent for r in base.region]
+    elif isinstance(base, tir.Buffer):
+        buf = base
+        idx_dtype = _index_dtype(buf)
+        mins = [tir.IntImm(idx_dtype, 0) for _ in buf.shape]
+    else:
+        raise TypeError(f"T.access_ptr expects a Buffer, BufferLoad, BufferRegion, or a Var bound to one of them, but got {type(base)}.")
+
+    # Apply ignore_last_ndim by zeroing-out the ignored tail indices.
+    idx_dtype = _index_dtype(buf)
+    ignore_last_ndim = int(ignore_last_ndim)
+    if ignore_last_ndim != 0:
+        upto = max(0, len(mins) - ignore_last_ndim)
+        mins = list(mins[:upto]) + [tir.IntImm(idx_dtype, 0) for _ in range(len(mins) - upto)]
+
+    # Support non-zero `offset` only for 1D buffers in the frontend meta-op.
+    if isinstance(offset, int):
+        if offset != 0:
+            if len(mins) != 1:
+                raise ValueError(
+                    "T.access_ptr(offset!=0) is only supported for 1D buffers when emitting tl.access_ptr. "
+                    "Use explicit indexing (e.g. A[i + off]) for N-D buffers."
+                )
+            mins = [mins[0] + tir.IntImm(idx_dtype, offset)]
+    elif isinstance(offset, PrimExpr):
+        if not (isinstance(offset, tir.IntImm) and int(offset.value) == 0):
+            if len(mins) != 1:
+                raise ValueError(
+                    "T.access_ptr(offset!=0) is only supported for 1D buffers when emitting tl.access_ptr. "
+                    "Use explicit indexing (e.g. A[i + off]) for N-D buffers."
+                )
+            mins = [mins[0] + offset]
+    else:
+        raise TypeError(f"T.access_ptr offset must be int or PrimExpr, but got {type(offset)}.")
+
+    base_load = BufferLoad(buf, mins)
+
+    # Compute 1D extent (in elements).
+    extent_1d: PrimExpr
+    if extent is not None:
+        extent_1d = convert(extent)
+    elif len(extents) > 0:
+        exts = [convert(e) for e in extents]
+        if len(exts) > len(buf.shape):
+            raise ValueError(f"T.access_ptr got {len(exts)} extents for a buffer with ndim={len(buf.shape)}.")
+        if len(exts) < len(buf.shape):
+            pad = [tir.IntImm(idx_dtype, 1) for _ in range(len(buf.shape) - len(exts))]
+            exts = pad + exts
+        extent_1d = tir.IntImm(idx_dtype, 1)
+        for e in exts:
+            extent_1d = extent_1d * e
+    else:
+        # Match `tir.Buffer.access_ptr` defaults:
+        # - BufferLoad base: element pointer (extent=1)
+        # - BufferRegion base: product of region extents
+        # - Buffer base: full buffer size (product of shape)
+        if is_buffer_load_base:
+            extent_1d = tir.IntImm(idx_dtype, 1)
+        elif inferred_region_extents is not None:
+            extent_1d = tir.IntImm(idx_dtype, 1)
+            for e in inferred_region_extents:
+                extent_1d = extent_1d * convert(e)
+        else:
+            extent_1d = tir.IntImm(idx_dtype, 1)
+            for dim in buf.shape:
+                extent_1d = extent_1d * convert(dim)
+
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.access_ptr"),
+        base_load,
+        extent_1d,
+        tir.IntImm("int32", _rw_mask(access_type)),
+    )
+
+
+def deallocate_tmem(tmem: tir.Buffer) -> None:
+    """Explicitly deallocate a TMEM buffer allocated by ``T.alloc_tmem``.
+
+    By default, TileLang inserts a TMEM deallocation automatically at the end
+    of the allocation block. Calling ``T.deallocate_tmem(buf)`` suppresses that
+    automatic tail deallocation for ``buf`` and lowers an explicit deallocation
+    at the call site instead.
+
+    Notes:
+    - The deallocation must obey the hardware TMEM rules: it should be issued by
+      the same warp that performed the allocation.
+    - Once this API is used, the buffer lifetime is user-managed for the current
+      block; deallocating too early or conditionally is the user's responsibility.
 
     Args:
-        *args: Variable arguments to specify which memory barrier to retrieve
-
-    Returns:
-        tir.Call: A handle to the requested memory barrier
+        tmem: A TMEM buffer previously returned by ``T.alloc_tmem``.
     """
-    return tir.call_intrin("handle", tir.op.Op.get("tl.get_mbarrier"), *args)
+
+    if not isinstance(tmem, tir.Buffer):
+        raise TypeError(f"T.deallocate_tmem expects a tvm.tir.Buffer, but got {type(tmem)}.")
+    if tmem.scope() != "shared.tmem":
+        raise ValueError(f"T.deallocate_tmem expects a shared.tmem buffer, but got scope={tmem.scope()}.")
+
+    return evaluate(tir.call_intrin("handle", tir.op.Op.get("tl.deallocate_tmem"), tmem.data))
 
 
 def create_tma_descriptor(*args):
     """Create a Tensor Memory Access (TMA) descriptor.
 
-    Args:
-        *args: Variable arguments defining the TMA descriptor configuration
+    This is an internal API used by copy lowering. The argument list depends on
+    the tensor rank and encodes the full TMA descriptor configuration:
+
+        create_tma_descriptor(data_type, rank, global_addr,
+            global_shape..., global_stride..., smem_box..., smem_stride...,
+            interleave, swizzle, l2_promotion, oob_fill)
+
+    Total arguments: 7 + 4 * rank.
 
     Returns:
         tir.Call: A handle to the created TMA descriptor
@@ -116,8 +300,9 @@ def create_tma_descriptor(*args):
 def tma_load(*args):
     """Perform a Tensor Memory Access (TMA) load operation.
 
-    Args:
-        *args: Variable arguments specifying the TMA load parameters
+    This is an internal API used by copy lowering. Arguments:
+
+        tma_load(descriptor, mbarrier, smem_addr, coord_0, ..., coord_n, eviction_policy)
 
     Returns:
         tir.Call: A handle to the TMA load operation
@@ -125,40 +310,56 @@ def tma_load(*args):
     return tir.call_intrin("handle", tir.op.Op.get("tl.tma_load"), *args)
 
 
-def fence_proxy_async(*args):
-    """Create a fence for asynchronous proxy operations.
+def tma_load_2sm(*args):
+    """Perform a TMA load with 2SM (two Streaming Multiprocessors) on Blackwell.
 
-    Args:
-        *args: Variable arguments for fence configuration
+    This is an internal API. Same arguments as :func:`tma_load`, but with
+    the ``use_2cta`` annotation enabled for 2-CTA cooperative loading.
+
+    Returns:
+        tir.Call: A handle to the TMA load operation
+    """
+    return tir.call_intrin("handle", tir.op.Op.get("tl.tma_load"), *args, annotations={"use_2cta": 1})
+
+
+def fence_proxy_async():
+    """Issue a shared memory fence for asynchronous proxy operations.
+
+    Ensures that prior asynchronous operations (e.g. TMA stores) are visible
+    to subsequent memory accesses. Maps to ``fence.proxy.async.shared::cta``.
 
     Returns:
         tir.Call: A handle to the fence operation
     """
-    return tir.call_intrin("handle", tir.op.Op.get("tl.fence_proxy_async"), *args)
+    return tir.call_intrin("handle", tir.op.Op.get("tl.fence_proxy_async"))
 
 
-def tma_store_arrive(*args):
+def tma_store_arrive():
     """Signal the arrival of a TMA store operation.
 
-    Args:
-        *args: Variable arguments for the store arrival operation
+    Commits the current group of outstanding TMA store operations.
+    Maps to ``cp.async.bulk.commit_group``.
 
     Returns:
         tir.Call: A handle to the store arrive operation
     """
-    return tir.call_intrin("handle", tir.op.Op.get("tl.tma_store_arrive"), *args)
+    return tir.call_intrin("handle", tir.op.Op.get("tl.tma_store_arrive"))
 
 
-def tma_store_wait(*args):
+def tma_store_wait(count: int = 0):
     """Wait for completion of TMA store operations.
 
+    Waits until the number of outstanding TMA store groups is at most ``count``.
+    Maps to the PTX instruction ``cp.async.bulk.wait_group.read <count>``.
+
     Args:
-        *args: Variable arguments specifying which store operations to wait for
+        count (int): The maximum number of outstanding store groups allowed
+            to remain in flight. Defaults to 0 (wait for all stores to complete).
 
     Returns:
         tir.Call: A handle to the store wait operation
     """
-    return tir.call_intrin("handle", tir.op.Op.get("tl.tma_store_wait"), *args)
+    return tir.call_intrin("handle", tir.op.Op.get("tl.tma_store_wait"), count)
 
 
 def set_max_nreg(reg_count: int, is_inc: int):
@@ -209,84 +410,99 @@ def disable_warp_group_reg_alloc():
     return no_set_max_nreg()
 
 
-def mbarrier_wait_parity(mbarrier: int | PrimExpr | tir.Call, parity: int | Var):
+def ptx_arrive_cluster_barrier(mbarrier: BarrierType, cta_id: int | Var):
+    """Arrive at a shared barrier in cluster.
+
+    Args:
+        mbarrier: BarrierType
+            The memory barrier to arrive at
+        cta_id: int | Var
+            The peer CTA rank in cluster to arrive at.
+    """
+    return tir.call_intrin("handle", tir.op.Op.get("tl.ptx_arrive_cluster_barrier"), mbarrier, cta_id)
+
+
+def mbarrier_wait_parity(mbarrier: BarrierType, parity: int | Var):
     """Wait for memory barrier parity condition.
 
     Args:
-        mbarrier: Optional[int, PrimExpr]
+            mbarrier: BarrierType
             The memory barrier to wait on
-        parity: Optional[int, Var]
+        parity: int | Var
             The parity value to wait for
     Examples:
         .. code-block:: python
 
-            # Wait for parity 0 on barrier 0
-            T.mbarrier_wait_parity(0, 0)
+            mbar = T.alloc_barrier(1)
+            # Wait for parity 0 on a single mbarrier
+            T.mbarrier_wait_parity(mbar, 0)
 
-            # Wait for parity value in variable ko on barrier 1
-            T.mbarrier_wait_parity(1, ko)
-
-            # Wait using barrier handle
-            barrier = T.get_mbarrier(0)
-            T.mbarrier_wait_parity(barrier, 1)
+            mbars = T.alloc_barrier([128] * n)
+            # Wait for parity value on one of the mbarriers
+            T.mbarrier_wait_parity(mbars[ko], ko)
 
             # Common usage in pipelined kernels:
             for ko in range(num_stages):
                 # Producer waits for consumer to finish previous iteration
-                T.mbarrier_wait_parity(1, ko ^ 1)
+                T.mbarrier_wait_parity(mbars[1], ko ^ 1)
                 # Producer copies data
                 T.copy(A_global, A_shared)
                 # Producer signals data ready
-                T.mbarrier_arrive(0)
+                T.mbarrier_arrive(mbars[0])
 
                 # Consumer waits for producer data
-                T.mbarrier_wait_parity(0, ko)
+                T.mbarrier_wait_parity(mbars[0], ko)
                 # Consumer computes
                 T.gemm(A_shared, B_shared, C_local)
                 # Consumer signals completion
-                T.mbarrier_arrive(1)
+                T.mbarrier_arrive(mbars[1])
     Returns:
         tir.Call: A handle to the barrier wait operation
     """
-    if isinstance(mbarrier, (tir.Call, tir.BufferLoad)):
-        mbarrier = mbarrier
-    elif isinstance(mbarrier, (tir.PrimExpr, int)):
-        mbarrier = get_mbarrier(mbarrier)
-    elif isinstance(mbarrier, tir.Buffer):
-        mbarrier = tir.BufferLoad(mbarrier, [0])
-    else:
-        raise TypeError(f"mbarrier must be an integer or a tir.Call, but got {type(mbarrier)}")
+    mbarrier = _mbar_to_buffer_load(mbarrier)
     return tir.call_intrin("handle", tir.op.Op.get("tl.mbarrier_wait_parity"), mbarrier, parity)
 
 
-def mbarrier_arrive(mbarrier: int | PrimExpr | tir.Call):
+def mbarrier_arrive(mbarrier: BarrierType, cta_id: int | Var | None = None):
     """Arrive at memory barrier.
 
     Args:
-        mbarrier: Optional[int, PrimExpr]
+        mbarrier: BarrierType
             The memory barrier to arrive at
+        cta_id: int | Var | None
+            The peer CTA rank in cluster to arrive at. (Only valid for cluster barriers)
+            If not provided, will arrive on current CTA's barrier.
     """
-    if isinstance(mbarrier, (tir.Call, tir.BufferLoad)):
-        mbarrier = mbarrier
-    elif isinstance(mbarrier, (tir.PrimExpr, int)):
-        mbarrier = get_mbarrier(mbarrier)
-    elif isinstance(mbarrier, tir.Buffer):
-        mbarrier = tir.BufferLoad(mbarrier, [0])
+    mbarrier = _mbar_to_buffer_load(mbarrier)
+    if cta_id is not None:
+        assert mbarrier.buffer.scope() == "shared.cluster_barrier", f"mbarrier must be a cluster barrier, but got {mbarrier.buffer.scope}"
+        return ptx_arrive_cluster_barrier(mbarrier, cta_id)
     else:
-        raise TypeError(f"mbarrier must be an integer or a tir.Call, but got {type(mbarrier)}")
-    return ptx_arrive_barrier(mbarrier)
+        return ptx_arrive_barrier(mbarrier)
 
 
-def mbarrier_expect_tx(*args):
+def mbarrier_expect_tx(mbarrier: BarrierType, tx: int):
     """Set expected transaction count for memory barrier.
 
     Args:
-        *args: Variable arguments specifying the expected transaction count
+        mbarrier: BarrierType
+            The memory barrier to expect transaction count for
+        tx: int
+            The expected transaction count
 
     Returns:
         tir.Call: A handle to the barrier expectation operation
     """
-    return tir.call_intrin("handle", tir.op.Op.get("tl.mbarrier_expect_tx"), *args)
+    mbarrier = _mbar_to_buffer_load(mbarrier)
+    return tir.call_intrin("handle", tir.op.Op.get("tl.mbarrier_expect_tx"), mbarrier, tx)
+
+
+def mbarrier_arrive_expect_tx(mbarrier: BarrierType, tx: int):
+    """Arrive at a memory barrier and expect completion of async transactions."""
+    from tilelang.language.tir.op import ptx_arrive_barrier_expect_tx
+
+    mbarrier = _mbar_to_buffer_load(mbarrier)
+    return ptx_arrive_barrier_expect_tx(mbarrier, tx)
 
 
 def warpgroup_arrive():
@@ -460,7 +676,10 @@ def shuffle_elect(thread_extent: int) -> PrimExpr:
 
 
 def warpgroup_fence_operand(
-    buffer_or_ptr: tir.Buffer | PrimExpr, offset: int | PrimExpr = 0, num_regs: int | PrimExpr | None = None, dtype: str | None = None
+    buffer_or_ptr: BufferLikeType | PrimExpr,
+    offset: int | PrimExpr = 0,
+    num_regs: int | PrimExpr | None = None,
+    dtype: DType | None = None,
 ):
     """Insert a warpgroup fence for the destination accumulator registers.
 
@@ -468,7 +687,7 @@ def warpgroup_fence_operand(
     WGMMA operations by issuing an empty inline assembly barrier on every register.
 
     Args:
-        buffer_or_ptr: Buffer | BufferLoad | BufferRegion | PrimExpr
+        buffer_or_ptr: BufferLikeType | PrimExpr
             A buffer representing the accumulator fragment, a buffer load/region
             that identifies a starting element within the fragment, or a pointer expression
             (e.g., tvm_access_ptr/address_of/typed Var).
@@ -477,7 +696,7 @@ def warpgroup_fence_operand(
         num_regs: int | PrimExpr | None
             Number of 32-bit registers to fence. If None and a Buffer is provided, it will be
             derived from the buffer shape and dtype.
-        dtype: str | None
+        dtype: DType | None
             Data type string of the accumulator elements. When passing a buffer or
             buffer-derived expression, dtype is inferred. It is required only when
             passing a raw pointer expression that cannot be inferred.
@@ -631,29 +850,29 @@ def wait_wgmma(id: int):
     return tir.call_intrin("handle", tir.op.Op.get("tl.wait_wgmma"), id)
 
 
-def barrier_wait(barrier_id: int | PrimExpr | tir.Call, parity: int | Var | None = None):
+def barrier_wait(mbarrier: BarrierType, parity: int | Var):
     """Wait for a memory barrier to complete.
 
     Args:
-        barrier_id: Optional[int, PrimExpr]
+        mbarrier: BarrierType
             The memory barrier to wait on
-        parity: Optional[int, Var]
+        parity: int | Var
             The parity value to wait for
     Returns:
         tir.Call: A handle to the barrier wait operation
     Current implementation is a sugar syntax for mbarrier_wait_parity, as we only support parity 0 and 1.
     """
-    return mbarrier_wait_parity(barrier_id, parity)
+    return mbarrier_wait_parity(mbarrier, parity)
 
 
-def barrier_arrive(barrier_id: int | PrimExpr | tir.Call):
+def barrier_arrive(mbarrier: BarrierType):
     """Arrive at a memory barrier.
 
     Args:
-        barrier_id: Optional[int, PrimExpr]
+        mbarrier: BarrierType
             The memory barrier to arrive at
     """
-    return mbarrier_arrive(barrier_id)
+    return mbarrier_arrive(mbarrier)
 
 def activemask():
     """Return the active mask of the current warp.
@@ -679,47 +898,57 @@ def shfl(value: Union[int, PrimExpr, tir.Call], lane: Union[int, PrimExpr, tir.C
     else:
         return tir.call_extern(value.dtype, "__shfl_sync", 0xffffffff, value, lane)
 
-def shfl_xor(value: int | PrimExpr | tir.Call, offset: int | PrimExpr | tir.Call):
-    """Perform a shuffle operation with XOR offset.
+# Full-warp mask as a proper uint32 TIR constant so the emitted C/C++ source
+# prints as `0xFFFFFFFFu` instead of `(int64_t)4294967295` after TIR widening.
+_FULL_WARP_MASK = tir.const(0xFFFFFFFF, "uint32")
+_DEFAULT_SHFL_WIDTH = 32
 
-    Args:
-        value: Optional[int, PrimExpr]
-            The value to shuffle
-        offset: Optional[int, PrimExpr]
-            The offset for the shuffle operation
-    Returns:
-        tir.Call: A handle to the shuffle operation
+
+def _as_uint32_mask(mask: int | PrimExpr) -> PrimExpr:
+    """Normalize a warp lane mask to a uint32 TIR expression.
+
+    Python literals (e.g. ``0xFFFFFFFF``) would otherwise be widened to int64
+    by TIR and printed as ``(int64_t)4294967295`` in the generated source.
     """
-    if _IS_HIP_AVAILABLE:
-        return tir.call_extern(value.dtype, "__shfl_xor", value, offset)
-    else:
-        return tir.call_extern(value.dtype, "__shfl_xor_sync", 0xFFFFFFFF, value, offset)
+    if isinstance(mask, int):
+        return tir.const(mask, "uint32")
+    return mask
 
 
-def shfl_down(value: int | PrimExpr | tir.Call, offset: int | PrimExpr | tir.Call):
-    """Perform a shuffle operation with down offset.
-
-    Args:
-        value: Optional[int, PrimExpr]
-            The value to shuffle
+def shfl_xor(
+    value: int | PrimExpr | tir.Call,
+    delta: int | PrimExpr | tir.Call,
+    width: int | PrimExpr = _DEFAULT_SHFL_WIDTH,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+):
+    """XOR-swap ``value`` across lanes (``__shfl_xor_sync`` on CUDA,
+    ``__shfl_xor`` on HIP — mask ignored on HIP).
     """
-    if _IS_HIP_AVAILABLE:
-        return tir.call_extern(value.dtype, "__shfl_down", value, offset)
-    else:
-        return tir.call_extern(value.dtype, "__shfl_down_sync", 0xFFFFFFFF, value, offset)
+    return tir.call_intrin(value.dtype, tir.op.Op.get("tl.shfl_xor_sync"), _as_uint32_mask(mask), value, delta, width)
 
 
-def shfl_up(value: int | PrimExpr | tir.Call, offset: int | PrimExpr | tir.Call):
-    """Perform a shuffle operation with up offset.
-
-    Args:
-        value: Optional[int, PrimExpr]
-            The value to shuffle
+def shfl_down(
+    value: int | PrimExpr | tir.Call,
+    delta: int | PrimExpr | tir.Call,
+    width: int | PrimExpr = _DEFAULT_SHFL_WIDTH,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+):
+    """Shift ``value`` down by ``delta`` lanes (``__shfl_down_sync`` on CUDA,
+    ``__shfl_down`` on HIP).
     """
-    if _IS_HIP_AVAILABLE:
-        return tir.call_extern(value.dtype, "__shfl_up", value, offset)
-    else:
-        return tir.call_extern(value.dtype, "__shfl_up_sync", 0xFFFFFFFF, value, offset)
+    return tir.call_intrin(value.dtype, tir.op.Op.get("tl.shfl_down_sync"), _as_uint32_mask(mask), value, delta, width)
+
+
+def shfl_up(
+    value: int | PrimExpr | tir.Call,
+    delta: int | PrimExpr | tir.Call,
+    width: int | PrimExpr = _DEFAULT_SHFL_WIDTH,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+):
+    """Shift ``value`` up by ``delta`` lanes (``__shfl_up_sync`` on CUDA,
+    ``__shfl_up`` on HIP).
+    """
+    return tir.call_intrin(value.dtype, tir.op.Op.get("tl.shfl_up_sync"), _as_uint32_mask(mask), value, delta, width)
 
 
 def sync_threads(barrier_id: int = None, arrive_count: int = None):
@@ -739,11 +968,157 @@ def sync_warp(mask: int = None):
     return tir.call_intrin("void", tir.op.Op.get("tl.sync_warp"))
 
 
-def shfl_sync(mask: int, value: int | PrimExpr, srcLane: int, width: int = None):
-    """Receives data from a thread in the same warp."""
-    if width is None:
-        return tir.call_extern(value.dtype, "__shfl_sync", mask, value, srcLane)
-    return tir.call_extern(value.dtype, "__shfl_sync", mask, value, srcLane, width)
+def shfl_sync(
+    value: int | PrimExpr,
+    srcLane: int | PrimExpr,
+    width: int | PrimExpr = _DEFAULT_SHFL_WIDTH,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+):
+    """Broadcast ``value`` from ``srcLane`` to all lanes in the subgroup of
+    ``width`` lanes (``__shfl_sync`` on CUDA, ``__shfl`` on HIP — mask ignored
+    on HIP).
+    """
+    return tir.call_intrin(value.dtype, tir.op.Op.get("tl.shfl_sync"), _as_uint32_mask(mask), value, srcLane, width)
+
+
+# ---------------------------------------------------------------------------
+# Warp-vote / warp-ballot intrinsics
+#
+# The CUDA/HIP split and the uint32->uint64 zero-extension for ballot_sync and
+# activemask are handled in codegen (src/target/codegen_{cuda,hip}.cc). These
+# Python wrappers simply emit the backend-agnostic tl.* ops.
+# ---------------------------------------------------------------------------
+
+
+def any_sync(
+    predicate: int | PrimExpr,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+) -> PrimExpr:
+    """Non-zero if ANY active lane in ``mask`` has a non-zero ``predicate``.
+
+    Lowers to ``__any_sync(mask, predicate)`` on CUDA and ``__any(predicate)``
+    on HIP (the mask is ignored on HIP because the full wavefront is always
+    convergent).
+
+    Args:
+        predicate: Integer condition to test.
+        mask: Warp lane mask (defaults to ``0xFFFFFFFF``, i.e. all 32 lanes).
+
+    Returns:
+        int32: Non-zero if any thread in the mask has a non-zero predicate.
+    """
+    return tir.call_intrin("int32", tir.op.Op.get("tl.any_sync"), _as_uint32_mask(mask), predicate)
+
+
+def all_sync(
+    predicate: int | PrimExpr,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+) -> PrimExpr:
+    """Non-zero only if ALL active lanes in ``mask`` have a non-zero predicate.
+
+    Lowers to ``__all_sync(mask, predicate)`` on CUDA and ``__all(predicate)``
+    on HIP.
+
+    Args:
+        predicate: Integer condition to test.
+        mask: Warp lane mask (defaults to ``0xFFFFFFFF``, i.e. all 32 lanes).
+
+    Returns:
+        int32: Non-zero if all threads in the mask have a non-zero predicate.
+    """
+    return tir.call_intrin("int32", tir.op.Op.get("tl.all_sync"), _as_uint32_mask(mask), predicate)
+
+
+def ballot_sync(
+    predicate: int | PrimExpr,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+) -> PrimExpr:
+    """Return a ``uint64`` bitmask of lanes in ``mask`` whose predicate is set.
+
+    CUDA: ``__ballot_sync(mask, predicate)`` returns ``unsigned int``; codegen
+    zero-extends it to ``uint64`` (upper 32 bits always zero for 32-wide warps).
+    HIP: ``__ballot(predicate)`` returns ``uint64`` natively, covering all
+    64 wavefront lanes. The mask argument is ignored on HIP.
+
+    Returns:
+        uint64: Bitmask with bit N set if lane N's predicate is non-zero.
+    """
+    return tir.call_intrin("uint64", tir.op.Op.get("tl.ballot_sync"), _as_uint32_mask(mask), predicate)
+
+
+def ballot(predicate: int | PrimExpr) -> PrimExpr:
+    """Full-warp / full-wavefront ballot. Equivalent to
+    ``ballot_sync(predicate)`` (i.e. with the default full warp mask).
+
+    Returns:
+        uint64: Bitmask with bit N set if lane N's predicate is non-zero.
+    """
+    return tir.call_intrin("uint64", tir.op.Op.get("tl.ballot"), predicate)
+
+
+def activemask() -> PrimExpr:
+    """Return a ``uint64`` bitmask of currently active (non-exited) lanes.
+
+    Lowers to ``__activemask()`` (zero-extended to ``uint64``) on CUDA and
+    ``__ballot(1)`` on HIP.
+    """
+    return tir.call_intrin("uint64", tir.op.Op.get("tl.activemask"))
+
+
+# ---------------------------------------------------------------------------
+# Thread-block synchronization with predicate (shared across CUDA & HIP)
+# ---------------------------------------------------------------------------
+
+
+def syncthreads_count(predicate: int | PrimExpr) -> PrimExpr:
+    """Block barrier that returns the number of threads whose ``predicate``
+    evaluates to non-zero (``__syncthreads_count`` on CUDA and HIP).
+    """
+    return tir.call_intrin("int32", tir.op.Op.get("tl.syncthreads_count"), predicate)
+
+
+def syncthreads_and(predicate: int | PrimExpr) -> PrimExpr:
+    """Block barrier that returns non-zero only if ALL threads have a non-zero
+    ``predicate`` (``__syncthreads_and`` on CUDA and HIP).
+    """
+    return tir.call_intrin("int32", tir.op.Op.get("tl.syncthreads_and"), predicate)
+
+
+def syncthreads_or(predicate: int | PrimExpr) -> PrimExpr:
+    """Block barrier that returns non-zero if ANY thread has a non-zero
+    ``predicate`` (``__syncthreads_or`` on CUDA and HIP).
+    """
+    return tir.call_intrin("int32", tir.op.Op.get("tl.syncthreads_or"), predicate)
+
+
+# ---------------------------------------------------------------------------
+# Warp match intrinsics (CUDA sm_70+; unsupported on HIP)
+# ---------------------------------------------------------------------------
+
+
+def match_any_sync(
+    value: int | PrimExpr,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+) -> PrimExpr:
+    """Return a ``uint32`` bitmask of lanes in ``mask`` whose ``value`` equals
+    the calling lane's value. Lowers to ``__match_any_sync`` on CUDA
+    (compute capability >= 7.0). Not supported on HIP.
+    """
+    return tir.call_intrin("uint32", tir.op.Op.get("tl.match_any_sync"), _as_uint32_mask(mask), value)
+
+
+def match_all_sync(
+    value: int | PrimExpr,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+) -> PrimExpr:
+    """Return ``mask`` if all lanes in ``mask`` agree on ``value``, else 0.
+
+    Lowers to ``__match_all_sync`` on CUDA (compute capability >= 7.0); the
+    trailing ``int*`` predicate output is hidden in codegen and discarded.
+    Callers can reconstruct the predicate as ``result != 0``. Not supported
+    on HIP.
+    """
+    return tir.call_intrin("uint32", tir.op.Op.get("tl.match_all_sync"), _as_uint32_mask(mask), value)
 
 
 def sync_global():
@@ -851,9 +1226,10 @@ def loop_break():
     return tir.call_intrin("handle", tir.op.Op.get("tl.loop_break"))
 
 
-def cp_async_barrier_noinc(barrier_id: int | PrimExpr | tir.Call):
+def cp_async_barrier_noinc(barrier: BarrierType):
     """Perform a ptx async copy barrier using cp.async.mbarrier.arrive.noinc."""
-    return tir.call_intrin("handle", tir.op.Op.get("tl.ptx_cp_async_barrier_noinc"), barrier_id)
+    barrier = _mbar_to_buffer_load(barrier)
+    return tir.call_intrin("handle", tir.op.Op.get("tl.ptx_cp_async_barrier_noinc"), barrier)
 
 
 def _pack_s_waitcnt_imm(cnt: int, flag: Literal["vmcnt", "lgkmcnt", "expcnt"]) -> int:
@@ -900,15 +1276,29 @@ def s_waitcnt(cnt: int = 0, flag: Literal["vmcnt", "lgkmcnt", "expcnt"] = "vmcnt
     return tir.call_extern("int32", "__builtin_amdgcn_s_waitcnt", tir.IntImm("int32", imm))
 
 
-def tcgen05_mma_arrive(mbar_ptr):
+def tcgen05_mma_arrive(mbar: tir.Buffer | BufferLoad | PrimExpr, arrive_2cta: bool = False):
     """Signal UMMA (TCGEN05) barrier arrival for a shared-memory mbarrier pointer.
 
     Parameters
     ----------
-    mbar_ptr : PrimExpr
-        Pointer to the mbarrier object in shared memory (e.g., Barrier*).
+    mbar: tir.Buffer | BufferLoad | PrimExpr
+        The mbarrier object in shared memory (e.g., Barrier*) or its address.
+    arrive_2cta: bool
+        Whether to also arrive at the peer CTA's barrier.
+        If set, will be lowered to umma_arrive_multicast_2x1SM.
     """
-    return tir.call_intrin("void", tir.op.Op.get("tl.tcgen05_mma_arrive"), mbar_ptr)
+    if isinstance(mbar, (tir.Buffer, BufferLoad)):
+        mbar = retrieve_ptr(mbar, access_type="rw")
+    ann = {"use_2cta": 1} if arrive_2cta else {}
+    return tir.call_intrin("void", tir.op.Op.get("tl.tcgen05_mma_arrive"), mbar, annotations=ann)
+
+
+def tcgen05_before_thread_sync():
+    return tir.call_intrin("void", tir.op.Op.get("tl.tcgen05_before_thread_sync"))
+
+
+def tcgen05_after_thread_sync():
+    return tir.call_intrin("void", tir.op.Op.get("tl.tcgen05_after_thread_sync"))
 
 
 def ptx_mma_sm70(
@@ -1008,3 +1398,199 @@ def ptx_mma_sm70(
         accumulator,
         c_index,
     )
+
+
+def ldg32(src: BufferLikeType, pred: PrimExpr = None) -> PrimExpr:
+    """Load 32 bits (4 bytes) from global memory using explicit PTX instructions.
+
+    Usage: `T.ldg32(x[i])` or `T.ldg32(x[i:i+2])` emits `tl::ldg32(ptr)`.
+
+    Args:
+        src: A `Buffer`, `BufferRegion`, or `BufferLoad`.
+        pred: Optional predicate condition. If False, the load is skipped.
+
+    Returns:
+        PrimExpr: The loaded 32-bit value.
+
+    Example:
+        >>> val = T.ldg32(x[i])
+        >>> val = T.ldg32(x[i:i+2])  # load 2 x fp16
+        >>> val = T.ldg32(x[i], pred=i < N)  # predicated load
+    """
+    if not isinstance(src, BufferLikeTypeTuple):
+        raise TypeError(f"T.ldg32 expects Buffer, BufferRegion, or BufferLoad. Got {type(src)}: {src}")
+    ptr = retrieve_ptr(src, access_type="r")
+    if pred is None:
+        return tir.call_intrin("uint32", tir.op.Op.get("tl.ldg32"), ptr)
+    else:
+        return tir.call_intrin("uint32", tir.op.Op.get("tl.ldg32"), ptr, pred)
+
+
+def ldg64(src: BufferLikeType, pred: PrimExpr = None) -> PrimExpr:
+    """Load 64 bits (8 bytes) from global memory using explicit PTX instructions.
+
+    Usage: `T.ldg64(x[i])` or `T.ldg64(x[i:i+4])` emits `tl::ldg64(ptr)`.
+
+    Args:
+        src: A `Buffer`, `BufferRegion`, or `BufferLoad`.
+        pred: Optional predicate condition. If False, the load is skipped.
+
+    Returns:
+        PrimExpr: The loaded 64-bit value.
+
+    Example:
+        >>> val = T.ldg64(x[i])
+        >>> val = T.ldg64(x[i:i+4])  # load 4 x fp16
+        >>> val = T.ldg64(x[i], pred=i < N)  # predicated load
+    """
+    if not isinstance(src, BufferLikeTypeTuple):
+        raise TypeError(f"T.ldg64 expects Buffer, BufferRegion, or BufferLoad. Got {type(src)}: {src}")
+    ptr = retrieve_ptr(src, access_type="r")
+    if pred is None:
+        return tir.call_intrin("uint32x2", tir.op.Op.get("tl.ldg64"), ptr)
+    else:
+        return tir.call_intrin("uint32x2", tir.op.Op.get("tl.ldg64"), ptr, pred)
+
+
+def ldg128(src: BufferLikeType, pred: PrimExpr = None) -> PrimExpr:
+    """Load 128 bits (16 bytes) from global memory using explicit PTX instructions.
+
+    Usage: `T.ldg128(x[i])` or `T.ldg128(x[i:i+8])` emits `tl::ldg128(ptr)`.
+
+    Args:
+        src: A `Buffer`, `BufferRegion`, or `BufferLoad`.
+        pred: Optional predicate condition. If False, the load is skipped.
+
+    Returns:
+        PrimExpr: The loaded 128-bit value.
+
+    Example:
+        >>> val = T.ldg128(x[i])
+        >>> val = T.ldg128(x[i:i+8])  # load 8 x fp16
+        >>> val = T.ldg128(x[i], pred=i < N)  # predicated load
+    """
+    if not isinstance(src, BufferLikeTypeTuple):
+        raise TypeError(f"T.ldg128 expects Buffer, BufferRegion, or BufferLoad. Got {type(src)}: {src}")
+    ptr = retrieve_ptr(src, access_type="r")
+    if pred is None:
+        return tir.call_intrin("uint32x4", tir.op.Op.get("tl.ldg128"), ptr)
+    else:
+        return tir.call_intrin("uint32x4", tir.op.Op.get("tl.ldg128"), ptr, pred)
+
+
+def ldg256(src: BufferLikeType, pred: PrimExpr = None) -> PrimExpr:
+    """Load 256 bits (32 bytes) from global memory using explicit PTX instructions.
+
+    Usage: `T.ldg256(x[i])` or `T.ldg256(x[i:i+16])` emits `tl::ldg256(ptr)`.
+
+    Args:
+        src: A `Buffer`, `BufferRegion`, or `BufferLoad`.
+        pred: Optional predicate condition. If False, the load is skipped.
+
+    Returns:
+        PrimExpr: The loaded 256-bit value.
+
+    Example:
+        >>> val = T.ldg256(x[i])
+        >>> val = T.ldg256(x[i:i+16])  # load 16 x fp16
+        >>> val = T.ldg256(x[i], pred=i < N)  # predicated load
+    """
+    if not isinstance(src, BufferLikeTypeTuple):
+        raise TypeError(f"T.ldg256 expects Buffer, BufferRegion, or BufferLoad. Got {type(src)}: {src}")
+    ptr = retrieve_ptr(src, access_type="r")
+    if pred is None:
+        return tir.call_intrin("uint32x8", tir.op.Op.get("tl.ldg256"), ptr)
+    else:
+        return tir.call_intrin("uint32x8", tir.op.Op.get("tl.ldg256"), ptr, pred)
+
+
+def stg32(dst: BufferLikeType, value: PrimExpr, pred: PrimExpr = None) -> None:
+    """Store 32 bits (4 bytes) to global memory using explicit PTX instructions.
+
+    Usage: `T.stg32(y[i], value)` emits `tl::stg32(ptr, value)`.
+
+    Args:
+        dst: A `Buffer`, `BufferRegion`, or `BufferLoad` indicating the destination.
+        value: The 32-bit value to store.
+        pred: Optional predicate condition. If False, the store is skipped.
+
+    Example:
+        >>> T.stg32(y[i], val)
+        >>> T.stg32(y[i], val, pred=i < N)  # predicated store
+    """
+    if not isinstance(dst, BufferLikeTypeTuple):
+        raise TypeError(f"T.stg32 expects Buffer, BufferRegion, or BufferLoad. Got {type(dst)}: {dst}")
+    ptr = retrieve_ptr(dst, access_type="w")
+    if pred is None:
+        return tir.call_intrin("handle", tir.op.Op.get("tl.stg32"), ptr, value)
+    else:
+        return tir.call_intrin("handle", tir.op.Op.get("tl.stg32"), ptr, value, pred)
+
+
+def stg64(dst: BufferLikeType, value: PrimExpr, pred: PrimExpr = None) -> None:
+    """Store 64 bits (8 bytes) to global memory using explicit PTX instructions.
+
+    Usage: `T.stg64(y[i:i+2], value)` emits `tl::stg64(ptr, value)`.
+
+    Args:
+        dst: A `Buffer`, `BufferRegion`, or `BufferLoad` indicating the destination.
+        value: The 64-bit value to store (e.g., uint2).
+        pred: Optional predicate condition. If False, the store is skipped.
+
+    Example:
+        >>> T.stg64(y[i:i+2], val)
+        >>> T.stg64(y[i:i+2], val, pred=i < N)  # predicated store
+    """
+    if not isinstance(dst, BufferLikeTypeTuple):
+        raise TypeError(f"T.stg64 expects Buffer, BufferRegion, or BufferLoad. Got {type(dst)}: {dst}")
+    ptr = retrieve_ptr(dst, access_type="w")
+    if pred is None:
+        return tir.call_intrin("handle", tir.op.Op.get("tl.stg64"), ptr, value)
+    else:
+        return tir.call_intrin("handle", tir.op.Op.get("tl.stg64"), ptr, value, pred)
+
+
+def stg128(dst: BufferLikeType, value: PrimExpr, pred: PrimExpr = None) -> None:
+    """Store 128 bits (16 bytes) to global memory using explicit PTX instructions.
+
+    Usage: `T.stg128(y[i:i+4], value)` emits `tl::stg128(ptr, value)`.
+
+    Args:
+        dst: A `Buffer`, `BufferRegion`, or `BufferLoad` indicating the destination.
+        value: The 128-bit value to store (e.g., uint4).
+        pred: Optional predicate condition. If False, the store is skipped.
+
+    Example:
+        >>> T.stg128(y[i:i+4], val)
+        >>> T.stg128(y[i:i+4], val, pred=i < N)  # predicated store
+    """
+    if not isinstance(dst, BufferLikeTypeTuple):
+        raise TypeError(f"T.stg128 expects Buffer, BufferRegion, or BufferLoad. Got {type(dst)}: {dst}")
+    ptr = retrieve_ptr(dst, access_type="w")
+    if pred is None:
+        return tir.call_intrin("handle", tir.op.Op.get("tl.stg128"), ptr, value)
+    else:
+        return tir.call_intrin("handle", tir.op.Op.get("tl.stg128"), ptr, value, pred)
+
+
+def stg256(dst: BufferLikeType, value: PrimExpr, pred: PrimExpr = None) -> None:
+    """Store 256 bits (32 bytes) to global memory using explicit PTX instructions.
+
+    Usage: `T.stg256(y[i:i+8], value)` emits `tl::stg256(ptr, value)`.
+
+    Args:
+        dst: A `Buffer`, `BufferRegion`, or `BufferLoad` indicating the destination.
+        value: The 256-bit value to store (e.g., ulonglong4).
+        pred: Optional predicate condition. If False, the store is skipped.
+
+    Example:
+        >>> T.stg256(y[i:i+8], val)
+        >>> T.stg256(y[i:i+8], val, pred=i < N)  # predicated store
+    """
+    if not isinstance(dst, BufferLikeTypeTuple):
+        raise TypeError(f"T.stg256 expects Buffer, BufferRegion, or BufferLoad. Got {type(dst)}: {dst}")
+    ptr = retrieve_ptr(dst, access_type="w")
+    if pred is None:
+        return tir.call_intrin("handle", tir.op.Op.get("tl.stg256"), ptr, value)
+    else:
+        return tir.call_intrin("handle", tir.op.Op.get("tl.stg256"), ptr, value, pred)

@@ -88,7 +88,7 @@ def _init_logger():
 
     handler = TqdmLoggingHandler()
     formatter = logging.Formatter(
-        fmt="%(asctime)s  [TileLang:%(name)s:%(levelname)s]: %(message)s",
+        fmt="%(asctime)s  [TileLang:%(name)s:%(levelname)s] (%(filename)s:%(lineno)d): %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     handler.setFormatter(formatter)
@@ -238,10 +238,7 @@ if not env.is_light_import():
             if sys.platform.startswith("win32") and sys.version_info >= (3, 8):
                 for path in libinfo.get_dll_directories():
                     os.add_dll_directory(path)
-            # pylint: disable=protected-access
-            lib_name = "tilelang" if tvm.base._RUNTIME_ONLY else "tilelang_module"
-            # pylint: enable=protected-access
-            lib_path = libinfo.find_lib_path(lib_name)
+            lib_path = libinfo.find_lib_path("tilelang")
             return ctypes.CDLL(lib_path), lib_path
 
         # only load once here
@@ -254,6 +251,7 @@ if not env.is_light_import():
     from .utils import (
         TensorSupplyType,  # noqa: F401
         deprecated,  # noqa: F401
+        build_date,  # noqa: F401
     )
     from .layout import (
         Layout,  # noqa: F401

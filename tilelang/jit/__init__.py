@@ -90,10 +90,27 @@ def compile(
 
     assert isinstance(func, PrimFunc), f"target function must be a PrimFunc but got {type(func)}"
 
-    if hasattr(func, "out_idx_override"):
-        if func.out_idx_override is not None and out_idx is not None:
+    # Merge function-level attrs from PrimFunc
+    func_attrs = func.attrs
+    if func_attrs and "tilelang_out_idx" in func_attrs:
+        func_out_idx = list(func_attrs["tilelang_out_idx"])
+        if out_idx is not None:
             raise ValueError("Out index conflict: out_idx is specified and prim_func have returned `T.empty` tensors")
-        out_idx = func.out_idx_override or out_idx
+        out_idx = func_out_idx
+    if func_attrs and "tilelang_pass_configs" in func_attrs:
+        func_pc = dict(func_attrs["tilelang_pass_configs"])
+        if pass_configs is not None:
+            # External pass_configs override function-level ones
+            func_pc.update(pass_configs)
+        pass_configs = func_pc
+    if func_attrs and "tilelang_compile_flags" in func_attrs:
+        func_cf = list(func_attrs["tilelang_compile_flags"])
+        if compile_flags is not None:
+            if isinstance(compile_flags, str):
+                func_cf.append(compile_flags)
+            else:
+                func_cf.extend(compile_flags)
+        compile_flags = func_cf
 
     return cached(
         func=func,
@@ -313,7 +330,8 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         # auto: infer by checking if function returns PrimFunc directly
         if not isinstance(self.func, JITFunc):
             return "lazy"
-        return "lazy" if self.func._is_lazy_style(*args, **kwargs) else "eager"
+        is_lazy_style = self.func._is_lazy_style(*args, **kwargs)
+        return "lazy" if is_lazy_style else "eager"
 
     def initialize_jit_mode(self, *args: _P.args, **kwargs: _P.kwargs) -> Literal["lazy", "eager"]:
         if self.mode == "auto":
@@ -324,7 +342,10 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         return self.mode
 
     def par_compile(
-        self, configs: Iterable[dict[str, Any] | tuple[str, Any]], num_workers: int = None, ignore_error: bool = False
+        self,
+        configs: Iterable[dict[str, Any] | tuple[str, Any]],
+        num_workers: int = None,
+        ignore_error: bool = False,
     ) -> list[JITKernel[_KP, _T]]:
         """
         Parallel compile multiple TileLang PrimFunc with TVM and build JITKernels.
@@ -387,7 +408,12 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
                 func_name = self.func.attrs["global_symbol"]
             else:
                 func_name = getattr(self.func, "__name__", "jit_kernel")
-            kernel_file = f"tilelang_jit_kernel_{func_name}.c"
+
+            # cutedsl emits python executor not `c`
+            is_cutedsl = self.execution_backend == "cutedsl"
+            kernel_suffix = "py" if is_cutedsl else "c"
+            kernel_file = f"tilelang_jit_kernel_{func_name}.{kernel_suffix}"
+
             program_file = f"tilelang_jit_program_{func_name}.py"
             makedirs(self.debug_root_path, exist_ok=True)
             with open(path.join(self.debug_root_path, kernel_file), "w") as f:
@@ -404,6 +430,10 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         tuned_key_kwargs_tuple = tuple(sorted(tune_params.items()))
         key = (key_args_tuple, key_kwargs_tuple, tuned_key_kwargs_tuple)
         return key
+
+    def get_kernel_source(self, *args: _P.args, **kwargs: _P.kwargs) -> str:
+        kernel = self.compile(*args, **kwargs)
+        return kernel.get_kernel_source()
 
     def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> _Ret:
         # Separate out the tuning parameters from the user's kwargs
