@@ -23,26 +23,34 @@ def _check(original, transformed):
     # tvm.ir.assert_structural_equal(mod["main"], transformed["main"], True)
 
 
-def test_lower_hopper_intrin_barrier():
+def test_lower_shared_barrier():
+    """Test that LowerSharedBarrier converts shared.barrier buffers + barrier_init
+    annotations into ptx_init_barrier_thread_count calls.
+
+    This replaces the old test_lower_hopper_intrin_barrier which tested the
+    removed tl.create_list_of_mbarrier intrinsic.
+    """
+
     @T.prim_func
     def before():
         with T.Kernel(8):
             _ = T.launch_thread("threadIdx.x", 128)
-            T.create_list_of_mbarrier(128, 128, 128, 128)
+            mbarrier = T.alloc_barrier([128, 128, 128, 128])  # noqa: F841
 
-    @T.prim_func
-    def after():
-        with T.Kernel(8):
-            v_1 = T.launch_thread("threadIdx.x", 128)
-            T.evaluate(tir.Call("handle", "tir.create_barriers", [4]))
-            with T.If(v_1 == 0), T.Then():
-                T.evaluate(tir.Call("handle", "tir.ptx_init_barrier_thread_count", [T.get_mbarrier(0), 128]))
-                T.evaluate(tir.Call("handle", "tir.ptx_init_barrier_thread_count", [T.get_mbarrier(1), 128]))
-                T.evaluate(tir.Call("handle", "tir.ptx_init_barrier_thread_count", [T.get_mbarrier(2), 128]))
-                T.evaluate(tir.Call("handle", "tir.ptx_init_barrier_thread_count", [T.get_mbarrier(3), 128]))
-            T.evaluate(tir.Call("handle", "tir.tvm_storage_sync", ["shared"]))
+    mod = tvm.IRModule.from_expr(before.with_attr("global_symbol", "main"))
+    mod = tvm.tir.transform.BindTarget(auto_target)(mod)
+    mod = tl.transform.LowerSharedBarrier()(mod)
+    mod = tir.transform.LowerOpaqueBlock()(mod)
 
-    _check(before, after)
+    main_func = mod["main"]
+    body_text = main_func.script()
+
+    # After LowerSharedBarrier, we should see ptx_init_barrier_thread_count calls
+    assert "ptx_init_barrier_thread_count" in body_text
+    # Should see fence_barrier_init
+    assert "ptx_fence_barrier_init" in body_text
+    # Should see storage_sync
+    assert "tvm_storage_sync" in body_text
 
 
 if __name__ == "__main__":

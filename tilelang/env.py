@@ -279,11 +279,12 @@ class Environment:
     )  # disable kernel cache, usually for unit testing / debugging, high priority
     TILELANG_CLEAR_CACHE = EnvVar("TILELANG_CLEAR_CACHE", "0")  # DEPRECATED! clear cache automatically if set
 
-    # GEMM v1 (C++ `tl.tileop.gemm`) vs v2 (`tl.tileop.gemm_py`); default on until HCU/gemm_v2 is ready.
-    TILELANG_USE_GEMM_V1 = EnvVar("TILELANG_USE_GEMM_V1", "1")
     TILELANG_SOURCE_RECOMPILE = EnvVar("TILELANG_SOURCE_RECOMPILE", "0")  # cuda source aware recompilation
     # When saving kernel disk cache (HCU/ROCm): run hip compiler (aicc if on PATH, else hipcc) for .asm / LLVM IR / TIR.
     TILELANG_KERNEL_DUMP = EnvVar("TILELANG_KERNEL_DUMP", "0")
+    TILELANG_CLEANUP_TEMP_FILES = EnvVar(
+        "TILELANG_CLEANUP_TEMP_FILES", "0"
+    )  # cleanup temporary compiler files/dirs after compilation (default: keep for debugging)
 
     # Auto-tuning settings
     TILELANG_AUTO_TUNING_DISABLE_CACHE = EnvVar("TILELANG_AUTO_TUNING_DISABLE_CACHE", "0")
@@ -333,13 +334,8 @@ class Environment:
     def is_print_on_compilation_enabled(self) -> bool:
         return self.TILELANG_PRINT_ON_COMPILATION.lower() in ("1", "true", "yes", "on")
 
-    def use_gemm_v1(self) -> bool:
-        """Return True if GEMM v1 should be used based on env.
-
-        Controlled by `TILELANG_USE_GEMM_V1`. Truthy values are one of
-        {"1", "true", "yes", "on"} (case-insensitive).
-        """
-        return str(self.TILELANG_USE_GEMM_V1).lower() in ("1", "true", "yes", "on")
+    def should_cleanup_temp_files(self) -> bool:
+        return str(self.TILELANG_CLEANUP_TEMP_FILES).lower() in ("1", "true", "yes", "on")
 
     def get_default_target(self) -> str:
         """Get default compilation target from environment."""

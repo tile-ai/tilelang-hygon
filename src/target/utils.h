@@ -15,6 +15,8 @@ namespace tl {
 
 bool TargetIsCuda(Target target);
 bool TargetIsRocm(Target target);
+bool TargetIsMetal(Target target);
+bool TargetIsCPU(Target target);
 
 bool TargetIsVolta(Target target);
 bool TargetIsTuring(Target target);
@@ -27,11 +29,15 @@ bool TargetIsHCU(Target target);
 bool TargetHasMmacLitLts(Target target);
 /// Return mcpu string for HCU target (e.g. "gfx938"). Caller adds prefix as needed.
 std::string GetHcuArchString(Target target);
+bool TargetIsRDNA(Target target);
+bool TargetIsGfx950(Target target);
+
 bool TargetHasAsyncCopy(Target target);
 bool TargetHasLdmatrix(Target target);
 bool TargetHasStmatrix(Target target);
 bool TargetHasTmem(Target target);
 bool TargetHasBulkCopy(Target target);
+bool TargetIsCuTeDSL(Target target);
 bool TargetSupportVectorize256(Target target);
 int TargetGetWarpSize(Target target);
 bool TargetHasSMVersionGE(Target target, int version);

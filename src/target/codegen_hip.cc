@@ -9,6 +9,8 @@
 #include <tvm/tir/op.h>
 
 #include <cmath>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -18,6 +20,73 @@
 
 namespace tvm {
 namespace codegen {
+
+namespace {
+
+bool IsValidCPAsyncTransferBytes(int64_t bytes) {
+  return bytes == 4 || bytes == 8 || bytes == 16;
+}
+
+std::optional<DataType> GetAccessPtrElementType(const PrimExpr &expr) {
+  const auto *ptr_call = expr.as<CallNode>();
+  if (ptr_call == nullptr) {
+    return std::nullopt;
+  }
+  if (ptr_call->op.same_as(builtin::address_of())) {
+    const auto *buffer_load = ptr_call->args[0].as<BufferLoadNode>();
+    ICHECK(buffer_load) << "address_of arg must be BufferLoad";
+    return buffer_load->buffer->dtype;
+  }
+  if (ptr_call->op.same_as(builtin::tvm_access_ptr())) {
+    ICHECK(!ptr_call->args.empty());
+    return ptr_call->args[0].dtype();
+  }
+  if (ptr_call->op.same_as(tl::access_ptr())) {
+    ICHECK_EQ(ptr_call->args.size(), 3U)
+        << "tl.access_ptr expects 3 args: (BufferLoad, extent, rw_mask)";
+    const auto *buffer_load = ptr_call->args[0].as<BufferLoadNode>();
+    ICHECK(buffer_load) << "tl.access_ptr arg0 must be BufferLoad";
+    return buffer_load->buffer->dtype;
+  }
+  return std::nullopt;
+}
+
+int GetTileLangCPAsyncTransferBytes(const CallNode *op) {
+  ICHECK(op->args.size() == 3 || op->args.size() == 4)
+      << "tl::ptx_cp_async expects 3 or 4 arguments (dst_access_ptr, "
+         "src_access_ptr, num_elems, [predicate])";
+  const auto *num_elems_imm = op->args[2].as<IntImmNode>();
+  ICHECK(num_elems_imm) << "tl::ptx_cp_async num_elems must be IntImm, but got "
+                        << op->args[2];
+  int64_t num_elems = num_elems_imm->value;
+  ICHECK_GT(num_elems, 0);
+
+  auto dst_elem_type = GetAccessPtrElementType(op->args[0]);
+  auto src_elem_type = GetAccessPtrElementType(op->args[1]);
+  ICHECK(dst_elem_type.has_value() && src_elem_type.has_value())
+      << "tl::ptx_cp_async expects address_of, tl.access_ptr, or "
+         "tvm_access_ptr operands";
+
+  int64_t dst_total_bits =
+      num_elems * dst_elem_type.value().bits() * dst_elem_type.value().lanes();
+  int64_t src_total_bits =
+      num_elems * src_elem_type.value().bits() * src_elem_type.value().lanes();
+  ICHECK_EQ(dst_total_bits, src_total_bits)
+      << "tl::ptx_cp_async requires src/dst transfer widths to match, but got "
+      << dst_total_bits << " vs " << src_total_bits << " bits";
+  ICHECK_EQ(dst_total_bits % 8, 0)
+      << "tl::ptx_cp_async requires byte-aligned transfers, but got "
+      << dst_total_bits << " bits";
+
+  int64_t total_bytes = dst_total_bits / 8;
+  ICHECK(IsValidCPAsyncTransferBytes(total_bytes))
+      << "tl::ptx_cp_async requires a final PTX byte width in {4, 8, 16}, but "
+         "got "
+      << total_bytes;
+  return static_cast<int>(total_bytes);
+}
+
+} // namespace
 
 static std::string GetFP8Type(DataType type) {
   std::stringstream stream;
@@ -37,17 +106,11 @@ static std::string GetFP8Type(DataType type) {
     LOG(FATAL) << "Only support scalar and vector types of width (2, 4, 8, 16) "
                   "for FP8";
   }
-  if (type.code() == DataType::kFloat8_e4m3fn) {
+  if (type.is_float8_e4m3fn() || type.is_float8_e4m3fnuz() ||
+      type.is_float8_e4m3() || type.code() == DataType::kFloat8_e4m3b11fnuz) {
     stream << "fp8_e4" << vec << "_t";
-  } else if (type.code() == DataType::kFloat8_e4m3fnuz) {
-    stream << "fp8_e4" << vec << "_t";
-  } else if (type.code() == DataType::kFloat8_e4m3) {
-    stream << "fp8_e4" << vec << "_t";
-  } else if (type.code() == DataType::kFloat8_e4m3b11fnuz) {
-    stream << "fp8_e4" << vec << "_t";
-  } else if (type.code() == DataType::kFloat8_e5m2) {
-    stream << "fp8_e5" << vec << "_t";
-  } else if (type.code() == DataType::kFloat8_e5m2fnuz) {
+  } else if (type.is_float8_e5m2() || type.is_float8_e5m2fnuz() ||
+             type.code() == DataType::kFloat8_e5m2) {
     stream << "fp8_e5" << vec << "_t";
   } else if (type.code() == DataType::kFloat8_e8m0fnu) {
     stream << "fp8_e8" << vec << "_t";
@@ -237,6 +300,14 @@ void CodeGenTileLangHIP::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
         ICHECK_EQ(lanes % 2, 0)
             << "only support even lane for float type with lanes > 4";
         os << "ulonglong" << lanes / 2;
+      } else if (lanes == 16) {
+        // float32x16: GCC vector extension type used by MFMA accumulators.
+        os << "float32x16";
+        return;
+      } else if (lanes == 32) {
+        // float32x32: GCC vector extension type used by MFMA accumulators.
+        os << "float32x32";
+        return;
       } else {
         fail = true;
       }
@@ -262,6 +333,10 @@ void CodeGenTileLangHIP::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
     } else if (lanes <= 8) {
       ICHECK_EQ(lanes % 2, 0) << "only support even lane for half type";
       os << "uint" << lanes / 2;
+    } else if (lanes == 16) {
+      // bfloat16x16: struct { bfloat16_t data[16]; } used by MFMA accumulators.
+      os << "bfloat16x16";
+      return;
     } else {
       fail = true;
     }
@@ -431,6 +506,7 @@ void CodeGenTileLangHIP::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
 void CodeGenTileLangHIP::PrintVecBinaryOp(const std::string &op, DataType t,
                                           PrimExpr lhs, PrimExpr rhs,
                                           std::ostream &os) { // NOLINT(*)
+
   // Declare the result.
   std::string sret = name_supply_->FreshName("_");
   this->PrintIndent();
@@ -474,6 +550,8 @@ void CodeGenTileLangHIP::PrintVecElemLoad(const std::string &vec, DataType t,
 
   static const char access[] = {'x', 'y', 'z', 'w'};
   ICHECK(i >= 0 && i < (t.bits() == 8                        ? 16
+                        : (t.lanes() == 16)                  ? 16
+                        : (t.lanes() == 32)                  ? 32
                         : (t.bits() == 16 || t.bits() == 32) ? 8
                                                              : 4));
   if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
@@ -484,6 +562,14 @@ void CodeGenTileLangHIP::PrintVecElemLoad(const std::string &vec, DataType t,
       std::string ac = t.lanes() == 4 ? vec : (vec + "." + access[i / 4]);
       os << "((" << type_name << ")(" << ac << " >> " << i % 4 * 8 << "))";
     }
+  } else if ((t.lanes() == 16 || t.lanes() == 32) && t.bits() == 32 &&
+             t.is_float()) {
+    // float32x16/float32x32: __attribute__((__vector_size__(...))) supports
+    // subscript.
+    os << vec << "[" << i << "]";
+  } else if (t.lanes() == 16 && t.is_bfloat16()) {
+    // bfloat16x16: struct { bfloat16_t data[16]; }
+    os << vec << ".data[" << i << "]";
   } else if (t.is_float16()) {
     os << "((half2*)(&(" << vec << "." << access[i / 2] << ")))->"
        << access[i % 2];
@@ -519,13 +605,16 @@ void CodeGenTileLangHIP::PrintVecElemStore(const std::string &vec, DataType t,
                                            int i, const std::string &value) {
   this->PrintIndent();
   static const char access[] = {'x', 'y', 'z', 'w'};
+
   ICHECK(i >= 0 && i < (t.bits() == 8                        ? 16
+                        : (t.lanes() == 16)                  ? 16
+                        : (t.lanes() == 32)                  ? 32
                         : (t.bits() == 16 || t.bits() == 32) ? 8
                                                              : 4));
   if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
     if (t.lanes() == 2 || t.lanes() == 3) {
-      stream << vec << '.' << access[i % t.lanes()] << "="
-             << "(" << value << ");\n";
+      stream << vec << '.' << access[i % t.lanes()] << "=" << "(" << value
+             << ");\n";
     } else {
       std::string ac = t.lanes() == 4 ? vec : (vec + "." + access[i / 4]);
       stream << ac << "=";
@@ -535,6 +624,14 @@ void CodeGenTileLangHIP::PrintVecElemStore(const std::string &vec, DataType t,
       }
       stream << "(" << value << " << " << i % 4 * 8 << ");\n";
     }
+  } else if ((t.lanes() == 16 || t.lanes() == 32) && t.bits() == 32 &&
+             t.is_float()) {
+    // float32x16/float32x32: __attribute__((__vector_size__(...))) supports
+    // subscript.
+    stream << vec << "[" << i << "] = " << value << ";\n";
+  } else if (t.lanes() == 16 && t.is_bfloat16()) {
+    // bfloat16x16: struct { bfloat16_t data[16]; }
+    stream << vec << ".data[" << i << "] = " << value << ";\n";
   } else if (t.is_float16()) {
     stream << "*((half_t*)(&(((half2*)(&(" << vec << "." << access[i / 2]
            << ")))->" << access[i % 2] << "))) = " << value << ";\n";
@@ -572,6 +669,10 @@ void CodeGenTileLangHIP::PrintStorageSync(const CallNode *op) {
     // DO nothing.
   } else if (sync == "shared" || sync == "shared.dyn") {
     this->PrintIndent();
+    // TODO: change to __builtin_amdgcn_s_barrier() later
+    // __syncthreads() will add a vmcnt(0) to final asm, which will break all
+    // buffer_load_async and buffer_load_async...lds
+    // in tilelang vmcnt should be managed explicitly by cp_async_wait.
     this->stream << "__syncthreads();\n";
   }
 }
@@ -744,9 +845,8 @@ std::string CodeGenTileLangHIP::GetBufferRef(DataType t,
     // sizes in that case.
     int div_factor = (t.lanes() == 1) ? (32 / t.bits()) : t.lanes();
 
-    os << "*("
-       << "(" << ptr_cast(t) << vid << ")"
-       << " + " << index_str << " / " << div_factor << ")";
+    os << "*(" << "(" << ptr_cast(t) << vid << ")" << " + " << index_str
+       << " / " << div_factor << ")";
   } else if (t == buffer_element_dtype) {
     os << buffer_str << "[" << index_str << "]";
   } else {
@@ -767,8 +867,7 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     this->stream << ");\n";
   };
-  if (op->op.same_as(builtin::ptx_cp_async()) ||
-      op->op.same_as(tl::ptx_cp_async())) {
+  if (op->op.same_as(builtin::ptx_cp_async())) {
     // args[0] = dst_access_ptr, args[1] = src_access_ptr, args[2] = bytes,
     // args[3] = predicate (optional)
     ICHECK(op->args.size() == 3 || op->args.size() == 4)
@@ -788,6 +887,20 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
                    << ", " << src << ", " << condition << ");\n";
     }
+  } else if (op->op.same_as(tl::ptx_cp_async())) {
+    int total_bytes = GetTileLangCPAsyncTransferBytes(op);
+    std::string dst = this->PrintExpr(op->args[0]);
+    std::string src = this->PrintExpr(op->args[1]);
+    std::string size = std::to_string(total_bytes);
+    this->PrintIndent();
+    if (op->args.size() == 3) {
+      this->stream << "tl::cp_async_gs<" << size << ">(" << dst << ", " << src
+                   << ");\n";
+    } else {
+      std::string condition = this->PrintExpr(op->args[3]);
+      this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
+                   << ", " << src << ", " << condition << ");\n";
+    }
   } else if (op->op.same_as(builtin::ptx_commit_group())) {
     print_extern_call_stmt("tl::cp_async_commit");
   } else if (op->op.same_as(builtin::ptx_wait_group())) {
@@ -800,10 +913,6 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string barrier_name = "_mbarrier";
     this->stream << "__shared__ uint64_t " << barrier_name << "["
                  << barrier_count << "];\n";
-  } else if (op->op.same_as(tl::get_mbarrier())) {
-    std::string barrier_name = "_mbarrier";
-    std::string barrier_id = this->PrintExpr(op->args[0]);
-    os << barrier_name + "[" + barrier_id + "]";
   } else if (op->op.same_as(builtin::ptx_arrive_barrier())) {
     print_extern_call_stmt("tl::mbarrier_arrive");
   } else if (op->op.same_as(builtin::ptx_init_barrier_thread_count())) {
@@ -830,6 +939,89 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::pack_b16())) {
     os << "__pack_half2(" << this->PrintExpr(op->args[0]) << ", "
        << this->PrintExpr(op->args[1]) << ")";
+  } else if (op->op.same_as(tl::any_sync())) {
+    ICHECK_EQ(op->args.size(), 2U) << "tl.any_sync expects <mask, predicate>.";
+    // HIP __any takes only the predicate; the mask is ignored because
+    // wavefront execution is always convergent across the full wave.
+    os << "__any(" << PrintExpr(op->args[1]) << ")";
+  } else if (op->op.same_as(tl::all_sync())) {
+    ICHECK_EQ(op->args.size(), 2U) << "tl.all_sync expects <mask, predicate>.";
+    os << "__all(" << PrintExpr(op->args[1]) << ")";
+  } else if (op->op.same_as(tl::ballot_sync())) {
+    ICHECK_EQ(op->args.size(), 2U)
+        << "tl.ballot_sync expects <mask, predicate>.";
+    // HIP __ballot returns uint64 natively, covering every lane of the
+    // wavefront; the CUDA-style mask argument is ignored.
+    os << "((unsigned long long)__ballot(" << PrintExpr(op->args[1]) << "))";
+  } else if (op->op.same_as(tl::ballot())) {
+    ICHECK_EQ(op->args.size(), 1U) << "tl.ballot expects <predicate>.";
+    os << "((unsigned long long)__ballot(" << PrintExpr(op->args[0]) << "))";
+  } else if (op->op.same_as(tl::activemask())) {
+    ICHECK(op->args.empty()) << "tl.activemask takes no arguments.";
+    os << "((unsigned long long)__ballot(1))";
+  } else if (op->op.same_as(tl::syncthreads_count())) {
+    ICHECK_EQ(op->args.size(), 1U)
+        << "tl.syncthreads_count expects <predicate>.";
+    os << "__syncthreads_count(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::syncthreads_and())) {
+    ICHECK_EQ(op->args.size(), 1U) << "tl.syncthreads_and expects <predicate>.";
+    os << "__syncthreads_and(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::syncthreads_or())) {
+    ICHECK_EQ(op->args.size(), 1U) << "tl.syncthreads_or expects <predicate>.";
+    os << "__syncthreads_or(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::shfl_sync())) {
+    ICHECK_EQ(op->args.size(), 4U)
+        << "tl.shfl_sync expects <mask, value, src_lane, width>.";
+    // HIP __shfl takes only (value, src_lane, width); the mask is ignored.
+    os << "__shfl(" << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2])
+       << ", " << PrintExpr(op->args[3]) << ")";
+  } else if (op->op.same_as(tl::shfl_xor_sync())) {
+    ICHECK_EQ(op->args.size(), 4U)
+        << "tl.shfl_xor_sync expects <mask, value, lane_mask, width>.";
+    os << "__shfl_xor(" << PrintExpr(op->args[1]) << ", "
+       << PrintExpr(op->args[2]) << ", " << PrintExpr(op->args[3]) << ")";
+  } else if (op->op.same_as(tl::shfl_down_sync())) {
+    ICHECK_EQ(op->args.size(), 4U)
+        << "tl.shfl_down_sync expects <mask, value, delta, width>.";
+    os << "__shfl_down(" << PrintExpr(op->args[1]) << ", "
+       << PrintExpr(op->args[2]) << ", " << PrintExpr(op->args[3]) << ")";
+  } else if (op->op.same_as(tl::shfl_up_sync())) {
+    ICHECK_EQ(op->args.size(), 4U)
+        << "tl.shfl_up_sync expects <mask, value, delta, width>.";
+    os << "__shfl_up(" << PrintExpr(op->args[1]) << ", "
+       << PrintExpr(op->args[2]) << ", " << PrintExpr(op->args[3]) << ")";
+  } else if (op->op.same_as(tl::match_any_sync()) ||
+             op->op.same_as(tl::match_all_sync())) {
+    LOG(FATAL) << "tl." << op->op << " is not supported on HIP: the "
+               << "__match_{any,all}_sync primitives have no HIP equivalent.";
+  } else if (op->op.same_as(tl::add2()) || op->op.same_as(tl::sub2()) ||
+             op->op.same_as(tl::mul2()) || op->op.same_as(tl::fma2()) ||
+             op->op.same_as(tl::max2()) || op->op.same_as(tl::min2()) ||
+             op->op.same_as(tl::abs2())) {
+    // Packed x2 element-wise math intrinsics.
+    // HIP currently only supports float32x2 (float2).
+    std::string op_name;
+    if (op->op.same_as(tl::add2()))
+      op_name = "add2";
+    else if (op->op.same_as(tl::sub2()))
+      op_name = "sub2";
+    else if (op->op.same_as(tl::mul2()))
+      op_name = "mul2";
+    else if (op->op.same_as(tl::fma2()))
+      op_name = "fma2";
+    else if (op->op.same_as(tl::max2()))
+      op_name = "max2";
+    else if (op->op.same_as(tl::min2()))
+      op_name = "min2";
+    else
+      op_name = "abs2";
+
+    os << "tl::" << op_name << "(";
+    os << PrintExpr(op->args[0]);
+    for (size_t i = 1; i < op->args.size(); ++i) {
+      os << ", " << PrintExpr(op->args[i]);
+    }
+    os << ")";
   } else if (op->op.same_as(tl::__ldg())) {
     // HIP fallback: regular load
     const BufferLoadNode *bl = op->args[0].as<BufferLoadNode>();
@@ -940,13 +1132,20 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
         {"float32", "float"},
         {"float64", "double"},
         {"float16x4", "float16x4"},
+        {"float16x8", "float16x8"},
         {"bfloat16x4", "bfloat16x4_vec"},
+        {"bfloat16x8", "bfloat16x8_vec"},
         {"float32x4", "float32x4"},
         {"float8_e4m3fnuzx4", "fp8_e4_4_t"},
+        {"float8_e4m3fnx4", "fp8_e4_4_t"},
         {"float8_e4m3fnuzx8", "long"},
+        {"float8_e4m3fnx8", "long"},
         {"float8_e5m2fnuzx4", "fp8_e5_4_t"},
         {"float8_e5m2fnuzx8", "long"},
-        {"float32x16", "float32x16"}};
+        {"float8_e5m2x4", "fp8_e5_4_t"},
+        {"float8_e5m2x8", "long"},
+        {"float32x16", "float32x16"},
+        {"float32x32", "float32x32"}};
     std::string call_mfma_code = R"({
       *((({C_dtype}*){c_ref}) + {c_bias}) = {mfma_buildin}(*((({A_dtype}*){a_ref}) + {a_bias}),
                     *((({B_dtype}*){b_ref}) + {b_bias}),
@@ -966,6 +1165,66 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("{c_ref}", c_ref);
     replacer.register_rule("{c_bias}", c_bias);
     os << replacer.rewrite(call_mfma_code);
+  } else if (op->op.same_as(tl::tvm_rdna_wmma())) {
+    // arg 0: shape string, e.g. "f32_16x16x16_f16_w32"
+    // arg 1: A layout: "row"/"col"
+    // arg 2: B layout: "row"/"col"
+    // arg 3: A dtype, e.g. "float16x8"
+    // arg 4: B dtype
+    // arg 5: C dtype, e.g. "float32x8"
+    // arg 6: A data pointer
+    // arg 7: A element index (in units of the vectorized type)
+    // arg 8: B data pointer
+    // arg 9: B element index
+    // arg 10: C data pointer
+    // arg 11: C element index
+    ICHECK(op->args.size() == 12U) << "tvm_rdna_wmma expects 12 arguments";
+    std::string shape = Downcast<StringImm>(op->args[0])->value;
+    std::string A_layout = Downcast<StringImm>(op->args[1])->value;
+    std::string B_layout = Downcast<StringImm>(op->args[2])->value;
+    std::string A_dtype = Downcast<StringImm>(op->args[3])->value;
+    std::string B_dtype = Downcast<StringImm>(op->args[4])->value;
+    std::string C_dtype = Downcast<StringImm>(op->args[5])->value;
+    std::string a_ref = this->PrintExpr(op->args[6]);
+    std::string a_bias = this->PrintExpr(op->args[7]);
+    std::string b_ref = this->PrintExpr(op->args[8]);
+    std::string b_bias = this->PrintExpr(op->args[9]);
+    std::string c_ref = this->PrintExpr(op->args[10]);
+    std::string c_bias = this->PrintExpr(op->args[11]);
+
+    // Determine wmma builtin name from shape
+    // shape = "f32_16x16x16_f16_w32" ->
+    // "__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12" For gfx12 targets use
+    // the _gfx12 suffix variant.
+    std::string wmma_builtin = "__builtin_amdgcn_wmma_" + shape + "_gfx12";
+
+    // Emit the WMMA call.
+    // Signature: v8f32 = wmma_builtin(v8f16 a, v8f16 b, v8f32 c)
+    // where v8f16 = __fp16 x 8, v8f32 = float x 8.
+    // A/B buffers hold half_t (fp16), C/D buffers hold float.
+    // Each element index accesses a packed vector of 8 elements.
+    //
+    // Using typedef'd vector types for the cast:
+    //   typedef __attribute__((__vector_size__(8 * sizeof(__fp16)))) __fp16
+    //   tl_v8f16; typedef __attribute__((__vector_size__(8 * sizeof(float))))
+    //   float tl_v8f32;
+    std::string call_wmma_code = R"({
+      typedef __attribute__((__vector_size__(8 * sizeof(__fp16)))) __fp16 tl_v8f16;
+      typedef __attribute__((__vector_size__(8 * sizeof(float)))) float tl_v8f32;
+      *((tl_v8f32*){c_ref} + {c_bias}) = {wmma_builtin}(
+          *((tl_v8f16*){a_ref} + {a_bias}),
+          *((tl_v8f16*){b_ref} + {b_bias}),
+          *((tl_v8f32*){c_ref} + {c_bias}));
+    })";
+    Replacer wmma_replacer;
+    wmma_replacer.register_rule("{wmma_builtin}", wmma_builtin);
+    wmma_replacer.register_rule("{a_ref}", a_ref);
+    wmma_replacer.register_rule("{a_bias}", a_bias);
+    wmma_replacer.register_rule("{b_ref}", b_ref);
+    wmma_replacer.register_rule("{b_bias}", b_bias);
+    wmma_replacer.register_rule("{c_ref}", c_ref);
+    wmma_replacer.register_rule("{c_bias}", c_bias);
+    os << wmma_replacer.rewrite(call_wmma_code);
   } else if (op->op.same_as(builtin::thread_return())) {
     os << "return";
   } else if (op->op.same_as(tl::tl_gemm())) {
@@ -1089,32 +1348,35 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
 }
 
 void CodeGenTileLangHIP::VisitStmt_(const AttrStmtNode *op) {
-  if (op->attr_key == tir::attr::async_commit_queue_scope) {
-    const IntImmNode *queue_id = op->value.as<IntImmNode>();
-    ICHECK(queue_id && queue_id->value == 0)
-        << "For CUDA, the index of an async queue must be 0.";
-    this->VisitStmt(op->body);
-    auto commit_group = Call(DataType::Void(), builtin::ptx_commit_group(), {});
-    this->VisitExpr(commit_group, this->stream);
-    return;
-  } else if (op->attr_key == tir::attr::async_wait_queue_scope) {
-    auto wait_attrs = GetAsyncWaitAttributes(op);
-    auto queue_id = wait_attrs.first.as<IntImmNode>();
-    ICHECK(queue_id && queue_id->value == 0)
-        << "For CUDA, the index of an async queue must be 0.";
-    auto wait_cnt = wait_attrs.second;
-    auto wait_group =
-        Call(DataType::Void(), builtin::ptx_wait_group(), {wait_cnt});
-    this->VisitExpr(wait_group, this->stream);
-    auto inner = op->body.as<AttrStmtNode>();
-    ICHECK(inner);
-    this->VisitStmt(inner->body);
+  if (op->attr_key == tl::attr::kLexicalAllocScope) {
+    PrintIndent();
+    stream << "{\n";
+    int scope = BeginScope();
+    PrintStmt(op->body);
+    EndScope(scope);
+    PrintIndent();
+    stream << "}\n";
     return;
   } else if (op->attr_key == "threadblock_swizzle_pattern") {
     this->PrintIndent();
-    const StringImmNode *pattern = op->value.as<StringImmNode>();
-    ICHECK(pattern);
-    this->stream << "const dim3 blockIdx = " << pattern->value << "();\n";
+    std::string func_name;
+    int panel_size = 0;
+    if (const auto *call = op->value.as<CallNode>()) {
+      if (call->op.same_as(tir::builtin::tvm_tuple()) &&
+          call->args.size() >= 2) {
+        const auto *name_node = call->args[0].as<StringImmNode>();
+        const auto *size_node = call->args[1].as<IntImmNode>();
+        ICHECK(name_node && size_node) << "threadblock_swizzle_pattern expects "
+                                          "tvm_tuple(device_func, panel_size)";
+        func_name = name_node->value;
+        panel_size = static_cast<int>(size_node->value);
+      }
+    }
+    ICHECK(!func_name.empty() && panel_size > 0)
+        << "threadblock_swizzle_pattern: failed to extract func_name and "
+           "panel_size";
+    this->stream << "const dim3 blockIdx = tl::" << func_name << "<"
+                 << panel_size << ">();\n";
     this->VisitStmt(op->body);
     return;
   }
@@ -1156,8 +1418,8 @@ void CodeGenTileLangHIP::VisitExpr_(const RampNode *op, std::ostream &os) {
   PrintType(op->dtype, os);
   os << "(";
   for (int i = 0; i < lanes; i++) {
-    os << "(" << PrintExpr(op->base) << ")"
-       << "+(" << PrintExpr(op->stride) << "*" << i << ")";
+    os << "(" << PrintExpr(op->base) << ")" << "+(" << PrintExpr(op->stride)
+       << "*" << i << ")";
     if (i != lanes - 1)
       os << ", ";
   }
@@ -1213,13 +1475,45 @@ void CodeGenTileLangHIP::VisitExpr_(const BroadcastNode *op,
   if (op->dtype.is_float() && op->dtype.bits() == 32 &&
       op->dtype.lanes() == 8) {
     std::string v = PrintExpr(op->value);
+    // HIP does not allow taking the address of a temporary, so use a union
+    // to reinterpret float2 as unsigned long long without UB or temp-address.
     os << "make_ulonglong4(";
     for (int i = 0; i < 4; ++i) {
       if (i != 0)
         os << ", ";
-      os << "*(unsigned long long*)&make_float2(" << v << ", " << v << ")";
+      os << "([&]{ union { float2 f; unsigned long long u; } _tmp;"
+         << " _tmp.f = make_float2(" << v << ", " << v
+         << "); return _tmp.u; }())";
     }
     os << ')';
+    return;
+  }
+
+  if (op->dtype.is_float() && op->dtype.bits() == 32 &&
+      (op->dtype.lanes() == 16 || op->dtype.lanes() == 32)) {
+    // float32x16/float32x32: GCC vector extension — initialize with compound
+    // literal.
+    std::string v = PrintExpr(op->value);
+    os << "(float32x" << op->dtype.lanes() << "){";
+    for (int i = 0; i < op->dtype.lanes(); ++i) {
+      if (i != 0)
+        os << ", ";
+      os << v;
+    }
+    os << "}";
+    return;
+  }
+
+  if (op->dtype.is_bfloat16() && op->dtype.lanes() == 16) {
+    // bfloat16x16: struct aggregate initializer.
+    std::string v = PrintExpr(op->value);
+    os << "bfloat16x16{";
+    for (int i = 0; i < 16; ++i) {
+      if (i != 0)
+        os << ", ";
+      os << v;
+    }
+    os << "}";
     return;
   }
 
@@ -1382,7 +1676,7 @@ void CodeGenTileLangHIP::PrintVecElemLoadExpr(DataType t, int i,
     return;
   }
 
-  if (t.is_bfloat16()) {
+  if (t.is_bfloat16() && t.lanes() != 16) {
     if (i == 0) {
       os << "make_";
       PrintType(t, os);
@@ -1398,6 +1692,30 @@ void CodeGenTileLangHIP::PrintVecElemLoadExpr(DataType t, int i,
         os << ")";
       }
     }
+    return;
+  }
+
+  if ((t.lanes() == 16 || t.lanes() == 32) && t.bits() == 32 && t.is_float()) {
+    // float32x16/float32x32: compound literal.
+    if (i == 0)
+      os << "(float32x" << t.lanes() << "){";
+    os << value;
+    if (i != t.lanes() - 1)
+      os << ",";
+    else
+      os << "}";
+    return;
+  }
+
+  if (t.lanes() == 16 && t.is_bfloat16()) {
+    // bfloat16x16: struct aggregate initializer.
+    if (i == 0)
+      os << "bfloat16x16{";
+    os << value;
+    if (i != t.lanes() - 1)
+      os << ",";
+    else
+      os << "}";
     return;
   }
 

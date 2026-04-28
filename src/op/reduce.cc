@@ -15,7 +15,10 @@
 #include "../op/parallel.h"
 #include "../target/utils.h"
 #include "../transform/loop_partition.h"
+#include "builtin.h"
 #include "tir/transforms/ir_utils.h"
+#include "tvm/ir/expr.h"
+#include "tvm/tir/expr.h"
 #include "tvm/tir/stmt.h"
 #include "utils.h"
 
@@ -31,15 +34,37 @@ using namespace tir;
 ReduceOp::ReduceOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   ObjectPtr<ReduceOpNode> node = tvm::ffi::make_object<ReduceOpNode>();
   // Accept BufferRegion/BufferLoad for src/dst
-  node->srcRegion_ = NormalizeToBufferRegion(args[0]);
-  node->dstRegion_ = NormalizeToBufferRegion(args[1]);
+  auto src_access = NormalizeToAccessRegion(args[0], kAccessRead);
+  auto dst_access = NormalizeToAccessRegion(args[1], kAccessReadWrite);
+  node->srcRegion_ = src_access.region;
+  node->dstRegion_ = dst_access.region;
+  node->SetAccessRegions({src_access, dst_access});
   node->src = node->srcRegion_->buffer;
   node->dst = node->dstRegion_->buffer;
   std::string reduce_type = args[2].as<StringImm>().value()->value;
   node->dim = args[3].as<IntImm>().value()->value;
   node->type = ReduceType(reduce_type);
   node->clear = args[4].as<Bool>().value();
+  // Optional annotation: "nan_propagate" — for fp16/bf16 max/min/absmax,
+  // when true, lower to CUDA __hmax_nan/__hmin_nan so NaNs propagate.
+  if (auto opt = annotations.Get("nan_propagate")) {
+    if (auto b = opt.value().as<Bool>()) {
+      node->nan_propagate = b.value();
+    } else if (auto i = opt.value().as<IntImm>()) {
+      node->nan_propagate = i.value()->value != 0;
+    }
+  }
   data_ = std::move(node);
+}
+
+AccessRegions ReduceOpNode::GetAccessRegions() const {
+  AccessRegions result;
+  result.reads.push_back(srcRegion_);
+  if (!clear) {
+    result.reads.push_back(dstRegion_);
+  }
+  result.writes.push_back(dstRegion_);
+  return result;
 }
 
 TileOperator ReduceOpNode::Clone() const {
@@ -105,15 +130,26 @@ PrimExpr ReduceOpNode::MakeReduce(const PrimExpr &acc,
   if (acc->dtype != rhs->dtype) {
     rhs = Cast(acc->dtype, rhs);
   }
+  const bool use_nan_op =
+      nan_propagate && (acc.dtype().is_float16() || acc.dtype().is_bfloat16());
   if (type->isSum()) {
     return acc + rhs;
   } else if (type->isAbsSum()) {
     return acc + Max(rhs, -rhs);
   } else if (type->isMax()) {
+    if (use_nan_op) {
+      return Call(acc.dtype(), tl::max_nan(), {acc, rhs});
+    }
     return Max(acc, rhs);
   } else if (type->isMin()) {
+    if (use_nan_op) {
+      return Call(acc.dtype(), tl::min_nan(), {acc, rhs});
+    }
     return Min(acc, rhs);
   } else if (type->isAbsMax()) {
+    if (use_nan_op) {
+      return Call(acc.dtype(), tl::max_nan(), {acc, tvm::abs(rhs)});
+    }
     return Max(acc, tvm::abs(rhs));
   } else if (type->isBitAnd()) {
     return acc & rhs;
@@ -127,16 +163,18 @@ PrimExpr ReduceOpNode::MakeReduce(const PrimExpr &acc,
 }
 
 std::string ReduceOpNode::MakeCodegenReducer() const {
+  const bool use_nan_op =
+      nan_propagate && (dst->dtype.is_float16() || dst->dtype.is_bfloat16());
   if (type->isSum()) {
     return "tl::SumOp";
   } else if (type->isAbsSum()) {
     return "tl::SumOp";
   } else if (type->isMax()) {
-    return "tl::MaxOp";
+    return use_nan_op ? "tl::MaxOpNan" : "tl::MaxOp";
   } else if (type->isMin()) {
-    return "tl::MinOp";
+    return use_nan_op ? "tl::MinOpNan" : "tl::MinOp";
   } else if (type->isAbsMax()) {
-    return "tl::MaxOp";
+    return use_nan_op ? "tl::MaxOpNan" : "tl::MaxOp";
   } else if (type->isBitAnd()) {
     return "tl::BitAndOp";
   } else if (type->isBitOr()) {
@@ -349,15 +387,49 @@ Stmt ReduceOpNode::LowerWarpReduce(const LowerArgs &T, arith::Analyzer *analyzer
   return body;
 }
 
+static Array<PrimExpr> InputPlaceholders(size_t n) {
+  Array<PrimExpr> result;
+  result.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    result.push_back(InputPlaceholder(i));
+  }
+  return result;
+}
+
+static Fragment ComputeReducerLayout(const Fragment &src_layout, int dim) {
+  PrimExpr src_rep_extent = src_layout->ReplicateExtent();
+  PrimExpr indice_rep_extent = src_layout->InputShape()[dim];
+  PrimExpr reducer_rep_extent = indice_rep_extent * src_rep_extent;
+
+  auto fwd = InputPlaceholders(src_layout->InputDim() - 1);
+  fwd.insert(fwd.begin() + dim,
+             FloorMod(ReplicationPlaceholder(), indice_rep_extent));
+
+  auto thd = src_layout->ForwardThread(
+      fwd, FloorDiv(ReplicationPlaceholder(), indice_rep_extent));
+
+  auto reducer_shape = src_layout->InputShape();
+  reducer_shape.erase(reducer_shape.begin() + dim);
+  if (reducer_shape.empty()) {
+    reducer_shape.push_back(1);
+  }
+
+  auto reducer_layout =
+      Fragment(reducer_shape, {}, thd, reducer_rep_extent, std::nullopt)
+          ->CondenseReplicateVar()
+          ->BindThreadRange(src_layout->ThreadRange());
+  return reducer_layout;
+}
+
 /**
  * @brief Lower the Reduce operator to a TIR statement.
  *
  * Lowers a ReduceOpNode operating on fragment-scoped buffers into a sequence of
  * TIR statements implementing: optional initialization, thread-local reduction
  * (unrolled inner loops), inter-thread reduction via a runtime AllReduce call
- * (Hopper-specific `run_hopper` variant when TargetIsHopper(T.target) is true),
- * and an optional accumulation or copy back to the destination buffer when a
- * temporary clear buffer is used.
+ * (Hopper targets use `NamedBarrier` instead of the default
+ * `SyncThreadsBarrier`), and an optional accumulation or copy back to the
+ * destination buffer when a temporary clear buffer is used.
  *
  * Behavior notes:
  * - Only supports src and dst in "local.fragment" scope; otherwise it checks
@@ -370,7 +442,7 @@ Stmt ReduceOpNode::LowerWarpReduce(const LowerArgs &T, arith::Analyzer *analyzer
  * reduction.
  * - Performs iterator compression for local reduction loops using `analyzer`.
  * - Detects parallel thread splitting from the normalized iterator sum and
- *   emits a call to a templated `tl::AllReduce<...>::run` (or `run_hopper`)
+ *   emits a call to a templated `tl::AllReduce<...>::run`
  *   via `builtin::call_extern`. For sufficiently large reducing thread counts
  *   (> 32) a workspace is allocated via T.AddWorkspace and passed to the
  *   AllReduce call.
@@ -386,6 +458,13 @@ Stmt ReduceOpNode::LowerWarpReduce(const LowerArgs &T, arith::Analyzer *analyzer
  * @return Stmt Lowered TIR statement implementing the reduction.
  */
 Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
+  if (nan_propagate && (dst->dtype.is_float16() || dst->dtype.is_bfloat16()) &&
+      !TargetIsCuda(T.target)) {
+    LOG(FATAL) << "ReduceOp: nan_propagate=True for fp16/bf16 max/min/absmax "
+                  "is only supported on CUDA targets (requires "
+                  "__hmax_nan/__hmin_nan intrinsics). Target was: "
+               << T.target->str();
+  }
   auto get_buffer = [&](const Buffer &buf) {
     if (T.buffer_remap.count(buf))
       return T.buffer_remap[buf];
@@ -401,14 +480,16 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   auto dst_scope = this->dst.scope();
 
   if (src_scope == "local.fragment" && dst_scope == "local.fragment") {
-    Buffer src_buffer = get_buffer(this->src);
-    Buffer dst_buffer = get_buffer(this->dst);
-    Fragment src_layout = T.layout_map[this->src].as<Fragment>().value();
-    Fragment dst_layout = T.layout_map[this->dst].as<Fragment>().value();
-    size_t src_dim = src_layout->InputDim();
-    size_t dst_dim = dst_layout->InputDim();
 
-    bool is_1d_reduce = src_dim == dst_dim && dst_dim == 1;
+    auto src_buffer = get_buffer(this->src);
+    auto dst_buffer = get_buffer(this->dst);
+    auto src_layout = T.layout_map[this->src].as<Fragment>().value();
+    auto dst_layout = T.layout_map[this->dst].as<Fragment>().value();
+    auto red_layout = ComputeReducerLayout(src_layout, dim);
+    auto src_dim = src_layout->InputDim();
+    auto dst_dim = dst_layout->InputDim();
+
+    auto is_1d_reduce = src_dim == dst_dim && dst_dim == 1;
 
     if (is_1d_reduce) {
       ICHECK(is_one(dst_layout->OutputShape().back()))
@@ -432,60 +513,86 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     IterVar reduce_iv(reduce_dom, Var("rv"), IterVarType::kDataPar);
     src_vars.insert(src_vars.begin() + this->dim, reduce_iv);
 
-    Array<PrimExpr> src_indices = src_layout->Forward(
+    auto src_indices = src_layout->Forward(
         src_vars.Map([](const auto &iv) { return PrimExpr(iv->var); }));
-    Array<PrimExpr> dst_indices = dst_layout->Forward(
+    auto dst_indices = dst_layout->Forward(
+        dst_vars.Map([](const auto &iv) { return PrimExpr(iv->var); }));
+    auto red_indices = red_layout->Forward(
         dst_vars.Map([](const auto &iv) { return PrimExpr(iv->var); }));
 
     Array<Stmt> stmts;
 
-    bool require_init = this->clear;
+    auto require_init = this->clear;
     if (this->type->isSum() || this->type->isAbsSum() ||
         this->type->isBitAnd() || this->type->isBitOr() ||
         this->type->isBitXor()) {
       require_init = true;
     }
 
-    Buffer clear_buffer = dst_buffer;
-    bool need_duplicate = false;
+    auto clear_buffer = dst_buffer;
+    auto need_duplicate = false;
+    auto need_update = false;
     if ((this->type->isSum() || this->type->isAbsSum()) && !this->clear) {
       need_duplicate = true;
+      need_update = true;
     } else if (this->type->isBitAnd() && !this->clear) {
       need_duplicate = true;
+      need_update = true;
     } else if ((this->type->isBitOr() || this->type->isBitXor()) &&
                !this->clear) {
       need_duplicate = true;
+      need_update = true;
+    } else if ((this->type->isMax() || this->type->isMin() ||
+                this->type->isAbsMax()) &&
+               !this->clear) {
+      need_duplicate = true;
+      need_update = true;
     }
+
+    // red_layout should always contain dst_layout
+    // if we can prove they are the same, no need to duplicate buffer
+    // otherwise, red_layout contains more replicated dimensions than dst_layout
+    if (!analyzer->CanProve(dst_layout->ReplicateExtent() ==
+                            red_layout->ReplicateExtent())) {
+      need_duplicate = true;
+    }
+    ICHECK(!analyzer->CanProve(dst_layout->ReplicateExtent() >
+                               red_layout->ReplicateExtent()))
+        << "Inconsistent layouts between src and dst in ReduceOp: "
+        << "dst_layout=" << dst_layout << "red_layout=" << red_layout;
 
     if (need_duplicate) {
       // Create a new buffer with same shape and dtype as dst_buffer
-      clear_buffer = decl_buffer(dst_buffer->shape, dst_buffer->dtype,
+      clear_buffer = decl_buffer(red_layout->OutputShape(), dst_buffer->dtype,
                                  dst_buffer->name + "_clear",
                                  GetPtrStorageScope(dst_buffer->data));
     }
     // make reduce-init stmt
-    if (require_init) {
+    // For max/min/absmax with clear=false and need_duplicate, we still need to
+    // initialize the temporary buffer with identity values since the original
+    // dst values will be combined later via need_update
+    if (require_init ||
+        (need_duplicate && (this->type->isMax() || this->type->isMin() ||
+                            this->type->isAbsMax()))) {
       stmts.push_back(
-          BufferStore(clear_buffer, this->MakeInitValue(), dst_indices));
+          BufferStore(clear_buffer, this->MakeInitValue(), red_indices));
     }
 
     // make thread-local reduce
     Array<PrimExpr> src_indice_compressed;
     Array<IterVar> src_var_compressed;
     for (size_t i = 0; i < src_layout->OutputDim(); ++i) {
-      PrimExpr expr;
-      IterVar var;
-      std::tie(expr, var) = CompressIterator(
-          src_indices[i], src_vars, src_vars[this->dim]->var, analyzer);
+      auto [expr, var] = CompressIterator(src_indices[i], src_vars,
+                                          src_vars[this->dim]->var, analyzer);
       src_indice_compressed.push_back(expr);
       src_var_compressed.push_back(var);
     }
 
     Stmt reduce_local = BufferStore(
         clear_buffer,
-        this->MakeReduce(BufferLoad(clear_buffer, dst_indices),
+        this->MakeReduce(BufferLoad(clear_buffer, red_indices),
                          BufferLoad(src_buffer, src_indice_compressed)),
-        dst_indices);
+        red_indices);
 
     for (int i = static_cast<int>(src_layout->OutputDim()) - 1; i >= 0; --i) {
       reduce_local =
@@ -495,14 +602,25 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     }
     stmts.push_back(reduce_local);
 
-    PrimExpr src_thread = src_layout->ForwardThread(
+    auto src_thread = src_layout->ForwardThread(
         src_vars.Map([](const auto &iv) { return PrimExpr(iv->var); }), {});
     auto iter_sum =
         arith::NormalizeToIterSum(src_thread, ToVMap(src_vars), analyzer);
     for (const auto &iter_split : iter_sum->args) {
       auto mark = iter_split->source->source.as<Var>();
-      ICHECK(mark) << "Not a normalized iterator: " << iter_split->source;
+      if (!mark)
+        continue;
       if (mark.value().same_as(src_vars[this->dim]->var)) {
+        // `scale` is the stride of participating threads in the thread index
+        // space.  When the thread-to-data mapping for the reduce dimension is
+        // normalized as  threadIdx = source * scale + ...,
+        //   * scale == 1  means threads are contiguous (0, 1, 2, ...),
+        //   * scale  > 1  means threads are interleaved (0, scale, 2*scale,
+        //     ...).
+        // Both cases use the recursive XOR-butterfly reduce.
+        // `extent` is the number of distinct thread positions along the reduce
+        // dimension, so reducing_threads = extent * scale covers the full
+        // thread index range that participates in the reduction.
         auto scale = as_const_int(iter_split->scale);
         auto extent = as_const_int(iter_split->extent);
         ICHECK(scale != nullptr && extent != nullptr);
@@ -513,49 +631,91 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         std::stringstream ss;
 
         auto thread_offset = T.thread_bounds->min;
-        if (TargetIsHopper(T.target) || TargetIsSm100(T.target) ||
-            TargetIsSM120(T.target)) {
+        if (TargetHasSMVersionGE(T.target, 90)) {
           auto all_threads = T.thread_bounds->extent;
           ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
              << reducing_threads << ", " << (*scale) << ", " << thread_offset
-             << ", " << all_threads << ">::run_hopper";
+             << ", tl::NamedBarrier<" << all_threads << ">>::run";
         } else {
           ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
              << reducing_threads << ", " << (*scale) << ", " << thread_offset
              << ">::run";
         }
         Array<PrimExpr> thread_reduce_args = {
-            StringImm(ss.str()), BufferLoad(clear_buffer, dst_indices)};
+            StringImm(ss.str()), BufferLoad(clear_buffer, red_indices)};
+        // The butterfly reduce path needs one shared-memory slot per
+        // thread in the block.
         if (reducing_threads > 32) {
-          PrimExpr workspace = T.AddWorkspace(
-              *as_const_int(T.thread_bounds->extent), clear_buffer->dtype);
+          int workspace_size =
+              static_cast<int>(*as_const_int(T.thread_bounds->extent));
+          PrimExpr workspace =
+              T.AddWorkspace(workspace_size, clear_buffer->dtype);
           thread_reduce_args.push_back(workspace);
         }
         auto call = Call(clear_buffer->dtype, builtin::call_extern(),
                          thread_reduce_args);
-        stmts.push_back(BufferStore(clear_buffer, call, dst_indices));
+        stmts.push_back(BufferStore(clear_buffer, call, red_indices));
       }
     }
 
+    // Layout status in the loop:
+    //     clear_buffer: red_layout
+    //     dst_buffer:   dst_layout
+    //     loop_layout:  red_layout
+    // At each step of the loop, we do reduction on
+    // `clear_buffer[red_layout(loop_idx)]`
+    //   and then transfer it to `dst_buffer[dst_layout(loop_idx)]`
+    // However, since the red_layout is larger than dst_layout, not all write
+    // operations are valid We need to add predicate to guard the write
+    // operations
+    PrimExpr predicate = Bool(true);
+    {
+      // dst_indices is the same as loop_indices
+      auto dst_th_indices = dst_indices;
+      dst_th_indices.push_back(T.thread_var);
+      // 1. compute loop_idx based on thread: [dst_indices, T.thread_var] =>
+      // [loop_indices]
+      auto inv = dst_layout->Inverse()->Forward(dst_th_indices);
+      inv.pop_back(); // remove replicate var
+      // 2. ensure computed loop_idx maps back to the same [loop_indices]
+      for (int i = 0; i < static_cast<int>(dst_layout->InputDim()); i++) {
+        predicate = predicate && (inv[i] == dst_vars[i]->var);
+      }
+      // 3. simplify predicate
+      predicate = analyzer->Simplify(predicate);
+    }
     if (need_duplicate) {
-      PrimExpr src_val = BufferLoad(clear_buffer, dst_indices);
-      PrimExpr dst_val = BufferLoad(dst_buffer, dst_indices);
       PrimExpr update;
-      if (this->type->isSum() || this->type->isAbsSum()) {
-        update = dst_val + src_val;
-      } else if (this->type->isBitAnd()) {
-        update = this->clear ? src_val : bitwise_and(dst_val, src_val);
-      } else if (this->type->isBitOr()) {
-        update = bitwise_or(dst_val, src_val);
-      } else if (this->type->isBitXor()) {
-        update = bitwise_xor(dst_val, src_val);
+      if (need_update) {
+        auto src_val = BufferLoad(clear_buffer, red_indices);
+        auto dst_val = BufferLoad(dst_buffer, dst_indices);
+        if (this->type->isSum() || this->type->isAbsSum()) {
+          update = dst_val + src_val;
+        } else if (this->type->isBitAnd()) {
+          update = this->clear ? src_val : bitwise_and(dst_val, src_val);
+        } else if (this->type->isBitOr()) {
+          update = bitwise_or(dst_val, src_val);
+        } else if (this->type->isBitXor()) {
+          update = bitwise_xor(dst_val, src_val);
+        } else if (this->type->isMax() || this->type->isAbsMax()) {
+          update = Max(dst_val, src_val);
+        } else if (this->type->isMin()) {
+          update = Min(dst_val, src_val);
+        } else {
+          LOG(FATAL) << "Unsupported reduce type: " << this->type->type;
+        }
       } else {
-        LOG(FATAL) << "Unsupported reduce type: " << this->type->type;
+        update = BufferLoad(clear_buffer, red_indices);
       }
-      stmts.push_back(BufferStore(dst_buffer, update, dst_indices));
+      auto store = BufferStore(dst_buffer, update, dst_indices);
+      if (analyzer->CanProve(predicate)) {
+        stmts.push_back(store);
+      } else {
+        stmts.push_back(IfThenElse(predicate, store));
+      }
     }
 
-    Stmt body = stmts.size() > 1 ? SeqStmt(stmts) : stmts[0];
+    auto body = stmts.size() > 1 ? SeqStmt(stmts) : stmts[0];
     for (int i = static_cast<int>(dst_layout->InputDim()) - 1; i >= 0; --i) {
       body = For(dst_vars[i]->var, 0, dst_vars[i]->dom->extent,
                  ForKind::kParallel, body);
@@ -563,9 +723,10 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
     if (dst_layout->InputDim() > 0) {
       body = PartitionLoop(Downcast<For>(body), T.thread_var, analyzer,
-                           dst_layout);
+                           red_layout);
+      body = PragmaUnrollLoop(Downcast<For>(body));
     } else {
-      PrimExpr guard = (T.thread_var == T.thread_bounds->min);
+      auto guard = (T.thread_var == T.thread_bounds->min);
       body = IfThenElse(guard, body);
     }
 
@@ -590,7 +751,7 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &T,
       T.layout_map.count(src)) {
     auto src_layout = T.layout_map[src].as<Fragment>().value();
 
-    // For warp reduce (dim == -1), src and dst have the same layout
+    // Warp-level reduce (dim == -1): src and dst share the same layout.
     if (dim == -1) {
       Fragment dst_layout = src_layout;
 
@@ -611,97 +772,32 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &T,
       return {};
     }
 
-    PrimExpr indice_rep_extent = src->shape[dim];
-    PrimExpr src_rep_extent = src_layout->ReplicateExtent();
-    PrimExpr dest_buffer_rep_extent = indice_rep_extent * src_rep_extent;
+    auto reducer_layout = ComputeReducerLayout(src_layout, this->dim);
 
-    Array<PrimExpr> fwd;
-    for (int i = 0; i < static_cast<int>(src->shape.size()); i++) {
-      if (i == dim) {
-        fwd.push_back(FloorMod(ReplicationPlaceholder(), indice_rep_extent));
-      } else if (i < dim) {
-        fwd.push_back(InputPlaceholder(i));
-      } else if (i > dim) {
-        fwd.push_back(InputPlaceholder(i - 1));
-      }
-    }
-    auto thd = src_layout->ForwardThread(
-        fwd, FloorDiv(ReplicationPlaceholder(), indice_rep_extent));
-
-    // Ensure the thread count is divisible by the replicate extent.
-    // Otherwise, we cannot infer a valid fragment<->fragment layout.
-    {
-      arith::Analyzer analyzer;
-      PrimExpr num_threads = T.thread_bounds->extent;
-      // Though the dest_buffer_rep_extent will be compressed at
-      // CondenseReplicateVar, we need to check the divisibility here to avoid
-      // the issue that the thread count is not divisible by the replicate
-      // extent.
-      if (!analyzer.CanProve(FloorMod(num_threads, dest_buffer_rep_extent) ==
-                             0) &&
-          !analyzer.CanProve(FloorMod(dest_buffer_rep_extent, num_threads) ==
-                             0)) {
-        ICHECK(false) << "ReduceOp fragment layout inference failed: "
-                         "num_threads % replicate_extent != 0. "
-                      << "This mapping requires the block's thread count to be "
-                         "divisible by the "
-                      << "replicate extent. "
-                      << "Try one of: (1) choose a thread block size divisible "
-                         "by replicate_extent; "
-                      << "(2) pick a different reduce dimension or adjust the "
-                         "source fragment layout; "
-                      << "Details: num_threads=" << num_threads
-                      << ", replicate_extent=" << indice_rep_extent
-                      << ", src=" << src << ", dst=" << dst;
-      }
+    if (!T.layout_map.count(dst)) {
+      return {{dst, reducer_layout}};
     }
 
-    Fragment dst_layout =
-        Fragment(dst->shape, {}, thd, dest_buffer_rep_extent, std::nullopt)
-            ->CondenseReplicateVar()
-            ->BindThreadRange(T.thread_bounds);
+    auto orig_dst_layout = T.layout_map.Get(dst).value().as<Fragment>().value();
+    ICHECK(reducer_layout->InputDim() == orig_dst_layout->InputDim());
 
-    if (!T.layout_map.count(dst))
-      return {{dst, dst_layout}};
-    else {
-      // Check if computed layout is compatible with existing: the existing one
-      // must strictly contains the computed layout
-      auto orig_dst_layout =
-          T.layout_map.Get(dst).value().as<Fragment>().value();
-      ICHECK(dst_layout->InputDim() == orig_dst_layout->InputDim());
-      Array<PrimExpr> indices;
-      indices.reserve(dst_layout->InputDim());
-      arith::Analyzer inner_analyzer;
-      for (int i = 0; i < dst_layout->InputDim(); ++i) {
-        auto x = InputPlaceholder(i);
-        indices.push_back(x);
-        // should be literal - literal = 0, any analyzer will work
-        ICHECK(is_zero(inner_analyzer.Simplify(
-            dst_layout->InputShape()[i] - orig_dst_layout->InputShape()[i])));
-        inner_analyzer.Bind(x, Range(0, dst_layout->InputShape()[i]));
-      }
-
-      ICHECK(as_const_int(dst_layout->ReplicateExtent()));
-      ICHECK(as_const_int(src_layout->ReplicateExtent()));
-      auto dst_rep = *as_const_int(dst_layout->ReplicateExtent());
-      auto src_rep = *as_const_int(src_layout->ReplicateExtent());
-
-      // For normal reduce, check one direction
-      if (dst_rep < src_rep ||
-          !ProveFragmentContains(orig_dst_layout, dst_layout, indices, indices,
-                                 inner_analyzer)) {
-        std::ostringstream oss;
-        oss << "Layout may conflict with ReduceOp for buffer " << dst << " vs. "
-            << src << "\nLHS = " << src_layout->DebugOutput()
-            << "\nRHS = " << orig_dst_layout->DebugOutput()
-            << "\nYou may need to use a shared memory to transform the "
-               "layout";
-        throw LayoutConflictException(oss.str());
-      }
-
-      if (dst_rep > src_rep) {
-        return {{dst, dst_layout}};
-      }
+    auto indices = InputPlaceholders(reducer_layout->InputDim());
+    arith::Analyzer analyzer;
+    for (size_t i = 0; i < indices.size(); i++) {
+      analyzer.Bind(Downcast<Var>(indices[i]),
+                    Range(0, reducer_layout->InputShape()[i]));
+    }
+    if (!ProveFragmentContains(orig_dst_layout, reducer_layout, indices,
+                               indices, analyzer)) {
+      std::ostringstream oss;
+      oss << "Layout may conflict with ReduceOp for buffer " << dst << " vs. "
+          << src << "\n"
+          << "src_layout = " << src_layout << "\n"
+          << "reducer_layout = " << reducer_layout << "\n"
+          << "orig_dst_layout = " << orig_dst_layout << "\n"
+          << "You may need to use a shared memory to transform the "
+             "layout";
+      throw LayoutConflictException(oss.str());
     }
   }
   return {};
@@ -732,8 +828,11 @@ CumSumOp::CumSumOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   ObjectPtr<CumSumOpNode> node = tvm::ffi::make_object<CumSumOpNode>();
   // node->src = vmap[GetVarFromAccessPtr(args[0])];
   // node->dst = vmap[GetVarFromAccessPtr(args[1])];
-  node->srcRegion_ = NormalizeToBufferRegion(args[0]);
-  node->dstRegion_ = NormalizeToBufferRegion(args[1]);
+  auto src_access = NormalizeToAccessRegion(args[0], kAccessRead);
+  auto dst_access = NormalizeToAccessRegion(args[1], kAccessWrite);
+  node->srcRegion_ = src_access.region;
+  node->dstRegion_ = dst_access.region;
+  node->SetAccessRegions({src_access, dst_access});
   node->src = node->srcRegion_->buffer;
   node->dst = node->dstRegion_->buffer;
   node->dim = args[2].as<IntImm>().value()->value;
@@ -750,9 +849,8 @@ Stmt CumSumOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   if (IsFragmentBuffer(this->src) && IsFragmentBuffer(this->dst)) {
     LOG(FATAL) << "CumSum for fragment not implemented, please raise an issue "
                   "if you need this feature.";
-  } else if (this->src.scope() == "shared.dyn" ||
-             this->src.scope() == "shared") {
-    ICHECK(this->dst.scope() == "shared.dyn" || this->dst.scope() == "shared");
+  } else if (IsSharedBuffer(this->src)) {
+    ICHECK(IsSharedBuffer(this->dst));
     std::stringstream ss;
     auto threads = T.thread_bounds->extent;
     Array<PrimExpr> args;

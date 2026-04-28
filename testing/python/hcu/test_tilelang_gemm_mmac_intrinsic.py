@@ -216,7 +216,7 @@ def assert_tl_matmul_correctness(M,
                              B.T.to(torch.float32)).to(getattr(torch, out_dtype))
     elif a_transposed and not b_transposed:
         # Get Reference Result
-        ref_c = torch.matmul(A.Tto(torch.float32),
+        ref_c = torch.matmul(A.T.to(torch.float32),
                              B.to(torch.float32)).to(getattr(torch, out_dtype))
     elif not a_transposed and b_transposed:
         # Get Reference Result

@@ -74,9 +74,11 @@ DataType DTypeFromString(const std::string str) {
     return DataType::kInt64;
   } else if (str == "uint64" || str == ".u64") {
     return DataType::kUInt64;
-  } else if (str == "float8_e4m3" || str == "e4m3" || str == ".e4m3") {
+  } else if (str == "float8_e4m3" || str == "float8_e4m3fn" || str == "e4m3" ||
+             str == ".e4m3") {
     return DataType::kFloat8_e4m3;
-  } else if (str == "float8_e5m2" || str == "e5m2" || str == ".e5m2") {
+  } else if (str == "float8_e5m2" || str == "float8_e5m2fn" || str == "e5m2" ||
+             str == ".e5m2") {
     return DataType::kFloat8_e5m2;
   } else if (str == "float16" || str == "fp16" || str == ".f16") {
     return DataType::kFloat16;
@@ -1427,7 +1429,7 @@ std::string PrintCpAsyncBulkAsm(const std::string &shared_ptr,
     unsigned int smem_addr_int = cast_smem_ptr_to_int({smem_addr});
     unsigned int barrier_addr_int = cast_smem_ptr_to_int({barrier});
     __asm__ __volatile__(
-      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+      "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
       :: "r"(smem_addr_int), "l"({global_ptr}), "r"({bytes}), "r"(barrier_addr_int)
       : "memory"
     );

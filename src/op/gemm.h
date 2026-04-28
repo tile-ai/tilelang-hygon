@@ -40,7 +40,15 @@ inline const char *GemmWarpPolicyTypeToString(GemmWarpPolicyType type) {
 }
 
 // Target GEMM instruction
-enum class GemmInst : uint8_t { kMMA, kWGMMA, kTCGEN5MMA, kMFMA };
+enum class GemmInst : uint8_t {
+  kMMA,
+  kWGMMA,
+  kTCGEN5MMA,
+  kMFMA,
+  kScalar,
+  kWMMA,
+  kHCUMMAC, ///< AMD HCU matrix core (distinct from CDNA MFMA; Python GemmHCUMMAC)
+};
 
 /// Convert GemmInst enum to string for debugging
 inline const char *GemmInstToString(GemmInst inst) {
@@ -53,6 +61,12 @@ inline const char *GemmInstToString(GemmInst inst) {
     return "TCGEN5MMA";
   case GemmInst::kMFMA:
     return "MFMA";
+  case GemmInst::kScalar:
+    return "Scalar";
+  case GemmInst::kWMMA:
+    return "WMMA";
+  case GemmInst::kHCUMMAC:
+    return "HCUMMAC";
   default:
     return "Unknown";
   }
@@ -128,9 +142,49 @@ public:
   }
 };
 
+/// MLS / HCU lowering hints extracted in C++ (PropagationTirCollector) and
+/// passed into Python GEMM lowering when target is HCU.
+class GemmHcuLoweringMetaNode : public Object {
+public:
+  int a_from_mls{0};
+  int b_from_mls{0};
+  int a_mls_trans{0};
+  int b_mls_trans{0};
+  int mls_tile_m{-1};
+  int mls_tile_ka{-1};
+  int mls_tile_n{-1};
+  int mls_tile_kb{-1};
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.GemmHcuLoweringMeta",
+                                    GemmHcuLoweringMetaNode, Object);
+
+  static void RegisterReflection() {
+    namespace refl = tvm::ffi::reflection;
+    refl::ObjectDef<GemmHcuLoweringMetaNode>()
+        .def_ro("a_from_mls", &GemmHcuLoweringMetaNode::a_from_mls)
+        .def_ro("b_from_mls", &GemmHcuLoweringMetaNode::b_from_mls)
+        .def_ro("a_mls_trans", &GemmHcuLoweringMetaNode::a_mls_trans)
+        .def_ro("b_mls_trans", &GemmHcuLoweringMetaNode::b_mls_trans)
+        .def_ro("mls_tile_m", &GemmHcuLoweringMetaNode::mls_tile_m)
+        .def_ro("mls_tile_ka", &GemmHcuLoweringMetaNode::mls_tile_ka)
+        .def_ro("mls_tile_n", &GemmHcuLoweringMetaNode::mls_tile_n)
+        .def_ro("mls_tile_kb", &GemmHcuLoweringMetaNode::mls_tile_kb);
+  }
+};
+
+class GemmHcuLoweringMeta : public ObjectRef {
+public:
+  explicit GemmHcuLoweringMeta(ObjectPtr<GemmHcuLoweringMetaNode> ptr)
+      : ObjectRef(std::move(ptr)) {}
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(GemmHcuLoweringMeta, ObjectRef,
+                                                GemmHcuLoweringMetaNode);
+};
+
 class GemmNode : public TileOperatorNode {
 public:
   bool checkWgmma() const;
+  bool allowTcgen5Mma(Target target) const;
+  bool allowWgmma(int block_size, Target target) const;
   tir::Buffer a_, b_, c_;
   // BufferRegion for A, B and C
   BufferRegion aRegion_, bRegion_, cRegion_;
@@ -139,14 +193,17 @@ public:
   int strideA_, strideB_;
   int offsetA_, offsetB_;
   PrimExpr clearAccum_ = const_false();
+  tir::BufferLoad mbar_; // mbar is optional, only used for TCGEN5MMA
+  Array<PrimExpr> cCoords_;
   // k_pack please ref to bitblas/tl/mfma_macro_generator.py::k_pack
   // only will be enabled under cdna mfma instructions
   int kPack_ = 1;
   int wgWait_ = 0;
-  BufferRegion mbarRegion_;
-  std::optional<tir::Buffer> mbar_; // mbar is optional, only used for TCGEN5MMA
-  Array<PrimExpr> cCoords_;
+  bool isWgmma_ = false;
+  bool isTcgen05_ = false;
   mutable GemmWarpPolicy policy_;
+  Map<String, ObjectRef> annotations_;
+
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Gemm", GemmNode, TileOperatorNode);
 
   static void RegisterReflection() {
@@ -168,23 +225,26 @@ public:
         .def_ro("offsetA", &GemmNode::offsetA_)
         .def_ro("offsetB", &GemmNode::offsetB_)
         .def_ro("clearAccum", &GemmNode::clearAccum_)
+        .def_ro("mbar", &GemmNode::mbar_)
+        .def_ro("cCoords", &GemmNode::cCoords_)
         .def_ro("kPack", &GemmNode::kPack_)
         .def_ro("wgWait", &GemmNode::wgWait_)
-        .def_ro("policy", &GemmNode::policy_);
+        .def_ro("isWgmma", &GemmNode::isWgmma_)
+        .def_ro("isTcgen05", &GemmNode::isTcgen05_)
+        .def_ro("policy", &GemmNode::policy_)
+        .def_ro("annotations", &GemmNode::annotations_);
   }
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
   LayoutMap InferLayout(const LayoutInferArgs &T,
                         InferLevel level) const override;
+  AccessRegions GetAccessRegions() const override;
 
   TileOperator Clone() const override;
 
   GemmInst getGemmInst(int block_size, Target target) const;
 
 private:
-  bool allowTcgen5Mma(Target target) const;
-  bool allowWgmma(int block_size, Target target) const;
-
   mutable bool completed_ = false;
 };
 
