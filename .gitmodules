@@ -7,4 +7,4 @@
 [submodule "3rdparty/composable_kernel"]
 	path = 3rdparty/composable_kernel
 	# url = https://github.com/ROCm/composable_kernel
-	url = ssh://git@10.16.6.30:10022/dcutoolkit/deeplearing/composable_kernel
+	url = http://42.228.13.241:10068/dcutoolkit/deeplearing/composable_kernel
