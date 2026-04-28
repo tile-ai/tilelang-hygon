@@ -1140,10 +1140,9 @@ TVM_FFI_STATIC_INIT_BLOCK() {
              return makeSwizzledLayout(buffer, k_inner, allow_pad);
            })
       .def("tl.make_hcu_swizzled_layout",
-      [](int stride, int continuous, int element_size, int inner_pack = 1) {
-          return makeGemmABLayoutCDNA(stride, continuous,
-                                        element_size, inner_pack);
-      })
+           [](const Buffer &buffer, int kPack) {
+             return makeHCUSwizzledLayout(buffer, kPack);
+           })
       .def("tl.make_volta_swizzled_layout",
            [](const Buffer &buffer, bool is_a, bool k_inner) {
              return makeVoltaSwizzledLayout(buffer, is_a, k_inner);

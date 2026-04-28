@@ -1164,6 +1164,14 @@ Layout makeSwizzledLayout(const Buffer &buffer, bool k_inner, bool allow_pad) {
   return ExpandLayout2D(base, buffer);
 }
 
+Layout makeHCUSwizzledLayout(const Buffer &buffer, int kPack) {
+  auto info = GetSwizzleShapeInfoChecked(buffer);
+  auto base = makeGemmABLayoutCDNA(
+      static_cast<int>(info.stride), static_cast<int>(info.continuous),
+      info.element_size, kPack);
+  return ExpandLayout2D(base, buffer);
+}
+
 Layout makeVoltaSwizzledLayout(const Buffer &buffer, bool is_a, bool k_inner) {
   auto info = GetSwizzleShapeInfoChecked(buffer);
   auto base =

@@ -303,6 +303,7 @@ Layout makeGemmSparseAmpereABLayout(int mat_stride, int mat_continuous,
 
 Layout makeSwizzledLayout(const Buffer &buffer, bool k_inner = true,
                           bool allow_pad = true);
+Layout makeHCUSwizzledLayout(const Buffer &buffer, int kPack);
 Layout makeVoltaSwizzledLayout(const Buffer &buffer, bool is_a = true,
                                bool k_inner = true);
 Layout makeWgmmaSwizzledLayout(const Buffer &buffer, int continuity = -1,
