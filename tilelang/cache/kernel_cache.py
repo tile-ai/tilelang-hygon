@@ -33,17 +33,17 @@ from tilelang.contrib.hcu import get_hcu_compile_flags
 
 def _make_obj(src, fmt: Literal["asm", "llir", "so"], mode: str):
     """
-    Makes an object file from a source file.
+    Re-compile ``device_kernel.cu`` for debug artifacts (asm / LLVM IR / host .so).
 
-    Args:
-        src: The source file path or file object.
-        fmt: The format of the object file.
-            - "asm": Assembly file.
-            - "llir": LLVM IR file.
-            - "so": Shared object file.
+    Uses ``-O3``, ``-std=c++17``, same ``-I`` paths and ``get_hcu_compile_flags`` as
+    ``hipcc.compile_hip`` where applicable. Assembly and LLVM IR dumps pass ``-g`` by
+    default (same as historical behavior).
 
-    Returns:
-        The object file path.
+    Note:
+        Runtime loads an AMDGPU **code object** (hsaco). A textual ``-S`` dump from a
+        HIP translation unit may still differ from **disassembling that hsaco** (e.g.
+        ``llvm-objdump --mcpu=... -d``). For the closest match to what executes on
+        the GPU, dump/disassemble the **hsaco** produced by the same sources and arch.
     """
 
     src_path = src if isinstance(src, str) else src.name
@@ -54,22 +54,21 @@ def _make_obj(src, fmt: Literal["asm", "llir", "so"], mode: str):
 
     command = [
         get_hip_compiler(),
+        "-O3",
         "-std=c++17",
         f"--offload-arch={arch}",
         "-I" + env.COMPOSABLE_KERNEL_INCLUDE_DIR,
         "-I" + env.TILELANG_TEMPLATE_PATH,
-        #"-g",
         src_path,
-        #"-S",
-        #"-emit-llvm" if fmt == "llir" else "",
-        "-o", obj_file_path,
+        "-o",
+        obj_file_path,
     ]
     match fmt:
-        case "asm": # assembly
+        case "asm":
             command += ["-S", "-g"]
-        case "llir": # LLVM IR
-            command += ["-S",  "-g", "-emit-llvm"]
-        case "so": # shared object
+        case "llir":
+            command += ["-S", "-g", "-emit-llvm"]
+        case "so":
             command += ["--shared", "-fPIC"]
         case _:
             return None
@@ -594,31 +593,6 @@ class KernelCache:
         device_kernel_source, host_kernel_source = self._load_kernel_source(
             device_kernel_path, host_kernel_path, verbose
         )
-        if (
-            device_kernel_source
-            and env.TILELANG_SOURCE_RECOMPILE.lower() in ("1", "true", "yes", "on")
-        ):
-            try:
-                self.logger.debug("Recompiling %s from disk cache (TILELANG_SOURCE_RECOMPILE).", host_kernel_path)
-                KernelCache._safe_write_file(
-                    kernel_lib_path,
-                    "wb",
-                    lambda file: file.write(_make_obj(host_kernel_path, "so", "rb")),
-                )
-                asm_path = os.path.join(cache_path, self.asm_kernel_path)
-                llir_path = os.path.join(cache_path, self.llir_kernel_path)
-                KernelCache._safe_write_file(
-                    asm_path,
-                    "w",
-                    lambda file: file.write(_make_obj(device_kernel_path, "asm", "r")),
-                )
-                KernelCache._safe_write_file(
-                    llir_path,
-                    "w",
-                    lambda file: file.write(_make_obj(device_kernel_path, "llir", "r")),
-                )
-            except Exception as e:
-                self.logger.error("Error recompiling kernel sources from disk cache: %s", e)
 
         # Load kernel parameters
         kernel_params: list[KernelParam] | None = None

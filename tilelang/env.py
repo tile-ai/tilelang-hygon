@@ -279,7 +279,9 @@ class Environment:
     )  # disable kernel cache, usually for unit testing / debugging, high priority
     TILELANG_CLEAR_CACHE = EnvVar("TILELANG_CLEAR_CACHE", "0")  # DEPRECATED! clear cache automatically if set
 
-    TILELANG_SOURCE_RECOMPILE = EnvVar("TILELANG_SOURCE_RECOMPILE", "0")  # cuda source aware recompilation
+    # (tilelang.contrib.hcu): replace emitted HIP device TU from disk before hipcc (see hcu_recompute_from_source).
+    TILELANG_OVERRIDE_DEVICE_SOURCE = EnvVar("TILELANG_OVERRIDE_DEVICE_SOURCE", None)
+    TILELANG_OVERRIDE_DEVICE_SOURCE_DIR = EnvVar("TILELANG_OVERRIDE_DEVICE_SOURCE_DIR", None)
     # When saving kernel disk cache (HCU/ROCm): run hip compiler (aicc if on PATH, else hipcc) for .asm / LLVM IR / TIR.
     TILELANG_KERNEL_DUMP = EnvVar("TILELANG_KERNEL_DUMP", "0")
     TILELANG_CLEANUP_TEMP_FILES = EnvVar(
