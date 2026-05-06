@@ -21,6 +21,10 @@ from tilelang.env import get_hip_compiler
 def compile_hip(code, target_format="hsaco", arch=None, options=None, path_target=None, verbose=False):
     """Compile HIP code with the active HIP compiler (aicc if on PATH, else hipcc).
 
+    Appends the same ``-mllvm=...`` tuning list as ``kernel_cache`` /
+    ``libgen`` via ``get_hcu_compile_flags`` (DTK may yield an empty list).
+    Unsupported architectures raise ``ValueError`` from ``get_hcu_compile_flags``.
+
     Parameters
     ----------
     code : str
@@ -70,6 +74,11 @@ def compile_hip(code, target_format="hsaco", arch=None, options=None, path_targe
             cmd += options
         else:
             raise ValueError("options must be str or list of str")
+
+    # Lazy import avoids circular import: contrib -> hipcc -> hcu -> engine -> utils.target
+    from tilelang.contrib.hcu import get_hcu_compile_flags
+
+    cmd.extend(get_hcu_compile_flags(arch))
 
     cmd += ["-o", file_target]
     cmd += [temp_code]
