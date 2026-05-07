@@ -10,6 +10,7 @@ from tvm.target import Target
 
 from tilelang.engine.callback import register_hip_postproc_callback
 from tilelang.env import get_hip_compiler
+from tilelang.transform.pass_config import PassConfigKey
 
 _GLOBAL_KERNEL_RE = re.compile(
     r'extern\s+"C"\s+__global__\s+\w+(?:\s+__launch_bounds__\s*\([^)]*\))?\s+(\w+)\s*\(',
@@ -116,7 +117,16 @@ def hcu_recompute_from_source(code: str, _target: Target) -> str:
     return override
 
 
-def get_hcu_compile_flags(arch: str):
+def _pass_config_truthy(pass_configs: dict | None, key: PassConfigKey) -> bool:
+    if not pass_configs:
+        return False
+    v = pass_configs.get(key)
+    if v is None:
+        v = pass_configs.get(key.value)
+    return bool(v)
+
+
+def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
     # DTK toolchain (e.g. ROCM_PATH=/opt/dtk/...) uses its own defaults; do not inject LLVM hacks.
     # If get_hip_compiler() resolves to aicc (on PATH), still apply the LLVM tuning flags below.
     rocm_path = os.environ.get("ROCM_PATH", "")
@@ -130,9 +140,10 @@ def get_hcu_compile_flags(arch: str):
             "-mllvm=-ds-load-store-latency=6",
             "-mllvm=-disable-machine-sink=True",
             "-mllvm=-check-valu-data-forward-hazards=0",
-            # "-mllvm=-disable-cluster-lds-memops=true",
-            "-mllvm=-enable-hcu-approx-func-fp-math=true",
+            # # "-mllvm=-disable-cluster-lds-memops=true",
         ]
+        if _pass_config_truthy(pass_configs, PassConfigKey.TL_ENABLE_FAST_MATH):
+            flags.append("-mllvm=-enable-hcu-approx-func-fp-math=true")
         if arch in ["gfx938", "gfx92a", "gfx946"]:
             flags.append("-mllvm=-hcu-update-wait-by-reverse-search=true")
             flags.append("-mllvm=-hcu-pre-emit-load-store-opt=false")

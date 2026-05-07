@@ -159,7 +159,9 @@ def tilelang_callback_cuda_compile(code, target, pass_config=None):
 
 
 @tvm_ffi.register_global_func("tilelang_callback_hip_compile", override=True)
-def tilelang_callback_hip_compile(code, target):
+def tilelang_callback_hip_compile(code, target, pass_config=None):
+    """Compile HIP device code to hsaco; ``pass_config`` matches CUDA callback."""
+    cfg = pass_config or {}
     hsaco = hipcc.compile_hip(
         code,
         target_format="hsaco",
@@ -168,6 +170,7 @@ def tilelang_callback_hip_compile(code, target):
             "-I" + TILELANG_TEMPLATE_PATH,
             "-I" + COMPOSABLE_KERNEL_INCLUDE_DIR,
         ],
+        pass_config=cfg,
         verbose=False,
     )
 
