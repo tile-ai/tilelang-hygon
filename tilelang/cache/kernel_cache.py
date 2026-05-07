@@ -31,12 +31,18 @@ from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
 from tilelang.contrib.hcu import get_hcu_compile_flags
 
 
-def _make_obj(src, fmt: Literal["asm", "llir", "so"], mode: str):
+def _make_obj(
+    src,
+    fmt: Literal["asm", "llir", "so"],
+    mode: str,
+    pass_configs: dict | None = None,
+):
     """
     Re-compile ``device_kernel.cu`` for debug artifacts (asm / LLVM IR / host .so).
 
     Uses ``-O3``, ``-std=c++17``, same ``-I`` paths and ``get_hcu_compile_flags`` as
-    ``hipcc.compile_hip`` where applicable. Assembly and LLVM IR dumps pass ``-g`` by
+    ``hipcc.compile_hip`` where applicable (including ``pass_configs`` / ``tl.enable_fast_math``).
+    Assembly and LLVM IR dumps pass ``-g`` by
     default (same as historical behavior).
 
     Note:
@@ -73,7 +79,7 @@ def _make_obj(src, fmt: Literal["asm", "llir", "so"], mode: str):
         case _:
             return None
 
-    command += get_hcu_compile_flags(arch)
+    command += get_hcu_compile_flags(arch, pass_configs)
 
     try:
         ret = subprocess.run(
@@ -646,15 +652,16 @@ class KernelCache:
                     asm_path = os.path.join(cache_path, self.asm_kernel_path)
                     llir_path = os.path.join(cache_path, self.llir_kernel_path)
                     tir_path = os.path.join(cache_path, self.tir_kernel_path)
+                    dump_pc = getattr(kernel, "pass_configs", None)
                     KernelCache._safe_write_file(
                         asm_path,
                         "w",
-                        lambda file: file.write(_make_obj(device_kernel_path, "asm", "r")),
+                        lambda file: file.write(_make_obj(device_kernel_path, "asm", "r", dump_pc)),
                     )
                     KernelCache._safe_write_file(
                         llir_path,
                         "w",
-                        lambda file: file.write(_make_obj(device_kernel_path, "llir", "r")),
+                        lambda file: file.write(_make_obj(device_kernel_path, "llir", "r", dump_pc)),
                     )
                     if kernel.prim_func is not None:
                         KernelCache._safe_write_file(

@@ -10,6 +10,7 @@
 #include "codegen_hip.h"
 #include "runtime/rocm/rocm_module.h"
 #include <tvm/ffi/function.h>
+#include <tvm/ir/transform.h>
 
 #ifndef kTVMGridConstant
 #define kTVMGridConstant 130
@@ -84,7 +85,8 @@ ffi::Module BuildTileLangHIP(IRModule mod, Target target) {
   std::string ptx;
 
   if (auto f = Function::GetGlobal("tilelang_callback_hip_compile")) {
-    ptx = (*f)(code, target).cast<std::string>();
+    tvm::transform::PassContext pass_ctx = tvm::transform::PassContext::Current();
+    ptx = (*f)(code, target, pass_ctx->config).cast<std::string>();
     if (ptx[0] != '/')
       fmt = "hsaco";
   } else {

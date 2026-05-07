@@ -107,7 +107,7 @@ class LibraryGenerator:
                 "--shared",
                 src.name,
             ]
-            command += get_hcu_compile_flags(arch)
+            command += get_hcu_compile_flags(arch, self.pass_configs or {})
             command += [
                 "-I" + COMPOSABLE_KERNEL_INCLUDE_DIR,
             ]

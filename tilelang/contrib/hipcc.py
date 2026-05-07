@@ -15,14 +15,30 @@ from tvm.contrib import utils
 from tvm.base import py_str
 from tvm.contrib.rocm import get_rocm_arch, find_rocm_path
 
-from tilelang.env import get_hip_compiler
+from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR, TILELANG_TEMPLATE_PATH, get_hip_compiler
 
 
-def compile_hip(code, target_format="hsaco", arch=None, options=None, path_target=None, verbose=False):
+def compile_hip(
+    code,
+    target_format="hsaco",
+    arch=None,
+    options=None,
+    path_target=None,
+    verbose=False,
+    pass_config=None,
+):
     """Compile HIP code with the active HIP compiler (aicc if on PATH, else hipcc).
 
     Appends the same ``-mllvm=...`` tuning list as ``kernel_cache`` /
     ``libgen`` via ``get_hcu_compile_flags`` (DTK may yield an empty list).
+
+    ``pass_config`` is the TVM ``PassContext`` config dict, forwarded from C++
+    ``target.build.tilelang_hip`` into ``tilelang_callback_hip_compile`` (same
+    pattern as CUDA). When ``tl.enable_fast_math`` is true, HCU targets append
+    ``-mllvm=-enable-hcu-approx-func-fp-math=true``.
+    If ``pass_config`` is omitted (e.g. direct ``compile_hip`` calls), it defaults
+    to no optional LLVM tuning from config.
+
     Unsupported architectures raise ``ValueError`` from ``get_hcu_compile_flags``.
 
     Parameters
@@ -41,6 +57,9 @@ def compile_hip(code, target_format="hsaco", arch=None, options=None, path_targe
 
     path_target : str, optional
         Output file.
+
+    pass_config : dict, optional
+        Same object as the third argument of ``tilelang_callback_hip_compile``.
 
     Return
     ------
@@ -75,10 +94,12 @@ def compile_hip(code, target_format="hsaco", arch=None, options=None, path_targe
         else:
             raise ValueError("options must be str or list of str")
 
+    cfg = pass_config or {}
+
     # Lazy import avoids circular import: contrib -> hipcc -> hcu -> engine -> utils.target
     from tilelang.contrib.hcu import get_hcu_compile_flags
 
-    cmd.extend(get_hcu_compile_flags(arch))
+    cmd.extend(get_hcu_compile_flags(arch, cfg))
 
     cmd += ["-o", file_target]
     cmd += [temp_code]
@@ -103,7 +124,20 @@ def compile_hip(code, target_format="hsaco", arch=None, options=None, path_targe
 
 
 @tvm_ffi.register_global_func("tilelang_callback_hip_compile", override=True)
-def tilelang_callback_hip_compile(code, target):
-    """use HIP compiler (aicc or hipcc) to generate hsaco for better optimization"""
-    hsaco = compile_hip(code, target_format="hsaco")
-    return hsaco
+def tilelang_callback_hip_compile(code, target, pass_config=None):
+    """HIP hsaco compile callback; ``pass_config`` matches ``tilelang_callback_cuda_compile``."""
+    cfg = pass_config or {}
+    return compile_hip(
+        code,
+        target_format="hsaco",
+        options=[
+            "-std=c++17",
+            "-I" + TILELANG_TEMPLATE_PATH,
+            "-I" + COMPOSABLE_KERNEL_INCLUDE_DIR,
+        ],
+        pass_config=cfg,
+        verbose=False,
+    )
+
+
+# Also registered (override) from ``tilelang.engine.lower`` when the compiler package loads.
