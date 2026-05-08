@@ -155,6 +155,7 @@ def gemm(
     clear_accum: bool = False,
     k_pack: int = 1,
     mbar: BarrierType | None = None,
+    use_tf32: bool = False,
 ) -> tir.PrimExpr:
     """TileLang GEMM operator.
 
@@ -178,10 +179,14 @@ def gemm(
         k_pack (int): Numbers of packed matrix cores, for ROCm only. Defaults to 1.
         mbar (BarrierType, i.e. Buffer | BufferLoad, or Var, optional): Mbarrier in Blackwell.
             Required when this GEMM lowers to TCGEN5MMA. Defaults to None.
+        use_tf32 (bool): When True and target uses HCU lowering with float32 operands, use
+            TF32 matrix instructions (A/B pointers lowered as ``int32`` for ``tl::MmacTraits<int>``).
+            Defaults to False; ignored on non-HCU paths.
 
     Returns:
         tir.Call: A handle to the GEMM operation.
     """
+    ann = {"use_tf32": tir.const(1, "int32")} if use_tf32 else None
     return _gemm_impl(
         "tl.tileop.gemm",
         A,
@@ -194,6 +199,7 @@ def gemm(
         k_pack,
         0,
         mbar,
+        annotations=ann,
     )
 
 
