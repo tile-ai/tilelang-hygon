@@ -4,7 +4,7 @@ from tilelang import _ffi_api
 from tilelang import language as T
 from tilelang.layout.swizzle import make_hcu_swizzled_layout
 from tilelang.transform.simplify import _Simplify
-from tilelang.utils.language import is_fragment, is_shared, is_shared_dynamic, retrieve_ptr
+from tilelang.utils.language import is_fragment, is_shared, is_shared_dynamic, retrieve_ptr, retrieve_stride
 from tilelang.utils.target import get_hcu_arch_string, target_has_mmac_lit_lts, target_is_hcu
 from tvm import DataType, tir
 from tvm.ir import Range
@@ -242,6 +242,16 @@ class GemmHCUMMAC(GemmBase):
             if int(self.wg_wait) != 0:
                 raise ValueError("wg_wait must be 0 for HCU gemm")
 
+        use_tf32 = self.use_tf32
+        if use_tf32:
+            if use_gemm_mls:
+                raise ValueError("HCU gemm: use_tf32=True is not supported for gemm_mls (MLS) path")
+            if self.A.dtype != T.float32 or self.B.dtype != T.float32:
+                raise ValueError(
+                    "HCU gemm: use_tf32=True requires float32 A and B dtypes, got "
+                    f"A.dtype={self.A.dtype}, B.dtype={self.B.dtype}"
+                )
+
         parts.append(">")
         template = "".join(parts)
 
@@ -252,6 +262,15 @@ class GemmHCUMMAC(GemmBase):
 
         @T.prim_func
         def _hcu_tl_gemm() -> None:
-            T.call_intrin("handle", gemm_op, template, Aptr, Bptr, Cptr)
+            tf32_ann = {"tl.hcu_tf32_ab": 1} if use_tf32 else None
+            T.call_intrin(
+                "handle",
+                gemm_op,
+                template,
+                Aptr,
+                Bptr,
+                Cptr,
+                annotations=tf32_ann,
+            )
 
         return _Simplify(_hcu_tl_gemm, inline_let=True)
