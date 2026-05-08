@@ -165,6 +165,25 @@ class GemmBase:
         return getattr(self.gemm_node, "mbar", None)
 
     @property
+    def use_tf32(self) -> bool:
+        """True when ``T.gemm(..., use_tf32=True)`` (HCU: TF32 MMA via int-typed AB)."""
+        ann = getattr(self.gemm_node, "annotations", None)
+        if ann is None:
+            return False
+        try:
+            v = ann["use_tf32"]
+        except (KeyError, TypeError):
+            return False
+        if isinstance(v, tir.IntImm):
+            return bool(v.value)
+        if isinstance(v, (int, bool)):
+            return bool(v)
+        val = getattr(v, "value", None)
+        if val is not None:
+            return int(val) != 0
+        return False
+
+    @property
     def C_coords(self):
         coords = getattr(self.gemm_node, "cCoords", None)
         if coords is None or len(coords) == 0:

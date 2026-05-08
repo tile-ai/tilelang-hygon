@@ -1712,12 +1712,35 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(builtin::thread_return())) {
     os << "return";
   } else if (op->op.same_as(tl::tl_gemm())) {
-    ICHECK(op->args.size() == 4) << "tl_gemm expects 4 arguments <op_instance, "
-                                    "A_ptr, B_ptr, C_ptr>, but got "
-                                 << op->args.size();
+    ICHECK_EQ(op->args.size(), 4U)
+        << "tl_gemm expects 4 arguments <op_instance, "
+           "A_ptr, B_ptr, C_ptr>, but got "
+        << op->args.size();
     auto op_instance = Downcast<StringImm>(op->args[0]);
-    this->PrintCallExtern(GetType(tvm::ffi::GetRef<PrimExpr>(op)),
-                          op_instance->value, op->args, true, os);
+    bool hcu_tf32_ab = false;
+    auto ab_hint = op->annotations.find("tl.hcu_tf32_ab");
+    if (ab_hint != op->annotations.end()) {
+      const auto *imm = (*ab_hint).second.as<IntImmNode>();
+      hcu_tf32_ab = imm && imm->value != 0;
+    }
+    if (hcu_tf32_ab) {
+      os << static_cast<std::string>(op_instance->value) << "(";
+      for (size_t i = 1; i < op->args.size(); ++i) {
+        if (i > 1) {
+          os << ", ";
+        }
+        std::string arg = PrintExpr(op->args[i]);
+        if (i == 1 || i == 2) {
+          os << "reinterpret_cast<int *>(" << arg << ")";
+        } else {
+          os << arg;
+        }
+      }
+      os << ")";
+    } else {
+      this->PrintCallExtern(GetType(tvm::ffi::GetRef<PrimExpr>(op)),
+                            op_instance->value, op->args, true, os);
+    }
   } else if (op->op.same_as(tl::tl_gemm_sp())) {
     LOG(FATAL) << "tl_gemm_sp is not supported on HCU";
   } else if (op->op.same_as(tl::loop_break())) {

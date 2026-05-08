@@ -78,6 +78,21 @@ template <> struct MmacTraits<float> {
   }
 };
 
+// for tf32 mmac using int for template type
+template <> struct MmacTraits<int> {
+  template <typename AccType>
+  static TL_DEVICE void mmac_op(const int *b, const int *a, AccType *c) {
+#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
+    // default: lit en, lts disable (aligned with tvm_mfma f32_16x16x8_f32_lit_lts)
+    *c = __builtin_hcu_mmac_f32_16x16x8_tf32_lit_lts(*((int32x2 *)a),
+                                                   *((int32x2 *)b), *c, 1, 0);
+#else
+    *c = __builtin_hcu_mmac_f32_16x16x8_tf32(*((int32x2 *)a),
+                                        *((int32x2 *)b), *c);
+#endif
+  }
+};
+
 #if defined(HIP_FP8_ENABLED)
 // Specialization for fp8_e4_t
 template <> struct MmacTraits<fp8_e4_t> {
