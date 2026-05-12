@@ -63,111 +63,23 @@ using float16x16 =
     __attribute__((__vector_size__(16 * sizeof(float16_t)))) float16_t;
 
 using half_t = float16_t;
-using bfloat16_t = ck_tile::bf16_t;
-using bfloat16x2 = ck_tile::bf16x2_t;
-using bfloat16x4 = ck_tile::bf16x4_t;
-using bfloat16x8 = ck_tile::bf16x8_t;
-using bfloat16x16 = ck_tile::bf16x16_t;
 
-// Tilelang's own bfloat16_t implementation
-// This provides true conversion with float and supports conversion to ck_tile::bf16_t (ushort)
-struct __align__(2) bf16_cvt_t {
-  using raw_type = uint16_t;
-  raw_type data;
+using bfloat16_t = __bf16;
 
-  // Static method for bit_cast
-  TL_DEVICE static constexpr bf16_cvt_t bit_cast(raw_type x) {
-    bf16_cvt_t y;
-    y.data = x;
-    return y;
-  }
+struct bfloat16x2 {
+  bfloat16_t x, y;
+};
 
-  // Default constructor
-  TL_DEVICE constexpr bf16_cvt_t() : data() {}
+struct bfloat16x4 {
+  bfloat16_t data[4];
+};
 
-  // Construct from float - use ck_tile's conversion function
-  #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
-  TL_DEVICE explicit bf16_cvt_t(const float& x)
-    : data(__builtin_hcu_cvt_bf16_f32(x, false/*clamp*/, 0/*dst_sel:WORD_1*/)) {}
-  #else
-  TL_DEVICE explicit constexpr bf16_cvt_t(const float& x)
-    : data(ck_tile::float_to_bf16_raw<ck_tile::bf16_rounding_mode::standard_asm>(x)) {}
-  #endif
+struct bfloat16x8 {
+  bfloat16_t data[8];
+};
 
-  // Construct from double - use ck_tile's conversion function
-  #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
-  TL_DEVICE explicit bf16_cvt_t(const double& x)
-    : data(__builtin_hcu_cvt_bf16_f32(static_cast<float>(x), false/*clamp*/, 0/*dst_sel:WORD_1*/)) {}
-  #else
-  TL_DEVICE explicit constexpr bf16_cvt_t(const double& x)
-    : data(ck_tile::float_to_bf16_raw<ck_tile::bf16_rounding_mode::standard_asm>(static_cast<float>(x))) {}
-  #endif
-
-  // Construct from int
-  #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
-  TL_DEVICE explicit bf16_cvt_t(const int& x)
-    : data(__builtin_hcu_cvt_bf16_f32(static_cast<float>(x), false/*clamp*/, 0/*dst_sel:WORD_1*/)) {}
-  #else
-  TL_DEVICE explicit constexpr bf16_cvt_t(const int& x)
-    : data(ck_tile::float_to_bf16_raw<ck_tile::bf16_rounding_mode::standard_asm>(static_cast<float>(x))) {}
-  #endif
-
-  // Construct from unsigned int
-  #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
-  TL_DEVICE explicit bf16_cvt_t(const unsigned int& x)
-    : data(__builtin_hcu_cvt_bf16_f32(static_cast<float>(x), false/*clamp*/, 0/*dst_sel:WORD_1*/)) {}
-  #else
-  TL_DEVICE explicit constexpr bf16_cvt_t(const unsigned int& x)
-    : data(ck_tile::float_to_bf16_raw<ck_tile::bf16_rounding_mode::standard_asm>(static_cast<float>(x))) {}
-  #endif
-
-  // Construct from ck_tile::bf16_t (which is ushort when CK_TILE_USE_CUSTOM_DATA_TYPE is off)
-  // Direct bit_cast since ck_tile::bf16_t is just ushort in that case
-  TL_DEVICE constexpr bf16_cvt_t(const ck_tile::bf16_t& v)
-    : data(ck_tile::bit_cast<uint16_t>(v)) {}
-
-  // Cast to float - use ck_tile's conversion function
-  #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
-  TL_DEVICE explicit operator float() const {
-    return __builtin_hcu_cvt_f32_bf16(data, false/*clamp*/, 0/*omod*/, 0/*src0_sel:WORD_1*/);
-  }
-  #else
-  TL_DEVICE explicit constexpr operator float() const {
-    return ck_tile::bf16_to_float_raw(data);
-  }
-  #endif
-
-  // Cast to double - use ck_tile's conversion function
-  #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
-  TL_DEVICE explicit operator double() const {
-    return static_cast<double>(__builtin_hcu_cvt_f32_bf16(data, false/*clamp*/, 0/*omod*/, 0/*src0_sel:WORD_1*/));
-  }
-  #else
-  TL_DEVICE explicit constexpr operator double() const {
-    return static_cast<double>(ck_tile::bf16_to_float_raw(data));
-  }
-  #endif
-
-  // Cast to int
-  #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
-  TL_DEVICE explicit operator int() const {
-    return static_cast<int>(__builtin_hcu_cvt_f32_bf16(data, false/*clamp*/, 0/*omod*/, 0/*src0_sel:WORD_1*/));
-  }
-  #else
-  TL_DEVICE explicit constexpr operator int() const {
-    return static_cast<int>(ck_tile::bf16_to_float_raw(data));
-  }
-  #endif
-
-  // Conversion to ck_tile::bf16_t (ushort when CK_TILE_USE_CUSTOM_DATA_TYPE is off)
-  // This allows seamless interoperability with ck_tile
-  TL_DEVICE constexpr operator ck_tile::bf16_t() const {
-    return ck_tile::bit_cast<ck_tile::bf16_t>(data);
-  }
-
-  // Internal access
-  TL_DEVICE constexpr raw_type& get() { return data; }
-  TL_DEVICE constexpr raw_type get() const { return data; }
+struct bfloat16x16 {
+  bfloat16_t data[16];
 };
 
 typedef
@@ -212,8 +124,7 @@ TL_DEVICE unsigned __pack_bfloat162(const bfloat16_t x, const bfloat16_t y) {
 
 namespace tl {
 
-// Packed x2 element-wise math helpers (scalar float2 fallbacks; matches HIP tl::add2…).
-
+// Packed x2 element-wise math helpers (scalar float2).
 TL_DEVICE float2 add2(float2 a, float2 b) {
   float2 out;
   out.x = a.x + b.x;
@@ -322,27 +233,27 @@ template <> TL_DEVICE half_t shfl(half_t val, int srcLane) {
 }
 
 template <> TL_DEVICE bfloat16_t shfl_xor(bfloat16_t val, int laneMask) {
-  float f = ck_tile::type_convert<float>(val);
+  float f = static_cast<float>(val);
   float r = __shfl_xor(f, laneMask);
-  return ck_tile::type_convert<bfloat16_t>(r);
+  return static_cast<bfloat16_t>(r);
 }
 
 template <> TL_DEVICE bfloat16_t shfl_down(bfloat16_t val, int delta) {
-  float f = ck_tile::type_convert<float>(val);
+  float f = static_cast<float>(val);
   float r = __shfl_down(f, delta);
-  return ck_tile::type_convert<bfloat16_t>(r);
+  return static_cast<bfloat16_t>(r);
 }
 
 template <> TL_DEVICE bfloat16_t shfl_up(bfloat16_t val, int delta) {
-  float f = ck_tile::type_convert<float>(val);
+  float f = static_cast<float>(val);
   float r = __shfl_up(f, delta);
-  return ck_tile::type_convert<bfloat16_t>(r);
+  return static_cast<bfloat16_t>(r);
 }
 
 template <> TL_DEVICE bfloat16_t shfl(bfloat16_t val, int srcLane) {
-  float f = ck_tile::type_convert<float>(val);
+  float f = static_cast<float>(val);
   float r = __shfl(f, srcLane);
-  return ck_tile::type_convert<bfloat16_t>(r);
+  return static_cast<bfloat16_t>(r);
 }
 
 } // namespace tl
