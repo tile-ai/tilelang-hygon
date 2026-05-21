@@ -93,17 +93,23 @@ std::string HcuCkTemplateElemType(const std::string &printed_element_type) {
   if (printed_element_type == "bfloat16_t") {
     return "ck_tile::bf16_t";
   }
+  if (printed_element_type == "int64_t") {
+    return "double";
+  }
   return printed_element_type;
 }
 
-/// CK **src** pointers (`const T*`): `reinterpret_cast<const ck_tile::bf16_t*>` for `bfloat16_t`,
-/// else use the buffer name (already typed).
+/// CK **src** pointers (`const T*`): special-case bf16/i64 mappings, and always cast
+/// generic pointers to `const T*` (some HCU paths materialize tensor handles as `void*`).
 std::string HcuCkBufferSrcPtrExpr(const std::string &printed_element_type,
                                   const std::string &wave_ptr_expr) {
   if (printed_element_type == "bfloat16_t") {
     return "reinterpret_cast<const ck_tile::bf16_t*>(" + wave_ptr_expr + ")";
   }
-  return wave_ptr_expr;
+  if (printed_element_type == "int64_t") {
+    return "reinterpret_cast<const double*>(" + wave_ptr_expr + ")";
+  }
+  return "reinterpret_cast<const " + printed_element_type + "*>(" + wave_ptr_expr + ")";
 }
 
 /// CK **dst** pointers (`T*`): `reinterpret_cast<ck_tile::bf16_t*>` for `bfloat16_t`, else
@@ -112,6 +118,9 @@ std::string HcuCkBufferDstPtrExpr(const std::string &printed_element_type,
                                   const std::string &wave_ptr_expr) {
   if (printed_element_type == "bfloat16_t") {
     return "reinterpret_cast<ck_tile::bf16_t*>(" + wave_ptr_expr + ")";
+  }
+  if (printed_element_type == "int64_t") {
+    return "reinterpret_cast<double*>(" + wave_ptr_expr + ")";
   }
   return "(" + printed_element_type + "*)" + wave_ptr_expr;
 }
@@ -1249,6 +1258,16 @@ void CodeGenTileLangHCU::VisitExpr_(const CastNode *op, std::ostream &os) {
   os << sret;
 }
 
+void CodeGenTileLangHCU::VisitExpr_(const FloorDivNode* op, std::ostream& os) { // NOLINT(*)
+  // Match CUDA codegen behavior: lower FloorDiv to plain Div before printing.
+  PrintExpr(tir::Div(op->a, op->b), os);
+}
+
+void CodeGenTileLangHCU::VisitExpr_(const FloorModNode* op, std::ostream& os) { // NOLINT(*)
+  // Match CUDA codegen behavior: lower FloorMod to plain Mod before printing.
+  PrintExpr(tir::Mod(op->a, op->b), os);
+}
+
 void CodeGenTileLangHCU::PrintCallExtern(Type ret_type, ffi::String global_symbol,
                                          const ffi::Array<PrimExpr> &args,
                                          bool skip_first_arg,
@@ -1468,9 +1487,20 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintIndent();
     int num_mma = Downcast<IntImm>(op->args[0])->value;
     this->stream << "tl::wait_wgmma<" << std::to_string(num_mma) << ">();\n";
+  } else if (op->op.same_as(tl::sync_warp())) {
+    this->PrintIndent();
+    this->stream << "tl::sync_warp(";
+    if (!op->args.empty()) {
+      this->stream << this->PrintExpr(op->args[0]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::sync_grid())) {
+    LOG(FATAL) << "tl.sync_grid is not supported on HCU";
   } else if (op->op.same_as(tl::pack_b16())) {
     os << "__pack_half2(" << this->PrintExpr(op->args[0]) << ", "
        << this->PrintExpr(op->args[1]) << ")";
+  } else if (op->op.same_as(tl::sync_grid())) {
+    LOG(FATAL) << "tl.sync_grid is not supported on HCU";
   } else if (op->op.same_as(tl::any_sync())) {
     ICHECK_EQ(op->args.size(), 2U) << "tl.any_sync expects <mask, predicate>.";
     os << "__any(" << PrintExpr(op->args[1]) << ")";
@@ -1517,10 +1547,29 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
         << "tl.shfl_up_sync expects <mask, value, delta, width>.";
     os << "__shfl_up(" << PrintExpr(op->args[1]) << ", "
        << PrintExpr(op->args[2]) << ", " << PrintExpr(op->args[3]) << ")";
-  } else if (op->op.same_as(tl::match_any_sync()) ||
-             op->op.same_as(tl::match_all_sync())) {
-    LOG(FATAL) << "tl." << op->op << " is not supported on HCU: the "
-               << "__match_{any,all}_sync primitives have no HIP equivalent.";
+  } else if (op->op.same_as(tl::match_any_sync())) {
+    ICHECK_EQ(op->args.size(), 2U)
+        << "tl.match_any_sync expects <mask, value>.";
+    os << "tl::match_any_sync((unsigned long long)(" << PrintExpr(op->args[0])
+       << "), " << PrintExpr(op->args[1]) << ")";
+  } else if (op->op.same_as(tl::match_all_sync())) {
+    LOG(FATAL) << "tl.match_all_sync is not supported on HCU";
+  } else if (op->op.same_as(tl::get_lane_idx())) {
+    ICHECK_LE(op->args.size(), 1)
+        << "tl.get_lane_idx expects at most one argument <warp_size>.";
+    os << "tl::get_lane_idx(";
+    if (!op->args.empty()) {
+      os << PrintExpr(op->args[0]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::get_warp_idx())) {
+    ICHECK_LE(op->args.size(), 1)
+        << "tl.get_warp_idx expects at most one argument <warp_size>.";
+    os << "tl::get_warp_idx(";
+    if (!op->args.empty()) {
+      os << PrintExpr(op->args[0]);
+    }
+    os << ")";
   } else if (op->op.same_as(tl::add2()) || op->op.same_as(tl::sub2()) ||
              op->op.same_as(tl::mul2()) || op->op.same_as(tl::fma2()) ||
              op->op.same_as(tl::max2()) || op->op.same_as(tl::min2()) ||
@@ -1972,6 +2021,19 @@ void CodeGenTileLangHCU::VisitStmt_(const AllocateNode *op) {
       constant_size = constant_size / (32 / op->dtype.bits());
     }
     stream << ' ' << vid << '[' << constant_size << "];\n";
+    if (scope == "local.var") {
+      PrimExpr init = tir::make_const(op->dtype, 0);
+      auto init_it = op->annotations.find(tl::attr::kLocalVarInit);
+      if (init_it != op->annotations.end()) {
+        PrimExpr user_init = Downcast<PrimExpr>((*init_it).second);
+        if (!user_init.dtype().is_void() && user_init.dtype() != op->dtype) {
+          user_init = tir::Cast(op->dtype, user_init);
+        }
+        init = user_init;
+      }
+      PrintIndent();
+      stream << vid << "[0] = " << PrintExpr(init) << ";\n";
+    }
   }
 
   RegisterHandleType(op->buffer_var.get(), op->dtype);

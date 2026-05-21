@@ -421,7 +421,13 @@ tir::transform::Pass LowerIntrin() {
     ICHECK(target.defined()) << "LowerIntrin: Require the target attribute";
     arith::Analyzer analyzer;
     auto mtriple = target.value()->GetAttr<String>("mtriple", "");
-    n->body = IntrinInjecter(&analyzer, target.value()->kind->name,
+    std::string target_kind = target.value()->kind->name;
+#ifdef USE_HCU
+    if (target_kind == "hip") {
+      target_kind = "hcu";
+    }
+#endif
+    n->body = IntrinInjecter(&analyzer, target_kind,
                              mtriple.value())(std::move(n->body));
     return f;
   };

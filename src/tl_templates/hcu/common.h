@@ -96,6 +96,16 @@ using float32x32 = __attribute__((__vector_size__(32 * sizeof(float)))) float;
 
 using int8x4 = __attribute__((__vector_size__(4 * sizeof(int8_t)))) int8_t;
 
+TL_DEVICE half_t hcu_habs(half_t a) {
+  float v = static_cast<float>(a);
+  return static_cast<half_t>(v >= 0.0f ? v : -v);
+}
+
+TL_DEVICE bfloat16_t hcu_habs(bfloat16_t a) {
+  float v = static_cast<float>(a);
+  return static_cast<bfloat16_t>(v >= 0.0f ? v : -v);
+}
+
 // __shfl overload for _Float16/half_t
 // There is no half_t version of __shfl in HIP, so we implement it ourselves here.
 TL_DEVICE half_t __shfl(half_t var, int src_lane, int width = __AMDGCN_WAVEFRONT_SIZE) {
@@ -123,6 +133,59 @@ TL_DEVICE unsigned __pack_bfloat162(const bfloat16_t x, const bfloat16_t y) {
 }
 
 namespace tl {
+
+namespace detail {
+
+TL_DEVICE constexpr int default_warp_size() { return 64; }
+
+TL_DEVICE int linear_thread_idx_in_block() {
+  return threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+}
+
+} // namespace detail
+
+TL_DEVICE int get_lane_idx(int warp_size = detail::default_warp_size()) {
+  warp_size = warp_size > 0 ? warp_size : detail::default_warp_size();
+  return detail::linear_thread_idx_in_block() % warp_size;
+}
+
+TL_DEVICE int get_warp_idx_sync(int warp_size = detail::default_warp_size()) {
+  warp_size = warp_size > 0 ? warp_size : detail::default_warp_size();
+  return detail::linear_thread_idx_in_block() / warp_size;
+}
+
+TL_DEVICE int get_warp_idx(int warp_size = detail::default_warp_size()) {
+  warp_size = warp_size > 0 ? warp_size : detail::default_warp_size();
+  return detail::linear_thread_idx_in_block() / warp_size;
+}
+
+TL_DEVICE void sync_warp(unsigned long long mask = ~0ull) {
+  (void)mask;
+#if defined(__HIP_DEVICE_COMPILE__)
+  __builtin_amdgcn_wave_barrier();
+#endif
+}
+
+TL_DEVICE unsigned long long activemask() {
+  return (unsigned long long)__ballot(1);
+}
+
+template <typename T>
+TL_DEVICE unsigned long long match_any_sync(unsigned long long mask, T value) {
+  constexpr int kWaveSize = 64;
+  unsigned long long active = activemask() & mask;
+  unsigned long long out = 0ull;
+#pragma unroll
+  for (int src = 0; src < kWaveSize; ++src) {
+    if ((active >> src) & 1ull) {
+      T src_value = __shfl(value, src, kWaveSize);
+      if (src_value == value) {
+        out |= (1ull << src);
+      }
+    }
+  }
+  return out & active;
+}
 
 // Packed x2 element-wise math helpers (scalar float2).
 TL_DEVICE float2 add2(float2 a, float2 b) {
