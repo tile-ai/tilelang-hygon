@@ -1,6 +1,8 @@
 #pragma once
 
 #include "common.h"
+#include <cstdint>
+
 #include <ck_tile/core/arch/amd_buffer_addressing.hpp>
 
 using f32 = float;
@@ -41,6 +43,129 @@ __device__ void inc_m0(uint32_t m0_inc) {
 
 namespace tl {
 
+namespace detail {
+
+template <typename T, int ReadSize>
+TL_DEVICE void hcu_direct_load_global_to_lds_impl_offen(
+    const T *global_base_ptr, std::int32_t global_offset, T *lds_base_ptr,
+    std::int32_t lds_offset, bool is_valid, std::int32_t src_element_space_size,
+    std::uint8_t wave_lds_wrap_offset) {
+  static_assert(ReadSize == 4 || ReadSize == 8 || ReadSize == 16);
+  (void)wave_lds_wrap_offset;
+
+  const int32x4_t src_resource = make_wave_buffer_resource(
+      global_base_ptr,
+      static_cast<u32>(static_cast<std::uint64_t>(
+                           static_cast<u32>(src_element_space_size)) *
+                       sizeof(T)));
+
+  const std::int32_t element_offset_bytes =
+      is_valid ? global_offset * static_cast<std::int32_t>(sizeof(T))
+               : src_element_space_size * static_cast<std::int32_t>(sizeof(T));
+
+  T *lds_ptr = lds_base_ptr + lds_offset;
+  auto const lds_ptr_sgpr =
+      __builtin_amdgcn_readfirstlane(reinterpret_cast<uintptr_t>(lds_ptr));
+
+  if constexpr (ReadSize == 4) {
+    asm volatile("s_mov_b32 m0, %0; \n\t"
+                 "buffer_load_dword %1, %2, 0 offen lds;\n\t"
+                 ::"s"(lds_ptr_sgpr),
+                 "v"(element_offset_bytes),
+                 "s"(src_resource)
+                 : "memory");
+  } else if constexpr (ReadSize == 8) {
+    asm volatile("s_mov_b32 m0, %0; \n\t"
+                 "buffer_load_dwordx2 %1, %2, 0 offen lds;\n\t"
+                 ::"s"(lds_ptr_sgpr),
+                 "v"(element_offset_bytes),
+                 "s"(src_resource)
+                 : "memory");
+  } else {
+    asm volatile("s_mov_b32 m0, %0; \n\t"
+                 "buffer_load_dwordx4 %1, %2, 0 offen lds;\n\t"
+                 ::"s"(lds_ptr_sgpr),
+                 "v"(element_offset_bytes),
+                 "s"(src_resource)
+                 : "memory");
+  }
+}
+
+} // namespace detail
+
+// 与 codegen_hcu.cc / CK `hcu_direct_load_global_to_lds` 参数语义一致；仅实现 UseIdxenLoad=false。
+template <typename T, int NumElemsPerThread, bool UseIdxenLoad = false>
+TL_DEVICE void hcu_direct_load_global_to_lds(const T *global_base_ptr,
+                                               std::int32_t global_offset,
+                                               T *lds_base_ptr,
+                                               std::int32_t lds_offset,
+                                               bool is_valid,
+                                               std::int32_t src_element_space_size,
+                                               std::uint8_t wave_lds_wrap_offset = 0) {
+  static_assert(sizeof(T) * NumElemsPerThread == 4 ||
+                    sizeof(T) * NumElemsPerThread == 8 ||
+                    sizeof(T) * NumElemsPerThread == 16,
+                "ReadSize must be 4, 8 or 16 bytes");
+  static_assert(!UseIdxenLoad,
+                "tl::hcu_direct_load_global_to_lds: Idxen path not implemented");
+
+  constexpr int kReadSize = sizeof(T) * NumElemsPerThread;
+  detail::hcu_direct_load_global_to_lds_impl_offen<T, kReadSize>(
+      global_base_ptr, global_offset, lds_base_ptr, lds_offset, is_valid,
+      src_element_space_size, wave_lds_wrap_offset);
+}
+
+namespace detail {
+
+// 与 codegen_hcu.cc 约定：全局/global 传入「本线程区域起点」，须折算为 wave 统一基址 g_wave +
+// 元素偏移 off（buffer_load + readfirstlane）。LDS 侧 impl 会做 lds_ptr = base + lds_offset，
+// 与 (lds_wave, off) 代数上等价于 (l, 0)，故直接传本线程指针 l 与 lds_offset=0 即可。
+template <int NumUint32PerThread>
+TL_DEVICE void hcu_cp_async_gs_via_direct_lds(void *lds_base_ptr,
+                                              void const *global_base_ptr,
+                                              bool is_valid) {
+  static_assert(NumUint32PerThread == 1 || NumUint32PerThread == 2 ||
+                NumUint32PerThread == 4);
+  static constexpr std::int32_t k_max_src_elems =
+      static_cast<std::int32_t>(0xffffffffu / sizeof(uint32_t));
+
+  auto *const g = static_cast<const uint32_t *>(global_base_ptr);
+  uint32_t *const l = static_cast<uint32_t *>(lds_base_ptr);
+  const std::int32_t lane = static_cast<std::int32_t>(threadIdx.x);
+  const auto *const g_wave =
+      g - static_cast<size_t>(lane) * static_cast<size_t>(NumUint32PerThread);
+  const std::int32_t off = lane * static_cast<std::int32_t>(NumUint32PerThread);
+
+  // dword global→LDS 多数 HCU/gfx 可用；dwordx2/x4 依赖 ISA，不支持时退回同步向量读写以免非法指令或静默错误。
+#if defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
+#define TL_HCU_GLOBAL_TO_LDS_ASYNC_MULTIDWORD 1
+#else
+#define TL_HCU_GLOBAL_TO_LDS_ASYNC_MULTIDWORD 0
+#endif
+
+  if constexpr (NumUint32PerThread == 1) {
+    hcu_direct_load_global_to_lds<uint32_t, 1, false>(
+        g_wave, off, l, 0, is_valid, k_max_src_elems, 0);
+  } else if constexpr (TL_HCU_GLOBAL_TO_LDS_ASYNC_MULTIDWORD) {
+    if constexpr (NumUint32PerThread == 2) {
+      hcu_direct_load_global_to_lds<uint32_t, 2, false>(
+          g_wave, off, l, 0, is_valid, k_max_src_elems, 0);
+    } else {
+      hcu_direct_load_global_to_lds<uint32_t, 4, false>(
+          g_wave, off, l, 0, is_valid, k_max_src_elems, 0);
+    }
+  } else if constexpr (NumUint32PerThread == 2) {
+    *(uint2 *)lds_base_ptr =
+        is_valid ? *(const uint2 *)global_base_ptr : make_uint2(0, 0);
+  } else {
+    *(uint4 *)lds_base_ptr =
+        is_valid ? *(const uint4 *)global_base_ptr : make_uint4(0, 0, 0, 0);
+  }
+#undef TL_HCU_GLOBAL_TO_LDS_ASYNC_MULTIDWORD
+}
+
+} // namespace detail
+
 // AMDGPU automatically commit memory fence
 TL_DEVICE void cp_async_commit() {}
 
@@ -62,52 +187,20 @@ template <int N = 0> TL_DEVICE void cp_async_wait() {
   // async_gld_sld_fence(N);
 }
 
-template <bool pre_nop = false>
-CK_TILE_DEVICE void async_buffer_load_dword_v(void *smem, int32x4_t rsrc,
-                                              index_t voffset) {
-  auto const lds_ptr_sgpr =
-      __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>(smem)));
-  asm volatile("s_mov_b32 m0, %0; \n\t"
-               "buffer_load_dword %1, %2, 0 offen lds;\n\t" ::"s"(lds_ptr_sgpr),
-               "v"(voffset), "s"(rsrc)
-               : "memory");
-}
-
 template <int N>
 TL_DEVICE void cp_async_gs(void *lds_base_ptr, void const *global_base_ptr) {
-  if constexpr (N == 16) {
-    *(uint4 *)lds_base_ptr = *(const uint4 *)global_base_ptr;
-  } else if constexpr (N == 8) {
-    *(uint2 *)lds_base_ptr = *(const uint2 *)global_base_ptr;
-  } else if constexpr (N == 4) {
-    async_buffer_load_dword_v(
-        lds_base_ptr,
-        make_wave_buffer_resource(((const int32_t *)global_base_ptr) -
-                                  threadIdx.x),
-        threadIdx.x * N /*assume 4 bytes*/);
-  }
+  static_assert(N == 4 || N == 8 || N == 16, "tl::cp_async_gs: only N in {4,8,16}");
+  detail::hcu_cp_async_gs_via_direct_lds<N / 4>(lds_base_ptr, global_base_ptr,
+                                                  true);
 }
 
 template <int N>
 TL_DEVICE void cp_async_gs_conditional(void *lds_base_ptr,
                                        void const *global_base_ptr, bool cond) {
-  if constexpr (N == 16) {
-    *(uint4 *)lds_base_ptr =
-        cond ? *(const uint4 *)global_base_ptr : make_uint4(0, 0, 0, 0);
-  } else if constexpr (N == 8) {
-    *(uint2 *)lds_base_ptr =
-        cond ? *(const uint2 *)global_base_ptr : make_uint2(0, 0);
-  } else {
-    if (cond) {
-      async_buffer_load_dword_v(
-          lds_base_ptr,
-          make_wave_buffer_resource(((const int32_t *)global_base_ptr) -
-                                    threadIdx.x),
-          threadIdx.x * N /*assume 4 bytes*/);
-    } else {
-      *(uint4 *)lds_base_ptr = make_uint4(0, 0, 0, 0);
-    }
-  }
+  static_assert(N == 4 || N == 8 || N == 16,
+                "tl::cp_async_gs_conditional: only N in {4,8,16}");
+  detail::hcu_cp_async_gs_via_direct_lds<N / 4>(lds_base_ptr, global_base_ptr,
+                                                  cond);
 }
 
 // amd_buffer_load for tilelang
