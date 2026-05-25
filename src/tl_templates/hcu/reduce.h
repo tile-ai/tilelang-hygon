@@ -104,7 +104,7 @@ struct AllReduce {
       __syncthreads();
       x = Reducer()(x, red_buf[threadIdx.x ^ offset]);
     } else {
-      x = Reducer()(x, __shfl_xor(x, offset));
+      x = Reducer()(x, tl::shfl_xor(x, offset));
     }
     if constexpr (offset == scale) {
       return x;

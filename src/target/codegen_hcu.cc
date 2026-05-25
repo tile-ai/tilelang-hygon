@@ -89,40 +89,35 @@ int GetTileLangCPAsyncTransferBytes(const CallNode *op) {
 
 /// CK buffer / LDS helpers expect `ck_tile::bf16_t` in template parameters; generated TileLang
 /// code uses `bfloat16_t` (__bf16). Map only for template args, not for emitted value types.
-std::string HcuCkTemplateElemType(const std::string &printed_element_type) {
-  if (printed_element_type == "bfloat16_t") {
-    return "ck_tile::bf16_t";
+std::string HcuCkTemplateElemType(DataType dtype) {
+  DataType elem_type = dtype.element_of();
+  int elem_bits = elem_type.bits();
+  if (elem_bits == 8) {
+    return "int8_t";
   }
-  if (printed_element_type == "int64_t") {
+  if (elem_bits == 16) {
+    return elem_type.is_bfloat16() ? "ck_tile::bf16_t" : "half_t";
+  }
+  if (elem_bits == 32) {
+    return "float";
+  }
+  if (elem_bits == 64) {
     return "double";
   }
-  return printed_element_type;
+  LOG(FATAL) << "Unsupported HCU CK element bits: " << elem_bits;
+  return "";
 }
 
 /// CK **src** pointers (`const T*`): special-case bf16/i64 mappings, and always cast
 /// generic pointers to `const T*` (some HCU paths materialize tensor handles as `void*`).
-std::string HcuCkBufferSrcPtrExpr(const std::string &printed_element_type,
-                                  const std::string &wave_ptr_expr) {
-  if (printed_element_type == "bfloat16_t") {
-    return "reinterpret_cast<const ck_tile::bf16_t*>(" + wave_ptr_expr + ")";
-  }
-  if (printed_element_type == "int64_t") {
-    return "reinterpret_cast<const double*>(" + wave_ptr_expr + ")";
-  }
-  return "reinterpret_cast<const " + printed_element_type + "*>(" + wave_ptr_expr + ")";
+std::string HcuCkBufferSrcPtrExpr(DataType dtype, const std::string &wave_ptr_expr) {
+  return "reinterpret_cast<const " + HcuCkTemplateElemType(dtype) + "*>(" + wave_ptr_expr + ")";
 }
 
 /// CK **dst** pointers (`T*`): `reinterpret_cast<ck_tile::bf16_t*>` for `bfloat16_t`, else
 /// C-style cast to element pointer, e.g. `(float*)buf`.
-std::string HcuCkBufferDstPtrExpr(const std::string &printed_element_type,
-                                  const std::string &wave_ptr_expr) {
-  if (printed_element_type == "bfloat16_t") {
-    return "reinterpret_cast<ck_tile::bf16_t*>(" + wave_ptr_expr + ")";
-  }
-  if (printed_element_type == "int64_t") {
-    return "reinterpret_cast<double*>(" + wave_ptr_expr + ")";
-  }
-  return "(" + printed_element_type + "*)" + wave_ptr_expr;
+std::string HcuCkBufferDstPtrExpr(DataType dtype, const std::string &wave_ptr_expr) {
+  return "reinterpret_cast<" + HcuCkTemplateElemType(dtype) + "*>(" + wave_ptr_expr + ")";
 }
 
 } // namespace
@@ -248,13 +243,12 @@ bool CodeGenTileLangHCU::TryToEmitLDSBufferOp(const BufferStoreNode *buffer_stor
     GetBufferDesc(value_dtype, buffer_store->buffer.get(), buffer_store->indices[0]);
   auto load_desc =
     GetBufferDesc(buffer_load->dtype, buffer_load->buffer.get(), buffer_load->indices[0]);
-  std::string lds_base =
-      HcuCkBufferDstPtrExpr(store_desc.data_type, store_desc.wave_ptr);
-  std::string global_base =
-      HcuCkBufferSrcPtrExpr(load_desc.data_type, load_desc.wave_ptr);
+  std::string lds_base = HcuCkBufferDstPtrExpr(value_dtype, store_desc.wave_ptr);
+  std::string global_base = HcuCkBufferSrcPtrExpr(buffer_load->dtype, load_desc.wave_ptr);
   PrintIndent();
   stream << "ck::hcu_direct_load_global_to_lds<"
-         << HcuCkTemplateElemType(load_desc.data_type) << ", " << value_dtype.lanes() << ", false>("
+         << HcuCkTemplateElemType(buffer_load->dtype) << ", "
+         << value_dtype.lanes() << ", false>("
          << global_base << ", "              // global_base_ptr
          << load_desc.offset << ", "                // global_offset (in elements)
          << lds_base << ", "                        // lds_base_ptr
@@ -636,17 +630,18 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
       // Convert the value expression to a thread_buffer using bit_cast.
       // For lanes==1 this becomes thread_buffer<T,1>.
       std::string src_thread_buffer = "ck_tile::bit_cast<ck_tile::thread_buffer<" +
-                                      HcuCkTemplateElemType(desc.data_type) + ", " +
+                                      HcuCkTemplateElemType(value_dtype) + ", " +
                                       std::to_string(desc.num_elements) + ">>(" +
                                       value + ")";
 
       std::string pred = GetCurrentPredicate();
       PrintIndent();
       stream << "tl::amd_buffer_store<"
-             << HcuCkTemplateElemType(desc.data_type) << ", " << desc.num_elements << ", "
+             << HcuCkTemplateElemType(value_dtype) << ", "
+             << desc.num_elements << ", "
              << (pred == "true" ? "false" : "true") << ">("
              << src_thread_buffer << ", "
-             << HcuCkBufferDstPtrExpr(desc.data_type, desc.wave_ptr) << ", "
+             << HcuCkBufferDstPtrExpr(value_dtype, desc.wave_ptr) << ", "
              << desc.offset << ", "
              << pred << ", "
              << desc.element_space_size << ");\n";
@@ -1011,9 +1006,10 @@ std::string CodeGenTileLangHCU::GetVecLoadWithPredicate(DataType t,
     os << "*(";
     PrintType(t, os);
     os << "*)&(tl::amd_buffer_load<"
-       << HcuCkTemplateElemType(desc.data_type) << ", " << desc.num_elements << ", "
+       << HcuCkTemplateElemType(t) << ", " << desc.num_elements << ", "
        << (pred == "true" ? "false" : "true") << ">("
-       << HcuCkBufferSrcPtrExpr(desc.data_type, desc.wave_ptr) << ", " << desc.offset << ", " << pred << ", "
+       << HcuCkBufferSrcPtrExpr(t, desc.wave_ptr) << ", " << desc.offset << ", "
+       << pred << ", "
        << desc.element_space_size << ").get())";
 
     return os.str();
@@ -1044,15 +1040,15 @@ void CodeGenTileLangHCU::PrintVecStoreWithPredicate(const BufferNode* buffer,
   //                                        is_valid, element_space_size)
   // Convert the value expression to a thread_buffer using bit_cast
   std::string src_thread_buffer = "ck_tile::bit_cast<ck_tile::thread_buffer<" +
-                                  HcuCkTemplateElemType(desc.data_type) + ", " +
+                                  HcuCkTemplateElemType(t) + ", " +
                                   std::to_string(desc.num_elements) + ">>(" + value + ")";
 
   this->PrintIndent();
   this->stream << "tl::amd_buffer_store<"
-               << HcuCkTemplateElemType(desc.data_type) << ", " << desc.num_elements << ", "
+               << HcuCkTemplateElemType(t) << ", " << desc.num_elements << ", "
                << (pred == "true" ? "false" : "true") << ">("
                << src_thread_buffer << ", "
-               << HcuCkBufferDstPtrExpr(desc.data_type, desc.wave_ptr) << ", "
+               << HcuCkBufferDstPtrExpr(t, desc.wave_ptr) << ", "
                << desc.offset << ", "
                << pred << ", "
                << desc.element_space_size << ");\n";
@@ -1575,6 +1571,7 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
              op->op.same_as(tl::max2()) || op->op.same_as(tl::min2()) ||
              op->op.same_as(tl::abs2())) {
     std::string op_name;
+    std::vector<PrimExpr> packed_args(op->args.begin(), op->args.end());
     if (op->op.same_as(tl::add2()))
       op_name = "add2";
     else if (op->op.same_as(tl::sub2()))
@@ -1590,12 +1587,37 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     else
       op_name = "abs2";
 
-    os << "tl::" << op_name << "(";
-    os << PrintExpr(op->args[0]);
-    for (size_t i = 1; i < op->args.size(); ++i) {
-      os << ", " << PrintExpr(op->args[i]);
+    DataType dtype = op->dtype;
+    bool need_cast =
+        (dtype.is_bfloat16() || dtype.is_float16()) && dtype.lanes() == 2;
+    std::string native_type;
+    if (dtype.is_bfloat16()) {
+      native_type = "bfloat16x2";
+    } else if (dtype.is_float16()) {
+      native_type = "float16x2";
+    }
+
+    auto print_arg = [&](const PrimExpr &arg) -> std::string {
+      std::string arg_str = PrintExpr(arg);
+      if (need_cast) {
+        return "tl::from_uint1<" + native_type + ">(" + arg_str + ")";
+      }
+      return arg_str;
+    };
+
+    if (need_cast) {
+      os << "tl::to_uint1(tl::" << op_name << "(";
+    } else {
+      os << "tl::" << op_name << "(";
+    }
+    os << print_arg(packed_args[0]);
+    for (size_t i = 1; i < packed_args.size(); ++i) {
+      os << ", " << print_arg(packed_args[i]);
     }
     os << ")";
+    if (need_cast) {
+      os << ")";
+    }
   } else if (op->op.same_as(tl::__ldg())) {
     const BufferLoadNode *bl = op->args[0].as<BufferLoadNode>();
     ICHECK(bl) << "T.__ldg expects a BufferLoad as the first argument.";
@@ -2053,6 +2075,27 @@ void CodeGenTileLangHCU::VisitExpr_(const RampNode *op, std::ostream &os) {
       os << ", ";
   }
   os << "))";
+}
+
+void CodeGenTileLangHCU::VisitExpr_(const ShuffleNode *op,
+                                    std::ostream &os) { // NOLINT(*)
+  DataType t = op->dtype;
+  bool is_bf16x2 = t.is_bfloat16() && t.lanes() == 2;
+  bool is_fp16x2 = t.is_float16() && t.lanes() == 2;
+  if ((is_bf16x2 || is_fp16x2) && op->vectors.size() == 2 &&
+      op->vectors[0].dtype().lanes() == 1 &&
+      op->vectors[1].dtype().lanes() == 1) {
+    std::string e0 = PrintExpr(op->vectors[0]);
+    std::string e1 = PrintExpr(op->vectors[1]);
+    if (is_bf16x2) {
+      os << "uint1{__pack_bfloat162(" << e0 << ", " << e1 << ")}";
+    } else {
+      os << "uint1{__pack_half2((half_t)(" << e0 << "), (half_t)(" << e1
+         << "))}";
+    }
+    return;
+  }
+  CodeGenC::VisitExpr_(op, os);
 }
 
 void CodeGenTileLangHCU::VisitExpr_(const BroadcastNode *op,
