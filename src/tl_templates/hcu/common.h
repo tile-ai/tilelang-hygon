@@ -5,6 +5,7 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <cstring>
 
 #define HIPRT_INF_F __int_as_float(0x7f800000)
 #define HIPRT_NEGINF_F __int_as_float(0xff800000)
@@ -234,6 +235,101 @@ TL_DEVICE float2 abs2(float2 a) {
   float2 out;
   out.x = (a.x >= 0.0f) ? a.x : -a.x;
   out.y = (a.y >= 0.0f) ? a.y : -a.y;
+  return out;
+}
+
+template <typename T> TL_DEVICE T from_uint1(uint1 v) {
+  T r;
+  memcpy(&r, &v, sizeof(T));
+  return r;
+}
+
+template <typename T> TL_DEVICE uint1 to_uint1(T v) {
+  uint1 r;
+  memcpy(&r, &v, sizeof(uint1));
+  return r;
+}
+
+TL_DEVICE bfloat16x2 add2(bfloat16x2 a, bfloat16x2 b) {
+  return bfloat16x2{bfloat16_t(float(a.x) + float(b.x)),
+                    bfloat16_t(float(a.y) + float(b.y))};
+}
+
+TL_DEVICE bfloat16x2 sub2(bfloat16x2 a, bfloat16x2 b) {
+  return bfloat16x2{bfloat16_t(float(a.x) - float(b.x)),
+                    bfloat16_t(float(a.y) - float(b.y))};
+}
+
+TL_DEVICE bfloat16x2 mul2(bfloat16x2 a, bfloat16x2 b) {
+  return bfloat16x2{bfloat16_t(float(a.x) * float(b.x)),
+                    bfloat16_t(float(a.y) * float(b.y))};
+}
+
+TL_DEVICE bfloat16x2 fma2(bfloat16x2 a, bfloat16x2 b, bfloat16x2 c) {
+  return bfloat16x2{bfloat16_t(float(a.x) * float(b.x) + float(c.x)),
+                    bfloat16_t(float(a.y) * float(b.y) + float(c.y))};
+}
+
+TL_DEVICE bfloat16x2 max2(bfloat16x2 a, bfloat16x2 b) {
+  return bfloat16x2{float(a.x) > float(b.x) ? a.x : b.x,
+                    float(a.y) > float(b.y) ? a.y : b.y};
+}
+
+TL_DEVICE bfloat16x2 min2(bfloat16x2 a, bfloat16x2 b) {
+  return bfloat16x2{float(a.x) < float(b.x) ? a.x : b.x,
+                    float(a.y) < float(b.y) ? a.y : b.y};
+}
+
+TL_DEVICE bfloat16x2 abs2(bfloat16x2 a) {
+  return bfloat16x2{hcu_habs(a.x), hcu_habs(a.y)};
+}
+
+TL_DEVICE float16x2 add2(float16x2 a, float16x2 b) {
+  float16x2 out;
+  out[0] = half_t(float(a[0]) + float(b[0]));
+  out[1] = half_t(float(a[1]) + float(b[1]));
+  return out;
+}
+
+TL_DEVICE float16x2 sub2(float16x2 a, float16x2 b) {
+  float16x2 out;
+  out[0] = half_t(float(a[0]) - float(b[0]));
+  out[1] = half_t(float(a[1]) - float(b[1]));
+  return out;
+}
+
+TL_DEVICE float16x2 mul2(float16x2 a, float16x2 b) {
+  float16x2 out;
+  out[0] = half_t(float(a[0]) * float(b[0]));
+  out[1] = half_t(float(a[1]) * float(b[1]));
+  return out;
+}
+
+TL_DEVICE float16x2 fma2(float16x2 a, float16x2 b, float16x2 c) {
+  float16x2 out;
+  out[0] = half_t(float(a[0]) * float(b[0]) + float(c[0]));
+  out[1] = half_t(float(a[1]) * float(b[1]) + float(c[1]));
+  return out;
+}
+
+TL_DEVICE float16x2 max2(float16x2 a, float16x2 b) {
+  float16x2 out;
+  out[0] = float(a[0]) > float(b[0]) ? a[0] : b[0];
+  out[1] = float(a[1]) > float(b[1]) ? a[1] : b[1];
+  return out;
+}
+
+TL_DEVICE float16x2 min2(float16x2 a, float16x2 b) {
+  float16x2 out;
+  out[0] = float(a[0]) < float(b[0]) ? a[0] : b[0];
+  out[1] = float(a[1]) < float(b[1]) ? a[1] : b[1];
+  return out;
+}
+
+TL_DEVICE float16x2 abs2(float16x2 a) {
+  float16x2 out;
+  out[0] = hcu_habs(a[0]);
+  out[1] = hcu_habs(a[1]);
   return out;
 }
 
