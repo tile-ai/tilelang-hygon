@@ -33,6 +33,10 @@ bool TargetIsRDNA(Target target);
 bool TargetIsGfx950(Target target);
 
 bool TargetHasAsyncCopy(Target target);
+/// HCU mcpu whitelist for default T.copy auto async (wave-safe per-thread path).
+bool IsHCUEnableAutoAsyncCopyTarget(Target target);
+/// Default for tl.enable_async_copy / tir.use_async_copy when pass config unset.
+bool DefaultEnableAutoAsyncCopy(Target target);
 bool TargetHasLdmatrix(Target target);
 bool TargetHasStmatrix(Target target);
 bool TargetHasTmem(Target target);

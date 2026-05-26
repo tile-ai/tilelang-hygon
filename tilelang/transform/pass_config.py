@@ -120,7 +120,9 @@ class PassConfigKey(str, Enum):
     Explicit `T.async_copy` still requires cp.async support and may error if
     it cannot be lowered.
 
-    Default: True
+    Default: True on most targets. For HCU targets outside the whitelist in
+    ``src/target/utils.cc`` (``IsHCUEnableAutoAsyncCopyTarget``), ``@tilelang.jit``
+    injects False unless the user sets this key explicitly.
     """
 
     TL_ENABLE_LOWER_LDGSTG = "tl.enable_lower_ldgstg"
@@ -241,7 +243,12 @@ class PassConfigKey(str, Enum):
     """Disable vectorization optimization. Default: False"""
 
     TIR_USE_ASYNC_COPY = "tir.use_async_copy"
-    """Enable asynchronous memory copy operations. Default: True"""
+    """Enable asynchronous memory copy operations in pipeline planning.
+
+    Default: True on most targets. For HCU targets outside the whitelist in
+    ``src/target/utils.cc`` (``IsHCUEnableAutoAsyncCopyTarget``), ``@tilelang.jit``
+    injects False together with ``tl.enable_async_copy`` unless set explicitly.
+    """
 
     TIR_ENABLE_DEBUG = "tir.enable_debug"
     """Enable debug information in generated code. Default: False"""
@@ -277,6 +284,10 @@ _DEPRECATED_PASS_CONFIG_MESSAGES = {
 }
 
 
+def _pass_config_explicitly_set(pass_configs: dict[str, Any], key: PassConfigKey) -> bool:
+    return key in pass_configs or key.value in pass_configs
+
+
 def normalize_pass_configs(pass_configs: dict[str, Any] | None) -> dict[str, Any]:
     """Canonicalize known pass-config keys and emit compatibility warnings."""
     if pass_configs is None:
@@ -301,3 +312,26 @@ def normalize_pass_configs(pass_configs: dict[str, Any] | None) -> dict[str, Any
             warned_keys.add(warning_key)
 
     return normalized
+
+
+def apply_target_default_pass_configs(
+    target: Any,
+    pass_configs: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge target-aware compiler defaults into pass configs.
+
+    Currently disables automatic async copy when
+    ``default_enable_auto_async_copy(target)`` is False. Explicit user settings
+    always win. Whitelist lives in ``src/target/utils.cc``.
+    """
+    from tilelang.utils.target import default_enable_auto_async_copy
+
+    normalized = normalize_pass_configs(pass_configs)
+    if default_enable_auto_async_copy(target):
+        return normalized
+
+    merged = dict(normalized)
+    for key in (PassConfigKey.TL_ENABLE_ASYNC_COPY, PassConfigKey.TIR_USE_ASYNC_COPY):
+        if not _pass_config_explicitly_set(merged, key):
+            merged[key] = False
+    return merged
