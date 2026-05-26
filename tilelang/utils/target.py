@@ -262,6 +262,16 @@ def target_is_hcu(target: Target) -> bool:
     return _ffi_api.TargetIsHCU(target)
 
 
+def is_hcu_enable_auto_async_copy_target(target: Target) -> bool:
+    """Return whether an HCU target is whitelisted for default T.copy auto async."""
+    return _ffi_api.IsHCUEnableAutoAsyncCopyTarget(target)
+
+
+def default_enable_auto_async_copy(target: Target) -> bool:
+    """Default value for auto async copy pass configs when unset by the user."""
+    return _ffi_api.DefaultEnableAutoAsyncCopy(target)
+
+
 def target_has_mmac_lit_lts(target: Target) -> bool:
     return _ffi_api.TargetHasMmacLitLts(target)
 

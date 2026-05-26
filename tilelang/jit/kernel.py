@@ -26,7 +26,7 @@ from tilelang.profiler import Profiler, TensorSupplyType
 from tilelang.utils.target import determine_target
 from tilelang.contrib import nvcc as tl_nvcc
 from tilelang.transform import PassConfigKey
-from tilelang.transform.pass_config import normalize_pass_configs
+from tilelang.transform.pass_config import apply_target_default_pass_configs
 import logging
 import os
 
@@ -100,12 +100,11 @@ class JITKernel(Generic[_P, _T]):
         self.target_host = target_host
         self.verbose = verbose
 
-        self.pass_configs = normalize_pass_configs(pass_configs)
-
         self.compile_flags = [compile_flags] if isinstance(compile_flags, str) else compile_flags
 
         # Ensure the target is always a valid TVM Target object.
         self.target = determine_target(target, return_object=True)
+        self.pass_configs = apply_target_default_pass_configs(self.target, pass_configs)
 
         # Validate the execution backend.
         assert execution_backend in [
