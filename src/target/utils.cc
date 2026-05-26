@@ -178,6 +178,27 @@ bool TargetHasAsyncCopy(Target target) {
 
   return false;
 }
+
+bool IsHCUEnableAutoAsyncCopyTarget(Target target) {
+  if (!TargetIsHCU(target)) {
+    return false;
+  }
+  if (!target->attrs.count("mcpu")) {
+    return false;
+  }
+  std::string mcpu = Downcast<tvm::ffi::String>(target->attrs.at("mcpu"));
+  // Leave empty until an HCU platform supports per-thread async copy semantics.
+  static const std::set<std::string> auto_async_whitelist = {};
+  return auto_async_whitelist.find(mcpu) != auto_async_whitelist.end();
+}
+
+bool DefaultEnableAutoAsyncCopy(Target target) {
+  if (TargetIsHCU(target)) {
+    return IsHCUEnableAutoAsyncCopyTarget(target);
+  }
+  return true;
+}
+
 bool TargetHasLdmatrix(Target target) {
   if (!TargetIsCuda(target))
     return false;
@@ -365,6 +386,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            [](Target target) { return TargetIsGfx950(target); })
       .def("tl.TargetHasAsyncCopy",
            [](Target target) { return TargetHasAsyncCopy(target); })
+      .def("tl.IsHCUEnableAutoAsyncCopyTarget",
+           [](Target target) { return IsHCUEnableAutoAsyncCopyTarget(target); })
+      .def("tl.DefaultEnableAutoAsyncCopy",
+           [](Target target) { return DefaultEnableAutoAsyncCopy(target); })
       .def("tl.TargetHasLdmatrix",
            [](Target target) { return TargetHasLdmatrix(target); })
       .def("tl.TargetHasStmatrix",
