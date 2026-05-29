@@ -100,9 +100,9 @@ struct AllReduce {
 
     if constexpr (offset >= warpSize) {
       __syncthreads();
-      red_buf[threadIdx.x] = x;
+      red_buf[threadIdx.x - thread_offset] = x;
       __syncthreads();
-      x = Reducer()(x, red_buf[threadIdx.x ^ offset]);
+      x = Reducer()(x, red_buf[(threadIdx.x - thread_offset) ^ offset]);
     } else {
       x = Reducer()(x, tl::shfl_xor(x, offset));
     }
