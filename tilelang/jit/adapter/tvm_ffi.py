@@ -38,6 +38,8 @@ for _name in ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnu
 
 
 def _torch_tensor_to_ffi_arg(tensor: torch.Tensor) -> torch.Tensor | Any:
+    if not isinstance(tensor, torch.Tensor):
+        return tensor
     if tensor.dtype not in _FP8_TORCH_TO_TVM:
         return tensor
     import torch.utils.dlpack as torch_dlpack

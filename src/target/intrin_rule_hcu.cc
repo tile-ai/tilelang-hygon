@@ -160,7 +160,7 @@ TVM_REGISTER_OP("tir.nearbyint")
                                DispatchPureExtern<HCUMath>);
 
 TVM_REGISTER_OP("tir.exp").set_attr<FLowerIntrinsic>(
-    "hcu.FLowerIntrinsic", DispatchPureExtern<HCUFastMath>);
+    "hcu.FLowerIntrinsic", DispatchPureExtern<HCUMath>);
 
 TVM_REGISTER_OP("tir.exp2")
     .set_attr<FLowerIntrinsic>("hcu.FLowerIntrinsic",
