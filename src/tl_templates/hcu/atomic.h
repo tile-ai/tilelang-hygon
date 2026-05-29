@@ -6,22 +6,36 @@
 // are HCU-oriented helpers.
 #include "common.h"
 
+template <typename T> struct normalize_atomic_type {
+  using type = T;
+};
+
+template <> struct normalize_atomic_type<int64_t> {
+  using type = unsigned long long;
+};
+
+template <> struct normalize_atomic_type<uint64_t> {
+  using type = unsigned long long;
+};
+
 template <typename T1, typename T2>
 TL_DEVICE void AtomicAdd(T1 *address, T2 val, int memory_order = 0) {
   (void)memory_order;
-  atomicAdd(reinterpret_cast<T1 *>(address), static_cast<T1>(val));
+  using NT1 = typename normalize_atomic_type<T1>::type;
+  atomicAdd(reinterpret_cast<NT1 *>(address), static_cast<NT1>(val));
 }
 
 template <typename T1, typename T2>
 TL_DEVICE void AtomicAdd(T1 &address, T2 val, int memory_order = 0) {
-  (void)memory_order;
-  atomicAdd(reinterpret_cast<T1 *>(&address), static_cast<T1>(val));
+  AtomicAdd(&address, val, memory_order);
 }
 
 template <typename T1, typename T2>
 TL_DEVICE T1 AtomicAddRet(T1 *ref, T2 val, int memory_order = 0) {
   (void)memory_order;
-  return atomicAdd(ref, static_cast<T1>(val));
+  using NT1 = typename normalize_atomic_type<T1>::type;
+  NT1 ret = atomicAdd(reinterpret_cast<NT1 *>(ref), static_cast<NT1>(val));
+  return static_cast<T1>(ret);
 }
 
 template <typename T1, typename T2>
