@@ -163,7 +163,7 @@ TL_DEVICE int get_warp_idx(int warp_size = detail::default_warp_size()) {
 TL_DEVICE void sync_warp(unsigned long long mask = ~0ull) {
   (void)mask;
 #if defined(__HIP_DEVICE_COMPILE__)
-  __builtin_amdgcn_wave_barrier();
+  __builtin_amdgcn_s_barrier();
 #endif
 }
 
