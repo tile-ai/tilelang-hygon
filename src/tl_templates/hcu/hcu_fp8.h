@@ -2,7 +2,9 @@
 
 #include "common.h"
 
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
 #define HIP_FP8_ENABLED 1
+#endif
 
 using fp8_e4_t = ck_tile::fp8_t;
 using fp8_e4_2_t = ck_tile::fp8x2_t;

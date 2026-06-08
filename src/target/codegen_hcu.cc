@@ -93,6 +93,14 @@ std::string HcuCkTemplateElemType(DataType dtype) {
   DataType elem_type = dtype.element_of();
   int elem_bits = elem_type.bits();
   if (elem_bits == 8) {
+    if (elem_type.is_float8_e4m3fn() || elem_type.is_float8_e4m3fnuz() ||
+        elem_type.is_float8_e4m3() || elem_type.code() == DataType::kFloat8_e4m3b11fnuz) {
+      return "ck_tile::fp8_t";
+    }
+    if (elem_type.is_float8_e5m2() || elem_type.is_float8_e5m2fnuz() ||
+        elem_type.code() == DataType::kFloat8_e5m2) {
+      return "ck_tile::bf8_t";
+    }
     return "int8_t";
   }
   if (elem_bits == 16) {
@@ -1566,6 +1574,21 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       os << PrintExpr(op->args[0]);
     }
     os << ")";
+  } else if (op->op.same_as(tl::ieee_fmaf())) {
+    ICHECK_EQ(op->args.size(), 4U)
+        << "tl.ieee_fmaf expects <x, y, z, rounding_mode>.";
+    std::string rounding_mode = Downcast<StringImm>(op->args[3])->value;
+    ICHECK(rounding_mode == "rn")
+        << "HCU only supports tl.ieee_fmaf(..., rounding_mode=\"rn\").";
+    ICHECK(op->dtype.is_float())
+        << "tl.ieee_fmaf on HCU is currently only implemented for float32/float64.";
+    if (op->dtype.bits() == 32) {
+      os << "fmaf(" << PrintExpr(op->args[0]) << ", "
+         << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2]) << ")";
+    } else {
+      os << "fma(" << PrintExpr(op->args[0]) << ", "
+         << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2]) << ")";
+    }
   } else if (op->op.same_as(tl::add2()) || op->op.same_as(tl::sub2()) ||
              op->op.same_as(tl::mul2()) || op->op.same_as(tl::fma2()) ||
              op->op.same_as(tl::max2()) || op->op.same_as(tl::min2()) ||
