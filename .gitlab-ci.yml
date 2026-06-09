@@ -53,7 +53,13 @@ test:
     - pip install numpy==1.24.3 allure-pytest
     # 回归测试
     - git clone -b staging http://gitlab-ci-token:${CI_JOB_TOKEN}@42.228.13.241:10068/dcutoolkit/deeplearing/TileKernels.git /opt/TileKernels
-    - REPO_DIR=/opt/TileKernels TILELANG_CACHE_DIR=./cache_test TEST_RESULTS_DIR=${CI_PROJECT_DIR}/das-results GENERATE_ALLURE_REPORT=1 bash das-regression.sh --junitxml=${CI_PROJECT_DIR}/das-results/allure-results/results.xml
+    - export HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout 300)
+    - >-
+      REPO_DIR=/opt/TileKernels
+      TILELANG_CACHE_DIR=./cache_test
+      TEST_RESULTS_DIR=${CI_PROJECT_DIR}/das-results
+      GENERATE_ALLURE_REPORT=1
+      bash das-regression.sh --junitxml=${CI_PROJECT_DIR}/das-results/allure-results/results.xml
   artifacts:
     paths:
       - dist/*.whl
