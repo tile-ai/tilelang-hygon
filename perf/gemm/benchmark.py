@@ -5,7 +5,7 @@ Benchmark script for all GEMM implementations.
 import argparse
 import torch
 import tilelang as tl
-from perf.gemm.utils import ref_program, get_heuristic_config#, triton_gemm
+from perf.gemm.utils import ref_program, get_heuristic_config, triton_gemm
 from perf.gemm.vanilla_gemm import (
     gemm_vanilla,
     get_best_vanilla_config,
@@ -19,6 +19,8 @@ from perf.gemm.persistent_gemm import (
     gemm_persistent_v1,
     gemm_persistent_v2,
     gemm_persistent_v3,
+    gemm_persistent_v4,
+    gemm_persistent_v5,
 )
 from perf.gemm.splitk_gemm import gemm_splitk
 from perf.gemm.streamk_gemm import gemm_streamk
@@ -79,13 +81,15 @@ def main(M: int = 4096,
             raise ValueError(f"Autotune not supported for {impl} implementation. "
                            f"Supported: persistent, vanilla")
     else:
-        config = get_heuristic_config()
+        config = get_heuristic_config(impl)
 
         if impl == "persistent":
             # kernel = gemm_persistent(M, N, K, dtype=dtype, **config)
             # kernel = gemm_persistent_v1(M, N, K, dtype=dtype, **config)
             # kernel = gemm_persistent_v2(M, N, K, dtype=dtype, **config)
             kernel = gemm_persistent_v3(M, N, K, dtype=dtype, **config)
+            # kernel = gemm_persistent_v4(M, N, K, dtype=dtype, **config)
+            # kernel = gemm_persistent_v5(M, N, K, dtype=dtype, **config)
         elif impl == "vanilla":
             # kernel = gemm_vanilla(M, N, K, dtype=dtype, **config)
             kernel = gemm_vanilla_v1(M, N, K, dtype=dtype, **config)
@@ -123,8 +127,8 @@ def main(M: int = 4096,
     def ref_run():
         ref_program(*inputs)
 
-    # def triton_run():
-    #     triton_gemm(*inputs)
+    def triton_run():
+        triton_gemm(*inputs)
 
     # tilelang_latency = profiler.do_bench()
     # ref_latency = profiler.do_bench(ref_program)

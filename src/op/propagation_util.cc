@@ -8,10 +8,13 @@
  */
 
 #include "propagation_util.h"
+#include "builtin.h"
 #include "gemm.h"
-#include "mls.h"
 #include "operator.h"
 #include "propagation_tir_collector.h"
+
+#include <tvm/tir/builtin.h>
+#include <unordered_set>
 
 namespace tvm {
 namespace tl {
@@ -22,40 +25,73 @@ static bool IsGemm(const TileOperator &op) {
   return op->GetTypeKey() == std::string("tl.Gemm");
 }
 
+static bool IsGemmCallNode(const CallNode *call) {
+  if (call == nullptr) return false;
+  if (call->op.same_as(tl::tl_gemm())) return true;
+  if (call->op.as<OpNode>() &&
+      call->op.as<OpNode>()->name == std::string("tl.tileop.gemm"))
+    return true;
+  if (!call->op.same_as(builtin::call_extern()) || call->args.empty()) return false;
+  if (const auto *name = call->args[0].as<StringImmNode>()) {
+    std::string s = name->value;
+    return s.find("tl::gemm") == 0 || s.find("tl::tcgen5mma_gemm") == 0;
+  }
+  return false;
+}
+
+static bool GemmUsesBuffer(const GemmNode *gemm, const Buffer &buffer) {
+  return gemm->a_.same_as(buffer) || gemm->b_.same_as(buffer);
+}
+
+static std::optional<GemmWithInput> GemmWithInputFromCall(const CallNode *call,
+                                                          const Buffer &input) {
+  if (call == nullptr) return std::nullopt;
+  auto op = ParseOperator(tvm::ffi::GetRef<Call>(call));
+  if (!op.defined() || !IsGemm(op)) return std::nullopt;
+  auto gemm = Downcast<Gemm>(op);
+  if (!GemmUsesBuffer(gemm.get(), input)) return std::nullopt;
+  GemmWithInput r;
+  r.gemm = gemm;
+  r.input = input;
+  return r;
+}
+
+static std::optional<ProducerRecord> FindGemmProducerReading(
+    const PropagationTirCollector *tir, const Buffer &write_buf, const Buffer &read_buf,
+    int after_stmt_order) {
+  if (after_stmt_order < 0) {
+    return tir->FindLastGemmProducerReading(write_buf, read_buf);
+  }
+  return tir->FindFirstGemmProducerReading(write_buf, read_buf, after_stmt_order);
+}
+
 static Optional<TileOperator> PropagateToFindGemmConsumerOpTir(
-    Buffer buffer, const PropagationTirCollector *tir) {
+    Buffer buffer, const PropagationTirCollector *tir, int after_stmt_order) {
   if (!tir) return Optional<TileOperator>();
   for (const Buffer &out_buf : tir->GetConsumerOutputs(buffer)) {
     if (out_buf.scope() != "local.fragment") continue;
-    auto call_opt = tir->GetProducerCall(out_buf);
-    if (call_opt.defined()) {
-      auto op = ParseOperator(call_opt.value());
-      if (op.defined() && IsGemm(op)) return op;
+    if (auto rec = FindGemmProducerReading(tir, out_buf, buffer, after_stmt_order)) {
+      if (auto found = GemmWithInputFromCall(rec->call, buffer)) {
+        return found->gemm;
+      }
     }
-    // Recurse even when no producer call (e.g. BufferStore from mul/add)
-    auto found = PropagateToFindGemmConsumerOpTir(out_buf, tir);
+    auto found = PropagateToFindGemmConsumerOpTir(out_buf, tir, after_stmt_order);
     if (found.defined()) return found;
   }
   return Optional<TileOperator>();
 }
 
 static std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInputTir(
-    Buffer buffer, const PropagationTirCollector *tir) {
+    Buffer buffer, const PropagationTirCollector *tir, int after_stmt_order) {
   if (!tir) return std::nullopt;
   for (const Buffer &out_buf : tir->GetConsumerOutputs(buffer)) {
     if (out_buf.scope() != "local.fragment") continue;
-    auto call_opt = tir->GetProducerCall(out_buf);
-    if (call_opt.defined()) {
-      auto op = ParseOperator(call_opt.value());
-      if (op.defined() && IsGemm(op)) {
-        GemmWithInput r;
-        r.gemm = Downcast<Gemm>(op);
-        r.input = buffer;
-        return r;
+    if (auto rec = FindGemmProducerReading(tir, out_buf, buffer, after_stmt_order)) {
+      if (auto found = GemmWithInputFromCall(rec->call, buffer)) {
+        return found;
       }
     }
-    // Recurse even when no producer call (e.g. BufferStore from mul/add)
-    auto found = PropagateToFindGemmConsumerOpWithInputTir(out_buf, tir);
+    auto found = PropagateToFindGemmConsumerOpWithInputTir(out_buf, tir, after_stmt_order);
     if (found) return found;
   }
   return std::nullopt;
@@ -68,12 +104,31 @@ bool PropagateToFindGemmConsumer(Buffer buffer,
 
 Optional<TileOperator> PropagateToFindGemmConsumerOp(
     Buffer buffer, const PropagationTirCollector *tir_collector) {
-  return PropagateToFindGemmConsumerOpTir(buffer, tir_collector);
+  return PropagateToFindGemmConsumerOpTir(buffer, tir_collector, -1);
 }
 
 std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInput(
+    Buffer buffer, const PropagationTirCollector *tir_collector,
+    int after_stmt_order) {
+  return PropagateToFindGemmConsumerOpWithInputTir(buffer, tir_collector,
+                                                   after_stmt_order);
+}
+
+std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInputAfterCall(
+    Buffer buffer, const PropagationTirCollector *tir_collector,
+    const CallNode *after_site_call) {
+  int after_order = -1;
+  if (tir_collector != nullptr && after_site_call != nullptr) {
+    after_order = tir_collector->GetCallStmtOrder(after_site_call);
+  }
+  return PropagateToFindGemmConsumerOpWithInput(buffer, tir_collector,
+                                                  after_order);
+}
+
+std::vector<ReaderCallRecord> GetReaderCallsFromTir(
     Buffer buffer, const PropagationTirCollector *tir_collector) {
-  return PropagateToFindGemmConsumerOpWithInputTir(buffer, tir_collector);
+  if (!tir_collector) return {};
+  return tir_collector->GetReaderCalls(buffer);
 }
 
 static bool PropagateToFindProducerMatrixLoadFoundTir(
@@ -100,45 +155,14 @@ Array<TileOperator> GetConsumerOpsFromTir(Buffer buffer,
                                          const PropagationTirCollector *tir_collector) {
   Array<TileOperator> result;
   if (!tir_collector) return result;
-  for (const Buffer &out_buf : tir_collector->GetConsumerOutputs(buffer)) {
-    auto call_opt = tir_collector->GetProducerCall(out_buf);
-    if (!call_opt.defined()) continue;
-    auto op = ParseOperator(call_opt.value());
+  std::unordered_set<const CallNode *, CallNodePtrHash, CallNodePtrEqual> seen;
+  for (const ReaderCallRecord &reader : tir_collector->GetReaderCalls(buffer)) {
+    if (reader.call == nullptr || seen.count(reader.call)) continue;
+    seen.insert(reader.call);
+    auto op = ParseOperator(tvm::ffi::GetRef<Call>(reader.call));
     if (op.defined()) result.push_back(op);
   }
   return result;
-}
-
-static std::optional<std::pair<int, int>> GetMlsTileFromProducerChainTir(
-    Buffer buffer, const PropagationTirCollector *tir) {
-  if (!tir) return std::nullopt;
-  if (tir->ProducerIsMatrixLoad(buffer)) {
-    auto call_opt = tir->GetProducerCall(buffer);
-    if (!call_opt.defined()) return std::nullopt;
-    auto op = ParseOperator(call_opt.value());
-    if (auto mls = op.as<MatrixLoadNode>()) {
-      if (mls->mls_tile_mn > 0 && mls->mls_tile_k > 0) {
-        return std::make_pair(mls->mls_tile_mn, mls->mls_tile_k);
-      }
-    }
-    return std::nullopt;
-  }
-  if (tir->ProducerIsDsReadFormat(buffer)) {
-    auto inputs = tir->GetProducerInputs(buffer);
-    if (!inputs.empty()) {
-      return GetMlsTileFromProducerChainTir(inputs[0], tir);
-    }
-  }
-  for (const Buffer &in_buf : tir->GetProducerInputs(buffer)) {
-    if (in_buf.scope() != "local.fragment") continue;
-    if (auto found = GetMlsTileFromProducerChainTir(in_buf, tir)) return found;
-  }
-  return std::nullopt;
-}
-
-std::optional<std::pair<int, int>> GetMlsTileFromProducerChain(
-    Buffer buffer, const PropagationTirCollector *tir_collector) {
-  return GetMlsTileFromProducerChainTir(buffer, tir_collector);
 }
 
 }  // namespace tl

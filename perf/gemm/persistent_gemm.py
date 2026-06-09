@@ -2,6 +2,7 @@
 Persistent GEMM implementation.
 """
 
+from sre_parse import AT_LOCALE
 import torch
 import tilelang as tl
 import tilelang.language as T
@@ -334,7 +335,10 @@ def gemm_persistent_v2(M, N, K, block_M, block_N, block_K,
 # Impl:
 #   preload A/B to register swizzled before T.gemm
 #   use T.persistent instead of swizzle manually
-@tl.jit(out_idx=[-1], pass_configs={"tl.enable_aggressive_shared_memory_merge": True})
+@tl.jit(out_idx=[-1], pass_configs={
+     tl.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+    },
+)
 def gemm_persistent_v3(M, N, K, block_M, block_N, block_K,
                     num_stages, thread_num, group_size=8, wgs_per_cu=2,
                     dtype="float16", accum_dtype="float"):
@@ -395,7 +399,7 @@ def gemm_persistent_v3(M, N, K, block_M, block_N, block_K,
                         T.copy(B[bx * block_N, k * block_K], B_local_0, coalesced_width=8)
                         # preload B Block N_1
                         T.copy(B[bx * block_N + sub_block_N, k * block_K], B_local_1, coalesced_width=8)
-                        
+
                         # B Block N_0 swizzle
                         T.copy(B_local_0, B_shared_0)
                         T.copy(B_shared_0, B_local_0_)
@@ -404,7 +408,7 @@ def gemm_persistent_v3(M, N, K, block_M, block_N, block_K,
                         T.copy(B_local_1, B_shared_0)
                         T.copy(B_shared_0, B_local_1_)
                         
-                        # A local
+                        # # A local
                         T.copy(A_shared, A_local_0_)
                         
                         T.gemm(A_local_0_, B_local_0_, C_local_0, k_pack=2, transpose_B=True)
@@ -417,6 +421,199 @@ def gemm_persistent_v3(M, N, K, block_M, block_N, block_K,
 
     return _gemm_persistent
 
+# Impl:
+#   preload A/B to register swizzled before T.gemm
+#   use T.persistent instead of swizzle manually
+@tl.jit(out_idx=[-1], pass_configs={
+     tl.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+     tl.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+    },
+)
+def gemm_persistent_v4(M, N, K, block_M, block_N, block_K,
+                    num_stages, thread_num, group_size=8, wgs_per_cu=2,
+                    dtype="float16", accum_dtype="float"):
+    cu_num = torch.cuda.get_device_properties("cuda").multi_processor_count
+    m_blocks = T.ceildiv(M, block_M)
+    n_blocks = T.ceildiv(N, block_N)
+    grid_size = T.min(m_blocks * n_blocks, wgs_per_cu * cu_num)
+    # waves = T.ceildiv(m_blocks * n_blocks, grid_size)
+
+    split_n = 2
+    sub_block_N = block_N // split_n
+    k_loop = T.ceildiv(K, block_K)
+
+    @T.prim_func
+    def _gemm_persistent(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((N, K), dtype),
+            C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(grid_size, threads=thread_num) as (block_id):
+            A_shared = T.alloc_shared((2, block_M, block_K), dtype)
+            B_shared_0 = T.alloc_shared((2, sub_block_N, block_K), dtype)
+            B_shared_1 = T.alloc_shared((2, sub_block_N, block_K), dtype)
+           
+            A_local_0 = T.alloc_fragment((block_M, block_K), dtype)
+            B_local_0 = T.alloc_fragment((sub_block_N, block_K), dtype)
+            B_local_1 = T.alloc_fragment((sub_block_N, block_K), dtype)
+            
+            C_local_0 = T.alloc_fragment((block_M, sub_block_N), accum_dtype)
+            C_local_1 = T.alloc_fragment((block_M, sub_block_N), accum_dtype)
+
+            C_shared_0 = T.alloc_shared((block_M, sub_block_N), dtype)
+            T.annotate_layout({
+                C_shared_0: tl.layout.make_hcu_swizzled_layout(C_shared_0, major_pack=2),
+            })
+            
+            # bx: N, by: M
+            for bx, by in T.Persistent(
+                [T.ceildiv(N, block_N), T.ceildiv(M, block_M)],
+                wgs_per_cu * cu_num,
+                block_id,
+                group_size=1
+            ):
+                if by * block_M < M and bx * block_N < N:
+                    T.clear(C_local_0)
+                    T.clear(C_local_1)
+
+                    T.matrix_load(A[by * block_M, 0], A_shared[0, :, :])
+                    T.matrix_load(B[bx * block_N, 0], B_shared_0[0, :, :])
+                    T.matrix_load(B[bx * block_N + sub_block_N, 0], B_shared_1[0, :, :])
+                    for k in T.Serial(k_loop - 1):
+                        T.matrix_load(A[by * block_M, (k+1) * block_K], A_shared[((k+1) & 1), :, :])
+                        T.matrix_load(B[bx * block_N, (k+1) * block_K], B_shared_0[((k+1) & 1), :, :])
+                        T.matrix_load(B[bx * block_N + sub_block_N, (k+1) * block_K], B_shared_1[((k+1) & 1), :, :])
+
+                        T.s_waitcnt(3)
+                        T.sync_warp()
+                        # T.ds_read_format(A_shared[(k & 1), :, :], A_local_0)
+                        # T.ds_read_format(B_shared_0[(k & 1), :, :], B_local_0)
+                        # T.ds_read_format(B_shared_1[(k & 1), :, :], B_local_1)
+                        # T.gemm(A_local_0, B_local_0, C_local_0, transpose_B=True)
+                        # T.gemm(A_local_0, B_local_1, C_local_1, transpose_B=True)
+                        T.gemm(A_shared[(k & 1), :, :], B_shared_0[(k & 1), :, :], C_local_0, transpose_B=True)
+                        T.gemm(A_shared[(k & 1), :, :], B_shared_1[(k & 1), :, :], C_local_1, transpose_B=True)
+
+                    T.s_waitcnt(0)
+                    T.sync_warp()
+                    # T.ds_read_format(A_shared[((k_loop - 1) & 1), :, :], A_local_0)
+                    # T.ds_read_format(B_shared_0[((k_loop - 1) & 1), :, :], B_local_0)
+                    # T.ds_read_format(B_shared_1[((k_loop - 1) & 1), :, :], B_local_1)
+                    # T.gemm(A_local_0, B_local_0, C_local_0, transpose_B=True)
+                    # T.gemm(A_local_0, B_local_1, C_local_1, transpose_B=True)
+                    T.gemm(A_shared[((k_loop - 1) & 1), :, :], B_shared_0[((k_loop - 1) & 1), :, :], C_local_0, transpose_B=True)
+                    T.gemm(A_shared[((k_loop - 1) & 1), :, :], B_shared_1[((k_loop - 1) & 1), :, :], C_local_1, transpose_B=True)
+
+                    T.copy(C_local_0, C_shared_0)
+                    T.sync_threads()
+                    T.copy(C_shared_0, C[by * block_M, bx * block_N])
+                    T.copy(C_local_1, C_shared_0)
+                    T.sync_threads()
+                    T.copy(C_shared_0, C[by * block_M, bx * block_N + sub_block_N])
+
+    return _gemm_persistent
+
+# for small size like(1024 * 1024 * 1024)
+@tl.jit(out_idx=[-1], pass_configs={
+     tl.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+     tl.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+    },
+)
+def gemm_persistent_v5(M, N, K, block_M, block_N, block_K,
+                    num_stages, thread_num, group_size=8, wgs_per_cu=2,
+                    dtype="float16", accum_dtype="float", use_mls=False):
+    cu_num = torch.cuda.get_device_properties("cuda").multi_processor_count
+    m_blocks = T.ceildiv(M, block_M)
+    n_blocks = T.ceildiv(N, block_N)
+    grid_size = T.min(m_blocks * n_blocks, wgs_per_cu * cu_num)
+    # waves = T.ceildiv(m_blocks * n_blocks, grid_size)
+    k_loop = T.ceildiv(K, block_K)
+
+
+    @T.prim_func
+    def _gemm_persistent(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((N, K), dtype),
+            C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(grid_size, threads=thread_num) as (block_id):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_N, block_K), dtype)
+            A_local = T.alloc_fragment((block_M, block_K), dtype)
+            B_local = T.alloc_fragment((block_N, block_K), dtype)
+           
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+
+            C_shared = T.alloc_shared((block_M, block_N), dtype)
+            if use_mls:
+                # MLS: matrix_load / ds_read_format / gemm infer A/B shared layout.
+                T.annotate_layout({
+                    C_shared: tl.layout.make_hcu_swizzled_layout(C_shared, major_pack=2),
+                })
+            else:
+                T.annotate_layout({
+                    C_shared: tl.layout.make_hcu_swizzled_layout(C_shared, major_pack=2),
+                    B_shared: tl.layout.make_hcu_swizzled_layout(B_shared, major_pack=2),
+                    A_shared: tl.layout.make_hcu_swizzled_layout(A_shared, major_pack=2),
+                })
+            
+            # bx: N, by: M
+            for bx, by in T.Persistent(
+                [T.ceildiv(N, block_N), T.ceildiv(M, block_M)],
+                wgs_per_cu * cu_num,
+                block_id,
+                group_size=1
+            ):
+                if by * block_M < M and bx * block_N < N:
+                    T.clear(C_local)
+
+                    if use_mls:
+                        T.matrix_load(A[by * block_M, 0], A_shared)
+                        T.matrix_load(B[bx * block_N, 0], B_shared)
+                        for k in T.Serial(k_loop - 1):
+                            T.s_waitcnt(0)
+                            T.sync_warp()
+                            T.ds_read_format(A_shared, A_local)
+                            T.ds_read_format(B_shared, B_local)
+                            T.sync_threads()
+                            T.matrix_load(A[by * block_M, (k+1) * block_K], A_shared)
+                            T.matrix_load(B[bx * block_N, (k+1) * block_K], B_shared)
+                            T.gemm(A_local, B_local, C_local, transpose_B=True)
+
+                        T.s_waitcnt(0)
+                        T.sync_warp()
+                        T.ds_read_format(A_shared, A_local)
+                        T.ds_read_format(B_shared, B_local)
+                        T.gemm(A_local, B_local, C_local, transpose_B=True)
+                        # T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                    else:
+                        A_local_pre = T.alloc_fragment((block_M, block_K), dtype)
+                        B_local_pre = T.alloc_fragment((block_N, block_K), dtype)
+                        T.copy(A[by * block_M, 0], A_local_pre)
+                        T.copy(B[bx * block_N, 0], B_local_pre)
+                        for k in T.Serial(k_loop - 1):
+                            T.copy(A_local_pre, A_shared)
+                            T.sync_threads()
+                            T.copy(A[by * block_M, (k+1) * block_K], A_local_pre)
+                            T.copy(A_shared, A_local)
+                            T.copy(B_local_pre, B_shared)
+                            T.sync_threads()
+                            T.copy(B[bx * block_N, (k+1) * block_K], B_local_pre)
+                            T.copy(B_shared, B_local)
+                            T.gemm(A_local, B_local, C_local, k_pack=2, transpose_B=True)
+
+                        T.copy(A_local_pre, A_shared)
+                        T.copy(B_local_pre, B_shared)
+                        T.sync_threads()
+                        T.copy(A_shared, A_local)
+                        T.copy(B_shared, B_local)
+                        T.gemm(A_local, B_local, C_local, k_pack=2, transpose_B=True)  
+
+                    T.copy(C_local, C_shared)
+                    T.sync_threads()
+                    T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return _gemm_persistent
 
 # FIXME: Boudary check is not considered, so non-divisible block_N and group_size may cause
 #        correctness issue.

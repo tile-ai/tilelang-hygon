@@ -413,8 +413,9 @@ CK_TILE_DEVICE void mls_load_tile(DataType* p_data,
                                       Trans,
                                       HcuArch>;
     MlsBase mls(p_data, mls_stride, mn_length_raw, k_length_raw);
-    mls.set_window_origin(ck_tile::make_array<ck_tile::index_t>(block_mn_base, ck_tile::number<0>{}));
-    mls.update_base(block_k_base);
+    // mls.set_window_origin(ck_tile::make_array<ck_tile::index_t>(block_mn_base, ck_tile::number<0>{}));
+    // mls.update_base(block_k_base);
+    mls.set_window_origin(ck_tile::make_array<ck_tile::index_t>(block_mn_base, block_k_base));
     mls.template async_mls_load_asm<DataType, check_last_load, last_load>(smem, block_k_base);
 }
 

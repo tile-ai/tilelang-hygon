@@ -169,6 +169,9 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.InjectAssumes()(mod)
     # Simplify the IR expressions
     mod = tilelang.transform.Simplify()(mod)
+    # Collect MLS/GEMM dependency facts before any pass that ParseOperator's
+    # matrix_load / ds_read_format / gemm (HCU only).
+    mod = tilelang.transform.AnnotateMlsGemmDep()(mod)
     # Set layouts for reducers
     mod = tilelang.transform.LayoutReducer()(mod)
     # Tile-level warp specialization: runs before layout inference so that
