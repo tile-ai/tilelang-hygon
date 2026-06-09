@@ -46,7 +46,7 @@ test:
     - git merge origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME --no-edit
     - git submodule update --init --recursive
     # 编译
-    - pip install torch==${TORCH_VERSION} triton
+    - pip install torch==${TORCH_VERSION} triton cismi
     - pip install -r requirements.txt -r requirements-dev.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     - NO_TOOLCHAIN_VERSION=1 NO_GIT_VERSION=1 bash das-build.sh
     - pip install dist/*.whl
