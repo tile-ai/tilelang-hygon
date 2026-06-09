@@ -46,14 +46,20 @@ test:
     - git merge origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME --no-edit
     - git submodule update --init --recursive
     # 编译
-    - pip install torch==${TORCH_VERSION} triton
+    - pip install torch==${TORCH_VERSION} triton cismi
     - pip install -r requirements.txt -r requirements-dev.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     - NO_TOOLCHAIN_VERSION=1 NO_GIT_VERSION=1 bash das-build.sh
     - pip install dist/*.whl
     - pip install numpy==1.24.3 allure-pytest
     # 回归测试
     - git clone -b staging http://gitlab-ci-token:${CI_JOB_TOKEN}@42.228.13.241:10068/dcutoolkit/deeplearing/TileKernels.git /opt/TileKernels
-    - REPO_DIR=/opt/TileKernels TILELANG_CACHE_DIR=./cache_test TEST_RESULTS_DIR=${CI_PROJECT_DIR}/das-results GENERATE_ALLURE_REPORT=1 bash das-regression.sh --junitxml=${CI_PROJECT_DIR}/das-results/allure-results/results.xml
+    - export HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout 300)
+    - >-
+      REPO_DIR=/opt/TileKernels
+      TILELANG_CACHE_DIR=./cache_test
+      TEST_RESULTS_DIR=${CI_PROJECT_DIR}/das-results
+      GENERATE_ALLURE_REPORT=1
+      bash das-regression.sh --junitxml=${CI_PROJECT_DIR}/das-results/allure-results/results.xml
   artifacts:
     paths:
       - dist/*.whl
