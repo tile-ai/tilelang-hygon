@@ -26,7 +26,6 @@
 #include "../op/gemm.h"
 #include "../op/mls.h"
 #include "../op/parallel.h"
-#include "../op/propagation_tir_collector.h"
 #include "../op/region.h"
 #include "../op/utils.h"
 #include "../target/utils.h"
@@ -138,7 +137,6 @@ struct LayoutInferenceResult {
   Map<Buffer, Layout> layout_map;
   Map<For, Fragment> for_map;
   Map<For, PrimExpr> predicate_map;
-  Map<ObjectRef, TileOperator> call_to_op;
 };
 
 class BufferUseDefCollector : public IRVisitorWithAnalyzer {
@@ -194,10 +192,7 @@ public:
                         buffer_oob,
                         Map<Buffer, Buffer>{},
                         let_var_to_expr_,
-                        false,
-                        propagation_tir_collector_
-                            ? propagation_tir_collector_.get()
-                            : nullptr},
+                        false},
         level);
     // Process the returned updates
     for (const auto &[buffer, layout] : updates) {
@@ -485,11 +480,6 @@ public:
       }
     }
 
-    Map<ObjectRef, TileOperator> call_to_op;
-    for (int i = 0; i < infer_list_.size(); i++) {
-      call_to_op.Set(infer_list_stmt_[i], infer_list_[i]);
-    }
-
     // Collect layout info for For nodes
     Map<For, Fragment> for_map;
     Map<For, PrimExpr> predicate_map;
@@ -518,7 +508,7 @@ public:
       }
     }
 
-    return {layout_map, for_map, predicate_map, call_to_op};
+    return {layout_map, for_map, predicate_map};
   }
 
   void Collect(const PrimFunc &f) {
@@ -537,9 +527,6 @@ public:
         << "Layout_Inference: Require the target attribute";
     target_ = target.value();
     this->operator()(f->body);
-    propagation_tir_collector_ =
-        std::make_unique<PropagationTirCollector>(GetBufferMap());
-    propagation_tir_collector_->Collect(f->body);
     // Compute floating fragment buffers after collection
     ComputeFloatingFragmentBuffers(f->body);
   }
@@ -1065,8 +1052,6 @@ private:
   Target target_;
   LayoutMap annotated_layout_map_;
   bool skip_thread_partition_{false};
-  std::unique_ptr<PropagationTirCollector> propagation_tir_collector_;
-
   std::vector<TileOperator> BackupInferList() {
     std::vector<TileOperator> back_infer_list;
     back_infer_list.reserve(infer_list_.size());
@@ -1253,53 +1238,6 @@ private:
       : arith::IRMutatorWithAnalyzer(analyzer), result_(result) {};
 
   using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
-
-  Stmt VisitStmt_(const EvaluateNode *op) final {
-    auto call = op->value.as<CallNode>();
-    auto op_val = call ? call->op.as<Op>() : Optional<Op>();
-    if (call && op_val.defined() && op_val.value() == MatrixLoad::Get() &&
-        call->args.size() < 9) {
-      ObjectRef call_ref = tvm::ffi::GetRef<ObjectRef>(call);
-      ICHECK(result_.call_to_op.count(call_ref))
-          << "MatrixLoad call not found in call_to_op after layout inference.";
-      auto mls = result_.call_to_op[call_ref].as<MatrixLoadNode>();
-      ICHECK(mls) << "Expected MatrixLoadNode for matrix_load call.";
-      ICHECK(mls->mls_tile_mn > 0)
-          << "MatrixLoad tile info (mls_tile_mn, mls_tile_k, warp_mn, warp_k) "
-             "must be determined in InferLayout; got mls_tile_mn="
-          << mls->mls_tile_mn;
-      auto dtype = DataType::Int(64);
-      Array<PrimExpr> new_args = call->args;
-      new_args.push_back(IntImm(dtype, mls->mls_tile_mn));
-      new_args.push_back(IntImm(dtype, mls->mls_tile_k));
-      new_args.push_back(IntImm(dtype, mls->warp_mn));
-      new_args.push_back(IntImm(dtype, mls->warp_k));
-      new_args.push_back(IntImm(dtype, mls->trans ? 1 : 0));
-      return Evaluate(
-          Call(call->dtype, call->op, new_args, call->annotations, call->span));
-    } else if (call && op_val.defined() && op_val.value() == DsReadFormat::Get() &&
-        call->args.size() < 7) {
-      ObjectRef call_ref = tvm::ffi::GetRef<ObjectRef>(call);
-      ICHECK(result_.call_to_op.count(call_ref))
-          << "DsReadFormat call not found in call_to_op after layout inference.";
-      auto ds = result_.call_to_op[call_ref].as<DsReadFormatNode>();
-      ICHECK(ds) << "Expected DsReadFormatNode for ds_read_format call.";
-      ICHECK(ds->mls_tile_mn > 0)
-          << "DsReadFormat tile info (mls_tile_mn, mls_tile_k, warp_mn, warp_k) "
-             "must be determined in InferLayout; got mls_tile_mn="
-          << ds->mls_tile_mn;
-      auto dtype = DataType::Int(64);
-      Array<PrimExpr> new_args = call->args;
-      new_args.push_back(IntImm(dtype, ds->mls_tile_mn));
-      new_args.push_back(IntImm(dtype, ds->mls_tile_k));
-      new_args.push_back(IntImm(dtype, ds->warp_mn));
-      new_args.push_back(IntImm(dtype, ds->warp_k));
-      new_args.push_back(IntImm(dtype, ds->trans ? 1 : 0));
-      return Evaluate(
-          Call(call->dtype, call->op, new_args, call->annotations, call->span));
-    }
-    return IRMutatorWithAnalyzer::VisitStmt_(op);
-  }
 
   /**
    * @brief Visit and mutate a Block node to attach inferred layout information.

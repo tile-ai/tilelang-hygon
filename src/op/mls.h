@@ -22,15 +22,11 @@ class MatrixLoadNode : public TileOperatorNode {
 public:
   Buffer src, dst;
   Array<Range> src_ranges;  // from src region, last 2 dims = MN,K (order from Gemm)
+  Array<Range> dst_ranges;  // leading dims select ping-pong slice; last 2 = MN,K tile
   bool check_last_load;
   bool last_load;
-  /// MLS tile from InferLayout, written into IR by layout_inference. 0 = not set.
-  mutable int mls_tile_mn = 0;
-  mutable int mls_tile_k = 0;
-  mutable int warp_mn = 0;  // MLS warp division (not Gemm's), derived in InferLayout
-  mutable int warp_k = 0;   // MLS warp division (not Gemm's), derived in InferLayout
-  mutable bool trans = true;  // K-major (true) or MN-major (false), from consumer gemm or default
-  mutable bool completed_ = false;  // InferLayout done, skip re-run
+  /// Validated by AnnotateMlsGemmDep and stored as tl.mls_trans on the call.
+  bool mls_trans_{true};
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.MatrixLoad", MatrixLoadNode,
                                     TileOperatorNode);

@@ -18,7 +18,6 @@
 #include <vector>
 
 #include "../layout/layout.h"
-#include "propagation_tir_collector.h"
 
 namespace tvm {
 namespace tl {
@@ -104,9 +103,6 @@ struct LowerArgs {
   // cluster). Used by TMA copy lowering to scale expect_tx bytes for cluster
   // barriers.
   int cluster_size = 1;
-  // Optional TIR producer/consumer graph (e.g. MLS); used when lowering GEMM on
-  // HCU and for other propagation-based paths.
-  const PropagationTirCollector *tir_collector = nullptr;
 };
 
 struct LayoutInferArgs {
@@ -122,9 +118,6 @@ struct LayoutInferArgs {
   // Whether the current TileOp is nested inside a pipelined loop
   // (i.e. a surrounding loop annotated with num_stages > 0).
   bool in_pipeline = false;
-  // Optional TIR producer/consumer graph (e.g. MLS); feeds InferLayout for HCU
-  // GEMM and related operators.
-  const PropagationTirCollector *tir_collector = nullptr;
 };
 
 class TileOperator;

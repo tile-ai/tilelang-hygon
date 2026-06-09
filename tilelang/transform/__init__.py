@@ -54,6 +54,20 @@ def InstructionAnnotation():
     return _ffi_api.InstructionAnnotation()  # type: ignore
 
 
+def AnnotateMlsGemmDep():
+    """Annotate matrix_load / ds_read_format / gemm with MLS dependency metadata.
+
+    Runs PropagationTirCollector before layout inference and stores minimal
+    consumer-GEMM facts on tile-op Call annotations (HCU only).
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.AnnotateMlsGemmDep()  # type: ignore
+
+
 def LayoutInference():
     """LayoutInference
 
