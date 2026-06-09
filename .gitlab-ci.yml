@@ -39,7 +39,7 @@ test:
     - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
     # 安装 AICC
     - latest_run=$(ls /ArchivedFile/ai_cc/nightly/dtk_llvm_*.run 2>/dev/null | sort -t '_' -k4 -nr | head -n1)
-    - '[ -n "${latest_run}" ] && cp ${latest_run} ./ && chmod +x $(basename ${latest_run}) && echo "AICC 安装完成" || echo "跳过 AICC 安装"'
+    - '[ -n "${latest_run}" ] && cp ${latest_run} ./ && chmod +x $(basename ${latest_run}) && yes | bash $(basename ${latest_run}) && echo "AICC 安装完成" || echo "跳过 AICC 安装"'
     # 合并目标分支
     - git config user.email "ci@tilelang.local" && git config user.name "CI"
     - git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
@@ -76,7 +76,7 @@ publish:
     - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
     # 安装 AICC
     - latest_run=$(ls /ArchivedFile/ai_cc/nightly/dtk_llvm_*.run 2>/dev/null | sort -t '_' -k4 -nr | head -n1)
-    - '[ -n "${latest_run}" ] && cp ${latest_run} ./ && chmod +x $(basename ${latest_run}) && echo "AICC 安装完成" || echo "跳过 AICC 安装"'
+    - '[ -n "${latest_run}" ] && cp ${latest_run} ./ && chmod +x $(basename ${latest_run}) && yes | bash $(basename ${latest_run}) && echo "AICC 安装完成" || echo "跳过 AICC 安装"'
     - git submodule update --init --recursive
     # 编译
     - pip install torch==${TORCH_VERSION} ciupload
