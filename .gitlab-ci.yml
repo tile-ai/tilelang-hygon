@@ -7,6 +7,7 @@ variables:
   PIP_TRUSTED_HOST: "10.16.1.201"
   DTK_PKG: "/ArchivedFile/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz"
   DEVPI_URL: "http://10.16.1.201:9929/"
+  CISMI_TIMEOUT: "3600"
 
 .torch_matrix: &torch_matrix
   - TORCH_VERSION: ["2.10.0"]
@@ -53,7 +54,7 @@ test:
     - pip install numpy==1.24.3 allure-pytest
     # 回归测试
     - git clone -b staging http://gitlab-ci-token:${CI_JOB_TOKEN}@42.228.13.241:10068/dcutoolkit/deeplearing/TileKernels.git /opt/TileKernels
-    - export HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout 300)
+    - export HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout ${CISMI_TIMEOUT})
     - >-
       REPO_DIR=/opt/TileKernels
       TILELANG_CACHE_DIR=./cache_test
