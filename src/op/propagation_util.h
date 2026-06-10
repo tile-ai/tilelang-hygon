@@ -12,13 +12,12 @@
 
 #include "gemm.h"
 #include "operator.h"
+#include "propagation_tir_collector.h"
 
 namespace tvm {
 namespace tl {
 
 using namespace tir;
-
-class PropagationTirCollector;
 
 /*!
  * \brief Propagate forward through consumer chain to find Gemm (TIR only).
@@ -44,6 +43,22 @@ struct GemmWithInput {
  * connects to Gemm (may differ from start buffer when there are intermediate ops).
  */
 std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInput(
+    Buffer buffer, const PropagationTirCollector *tir_collector,
+    int after_stmt_order = -1);
+
+/*!
+ * \brief Site-aware pairing: resolve stmt_order from `after_site_call` via the
+ * collector, then find the first downstream GEMM after that call.
+ */
+std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInputAfterCall(
+    Buffer buffer, const PropagationTirCollector *tir_collector,
+    const CallNode *after_site_call);
+
+/*!
+ * \brief Tile-op consumers that read `buffer`, in program order.
+ * Prefer this over GetConsumerOpsFromTir when stmt_order pairing matters.
+ */
+std::vector<ReaderCallRecord> GetReaderCallsFromTir(
     Buffer buffer, const PropagationTirCollector *tir_collector);
 
 /*!
@@ -58,13 +73,6 @@ bool IsFromMls(Buffer buffer, const PropagationTirCollector *tir_collector);
  */
 Array<TileOperator> GetConsumerOpsFromTir(Buffer buffer,
                                           const PropagationTirCollector *tir_collector);
-
-/*!
- * \brief Get mls_tile (mn, k) from MatrixLoad or DsReadFormat in producer chain.
- * Returns nullopt when not found or mls_tile not set.
- */
-std::optional<std::pair<int, int>> GetMlsTileFromProducerChain(
-    Buffer buffer, const PropagationTirCollector *tir_collector);
 
 }  // namespace tl
 }  // namespace tvm

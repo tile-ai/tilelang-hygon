@@ -4,13 +4,13 @@
  */
 
 #include "mls.h"
-#include "gemm.h"
-#include "ds_read_format.h"
-#include "propagation_util.h"
+#include "mls_gemm_dep.h"
+#include "operator.h"
 #include "region.h"
 #include "../target/utils.h"
 #include "builtin.h"
 #include <algorithm>
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
 
@@ -28,7 +28,6 @@ static PrimExpr ToInt64ConstOrVar(const PrimExpr &expr) {
 }
 
 MatrixLoad::MatrixLoad(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
-  (void)annotations;
   ICHECK(args.size() >= 4)
       << "matrix_load expects at least 4 args: src_region, dst_region, "
          "check_last_k_load, last_k_load";
@@ -54,14 +53,11 @@ MatrixLoad::MatrixLoad(Array<PrimExpr> args, Map<String, ObjectRef> annotations)
   node->src = src_region->GetBuffer();
   node->dst = dst_buf;
   node->src_ranges = src_ranges;
+  node->dst_ranges = dst_ranges;
   node->check_last_load = args[2].as<IntImmNode>()->value != 0;
   node->last_load = args[3].as<IntImmNode>()->value != 0;
-  if (args.size() >= 9) {
-    node->mls_tile_mn = args[4].as<IntImmNode>()->value;
-    node->mls_tile_k = args[5].as<IntImmNode>()->value;
-    node->warp_mn = args[6].as<IntImmNode>()->value;
-    node->warp_k = args[7].as<IntImmNode>()->value;
-    node->trans = args[8].as<IntImmNode>()->value != 0;
+  if (auto mls_trans = GetMlsTransFromAnnotations(annotations)) {
+    node->mls_trans_ = mls_trans.value();
   }
 
   data_ = std::move(node);
@@ -123,6 +119,15 @@ constexpr MlsTileConfigSet kMlsTileConfigTable[] = {
      static_cast<int>(sizeof(kMlsTileConfigsB16NonTrans) / sizeof(kMlsTileConfigsB16NonTrans[0]))},
 };
 
+std::pair<int64_t, int64_t> MlsBlockDims(const Buffer &buf, bool mls_trans) {
+  ICHECK(buf->shape.size() >= 2);
+  size_t nd = buf->shape.size();
+  if (mls_trans) {
+    return {*as_const_int(buf->shape[nd - 2]), *as_const_int(buf->shape[nd - 1])};
+  }
+  return {*as_const_int(buf->shape[nd - 1]), *as_const_int(buf->shape[nd - 2])};
+}
+
 }  // namespace
 
 /*
@@ -139,10 +144,6 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k, int block_si
   int num_warps = block_size / TargetGetWarpSize(target);
   ICHECK(num_warps >= 1) << "num_warps must be >= 1";
 
-  // require_no_repeat: warp group extent must fit in block (no repeat load).
-  // When false, warp group extent may exceed block (C++ template handles repeat).
-  // Always prioritize MN first (wm), then K (wk), to match GEMM K-outer/MN-inner and
-  // SFC_WarpAccess MN-inner/K-outer for better locality.
   auto try_config = [&](int tile_mn, int tile_k, bool require_no_repeat) -> bool {
     if (block_k % tile_k != 0 || block_mn % tile_mn != 0) return false;
     int wm = std::min(block_mn / tile_mn, num_warps);
@@ -173,107 +174,29 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k, int block_si
 
 LayoutMap MatrixLoadNode::InferLayout(const LayoutInferArgs &T,
                                       InferLevel level) const {
-  if (completed_)
-    return {};
-
-  bool mls_trans = true;
-  bool found_gemm = false;
-  bool mls_trans_set = false;
-  auto consumers = GetConsumerOpsFromTir(dst, T.tir_collector);
-  for (const auto &c : consumers) {
-    if (c.as<GemmNode>()) {
-      found_gemm = true;
-      auto gemm = Downcast<Gemm>(c);
-      ICHECK(gemm->kPack_ == 1) << "MatrixLoad dst Gemm consumer must have kPack=1, got "
-                                << gemm->kPack_;
-      bool cur_trans = false;
-      if (gemm->a_.same_as(dst)) {
-        cur_trans = !gemm->transA_;
-      } else if (gemm->b_.same_as(dst)) {
-        cur_trans = gemm->transB_;
-      }
-      if (mls_trans_set) {
-        ICHECK(cur_trans == mls_trans) << "MatrixLoad dst Gemm consumers must have consistent mls_trans";
-      } else {
-        mls_trans = cur_trans;
-        mls_trans_set = true;
-      }
-    } else if (c->GetTypeKey() == std::string("tl.DsReadFormat")) {
-      auto gemm_with_input = PropagateToFindGemmConsumerOpWithInput(
-          Downcast<DsReadFormat>(c)->dst, T.tir_collector);
-      if (gemm_with_input) {
-        found_gemm = true;
-        auto gemm = gemm_with_input->gemm;
-        auto input_buf = gemm_with_input->input;
-        bool cur_trans = false;
-        if (input_buf.same_as(gemm->a_)) {
-          cur_trans = !gemm->transA_;
-        } else if (input_buf.same_as(gemm->b_)) {
-          cur_trans = gemm->transB_;
-        }
-        if (mls_trans_set) {
-          ICHECK(cur_trans == mls_trans) << "MatrixLoad dst Gemm consumers must have consistent mls_trans";
-        } else {
-          mls_trans = cur_trans;
-          mls_trans_set = true;
-        }
-      }
-    } else {
-      ICHECK(false) << "MatrixLoad dst consumers must be Gemm or DsReadFormat, got " << c->GetTypeKey();
-    }
-  }
-  if (!found_gemm) {
-    // for now, default to trans=true for ds_read_format when not feeding Gemm.
-    mls_trans = true;
-  }
-  this->trans = mls_trans;
-
-  // mls_trans=true: K is major (dim_size-1), mls_trans=false: K is non-major (dim_size-2).
-  // Tile MN×K always uses the last two buffer dimensions (aligned with src trailing MN,K).
-  ICHECK(dst->shape.size() >= 2);
-  size_t dst_nd = dst->shape.size();
-  int64_t block_mn =
-      mls_trans ? *as_const_int(dst->shape[dst_nd - 2]) : *as_const_int(dst->shape[dst_nd - 1]);
-  int64_t block_k =
-      mls_trans ? *as_const_int(dst->shape[dst_nd - 1]) : *as_const_int(dst->shape[dst_nd - 2]);
-  int64_t block_size = *as_const_int(T.thread_bounds->extent);
-  int elem_bits = src->dtype.bits();
-  int w_mn, w_k, t_mn, t_k;
-  ComputeMlsWarpPartition(mls_trans, block_mn, block_k, block_size, T.target,
-                         elem_bits, w_mn, w_k, t_mn, t_k);
-  this->mls_tile_mn = t_mn;
-  this->mls_tile_k = t_k;
-  this->warp_mn = w_mn;
-  this->warp_k = w_k;
-  this->completed_ = true;
+  (void)T;
+  (void)level;
   return {};
 }
 
 Stmt MatrixLoadNode::Lower(const LowerArgs &T,
                            arith::Analyzer *analyzer) const {
+  (void)analyzer;
   if (!TargetIsHCU(T.target)) {
     LOG(FATAL) << "matrix_load is only supported on HCU target";
   }
 
   ICHECK(dst->shape.size() >= 2)
       << "dst must have rank >= 2; MN×K tile uses the last two dimensions";
-
   ICHECK(src->shape.size() >= 2) << "src must be 2D";
 
-  ICHECK(this->mls_tile_mn > 0 && this->mls_tile_k > 0 && this->warp_mn > 0 &&
-         this->warp_k > 0)
-      << "MatrixLoad tile info must be set in InferLayout; "
-         "ensure layout inference runs before lower.";
-
-  bool mls_trans = this->trans;
-
-  // mls_trans=true: K is major (dim_size-1), mls_trans=false: K is non-major (dim_size-2).
-  // Tile MN×K uses the last two dimensions of dst (same convention as src_ranges tail).
-  size_t dst_nd = dst->shape.size();
-  int64_t block_mn =
-      mls_trans ? *as_const_int(dst->shape[dst_nd - 2]) : *as_const_int(dst->shape[dst_nd - 1]);
-  int64_t block_k =
-      mls_trans ? *as_const_int(dst->shape[dst_nd - 1]) : *as_const_int(dst->shape[dst_nd - 2]);
+  const bool mls_trans = mls_trans_;
+  auto [block_mn, block_k] = MlsBlockDims(dst, mls_trans);
+  int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
+  int tile_mn, tile_k, warp_m, warp_k;
+  ComputeMlsWarpPartition(mls_trans, static_cast<int>(block_mn), static_cast<int>(block_k),
+                          block_size, T.target, src->dtype.bits(), warp_m, warp_k, tile_mn,
+                          tile_k);
 
   size_t nr = this->src_ranges.size();
   ICHECK(nr >= 2);
@@ -286,7 +209,6 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
     block_mn_base = this->src_ranges[nr - 1]->min;
   }
 
-  // src shape: mls_trans => K at shape[1], !mls_trans => K at shape[0]
   PrimExpr mn_length_raw = mls_trans ? src->shape[nr - 2] : src->shape[nr - 1];
   PrimExpr k_length_raw = mls_trans ? src->shape[nr - 1] : src->shape[nr - 2];
   PrimExpr mls_stride = mls_trans ? k_length_raw : mn_length_raw;
@@ -306,8 +228,8 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
 
   std::stringstream ss;
   ss << "tl::mls::mls_load_tile<ck_tile::sequence<" << block_mn << ", "
-     << block_k << ">, ck_tile::sequence<" << this->mls_tile_mn << ", "
-     << this->mls_tile_k << ">, " << this->warp_mn << ", " << this->warp_k
+     << block_k << ">, ck_tile::sequence<" << tile_mn << ", "
+     << tile_k << ">, " << warp_m << ", " << warp_k
      << ", " << dtype_str << ", 1, "
      << (mls_trans ? "true" : "false")
      << ", ck_tile::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
@@ -317,9 +239,6 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   Buffer src_buf = T.buffer_remap.count(src) ? T.buffer_remap[src] : src;
   Buffer dst_buf = T.buffer_remap.count(dst) ? T.buffer_remap[dst] : dst;
 
-  // Flat element offset from leading dimensions (all dims before the last two). The
-  // extern mls_load_tile uses block_mn_base / block_k_base for the MN×K tile within
-  // the trailing 2D slice; src_ptr must point to the slice origin at (r0..r_{n-3}, 0, 0).
   PrimExpr leading_elem_offset = IntImm(DataType::Int(32), 0);
   if (nr > 2) {
     ICHECK_EQ(src_buf->shape.size(), nr)
@@ -339,7 +258,29 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   }
 
   auto src_ptr = src_buf.access_ptr(1, DataType::Handle(), 1, leading_elem_offset);
-  auto dst_ptr = dst_buf.access_ptr(2);
+
+  size_t dr = this->dst_ranges.size();
+  ICHECK(dr >= 2) << "matrix_load dst region must be at least 2D";
+  PrimExpr dst_leading_elem_offset = IntImm(DataType::Int(32), 0);
+  if (dr > 2) {
+    ICHECK_EQ(dst_buf->shape.size(), dr)
+        << "matrix_load dst buffer rank must match dst region rank, got shape.size()="
+        << dst_buf->shape.size() << " vs region rank=" << dr;
+    Array<PrimExpr> dst_idx_leading;
+    DataType dst_idx_dtype = dst_buf->DefaultIndexType();
+    for (size_t j = 0; j + 2 < dr; ++j) {
+      dst_idx_leading.push_back(this->dst_ranges[j]->min);
+    }
+    dst_idx_leading.push_back(make_const(dst_idx_dtype, 0));
+    dst_idx_leading.push_back(make_const(dst_idx_dtype, 0));
+    Array<PrimExpr> dst_offs = dst_buf.OffsetOf(dst_idx_leading);
+    ICHECK_EQ(dst_offs.size(), 1u)
+        << "matrix_load dst OffsetOf expects a single flat offset, got size="
+        << dst_offs.size();
+    dst_leading_elem_offset = dst_offs[0];
+  }
+
+  auto dst_ptr = dst_buf.access_ptr(2, DataType::Handle(), 1, dst_leading_elem_offset);
 
   Array<PrimExpr> call_args;
   call_args.push_back(StringImm(ss.str()));
@@ -359,6 +300,22 @@ TIR_REGISTER_TL_TILE_OP(MatrixLoad, matrix_load)
     .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                               Integer(CallEffectKind::kOpaque));
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def(
+      "tl.ComputeMlsWarpPartition",
+      [](bool trans, int block_mn, int block_k, int block_size, Target target, int elem_bits) {
+        int warp_mn = 0;
+        int warp_k = 0;
+        int mls_tile_mn = 0;
+        int mls_tile_k = 0;
+        ComputeMlsWarpPartition(trans, block_mn, block_k, block_size, target, elem_bits, warp_mn,
+                                warp_k, mls_tile_mn, mls_tile_k);
+        return Array<Integer>{Integer(warp_mn), Integer(warp_k), Integer(mls_tile_mn),
+                              Integer(mls_tile_k)};
+      });
+}
 
 } // namespace tl
 } // namespace tvm

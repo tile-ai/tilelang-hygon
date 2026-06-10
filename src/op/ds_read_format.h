@@ -6,6 +6,7 @@
 #ifndef TVM_TL_OP_DS_READ_FORMAT_H_
 #define TVM_TL_OP_DS_READ_FORMAT_H_
 
+#include "mls_gemm_dep.h"
 #include "operator.h"
 
 namespace tvm {
@@ -18,12 +19,8 @@ class DsReadFormatNode : public TileOperatorNode {
   Buffer src, dst;
   Array<Range> src_ranges;
   Array<Range> dst_ranges;
-  /// From InferLayout: mls tile (derived via ComputeMlsWarpPartition)
-  mutable int mls_tile_mn = 0;
-  mutable int mls_tile_k = 0;
-  mutable bool trans = true;
-  mutable int warp_mn = 0;
-  mutable int warp_k = 0;
+  /// Consumer GEMM facts from AnnotateMlsGemmDep (optional).
+  Optional<MlsGemmDepMeta> gemm_dep_;
   mutable bool completed_ = false;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.DsReadFormat", DsReadFormatNode,

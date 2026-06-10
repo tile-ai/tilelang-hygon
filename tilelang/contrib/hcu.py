@@ -134,7 +134,7 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
         return []
     if arch in ["gfx928", "gfx936", "gfx938", "gfx92a", "gfx946"]:
         flags = [
-            # "-mllvm=-support-768-vgprs=true",
+            "-mllvm=-support-768-vgprs=true",
             "-mllvm=-enable-latency-hack=true",
             "-mllvm=-mmac-latency=5",
             "-mllvm=-ds-load-store-latency=6",

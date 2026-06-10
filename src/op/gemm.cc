@@ -4,7 +4,6 @@
  */
 
 #include "gemm.h"
-#include "propagation_util.h"
 
 #include "builtin.h"
 #include <tvm/tir/builtin.h>
@@ -182,33 +181,6 @@ GemmInst GemmNode::getGemmInst(int block_size, Target target) const {
     ICHECK(0) << "Unsupported target for gemm: " << target->str();
     return GemmInst::kMMA;
   }
-}
-
-/// Build metadata for Python GEMM lowering on HCU (MLS flags and tile sizes).
-/// Mirrors the former GemmNode::Lower / InferLayout uses of IsFromMls and
-/// GetMlsTileFromProducerChain when tir_collector is available.
-static GemmHcuLoweringMeta MakeGemmHcuLoweringMeta(const GemmNode *self,
-                                                   const PropagationTirCollector *coll) {
-  auto node = tvm::ffi::make_object<GemmHcuLoweringMetaNode>();
-  if (coll) {
-    if (IsFromMls(self->a_, coll)) {
-      node->a_from_mls = 1;
-      if (auto tile = GetMlsTileFromProducerChain(self->a_, coll)) {
-        node->mls_tile_m = tile->first;
-        node->mls_tile_ka = tile->second;
-      }
-    }
-    if (IsFromMls(self->b_, coll)) {
-      node->b_from_mls = 1;
-      if (auto tile = GetMlsTileFromProducerChain(self->b_, coll)) {
-        node->mls_tile_n = tile->first;
-        node->mls_tile_kb = tile->second;
-      }
-    }
-  }
-  node->a_mls_trans = self->transA_ ? 0 : 1;
-  node->b_mls_trans = self->transB_ ? 1 : 0;
-  return GemmHcuLoweringMeta(std::move(node));
 }
 
 std::tuple<int, int, int> GemmWarpPolicyNode::computeWarpPartitionHCU(
@@ -594,15 +566,9 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     if (auto explicit_phase = GetAnnotatedMbarPhaseExpr(annotations_)) {
       mbar_phase = explicit_phase.value();
     }
-    ObjectRef hcu_meta;
-    if (TargetIsHCU(T.target)) {
-      // MLS-related fields are not recomputed in Python: pass a packed meta
-      // object built with PropagationTirCollector (same as legacy C++ path).
-      hcu_meta = MakeGemmHcuLoweringMeta(this, T.tir_collector);
-    }
     auto prim_func = Downcast<PrimFunc>((*f)(
         tvm::ffi::GetRef<Gemm>(this), T.layout_map, T.target, T.thread_bounds,
-        T.thread_var, mbar_phase, hcu_meta));
+        T.thread_var, mbar_phase));
     ICHECK(prim_func->attrs.defined());
     auto global_symbol =
         prim_func->attrs.GetAttr<tvm::ffi::String>("global_symbol");
@@ -642,14 +608,9 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
   LayoutMap results;
   if (const auto f = ffi::Function::GetGlobal("tl.gemm.infer_layout")) {
     // NOTE(wt): layout inference for most targets runs on the Python side
-    // (tl.gemm.infer_layout); HCU passes MLS hints via hcu_meta when present.
-    ObjectRef hcu_meta;
-    if (TargetIsHCU(T.target)) {
-      hcu_meta = MakeGemmHcuLoweringMeta(this, T.tir_collector);
-    }
+    // (tl.gemm.infer_layout); HCU reads tl.hcu_mls_meta from gemm.annotations.
     auto inferred_layouts = Downcast<LayoutMap>(
-        (*f)(tvm::ffi::GetRef<Gemm>(this), T.target, T.thread_bounds,
-             hcu_meta));
+        (*f)(tvm::ffi::GetRef<Gemm>(this), T.target, T.thread_bounds));
     // For MMA instructions, skip shared buffer layouts that are already
     // inferred by a prior operator to avoid layout conflicts when the same
     // shared buffer is consumed by multiple gemm ops with different transpose
@@ -716,7 +677,6 @@ TVM_REGISTER_OP("tl.GemmWarpPolicy")
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   GemmNode::RegisterReflection();
-  GemmHcuLoweringMetaNode::RegisterReflection();
   GemmWarpPolicyNode::RegisterReflection();
 }
 

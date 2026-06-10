@@ -19,11 +19,9 @@ from tilelang.utils.target import target_is_volta
 
 
 @tvm_ffi.register_global_func("tl.gemm.infer_layout")
-def gemm_infer_layout(
-    gemm: GemmMMA, target: Target, thread_bounds: Range, hcu_mls_meta=None
-):
+def gemm_infer_layout(gemm: GemmMMA, target: Target, thread_bounds: Range):
     thread_nums = thread_bounds.extent
-    return gemm.infer_layout(target, thread_nums, hcu_mls_meta)
+    return gemm.infer_layout(target, thread_nums)
 
 
 @tvm_ffi.register_global_func("tl.gemm.lower")
@@ -34,12 +32,9 @@ def gemm_lower(
     thread_bounds: Range,
     thread_var: tir.Var,
     mbar_phase_expr: tir.PrimExpr,
-    hcu_mls_meta=None,
 ):
     # We pass thread_bounds rather than thread_extents because tcgen5mma need to check this
-    stmt = gemm.lower(
-        layout_map, target, thread_bounds, thread_var, mbar_phase_expr, hcu_mls_meta
-    )
+    stmt = gemm.lower(layout_map, target, thread_bounds, thread_var, mbar_phase_expr)
     return stmt
 
 
@@ -128,13 +123,11 @@ class Gemm(Node, Scriptable):
     def is_tcgen05(self):
         return getattr(self, "isTcgen05", False)
 
-    def infer_layout(self, target: Target, thread_nums: int, hcu_mls_meta=None):
+    def infer_layout(self, target: Target, thread_nums: int):
         """Infer the layout for the GEMM operation based on target architecture."""
         gemm_inst = self._select_gemm_instruction(thread_nums, target)
         impl_class = self._get_implementation_class(gemm_inst, target)
         impl = impl_class(self)
-        if isinstance(impl, GemmHCUMMAC):
-            return impl.infer_layout(target, thread_nums, hcu_mls_meta)
         return impl.infer_layout(target, thread_nums)
 
     def lower(
@@ -144,25 +137,13 @@ class Gemm(Node, Scriptable):
         thread_bounds: Range,
         thread_var: tir.Var,
         mbar_phase_expr: tir.PrimExpr,
-        hcu_mls_meta=None,
     ):
         """Lower the GEMM operation to TIR statements based on target architecture."""
         thread_nums = thread_bounds.extent
         gemm_inst = self._select_gemm_instruction(thread_nums, target)
         impl_class = self._get_implementation_class(gemm_inst, target)
         impl = impl_class(self)
-        if isinstance(impl, GemmHCUMMAC):
-            return impl.lower(
-                layout_map,
-                target,
-                thread_bounds,
-                thread_var,
-                mbar_phase_expr,
-                hcu_mls_meta,
-            )
-        return impl.lower(
-            layout_map, target, thread_bounds, thread_var, mbar_phase_expr
-        )
+        return impl.lower(layout_map, target, thread_bounds, thread_var, mbar_phase_expr)
 
     def _select_gemm_instruction(self, thread_nums: int, target: Target) -> GemmInst:
         """Select the appropriate GEMM instruction based on target and thread configuration.

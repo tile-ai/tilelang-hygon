@@ -19,7 +19,7 @@ from tilelang.language.utils import (
 
 def matrix_load(
     src: tir.Buffer | tir.BufferLoad | tir.BufferRegion,
-    dst: tir.Buffer | tir.BufferLoad,
+    dst: tir.Buffer | tir.BufferLoad | tir.BufferRegion,
     last_k_load: bool | None = None,
 ):
     """MLS (Matrix Load Store) load from global memory to shared memory.
@@ -27,8 +27,9 @@ def matrix_load(
     Args:
         src: Global source tensor. Buffer/BufferLoad/BufferRegion - offset (block_mn_base,
             block_k_base) is extracted from region in C++ (region[].min).
-        dst: Destination shared tensor (``Buffer`` or ``BufferLoad`` only; must be shared
-            memory, must have extent).
+        dst: Destination shared tensor (``Buffer``, ``BufferLoad``, or ``BufferRegion``;
+            must be shared memory, must have extent). Use ``BufferRegion`` for ping-pong
+            slices such as ``A_shared[stage, :, :]``.
         last_k_load: If None (default), check_last_k_load=true (boundary k check). If set,
             check_last_k_load=false and use given last_k_load value.
             boundary mn check is always true.
@@ -71,9 +72,6 @@ def matrix_load(
             return data.buffer
         return None
 
-    assert not isinstance(dst, tir.BufferRegion), (
-        "matrix_load dst must be Buffer or BufferLoad, not BufferRegion"
-    )
     dst_buf = get_buffer(dst)
     assert dst_buf is not None, "matrix_load dst must be Buffer or BufferLoad"
     assert is_shared(dst_buf), f"matrix_load dst must be shared memory, got scope={dst_buf.scope()}"
@@ -81,10 +79,20 @@ def matrix_load(
     src_extent = get_extent(src)
     dst_extent = get_extent(dst)
     assert dst_extent is not None, "matrix_load dst must have extent (use Buffer or BufferLoad)"
-    src_extent = list(src_extent) if src_extent else [1] * len(dst_extent)
     dst_extent = list(dst_extent)
-    src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)
-    extent = [tir.max(a, b) for a, b in zip(src_extent, dst_extent)]
+    # MLS tile is always the trailing MN x K axes; leading dst dims are ping-pong / views.
+    mls_tile_rank = 2
+    dst_tile_extent = dst_extent[-mls_tile_rank:]
+    if src_extent is None:
+        src_tile_extent = list(dst_tile_extent)
+    else:
+        src_extent = list(src_extent)
+        if len(src_extent) >= mls_tile_rank:
+            src_tile_extent = src_extent[-mls_tile_rank:]
+        else:
+            pad = [tir.IntImm("int32", 1)] * (mls_tile_rank - len(src_extent))
+            src_tile_extent = pad + src_extent
+    src_tile_extent, dst_tile_extent = legalize_pairwise_extents(src_tile_extent, dst_tile_extent)
 
     def _to_region(data, access_type, per_buffer_extents):
         if isinstance(data, tir.Var) and T.has_let_value(data):
@@ -92,15 +100,15 @@ def matrix_load(
         if isinstance(data, tir.Buffer):
             return to_buffer_region(data, access_type=access_type, extents=per_buffer_extents)
         if isinstance(data, tir.BufferRegion):
-            return buffer_region_to_tile_region(data, access_type, extent)
+            return buffer_region_to_tile_region(data, access_type, per_buffer_extents)
         if isinstance(data, tir.BufferLoad):
             region = get_buffer_region_from_load(data)
             if region is None:
-                return buffer_load_to_tile_region(data, access_type, extent)
-            return buffer_region_to_tile_region(region, access_type, extent)
-        return buffer_load_to_tile_region(data, access_type, extent)
+                return buffer_load_to_tile_region(data, access_type, per_buffer_extents)
+            return buffer_region_to_tile_region(region, access_type, per_buffer_extents)
+        return buffer_load_to_tile_region(data, access_type, per_buffer_extents)
 
-    src_region = _to_region(src, "r", src_extent)
+    src_region = _to_region(src, "r", src_tile_extent)
     dst_region = _to_region(dst, "w", dst_extent)
 
     return tir.call_intrin(

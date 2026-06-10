@@ -142,44 +142,6 @@ public:
   }
 };
 
-/// MLS / HCU lowering hints extracted in C++ (PropagationTirCollector) and
-/// passed into Python GEMM lowering when target is HCU.
-class GemmHcuLoweringMetaNode : public Object {
-public:
-  int a_from_mls{0};
-  int b_from_mls{0};
-  int a_mls_trans{0};
-  int b_mls_trans{0};
-  int mls_tile_m{-1};
-  int mls_tile_ka{-1};
-  int mls_tile_n{-1};
-  int mls_tile_kb{-1};
-
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.GemmHcuLoweringMeta",
-                                    GemmHcuLoweringMetaNode, Object);
-
-  static void RegisterReflection() {
-    namespace refl = tvm::ffi::reflection;
-    refl::ObjectDef<GemmHcuLoweringMetaNode>()
-        .def_ro("a_from_mls", &GemmHcuLoweringMetaNode::a_from_mls)
-        .def_ro("b_from_mls", &GemmHcuLoweringMetaNode::b_from_mls)
-        .def_ro("a_mls_trans", &GemmHcuLoweringMetaNode::a_mls_trans)
-        .def_ro("b_mls_trans", &GemmHcuLoweringMetaNode::b_mls_trans)
-        .def_ro("mls_tile_m", &GemmHcuLoweringMetaNode::mls_tile_m)
-        .def_ro("mls_tile_ka", &GemmHcuLoweringMetaNode::mls_tile_ka)
-        .def_ro("mls_tile_n", &GemmHcuLoweringMetaNode::mls_tile_n)
-        .def_ro("mls_tile_kb", &GemmHcuLoweringMetaNode::mls_tile_kb);
-  }
-};
-
-class GemmHcuLoweringMeta : public ObjectRef {
-public:
-  explicit GemmHcuLoweringMeta(ObjectPtr<GemmHcuLoweringMetaNode> ptr)
-      : ObjectRef(std::move(ptr)) {}
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(GemmHcuLoweringMeta, ObjectRef,
-                                                GemmHcuLoweringMetaNode);
-};
-
 class GemmNode : public TileOperatorNode {
 public:
   bool checkWgmma() const;

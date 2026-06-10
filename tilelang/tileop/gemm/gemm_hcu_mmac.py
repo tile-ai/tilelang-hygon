@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from tilelang import _ffi_api
 from tilelang import language as T
 from tilelang.layout.swizzle import make_hcu_swizzled_layout
@@ -13,26 +15,72 @@ from tvm.target import Target
 from .gemm_base import GemmBase
 from .inst import GemmInst
 
+def _int_annotation(annotations, key: str, default: int = 0) -> int:
+    if not annotations:
+        return default
+    try:
+        val = annotations[key]
+    except (KeyError, TypeError):
+        return default
+    if isinstance(val, tir.IntImm):
+        return int(val.value)
+    if isinstance(val, (int, bool)):
+        return int(val)
+    attr_val = getattr(val, "value", None)
+    if attr_val is not None:
+        return int(attr_val)
+    return default
+
 
 def _is_shared_like(buf) -> bool:
     return is_shared(buf) or is_shared_dynamic(buf)
 
 
-def _unpack_hcu_meta(meta):
-    if meta is None:
+def _mls_block_dims(shape, mls_trans: bool) -> tuple[int, int]:
+    if mls_trans:
+        return int(shape[-2]), int(shape[-1])
+    return int(shape[-1]), int(shape[-2])
 
-        class _Z:
-            a_from_mls = 0
-            b_from_mls = 0
-            a_mls_trans = 0
-            b_mls_trans = 0
-            mls_tile_m = -1
-            mls_tile_ka = -1
-            mls_tile_n = -1
-            mls_tile_kb = -1
 
-        return _Z()
-    return meta
+def _compute_mls_tiles(trans: bool, block_mn: int, block_k: int, block_size: int, target: Target,
+                       elem_bits: int) -> tuple[int, int]:
+    warp_mn, warp_k, tile_mn, tile_k = _ffi_api.ComputeMlsWarpPartition(
+        bool(trans), int(block_mn), int(block_k), int(block_size), target, int(elem_bits))
+    _ = warp_mn
+    _ = warp_k
+    return int(tile_mn), int(tile_k)
+
+
+def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
+    """Read AnnotateMlsGemmDep flags from gemm.annotations and derive MLS tiles."""
+    annotations = getattr(gemm_node, "annotations", None) or {}
+    a_from_mls = _int_annotation(annotations, "tl.a_from_mls")
+    b_from_mls = _int_annotation(annotations, "tl.b_from_mls")
+    trans_a = bool(gemm_node.transA)
+    trans_b = bool(gemm_node.transB)
+    a_mls_trans = not trans_a
+    b_mls_trans = trans_b
+
+    mls_tile_m = mls_tile_ka = mls_tile_n = mls_tile_kb = -1
+    if a_from_mls:
+        block_mn, block_k = _mls_block_dims(A.shape, a_mls_trans)
+        mls_tile_m, mls_tile_ka = _compute_mls_tiles(
+            a_mls_trans, block_mn, block_k, block_size, target, DataType(A.dtype).bits)
+    if b_from_mls:
+        block_mn, block_k = _mls_block_dims(B.shape, b_mls_trans)
+        mls_tile_n, mls_tile_kb = _compute_mls_tiles(
+            b_mls_trans, block_mn, block_k, block_size, target, DataType(B.dtype).bits)
+
+    return SimpleNamespace(
+        a_from_mls=a_from_mls,
+        b_from_mls=b_from_mls,
+        a_mls_trans=int(a_mls_trans),
+        b_mls_trans=int(b_mls_trans),
+        mls_tile_m=mls_tile_m,
+        mls_tile_ka=mls_tile_ka,
+        mls_tile_n=mls_tile_n,
+        mls_tile_kb=mls_tile_kb,
+    )
 
 
 def _hcu_mls_ab_dtype_str(dtype) -> str:
@@ -64,10 +112,10 @@ def _clear_accum_template_flag(expr) -> str:
 class GemmHCUMMAC(GemmBase):
     """HCU matrix core GEMM: layout in Python, lowering via ``tl.tl_gemm`` + C++ templates."""
 
-    def infer_layout(self, target: Target, thread_nums: int, hcu_mls_meta=None):
+    def infer_layout(self, target: Target, thread_nums: int):
         if not target_is_hcu(target):
             raise ValueError("GemmHCUMMAC requires an HCU target")
-        meta = _unpack_hcu_meta(hcu_mls_meta)
+        meta = _resolve_hcu_mls_meta(self.gemm_node, self.A, self.B, int(thread_nums), target)
         a_from_mls = int(meta.a_from_mls)
         b_from_mls = int(meta.b_from_mls)
         a_mls_trans = bool(meta.a_mls_trans)
@@ -145,18 +193,17 @@ class GemmHCUMMAC(GemmBase):
         thread_bounds: Range,
         thread_var: tir.Var,
         mbar_phase_expr: tir.PrimExpr | None = None,
-        hcu_mls_meta=None,
     ):
         _ = layout_map
         _ = thread_var
         _ = mbar_phase_expr
         if not target_is_hcu(target):
             raise ValueError("GemmHCUMMAC lowering requires an HCU target")
-        meta = _unpack_hcu_meta(hcu_mls_meta)
+        thread_nums = int(thread_bounds.extent)
+        meta = _resolve_hcu_mls_meta(self.gemm_node, self.A, self.B, thread_nums, target)
         a_from_mls = int(meta.a_from_mls)
         b_from_mls = int(meta.b_from_mls)
         b_mls_trans = bool(meta.b_mls_trans)
-        thread_nums = int(thread_bounds.extent)
         element_byte_size = DataType(self.in_dtype).bits // 8
         _ffi_api.GemmWarpPolicyComputeWarpPartitionHCU(
             self.policy,

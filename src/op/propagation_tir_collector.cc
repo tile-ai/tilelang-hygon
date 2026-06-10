@@ -7,6 +7,8 @@
 #include "builtin.h"
 #include "region.h"
 
+#include <algorithm>
+
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
@@ -31,7 +33,9 @@ static bool IsDsReadFormatCall(const CallNode *call) {
 }
 
 static bool IsGemmCall(const CallNode *call) {
-  return call->op.same_as(tl::tl_gemm());
+  if (call->op.same_as(tl::tl_gemm())) return true;
+  if (!call->op.as<OpNode>()) return false;
+  return call->op.as<OpNode>()->name == "tl.tileop.gemm";
 }
 
 static bool IsCallExternGemm(const CallNode *call) {
@@ -40,6 +44,14 @@ static bool IsCallExternGemm(const CallNode *call) {
   if (const auto *name = call->args[0].as<StringImmNode>()) {
     std::string s = name->value;
     return s.find("tl::gemm") == 0 || s.find("tl::tcgen5mma_gemm") == 0;
+  }
+  return false;
+}
+
+static bool BufferInInputs(const Buffer &buf,
+                           const std::vector<Buffer> &inputs) {
+  for (const Buffer &in : inputs) {
+    if (in.same_as(buf)) return true;
   }
   return false;
 }
@@ -85,6 +97,19 @@ static Optional<BufferAndMask> GetBufferAndMaskFromExpr(
 
 }  // namespace
 
+void PropagationTirCollector::AppendProducerRecord(Buffer write,
+                                                   std::vector<Buffer> inputs,
+                                                   const CallNode *call) {
+  ProducerRecord rec;
+  rec.call = call;
+  rec.inputs = std::move(inputs);
+  rec.stmt_order = next_stmt_order_++;
+  if (call != nullptr) {
+    call_stmt_order_[call] = rec.stmt_order;
+  }
+  producer_records_map_[write].push_back(std::move(rec));
+}
+
 class PropagationTirCollector::Visitor : public StmtExprVisitor {
  public:
   explicit Visitor(PropagationTirCollector *collector)
@@ -98,13 +123,13 @@ class PropagationTirCollector::Visitor : public StmtExprVisitor {
     // Don't overwrite producer_inputs_map_ when buffer was already produced by a Call
     // (e.g. ds_read_format). In-place BufferStore would overwrite with [out_buf] causing
     // self-loop in propagation. Keep the original producer chain.
-    if (collector_->producer_call_map_.count(out_buf) == 0) {
-      // Filter self-reference: in-place store reads from out_buf, exclude it to avoid loop
+    if (collector_->producer_records_map_.count(out_buf) == 0) {
       std::vector<Buffer> filtered;
       for (const Buffer &b : buffers_read_) {
         if (!b.same_as(out_buf)) filtered.push_back(b);
       }
-      collector_->producer_inputs_map_[out_buf] = std::move(filtered);
+      collector_->producer_inputs_map_[out_buf] = filtered;
+      collector_->AppendProducerRecord(out_buf, filtered, nullptr);
     }
     current_write_ = Buffer();
   }
@@ -178,8 +203,8 @@ class PropagationTirCollector::Visitor : public StmtExprVisitor {
       for (const Buffer &r : read_bufs) {
         if (!r.same_as(w)) read_filtered.push_back(r);
       }
-      collector_->producer_inputs_map_[w] = std::move(read_filtered);
-      collector_->producer_call_map_[w] = call;
+      collector_->producer_inputs_map_[w] = read_filtered;
+      collector_->AppendProducerRecord(w, read_filtered, call);
       for (const Buffer &r : read_bufs) {
         if (!r.same_as(w)) {
           collector_->consumer_outputs_map_[r].push_back(w);
@@ -225,18 +250,97 @@ Array<Buffer> PropagationTirCollector::GetConsumerOutputs(const Buffer &buffer) 
   return ret;
 }
 
+std::vector<ProducerRecord> PropagationTirCollector::GetProducerRecords(
+    const Buffer &buffer) const {
+  auto it = producer_records_map_.find(buffer);
+  if (it == producer_records_map_.end()) return {};
+  return it->second;
+}
+
+std::vector<ReaderCallRecord> PropagationTirCollector::GetReaderCalls(
+    const Buffer &buffer) const {
+  std::vector<ReaderCallRecord> result;
+  for (const auto &kv : producer_records_map_) {
+    const Buffer &write = kv.first;
+    for (const ProducerRecord &rec : kv.second) {
+      if (rec.call == nullptr) continue;
+      if (!BufferInInputs(buffer, rec.inputs)) continue;
+      ReaderCallRecord r;
+      r.call = rec.call;
+      r.write = write;
+      r.stmt_order = rec.stmt_order;
+      result.push_back(r);
+    }
+  }
+  std::sort(result.begin(), result.end(),
+            [](const ReaderCallRecord &a, const ReaderCallRecord &b) {
+              return a.stmt_order < b.stmt_order;
+            });
+  return result;
+}
+
+static bool IsGemmProducerRecord(const ProducerRecord &rec) {
+  return rec.call != nullptr && (IsGemmCall(rec.call) || IsCallExternGemm(rec.call));
+}
+
+std::optional<ProducerRecord> PropagationTirCollector::FindFirstGemmProducerReading(
+    const Buffer &write_buf, const Buffer &read_buf, int after_order) const {
+  auto it = producer_records_map_.find(write_buf);
+  if (it == producer_records_map_.end()) return std::nullopt;
+  const ProducerRecord *best = nullptr;
+  for (const ProducerRecord &rec : it->second) {
+    if (rec.stmt_order <= after_order) continue;
+    if (!IsGemmProducerRecord(rec)) continue;
+    if (!BufferInInputs(read_buf, rec.inputs)) continue;
+    if (best == nullptr || rec.stmt_order < best->stmt_order) {
+      best = &rec;
+    }
+  }
+  if (best == nullptr) return std::nullopt;
+  return *best;
+}
+
+std::optional<ProducerRecord> PropagationTirCollector::FindLastGemmProducerReading(
+    const Buffer &write_buf, const Buffer &read_buf) const {
+  auto it = producer_records_map_.find(write_buf);
+  if (it == producer_records_map_.end()) return std::nullopt;
+  const ProducerRecord *best = nullptr;
+  for (const ProducerRecord &rec : it->second) {
+    if (!IsGemmProducerRecord(rec)) continue;
+    if (!BufferInInputs(read_buf, rec.inputs)) continue;
+    if (best == nullptr || rec.stmt_order > best->stmt_order) {
+      best = &rec;
+    }
+  }
+  if (best == nullptr) return std::nullopt;
+  return *best;
+}
+
+int PropagationTirCollector::GetCallStmtOrder(const CallNode *call) const {
+  if (call == nullptr) return -1;
+  auto it = call_stmt_order_.find(call);
+  if (it == call_stmt_order_.end()) return -1;
+  return it->second;
+}
+
 bool PropagationTirCollector::ProducerIsMatrixLoad(const Buffer &buffer) const {
-  auto it = producer_call_map_.find(buffer);
-  if (it == producer_call_map_.end()) return false;
-  const CallNode *call = it->second;
-  return IsMatrixLoadCall(call) || IsMlsLoadTileExternCall(call);
+  for (const ProducerRecord &rec : GetProducerRecords(buffer)) {
+    if (rec.call != nullptr &&
+        (IsMatrixLoadCall(rec.call) || IsMlsLoadTileExternCall(rec.call))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool PropagationTirCollector::ProducerIsDsReadFormat(const Buffer &buffer) const {
-  auto it = producer_call_map_.find(buffer);
-  if (it == producer_call_map_.end()) return false;
-  const CallNode *call = it->second;
-  return IsDsReadFormatCall(call) || IsDsReadFormatExternCall(call);
+  for (const ProducerRecord &rec : GetProducerRecords(buffer)) {
+    if (rec.call != nullptr &&
+        (IsDsReadFormatCall(rec.call) || IsDsReadFormatExternCall(rec.call))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool PropagationTirCollector::ConsumerIsGemm(const Buffer &buffer) const {
@@ -244,9 +348,13 @@ bool PropagationTirCollector::ConsumerIsGemm(const Buffer &buffer) const {
 }
 
 Optional<Call> PropagationTirCollector::GetProducerCall(const Buffer &buffer) const {
-  auto it = producer_call_map_.find(buffer);
-  if (it == producer_call_map_.end()) return Optional<Call>();
-  return tvm::ffi::GetRef<Call>(it->second);
+  const auto records = GetProducerRecords(buffer);
+  for (auto it = records.rbegin(); it != records.rend(); ++it) {
+    if (it->call != nullptr) {
+      return tvm::ffi::GetRef<Call>(it->call);
+    }
+  }
+  return Optional<Call>();
 }
 
 }  // namespace tl

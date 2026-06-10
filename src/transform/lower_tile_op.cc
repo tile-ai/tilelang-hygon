@@ -20,7 +20,6 @@
 #include "../op/gemm.h"
 #include "../op/gemm_sp.h"
 #include "../op/operator.h"
-#include "../op/propagation_tir_collector.h"
 #include "../op/utils.h"
 #include "../target/utils.h"
 #include "ptx_async_copy_injector.h"
@@ -243,9 +242,6 @@ public:
     // complete before lowering.
     AllocBufferCollector alloc_collector(substituter.buffer_data_to_buffer_);
     alloc_collector.Collect(f->body);
-    substituter.propagation_tir_collector_ =
-        std::make_unique<PropagationTirCollector>(substituter.buffer_data_to_buffer_);
-    substituter.propagation_tir_collector_->Collect(f->body);
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
     ICHECK(target.defined()) << "LowerTileOpPass: Require the target attribute";
     substituter.target_ = target.value();
@@ -1110,9 +1106,7 @@ private:
                       ? PrimExpr(IntImm(DataType::Int(32), 0))
                       : loop_mbar_phase_stack_.back(),
                   &mbarrier_buffer_,
-                  cluster_size_,
-                  propagation_tir_collector_ ? propagation_tir_collector_.get()
-                                             : nullptr},
+                  cluster_size_},
         analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }
@@ -1411,7 +1405,6 @@ private:
   std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> buffer_map_;
   Map<Var, Var> var_remap_;
   bool has_tma_{false};
-  std::unique_ptr<PropagationTirCollector> propagation_tir_collector_;
   // Flag to indicate we are inside a TMA context (tma_load, tma_load_im2col,
   // tma_store). When true, HandleAccessPtrAndOffset only updates buffer data
   // without recomputing indices, since swizzle is encoded in TMA descriptor

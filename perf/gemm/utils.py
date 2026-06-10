@@ -11,7 +11,7 @@ from tilelang.carver.arch import CUDA
 from tilelang.carver.arch import CDNA
 from tilelang.carver.roller.rasterization import NoRasterization
 
-'''
+
 from aiter.ops.triton.gemm_unquantized import gemm_unquantized
 
 def triton_gemm(A, B):
@@ -22,7 +22,7 @@ def triton_gemm(A, B):
     The result is a tensor with shape (M, N) equal to A @ B.T, using the inputs' dtypes.
     """
     return  gemm_unquantized(A, B, torch.float16)
-'''
+
 
 def ref_program(A, B):
     """
@@ -184,9 +184,9 @@ def _run_autotuner(kernel, configs, warmup=3, rep=20, pass_configs=None):
     return autotuner.run(warmup=warmup, rep=rep)
 
 
-def get_heuristic_config() -> dict:
+def get_heuristic_config(impl: str | None = None) -> dict:
     """Get a heuristic configuration for GEMM kernels."""
-    return {
+    config = {
         #"block_M": 128,
         #"block_N": 256,
         #"block_K": 32,
@@ -196,8 +196,11 @@ def get_heuristic_config() -> dict:
         "num_stages": 0,
         #"thread_num": 128,
         "thread_num": 256,
+        # "thread_num": 512,
         "group_size": 1,  # Enable group swizzling optimization
         #"enable_rasteration": True,
         "wgs_per_cu": 2,
-        "use_mls": True,
     }
+    if impl in ["vanilla"] :
+        config["use_mls"] = True
+    return config
