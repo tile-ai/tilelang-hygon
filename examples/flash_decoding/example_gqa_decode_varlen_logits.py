@@ -5,6 +5,8 @@ import tilelang
 import tilelang.language as T
 from tilelang.profiler import do_bench
 
+from hcu_example_utils import gqa_decode_kernel_config, jit_pass_configs, shared_swizzle_layout
+
 torch.manual_seed(0)
 
 
@@ -34,10 +36,11 @@ def get_configs():
     return configs
 
 
-@tilelang.jit(out_idx=[-2, -1])
+@tilelang.jit(out_idx=[-2, -1], pass_configs=jit_pass_configs())
 def flashattn(
     batch, heads, k_heads, max_seqlen_kv, total_seqlen_k, dim, has_sink, block_N=128, block_H=64, num_split=1, num_stages=1, threads=128
 ):
+    block_N, block_H, num_stages, threads = gqa_decode_kernel_config(block_N, block_H, num_stages, threads)
     scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
     shape_q = [batch, heads, dim]
     shape_k = [total_seqlen_k, k_heads, dim]
@@ -62,6 +65,7 @@ def flashattn(
     ):
         with T.Kernel(batch, heads // valid_block_H, num_split, threads=threads) as (bid, hid, bz):
             Q_shared = T.alloc_shared([block_H, dim], dtype)
+            Q_local = T.alloc_fragment([block_H, dim], dtype)
             K_shared = T.alloc_shared([block_N, dim], dtype)
             V_shared = T.alloc_shared([block_N, dim], dtype)
             O_shared = T.alloc_shared([valid_block_H, dim], dtype)
@@ -74,7 +78,6 @@ def flashattn(
             scores_sum = T.alloc_fragment([block_H], accum_dtype)
             logsum = T.alloc_fragment([block_H], accum_dtype)
             S_shared = T.alloc_shared([block_H, math.ceil(max_seqlen_kv / block_N)], accum_dtype)
-            S_shared_cast = T.alloc_shared([block_H, math.ceil(max_seqlen_kv / block_N)], dtype)
             s_aux_shared = T.alloc_shared([block_H], T.float32)
 
             cur_kv_head = hid // (kv_group_num // valid_block_H)
@@ -83,7 +86,9 @@ def flashattn(
             cur_end_k = cu_seqlens_k[bid + 1]
             cur_seqlen_k = cur_end_k - cur_start_k
 
+            T.annotate_layout({Q_shared: shared_swizzle_layout(Q_shared)})
             T.copy(Q[bid, hid * valid_block_H : hid * valid_block_H + block_H, :], Q_shared)
+            T.copy(Q_shared, Q_local)
             T.fill(acc_o, 0)
             T.fill(logsum, 0)
             T.fill(scores_max, -T.infinity(accum_dtype))
@@ -92,7 +97,7 @@ def flashattn(
             for k in T.Pipelined(loop_range, num_stages=num_stages):
                 T.copy(K[cur_start_k + k * block_N : cur_start_k + (k + 1) * block_N, cur_kv_head, :], K_shared)
                 T.clear(acc_s)
-                T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(Q_local, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                 for i, j in T.Parallel(block_H, block_N):
                     acc_s[i, j] = T.if_then_else(k * block_N + j < cur_seqlen_k, acc_s[i, j], -T.infinity(accum_dtype))
                 T.copy(scores_max, scores_max_prev)
@@ -124,8 +129,7 @@ def flashattn(
                 logsum[i] = T.log2(logsum[i]) + scores_max[i] * scale
             T.copy(acc_o[:valid_block_H, :], O_shared)
             T.copy(O_shared, Output[bid, hid * valid_block_H : (hid + 1) * valid_block_H, :])
-            T.copy(S_shared, S_shared_cast)
-            T.copy(S_shared_cast[:valid_block_H, :], S[bid, hid * valid_block_H : (hid + 1) * valid_block_H, :])
+            T.copy(S_shared[:valid_block_H, :], S[bid, hid * valid_block_H : (hid + 1) * valid_block_H, :])
 
     return flashattn_gqa_decode_no_split
 

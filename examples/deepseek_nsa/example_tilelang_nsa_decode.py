@@ -3,6 +3,8 @@ import torch
 from reference import naive_nsa_simple_inference
 import tilelang
 from tilelang import language as T
+
+from hcu_example_utils import block_threads
 import tilelang.testing
 
 tilelang.testing.set_random_seed(42)
@@ -46,7 +48,7 @@ def native_sparse_attention(
     BS = block_S
     BK = BV = block_T
     num_stages = 0
-    threads = 32
+    threads = block_threads()
 
     @T.prim_func
     def native_sparse_attention(

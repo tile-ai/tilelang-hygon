@@ -17,6 +17,8 @@ from reference import naive_nsa
 from einops import rearrange
 import tilelang
 
+from hcu_example_utils import block_threads
+
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True, tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
 def tilelang_kernel_fwd(
@@ -58,7 +60,7 @@ def tilelang_kernel_fwd(
     BS = block_S
     BK = BV = block_T
     num_stages = 0
-    threads = 32
+    threads = block_threads()
 
     @T.prim_func
     def native_sparse_attention(
@@ -198,7 +200,7 @@ def tilelang_kernel_bwd_dkv(
     dv_shape = [batch, seq_len, heads_kv, dim]
 
     block_mask_shape = [batch, seq_len, heads_kv, NS]
-    num_threads = 32
+    num_threads = block_threads()
     print("NV", NV, "NS", NS, "B", B, "H", H)
 
     @T.prim_func
@@ -361,7 +363,7 @@ def tilelang_kernel_bwd_dqkv(
     dv_shape = [batch, seq_len, heads_kv, dim]
 
     block_mask_shape = [batch, seq_len, heads_kv, NS]
-    num_threads = 32
+    num_threads = block_threads()
 
     @T.prim_func
     def flash_bwd_dqkv(

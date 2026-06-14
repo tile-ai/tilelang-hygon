@@ -54,6 +54,9 @@ MatrixLoad::MatrixLoad(Array<PrimExpr> args, Map<String, ObjectRef> annotations)
   node->dst = dst_buf;
   node->src_ranges = src_ranges;
   node->dst_ranges = dst_ranges;
+  AccessRegion src_access{BufferRegion(node->src, node->src_ranges), kAccessRead};
+  AccessRegion dst_access{BufferRegion(node->dst, node->dst_ranges), kAccessWrite};
+  node->SetAccessRegions({src_access, dst_access});
   node->check_last_load = args[2].as<IntImmNode>()->value != 0;
   node->last_load = args[3].as<IntImmNode>()->value != 0;
   if (auto mls_trans = GetMlsTransFromAnnotations(annotations)) {

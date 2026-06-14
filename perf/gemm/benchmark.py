@@ -9,7 +9,8 @@ from perf.gemm.utils import ref_program, get_heuristic_config, triton_gemm
 from perf.gemm.vanilla_gemm import (
     gemm_vanilla,
     get_best_vanilla_config,
-    gemm_vanilla_v1
+    gemm_vanilla_v1,
+    gemm_vanilla_v2,
 )
 from perf.gemm.persistent_gemm import gemm_persistent, get_best_persistent_config
 from perf.gemm.persistent_gemm import (
@@ -92,7 +93,7 @@ def main(M: int = 4096,
             # kernel = gemm_persistent_v5(M, N, K, dtype=dtype, **config)
         elif impl == "vanilla":
             # kernel = gemm_vanilla(M, N, K, dtype=dtype, **config)
-            kernel = gemm_vanilla_v1(M, N, K, dtype=dtype, **config)
+            kernel = gemm_vanilla_v2(M, N, K, dtype=dtype, **config)
         elif impl == "splitk":
             kernel = gemm_splitk(M, N, K, dtype=dtype, **config)
         elif impl == "streamk":

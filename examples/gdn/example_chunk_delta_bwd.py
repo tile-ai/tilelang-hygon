@@ -23,6 +23,8 @@ except ImportError:
 import torch
 import torch.nn.functional as F
 
+from hcu_example_utils import gdn_block_dv, shared_swizzle_layout
+
 torch.random.manual_seed(0)
 # torch.set_printoptions(profile="full")
 
@@ -207,6 +209,7 @@ def tilelang_chunk_gated_delta_rule_bwd_dhu(
     num_stages=0,
 ):
     block_S = chunk_size
+    block_DV = gdn_block_dv(block_DV)
     # Should support cu_seqlen
     BS = S // block_S
 
@@ -266,11 +269,10 @@ def tilelang_chunk_gated_delta_rule_bwd_dhu(
             Q_fragment_t = T.alloc_fragment((DK, block_S), dtype=accum_dtype)
 
             T.use_swizzle(10)
-
             T.annotate_layout(
                 {
-                    dO_shared: tilelang.layout.make_swizzled_layout(dO_shared),
-                    Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
+                    dO_shared: shared_swizzle_layout(dO_shared),
+                    Q_shared: shared_swizzle_layout(Q_shared),
                 }
             )
 

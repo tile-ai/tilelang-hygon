@@ -8,6 +8,7 @@
 #include <tvm/node/structural_equal.h>
 #include <tvm/tir/index_map.h>
 #include <tvm/tir/op.h>
+#include <tvm/tir/stmt_functor.h>
 #include "arith/pattern_match.h"
 
 #include <cmath>
@@ -598,6 +599,203 @@ void CodeGenTileLangHCU::VisitStmt_(const LetStmtNode *op) {
   CodeGenC::VisitStmt_(op);
 }
 
+namespace {
+
+bool IsMlsLoadTileCallExtern(const CallNode *call) {
+  if (!call->op.same_as(tir::builtin::call_extern()) || call->args.empty()) {
+    return false;
+  }
+  const auto *name = call->args[0].as<StringImmNode>();
+  return name && static_cast<std::string>(name->value).find("tl::mls::mls_load_tile<") == 0;
+}
+
+std::vector<std::string> SplitTopLevelTemplateArgs(const std::string &text) {
+  std::vector<std::string> args;
+  int depth = 0;
+  size_t start = 0;
+  for (size_t i = 0; i < text.size(); ++i) {
+    char c = text[i];
+    if (c == '<') {
+      ++depth;
+    } else if (c == '>') {
+      --depth;
+    } else if (c == ',' && depth == 0) {
+      size_t end = i;
+      while (start < end && text[start] == ' ') ++start;
+      while (end > start && text[end - 1] == ' ') --end;
+      args.push_back(text.substr(start, end - start));
+      start = i + 1;
+    }
+  }
+  size_t end = text.size();
+  while (start < end && text[start] == ' ') ++start;
+  while (end > start && text[end - 1] == ' ') --end;
+  args.push_back(text.substr(start, end - start));
+  return args;
+}
+
+std::string MlsBaseTemplateFromLoadTile(const std::string &sym) {
+  const std::string prefix = "tl::mls::mls_load_tile<";
+  ICHECK(sym.find(prefix) == 0) << "Unexpected MLS symbol: " << sym;
+  ICHECK_EQ(sym.back(), '>') << "Malformed MLS template symbol: " << sym;
+  auto args = SplitTopLevelTemplateArgs(sym.substr(prefix.size(), sym.size() - prefix.size() - 1));
+  ICHECK_GE(args.size(), 8U) << "mls_load_tile expects at least 8 template args";
+  std::ostringstream os;
+  os << "tl::mls::tilelang_mls_base<";
+  for (size_t i = 0; i < 8; ++i) {
+    if (i != 0) os << ", ";
+    os << args[i];
+  }
+  os << ">";
+  return os.str();
+}
+
+std::string MlsDataTypeFromLoadTile(const std::string &sym) {
+  const std::string prefix = "tl::mls::mls_load_tile<";
+  auto args = SplitTopLevelTemplateArgs(sym.substr(prefix.size(), sym.size() - prefix.size() - 1));
+  ICHECK_GE(args.size(), 5U) << "mls_load_tile expects DataType as template arg 4";
+  return args[4];
+}
+
+std::pair<std::string, std::string> MlsLastLoadTemplateArgs(const std::string &sym) {
+  const std::string prefix = "tl::mls::mls_load_tile<";
+  auto args = SplitTopLevelTemplateArgs(sym.substr(prefix.size(), sym.size() - prefix.size() - 1));
+  std::string check_last_load = args.size() > 8 ? args[8] : "true";
+  std::string last_load = args.size() > 9 ? args[9] : "false";
+  return {check_last_load, last_load};
+}
+
+}  // namespace
+
+void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
+  const auto *call = op->value.as<CallNode>();
+  if (call && call->op.same_as(tir::builtin::call_extern()) && !call->args.empty()) {
+    const auto *extern_sym = call->args[0].as<StringImmNode>();
+    if (extern_sym) {
+      const std::string sym = extern_sym->value;
+      const std::string resource_init_prefix = "tl::mls::resource_init<";
+      const std::string async_load_prefix = "tl::mls::async_load<";
+      const std::string async_load_mn_prefix = "tl::mls::async_load_mn<";
+
+      if (sym.find(resource_init_prefix) == 0) {
+        ICHECK_EQ(call->args.size(), 6U)
+            << "MLS resource_init expects symbol, name, src, stride, mn_len, k_len";
+        enable_gemm_mls_ = true;
+        const auto *name = call->args[1].as<StringImmNode>();
+        ICHECK(name) << "MLS resource_init expects a string resource name";
+        const std::string obj_name = name->value;
+        const std::string base_template =
+            sym.substr(resource_init_prefix.size(), sym.size() - resource_init_prefix.size() - 1);
+        PrintIndent();
+        stream << "using " << obj_name << "_t = " << base_template << ";\n";
+        PrintIndent();
+        stream << obj_name << "_t " << obj_name << "(" << PrintExpr(call->args[2])
+               << ", " << PrintExpr(call->args[3]) << ", " << PrintExpr(call->args[4])
+               << ", " << PrintExpr(call->args[5]) << ");\n";
+        return;
+      }
+
+      if (sym == "tl::mls::set_window_origin") {
+        ICHECK_EQ(call->args.size(), 4U)
+            << "MLS set_window_origin expects symbol, name, mn_base, k_base";
+        enable_gemm_mls_ = true;
+        const auto *name = call->args[1].as<StringImmNode>();
+        ICHECK(name) << "MLS set_window_origin expects a string resource name";
+        PrintIndent();
+        stream << name->value
+               << ".set_window_origin(ck_tile::make_array<ck_tile::index_t>("
+               << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3]) << "));\n";
+        return;
+      }
+
+      if (sym == "tl::mls::update_base") {
+        ICHECK_EQ(call->args.size(), 3U) << "MLS update_base expects symbol, name, k_base";
+        enable_gemm_mls_ = true;
+        const auto *name = call->args[1].as<StringImmNode>();
+        ICHECK(name) << "MLS update_base expects a string resource name";
+        PrintIndent();
+        stream << name->value << ".update_base(" << PrintExpr(call->args[2]) << ");\n";
+        return;
+      }
+
+      if (sym == "tl::mls::update_mn_base") {
+        ICHECK_EQ(call->args.size(), 3U) << "MLS update_mn_base expects symbol, name, mn_base";
+        enable_gemm_mls_ = true;
+        const auto *name = call->args[1].as<StringImmNode>();
+        ICHECK(name) << "MLS update_mn_base expects a string resource name";
+        PrintIndent();
+        stream << name->value << ".update_mn_base(" << PrintExpr(call->args[2]) << ");\n";
+        return;
+      }
+
+      if (sym.find(async_load_prefix) == 0) {
+        ICHECK_EQ(call->args.size(), 4U) << "MLS async_load expects symbol, name, dst, k_base";
+        enable_gemm_mls_ = true;
+        const auto *name = call->args[1].as<StringImmNode>();
+        ICHECK(name) << "MLS async_load expects a string resource name";
+        const std::string template_args =
+            sym.substr(async_load_prefix.size(), sym.size() - async_load_prefix.size() - 1);
+        PrintIndent();
+        stream << name->value << ".template async_mls_load_asm<" << template_args
+               << ">(" << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3]) << ");\n";
+        return;
+      }
+
+      if (sym.find(async_load_mn_prefix) == 0) {
+        ICHECK_EQ(call->args.size(), 4U)
+            << "MLS async_load_mn expects symbol, name, dst, mn_base";
+        enable_gemm_mls_ = true;
+        const auto *name = call->args[1].as<StringImmNode>();
+        ICHECK(name) << "MLS async_load_mn expects a string resource name";
+        const std::string template_args =
+            sym.substr(async_load_mn_prefix.size(), sym.size() - async_load_mn_prefix.size() - 1);
+        PrintIndent();
+        stream << name->value << ".template async_mls_load_asm_mn<" << template_args
+               << ">(" << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3]) << ");\n";
+        return;
+      }
+    }
+  }
+  if (call && IsMlsLoadTileCallExtern(call)) {
+    ICHECK_EQ(call->args.size(), 8U)
+        << "mls_load_tile extern expects symbol, src, stride, mn_len, k_len, mn_base, k_base, dst";
+    enable_gemm_mls_ = true;
+    const auto *sym_node = call->args[0].as<StringImmNode>();
+    const std::string sym = sym_node->value;
+
+    const std::string base_template = MlsBaseTemplateFromLoadTile(sym);
+    const std::string data_type = MlsDataTypeFromLoadTile(sym);
+    const auto [check_last_load, last_load] = MlsLastLoadTemplateArgs(sym);
+    const std::string src_ptr = PrintExpr(call->args[1]);
+    const std::string stride = PrintExpr(call->args[2]);
+    const std::string mn_len = PrintExpr(call->args[3]);
+    const std::string k_len = PrintExpr(call->args[4]);
+    const std::string mn_base = PrintExpr(call->args[5]);
+    const std::string k_base = PrintExpr(call->args[6]);
+    const std::string dst_ptr = PrintExpr(call->args[7]);
+
+    const std::string obj_name = "_tl_mls_" + std::to_string(mls_resource_object_counter_++);
+    PrintIndent();
+    stream << "using " << obj_name << "_t = " << base_template << ";\n";
+    PrintIndent();
+    stream << obj_name << "_t " << obj_name << "(" << src_ptr << ", "
+           << stride << ", " << mn_len << ", " << k_len << ");\n";
+    PrintIndent();
+    stream << obj_name
+           << ".set_window_origin(ck_tile::make_array<ck_tile::index_t>("
+           << mn_base << ", 0));\n";
+    PrintIndent();
+    stream << obj_name << ".update_base(" << k_base << ");\n";
+    PrintIndent();
+    stream << obj_name << ".template async_mls_load_asm<" << data_type
+           << ", " << check_last_load << ", " << last_load << ">("
+           << dst_ptr << ", " << k_base << ");\n";
+    return;
+  }
+
+  CodeGenC::VisitStmt_(op);
+}
+
 void CodeGenTileLangHCU::VisitStmt_(const tir::ForNode *op) {
   if (op->kind == tir::ForKind::kUnrolled) {
     PrintIndent();
@@ -605,9 +803,9 @@ void CodeGenTileLangHCU::VisitStmt_(const tir::ForNode *op) {
   }
   std::string extent =
       PrintExpr(arith::Analyzer().Simplify(op->extent + op->min));
-  PrintIndent();
   std::string vid = AllocVarID(op->loop_var.get());
   std::string start = PrintExpr(op->min);
+  PrintIndent();
   stream << "for (";
   PrintType(op->loop_var.dtype(), stream);
   stream << ' ' << vid << " = " << start << "; " << vid << " < " << extent
@@ -1462,6 +1660,8 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     int n = Downcast<IntImm>(op->args[0])->value;
     std::string func_name = "tl::cp_async_wait<" + std::to_string(n) + ">";
     print_extern_call_stmt(func_name, 1);
+  } else if (op->op.same_as(tl::async_gld_sld_fence())) {
+    print_extern_call_stmt("tl::async_gld_sld_fence");
   } else if (op->op.same_as(builtin::create_barriers())) {
     this->PrintIndent();
     int barrier_count = Downcast<IntImm>(op->args[0])->value;
@@ -2413,6 +2613,7 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   // reserve keywords
   ReserveKeywordsAsUnique();
   buffer_ops_disable_param_names_.clear();
+  mls_resource_object_counter_ = 0;
 
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol.has_value())

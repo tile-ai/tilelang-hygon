@@ -20,6 +20,7 @@ except ImportError:
     fla = None
 
 import torch
+from hcu_example_utils import gdn_block_dk, gemm_swizzle_panel_size
 from test_utils import assert_similar
 
 torch.random.manual_seed(0)
@@ -134,6 +135,7 @@ def tilelang_chunk_o_bwd_dqkwg(
     num_stages=0,
 ):
     block_S = chunk_size
+    block_DK = gdn_block_dk(block_DK)
     BS = S // block_S
     NK = math.ceil(DK / block_DK)
 
@@ -209,14 +211,9 @@ def tilelang_chunk_o_bwd_dqkwg(
             dg_last_fragment_scalar_2 = T.alloc_fragment((1,), dtype=gate_dtype)
             G_shared = T.alloc_shared((block_S, block_DK), dtype=gate_dtype)
 
-            T.use_swizzle(10)
-
-            T.annotate_layout(
-                {
-                    q_shared: tilelang.layout.make_swizzled_layout(q_shared),
-                    k_shared: tilelang.layout.make_swizzled_layout(k_shared),
-                }
-            )
+            swizzle_panel = gemm_swizzle_panel_size()
+            if swizzle_panel is not None:
+                T.use_swizzle(swizzle_panel)
 
             T.clear(dg_last_local_0)
             T.clear(dg_last_local_1)
@@ -278,7 +275,7 @@ def tilelang_chunk_o_bwd_dqkwg(
                     dq_fragment[i_s, i_k] = dq_fragment[i_s, i_k] * T.exp(G[bb, bs * block_S + i_s, bh]) * scale
                 T.clear(dg_fragment_reduce_tmp)
                 for i_s, i_k in T.Parallel(block_S, block_DK):
-                    dg_fragment_reduce_tmp[i_s, i_k] = dq_fragment[i_s, i_k] * q_shared[i_s, i_k]
+                    dg_fragment_reduce_tmp[i_s, i_k] = dq_fragment[i_s, i_k] * q_fragment[i_s, i_k]
                 # FIXME: The reduce_sum statement with clear=True will cause an error of warp specialized pass
                 T.reduce_sum(dg_fragment_reduce_tmp, dg_fragment, dim=-1, clear=False)
 
