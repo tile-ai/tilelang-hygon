@@ -440,7 +440,9 @@ def gemm_persistent_v4(M, N, K, block_M, block_N, block_K,
 
     split_n = 2
     sub_block_N = block_N // split_n
-    k_loop = T.ceildiv(K, block_K)
+    k_loop_ = T.ceildiv(K, block_K)
+    k_loop = T.ceildiv(k_loop_, 2)
+    remain = 2 - (k_loop_ % 2)
 
     @T.prim_func
     def _gemm_persistent(
@@ -456,7 +458,11 @@ def gemm_persistent_v4(M, N, K, block_M, block_N, block_K,
             A_local_0 = T.alloc_fragment((block_M, block_K), dtype)
             B_local_0 = T.alloc_fragment((sub_block_N, block_K), dtype)
             B_local_1 = T.alloc_fragment((sub_block_N, block_K), dtype)
-            
+
+            A_local_0_ = T.alloc_fragment((block_M, block_K), dtype)
+            B_local_0_ = T.alloc_fragment((sub_block_N, block_K), dtype)
+            B_local_1_ = T.alloc_fragment((sub_block_N, block_K), dtype)
+         
             C_local_0 = T.alloc_fragment((block_M, sub_block_N), accum_dtype)
             C_local_1 = T.alloc_fragment((block_M, sub_block_N), accum_dtype)
 
@@ -479,37 +485,96 @@ def gemm_persistent_v4(M, N, K, block_M, block_N, block_K,
                     T.matrix_load(A[by * block_M, 0], A_shared[0, :, :])
                     T.matrix_load(B[bx * block_N, 0], B_shared_0[0, :, :])
                     T.matrix_load(B[bx * block_N + sub_block_N, 0], B_shared_1[0, :, :])
+                    T.matrix_load(A[by * block_M, block_K], A_shared[1, :, :])
+                    T.matrix_load(B[bx * block_N, block_K], B_shared_0[1, :, :])
+                    T.matrix_load(B[bx * block_N + sub_block_N, block_K], B_shared_1[1, :, :])
+                    T.s_waitcnt(3)
+                    T.sync_warp()
+                    T.ds_read_format(A_shared[0, :, :], A_local_0)
+                    T.ds_read_format(B_shared_0[0, :, :], B_local_0)
+                    T.ds_read_format(B_shared_1[0, :, :], B_local_1)
+                    # T.s_waitcnt(0, flag="lgkmcnt")
+                    # T.sync_warp()
                     for k in T.Serial(k_loop - 1):
-                        T.matrix_load(A[by * block_M, (k+1) * block_K], A_shared[((k+1) & 1), :, :])
-                        T.matrix_load(B[bx * block_N, (k+1) * block_K], B_shared_0[((k+1) & 1), :, :])
-                        T.matrix_load(B[bx * block_N + sub_block_N, (k+1) * block_K], B_shared_1[((k+1) & 1), :, :])
+                        base = 2 * (k + 1)
+                        # T.sched_barrier()
+                        T.s_waitcnt(0, flag="lgkmcnt")
+                        # T.sync_warp()
+                        T.sched_barrier()
+                        T.matrix_load(A[by * block_M, base * block_K], A_shared[0, :, :])
+                        T.matrix_load(B[bx * block_N, base * block_K], B_shared_0[0, :, :])
+                        T.matrix_load(B[bx * block_N + sub_block_N, base * block_K], B_shared_1[0, :, :])
 
+                        T.sched_barrier()
+                        T.gemm(A_local_0, B_local_0, C_local_0, transpose_B=True)
+                        T.sched_barrier()
                         T.s_waitcnt(3)
                         T.sync_warp()
-                        # T.ds_read_format(A_shared[(k & 1), :, :], A_local_0)
-                        # T.ds_read_format(B_shared_0[(k & 1), :, :], B_local_0)
-                        # T.ds_read_format(B_shared_1[(k & 1), :, :], B_local_1)
-                        # T.gemm(A_local_0, B_local_0, C_local_0, transpose_B=True)
-                        # T.gemm(A_local_0, B_local_1, C_local_1, transpose_B=True)
-                        T.gemm(A_shared[(k & 1), :, :], B_shared_0[(k & 1), :, :], C_local_0, transpose_B=True)
-                        T.gemm(A_shared[(k & 1), :, :], B_shared_1[(k & 1), :, :], C_local_1, transpose_B=True)
+                        # T.sched_barrier()
+                        T.ds_read_format(A_shared[1, :, :], A_local_0_)
+                        T.ds_read_format(B_shared_0[1, :, :], B_local_0_)
+                        T.ds_read_format(B_shared_1[1, :, :], B_local_1_)
+                        T.sched_barrier()
+                        T.gemm(A_local_0, B_local_1, C_local_1, transpose_B=True)
+                        T.sched_barrier()
 
-                    T.s_waitcnt(0)
+                        T.s_waitcnt(0, flag="lgkmcnt")
+                        # T.sync_warp()
+                        T.sched_barrier()
+                        T.matrix_load(A[by * block_M, (base+1) * block_K], A_shared[1, :, :])
+                        T.matrix_load(B[bx * block_N, (base+1) * block_K], B_shared_0[1, :, :])
+                        T.matrix_load(B[bx * block_N + sub_block_N, (base+1) * block_K], B_shared_1[1, :, :])
+
+                        T.sched_barrier()
+                        T.gemm(A_local_0_, B_local_0_, C_local_0, transpose_B=True)
+                        T.sched_barrier()
+                        T.s_waitcnt(3)
+                        T.sync_warp()
+                        # T.sched_barrier()
+                        T.ds_read_format(A_shared[0, :, :], A_local_0)
+                        T.ds_read_format(B_shared_0[0, :, :], B_local_0)
+                        T.ds_read_format(B_shared_1[0, :, :], B_local_1)
+                        T.sched_barrier()
+                        T.gemm(A_local_0_, B_local_1_, C_local_1, transpose_B=True)
+
+                    if remain > 1:
+                        T.gemm(A_local_0, B_local_0, C_local_0, transpose_B=True)
+                        T.sched_barrier()
+                        T.s_waitcnt(3)
+                        T.sync_warp()
+                        # T.sched_barrier()
+                        T.ds_read_format(A_shared[1, :, :], A_local_0_)
+                        T.ds_read_format(B_shared_0[1, :, :], B_local_0_)
+                        T.ds_read_format(B_shared_1[1, :, :], B_local_1_)
+                        T.sched_barrier()
+                        T.gemm(A_local_0, B_local_1, C_local_1, transpose_B=True)
+                    else:
+                        T.sched_barrier()
+                        T.s_waitcnt(0, flag="lgkmcnt")
+                        T.sched_barrier()
+                        T.gemm(A_local_0, B_local_0, C_local_0, transpose_B=True)
+                        T.gemm(A_local_0, B_local_1, C_local_1, transpose_B=True)
+
+                    if remain > 1:
+                        T.sched_barrier()
+                        T.s_waitcnt(0, flag="lgkmcnt")
+                        T.sched_barrier()
+                        T.gemm(A_local_0_, B_local_0_, C_local_0, transpose_B=True)
+                        T.gemm(A_local_0_, B_local_1_, C_local_1, transpose_B=True)
+                        T.sched_barrier()
+
+                    # T.copy(C_local_0, C[by * block_M, bx * block_N])
+                    # T.copy(C_local_1, C[by * block_M, bx * block_N + sub_block_N])
+
                     T.sync_warp()
-                    # T.ds_read_format(A_shared[((k_loop - 1) & 1), :, :], A_local_0)
-                    # T.ds_read_format(B_shared_0[((k_loop - 1) & 1), :, :], B_local_0)
-                    # T.ds_read_format(B_shared_1[((k_loop - 1) & 1), :, :], B_local_1)
-                    # T.gemm(A_local_0, B_local_0, C_local_0, transpose_B=True)
-                    # T.gemm(A_local_0, B_local_1, C_local_1, transpose_B=True)
-                    T.gemm(A_shared[((k_loop - 1) & 1), :, :], B_shared_0[((k_loop - 1) & 1), :, :], C_local_0, transpose_B=True)
-                    T.gemm(A_shared[((k_loop - 1) & 1), :, :], B_shared_1[((k_loop - 1) & 1), :, :], C_local_1, transpose_B=True)
-
                     T.copy(C_local_0, C_shared_0)
                     T.sync_threads()
                     T.copy(C_shared_0, C[by * block_M, bx * block_N])
+                    T.sync_threads()
                     T.copy(C_local_1, C_shared_0)
                     T.sync_threads()
                     T.copy(C_shared_0, C[by * block_M, bx * block_N + sub_block_N])
+                    T.sync_threads()
 
     return _gemm_persistent
 

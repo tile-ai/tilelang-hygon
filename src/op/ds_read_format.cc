@@ -135,6 +135,9 @@ DsReadFormat::DsReadFormat(Array<PrimExpr> args, Map<String, ObjectRef> annotati
   node->dst = dst_buf;
   node->src_ranges = src_ranges;
   node->dst_ranges = dst_ranges;
+  AccessRegion src_access{BufferRegion(node->src, node->src_ranges), kAccessRead};
+  AccessRegion dst_access{BufferRegion(node->dst, node->dst_ranges), kAccessWrite};
+  node->SetAccessRegions({src_access, dst_access});
   node->gemm_dep_ = GetMlsGemmDepFromAnnotations(annotations);
   data_ = std::move(node);
 }

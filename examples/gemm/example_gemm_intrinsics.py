@@ -161,6 +161,11 @@ def ref_program(A, B):
 
 
 def main(M=4096, N=4096, K=4096):
+    import pytest
+    import torch
+
+    if torch.version.hip is not None:
+        pytest.skip("CUDA TensorCore intrinsic (ptx_ldmatrix); not run on HIP/HCU")
     in_dtype, out_dtype, accum_dtype = T.float16, T.float16, T.float32
     kernel = tl_matmul(M, N, K, in_dtype, out_dtype, accum_dtype)
     src_code = kernel.get_kernel_source()

@@ -134,6 +134,7 @@ struct tilelang_mls_base
         const auto warp_cluster_idx = get_warp_cluster_idx();
         const auto origin_mn        = block_window_origin.at(ck_tile::number<0>{});
         const auto origin_k         = block_window_origin.at(ck_tile::number<1>{});
+        mls_k_origin_               = origin_k;
 
         ck_tile::static_for<0, NumWarpAccessMN, 1>{}([&](auto i) {
             constexpr auto access_idx = ck_tile::make_tuple(i, ck_tile::number<0>{});
@@ -150,6 +151,8 @@ struct tilelang_mls_base
 
             const auto tile_mn = tile_warp_coord[ck_tile::number<0>{}];
             const auto tile_k  = tile_warp_coord[ck_tile::number<1>{}];
+            mls_mn_offset_(i) = tile_mn;
+            mls_k_offset_(i) = tile_k;
 
             const auto warp_coord_mn = origin_mn + tile_mn;
             const auto warp_coord_k  = origin_k + tile_k;
@@ -221,6 +224,40 @@ struct tilelang_mls_base
         init(block_window_origin);
     }
 
+    CK_TILE_DEVICE void set_k_filter(ck_tile::int32x4_t& mls_res, uint32_t filter)
+    {
+        if constexpr(Trans)
+        {
+            mls_res.w = (mls_res.w & ~static_cast<uint32_t>(0xff)) | filter;
+        }
+        else
+        {
+            mls_res.w = (mls_res.w & ~static_cast<uint32_t>(0xff00)) | (filter << 8);
+        }
+    }
+
+    CK_TILE_DEVICE void set_mn_filter(ck_tile::int32x4_t& mls_res, uint32_t filter)
+    {
+        if constexpr(Trans)
+        {
+            mls_res.w = (mls_res.w & ~static_cast<uint32_t>(0xff00)) | (filter << 8);
+        }
+        else
+        {
+            mls_res.w = (mls_res.w & ~static_cast<uint32_t>(0xff)) | filter;
+        }
+    }
+
+    CK_TILE_DEVICE uint32_t get_mn_filter(const ck_tile::index_t block_mn_base,
+                                          const ck_tile::index_t access_idx_mn)
+    {
+        const auto warp_coord_mn = block_mn_base + mls_mn_offset_(access_idx_mn);
+        return static_cast<uint32_t>(
+            ck_tile::min(TileLoadWarpPerIssueMN,
+                ck_tile::max(0,
+                             warp_coord_mn + TileLoadWarpPerIssueMN - mn_length_raw_)));
+    }
+
     template <typename T, bool bps = false, bool last_load = false>
     CK_TILE_DEVICE void async_mls_load_asm_impl_ct(CK_TILE_LDS_ADDR T* smem,
                                                   ck_tile::bool_constant<bps> = {},
@@ -237,17 +274,8 @@ struct tilelang_mls_base
 
             if constexpr(last_load)
             {
-                if constexpr(Trans)
-                {
-                    mls_res_(access_idx_mn).w |=
-                        static_cast<uint32_t>(mls_k_filter_[access_idx_k]);
-                }
-                else
-                {
-                    mls_res_(access_idx_mn).w |=
-                        (static_cast<uint32_t>(mls_k_filter_[access_idx_k])
-                         << ck_tile::number<8>{});
-                }
+                set_k_filter(mls_res_(access_idx_mn),
+                             static_cast<uint32_t>(mls_k_filter_[access_idx_k]));
             }
 
             if constexpr(HcuArch == ck_tile::hcu_target_enum::gfx938)
@@ -286,16 +314,59 @@ struct tilelang_mls_base
 
             if (last_load)
             {
-                if constexpr(Trans)
+                set_k_filter(mls_res_(access_idx_mn),
+                             static_cast<uint32_t>(mls_k_filter_[access_idx_k]));
+            }
+
+            if constexpr(HcuArch == ck_tile::hcu_target_enum::gfx938)
+            {
+                MlsAtom::template load<moffset, true>(
+                    reinterpret_cast<uintptr_t>(smem + mls_lds_offset_[i]),
+                    mls_res_[access_idx_mn],
+                    moffset,
+                    ck_tile::bool_constant<true>{});
+            }
+            else if constexpr(HcuArch == ck_tile::hcu_target_enum::gfx946)
+            {
+                MlsAtom::template load<moffset, true, bps>(
+                    reinterpret_cast<uintptr_t>(smem + mls_lds_offset_[i]),
+                    mls_res_[access_idx_mn],
+                    moffset,
+                    ck_tile::bool_constant<true>{},
+                    ck_tile::bool_constant<bps>{});
+            }
+        });
+    }
+
+    template <typename T, bool bps, bool check_k_filter, bool check_mn_filter>
+    CK_TILE_DEVICE void async_mls_load_asm_impl_rt_mn(CK_TILE_LDS_ADDR T* smem,
+                                                      ck_tile::bool_constant<bps>,
+                                                      ck_tile::index_t block_mn_base,
+                                                      bool last_mn_load)
+    {
+        ck_tile::static_for<0, NumWarpAccess, 1>{}([&](auto i) {
+            constexpr auto access_idx    = SFC_WarpAccess::get_index(i);
+            constexpr auto access_idx_mn = access_idx[ck_tile::number<0>{}];
+            constexpr auto access_idx_k  = access_idx[ck_tile::number<1>{}];
+
+            // moffset is always on K dimension
+            constexpr auto moffset =
+                ck_tile::number<access_idx_k * TileLoadWGPerIssue.at(ck_tile::number<1>{})>{};
+
+            if constexpr(check_k_filter)
+            {
+                if (mls_k_origin_ + BlockSizeK > k_length_raw_)
                 {
-                    mls_res_(access_idx_mn).w |=
-                        static_cast<uint32_t>(mls_k_filter_[access_idx_k]);
+                    set_k_filter(mls_res_(access_idx_mn),
+                                 static_cast<uint32_t>(mls_k_filter_[access_idx_k]));
                 }
-                else
+            }
+            if constexpr(check_mn_filter)
+            {
+                if (last_mn_load)
                 {
-                    mls_res_(access_idx_mn).w |=
-                        (static_cast<uint32_t>(mls_k_filter_[access_idx_k])
-                         << ck_tile::number<8>{});
+                    set_mn_filter(mls_res_(access_idx_mn),
+                                  get_mn_filter(block_mn_base, access_idx_mn));
                 }
             }
 
@@ -334,6 +405,25 @@ struct tilelang_mls_base
         }
     }
 
+    template <typename T,
+              bool bps = false,
+              bool check_k_filter = true,
+              bool check_mn_filter = true>
+    CK_TILE_DEVICE void async_mls_load_asm_mn(CK_TILE_LDS_ADDR T* smem,
+                                             ck_tile::index_t block_mn_base)
+    {
+        bool last_mn_load_rt = false;
+        if constexpr(check_mn_filter)
+        {
+            last_mn_load_rt = (block_mn_base + BlockSizeMN > mn_length_raw_);
+        }
+        async_mls_load_asm_impl_rt_mn<T, bps, check_k_filter, check_mn_filter>(
+            smem,
+            ck_tile::bool_constant<bps>{},
+            block_mn_base,
+            last_mn_load_rt);
+    }
+
     CK_TILE_DEVICE void move_base(const ck_tile::index_t block_k_base)
     {
         ck_tile::index_t addr_byte_offset;
@@ -366,14 +456,36 @@ struct tilelang_mls_base
             [&](auto i) { update_mls_addr_base(mls_res_(i), mls_base_addr_(i), addr_byte_offset); });
     }
 
+    CK_TILE_DEVICE void update_mn_base(const ck_tile::index_t block_mn_base)
+    {
+        ck_tile::static_for<0, NumWarpAccessMN, 1>{}([&](auto i) {
+            const auto warp_coord_mn = block_mn_base + mls_mn_offset_(i);
+
+            DataType* ptr_offset = p_data_;
+            if constexpr(Trans)
+            {
+                ptr_offset += warp_coord_mn * mls_stride_ + mls_k_origin_ + mls_k_offset_(i);
+            }
+            else
+            {
+                ptr_offset += (mls_k_origin_ + mls_k_offset_(i)) * mls_stride_ + warp_coord_mn;
+            }
+            mls_base_addr_(i) = reinterpret_cast<uintptr_t>(ptr_offset);
+            update_mls_addr_base(mls_res_(i), mls_base_addr_(i), 0);
+        });
+    }
+
     DataType* p_data_;
     ck_tile::array<ck_tile::int32x4_t, NumWarpAccessMN> mls_res_;
     ck_tile::array<uintptr_t, NumWarpAccessMN> mls_base_addr_;
+    ck_tile::array<ck_tile::index_t, NumWarpAccessMN> mls_mn_offset_;
+    ck_tile::array<ck_tile::index_t, NumWarpAccessMN> mls_k_offset_;
     ck_tile::array<uint8_t, NumWarpAccessK> mls_k_filter_;
 
     ck_tile::index_t mls_stride_;
     ck_tile::index_t mn_length_raw_;
     ck_tile::index_t k_length_raw_;
+    ck_tile::index_t mls_k_origin_{0};
     ck_tile::index_t last_block_remain_k;
 
     ck_tile::array<ck_tile::index_t, NumWarpAccess> mls_lds_offset_;

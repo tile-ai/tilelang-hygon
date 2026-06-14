@@ -257,6 +257,11 @@ TIR_DEFINE_TL_BUILTIN(ptx_cp_async)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(async_gld_sld_fence)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(fence_proxy_async)
     .set_num_inputs(0)
     .set_attr<TCallEffectKind>("TCallEffectKind",

@@ -452,7 +452,7 @@ def get_configs():
     iter_params = dict(
         block_T=[128, 256, 512],
         num_stages=[0, 1, 2, 4, 5],
-        threads=[32, 64, 128, 256, 512],
+        threads=[64, 128, 256, 512],
     )
     return [{k: v for k, v in zip(iter_params, values)} for values in itertools.product(*iter_params.values())]
 
@@ -462,7 +462,7 @@ def get_configs():
 )
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True, tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
 def tilelang_sparse_attention(
-    batch, heads, seq_len, dim, is_causal, scale=None, block_size=64, groups=1, selected_blocks=16, block_T=128, num_stages=2, threads=32
+    batch, heads, seq_len, dim, is_causal, scale=None, block_size=64, groups=1, selected_blocks=16, block_T=128, num_stages=2, threads=64
 ):
     if scale is None:
         scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)

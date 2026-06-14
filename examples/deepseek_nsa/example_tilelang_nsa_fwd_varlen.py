@@ -5,6 +5,8 @@ from packaging.version import parse
 
 import tilelang
 from tilelang import language as T
+
+from hcu_example_utils import block_threads
 import tilelang.testing
 
 import fla
@@ -50,7 +52,7 @@ def native_sparse_attention_varlen(batch, heads, c_seq_len, dim, is_causal, scal
     BS = block_S
     BK = BV = block_T
     num_stages = 0
-    threads = 32
+    threads = block_threads()
 
     @T.prim_func
     def native_sparse_attention_varlen(

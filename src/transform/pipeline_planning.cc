@@ -8,6 +8,8 @@
 
 #include "../op/builtin.h"
 #include "../op/copy.h"
+#include "../op/ds_read_format.h"
+#include "../op/mls.h"
 #include "../op/parallel.h"
 #include "../op/region.h"
 #include "../op/utils.h"
@@ -289,6 +291,16 @@ private:
       if (IsGlobalLikeBuffer(copy->src) && IsSharedBuffer(copy->dst)) {
         is_global_copy_pattern_ = true;
       }
+    }
+    if (const auto *matrix_load = tile_op.as<MatrixLoadNode>()) {
+      if (IsGlobalLikeBuffer(matrix_load->src) && IsSharedBuffer(matrix_load->dst)) {
+        is_global_copy_pattern_ = true;
+      }
+      return;
+    }
+    if (tile_op.as<DsReadFormatNode>()) {
+      has_non_copy_tile_op_ = true;
+      return;
     }
     // Conv2D im2col always uses TMA on Hopper.
     if (const auto *im2col = tile_op.as<Conv2DIm2ColOpNode>()) {
@@ -717,7 +729,8 @@ private:
         }
         return;
       }
-      if (tile_op.as<CopyNode>() || tile_op.as<Conv2DIm2ColOpNode>()) {
+      if (tile_op.as<CopyNode>() || tile_op.as<MatrixLoadNode>() ||
+          tile_op.as<Conv2DIm2ColOpNode>()) {
         saw_copy = true;
       } else {
         saw_non_copy_tile_op = true;
@@ -745,7 +758,8 @@ private:
       if (tile_op.as<RegionOpNode>()) {
         return;
       }
-      if (tile_op.as<CopyNode>() || tile_op.as<Conv2DIm2ColOpNode>()) {
+      if (tile_op.as<CopyNode>() || tile_op.as<MatrixLoadNode>() ||
+          tile_op.as<Conv2DIm2ColOpNode>()) {
         if (copy_tile_op.defined()) {
           saw_multiple_copy_ops = true;
           copy_tile_op = Optional<TileOperator>();
@@ -792,6 +806,14 @@ private:
 
     if (const auto *copy = copy_tile_op.value().as<CopyNode>()) {
       if (!IsGlobalLikeBuffer(copy->src) || !IsSharedBuffer(copy->dst)) {
+        return;
+      }
+      pinfo->copy_stage = true;
+      return;
+    }
+
+    if (const auto *matrix_load = copy_tile_op.value().as<MatrixLoadNode>()) {
+      if (!IsGlobalLikeBuffer(matrix_load->src) || !IsSharedBuffer(matrix_load->dst)) {
         return;
       }
       pinfo->copy_stage = true;
