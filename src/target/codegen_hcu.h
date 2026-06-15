@@ -72,6 +72,7 @@ protected:
   // global memory using amd_buffer_store.
   void VisitStmt_(const BufferStoreNode *op) final;
   void VisitStmt_(const LetStmtNode *op) final;
+  void VisitStmt_(const EvaluateNode *op) final;
 
   virtual std::string GetBufferRef(DataType t, const BufferNode *buffer,
                                    PrimExpr index) final;
@@ -179,6 +180,7 @@ private:
   /// LetStmt RHS (PrimExpr); used only by IsProvablyZeroOrZeroBroadcast (IsZeroValue).
   /// Kept separate from var_idmap_ so we never alter SSA / name resolution behavior.
   std::unordered_map<const VarNode*, PrimExpr> let_initializer_expr_for_predicate_;
+  int mls_resource_object_counter_{0};
 };
 
 } // namespace codegen

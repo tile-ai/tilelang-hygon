@@ -1,8 +1,10 @@
 import tilelang
 import tilelang.language as T
 
+from hcu_example_utils import jit_pass_configs, splitk_tile_config
 
-@tilelang.jit
+
+@tilelang.jit(pass_configs=jit_pass_configs())
 def matmul(M, N, K, block_M, block_N, block_K, split_k, dtype=T.float16, accum_dtype=T.float32, out_dtype=T.float32):
     splitK = K // split_k
 
@@ -35,10 +37,8 @@ def main():
     M = 1024
     N = 1024
     K = 1024
-    block_M = 128
-    block_N = 128
-    block_K = 32
     split_k = 4
+    block_M, block_N, block_K = splitk_tile_config()
 
     kernel = matmul(M, N, K, block_M, block_N, block_K, split_k)
 
@@ -59,11 +59,8 @@ def run_regression_perf():
     M = 4096
     N = 4096
     K = 4096
-    block_M = 128
-    block_N = 128
-    block_K = 32
     split_k = 4
-
+    block_M, block_N, block_K = splitk_tile_config()
     kernel = matmul(M, N, K, block_M, block_N, block_K, split_k)
     import torch
 

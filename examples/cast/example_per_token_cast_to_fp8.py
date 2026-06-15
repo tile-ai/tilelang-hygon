@@ -4,26 +4,32 @@ import tilelang.language as T
 from typing import Tuple
 from tilelang.utils.tensor import torch_assert_close
 
+from hcu_example_utils import fp8_tl_dtype
+
 
 @tilelang.jit(out_idx=[1, 2])
 def per_token_cast_to_fp8(M, N, blk_m):
+    # float32 input triggers unsupported fp8 cast in HCU codegen; use fp32 accum like group cast.
     dtype = T.float
+    accum_dtype = T.float32
     group_size = 128
     fp8_min = -448.0
     fp8_max = 448.0
 
     @T.prim_func
     def per_token_cast(
-        X: T.Tensor((M, N), dtype), X_fp8: T.Tensor((M, N), T.float8_e4m3fn), X_amax: T.Tensor((M, T.ceildiv(N, group_size)), dtype)
+        X: T.Tensor((M, N), dtype),
+        X_fp8: T.Tensor((M, N), fp8_tl_dtype("e4m3")),
+        X_amax: T.Tensor((M, T.ceildiv(N, group_size)), dtype),
     ):
         with T.Kernel(T.ceildiv(M, blk_m), T.ceildiv(N, group_size), threads=128) as (bx, by):
             row = bx
             row_g_id = by
-            y_local = T.alloc_fragment((blk_m, group_size), dtype)
-            y_amax_local = T.alloc_fragment((blk_m,), dtype)
-            y_s_local = T.alloc_fragment((blk_m,), dtype)
-            y_q_local = T.alloc_fragment((blk_m, group_size), dtype)
-            y_q_local_fp8 = T.alloc_fragment((blk_m, group_size), T.float8_e4m3fn)
+            y_local = T.alloc_fragment((blk_m, group_size), accum_dtype)
+            y_amax_local = T.alloc_fragment((blk_m,), accum_dtype)
+            y_s_local = T.alloc_fragment((blk_m,), accum_dtype)
+            y_q_local = T.alloc_fragment((blk_m, group_size), accum_dtype)
+            y_q_local_fp8 = T.alloc_fragment((blk_m, group_size), fp8_tl_dtype("e4m3"))
 
             T.copy(X[row * blk_m : (row + 1) * blk_m, row_g_id * group_size : (row_g_id + 1) * group_size], y_local)
             T.reduce_absmax(y_local, y_amax_local, dim=1)

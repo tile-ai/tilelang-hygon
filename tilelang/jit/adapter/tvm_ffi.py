@@ -37,18 +37,28 @@ for _name in ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnu
         _FP8_TORCH_TO_TVM[_td] = _name
 
 
+def _torch_fp8_to_ffi_view(
+    tensor: torch.Tensor,
+    shape: tuple[int, ...] | list[int],
+    torch_dtype: torch.dtype,
+) -> Any:
+    """Expose FP8 tensor storage to tvm_ffi via int8 DLPack + typed view."""
+    import torch.utils.dlpack as torch_dlpack
+
+    tvm_dtype = _FP8_TORCH_TO_TVM[torch_dtype]
+    if tensor.dtype == torch.int8:
+        storage = tensor.contiguous()
+    else:
+        storage = tensor.contiguous().view(torch.int8)
+    return runtime.from_dlpack(torch_dlpack.to_dlpack(storage))._create_view(shape, dtype=tvm_dtype)
+
+
 def _torch_tensor_to_ffi_arg(tensor: torch.Tensor) -> torch.Tensor | Any:
     if not isinstance(tensor, torch.Tensor):
         return tensor
     if tensor.dtype not in _FP8_TORCH_TO_TVM:
         return tensor
-    import torch.utils.dlpack as torch_dlpack
-
-    tvm_dtype = _FP8_TORCH_TO_TVM[tensor.dtype]
-    t = tensor.contiguous()
-    return runtime.from_dlpack(torch_dlpack.to_dlpack(t.view(torch.int8)))._create_view(
-        tensor.shape, dtype=tvm_dtype
-    )
+    return _torch_fp8_to_ffi_view(tensor, tuple(tensor.shape), tensor.dtype)
 
 
 if sys.platform == "darwin":
@@ -234,7 +244,9 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
             # Stitch the full positional argument list expected by the TVM executable
             ins_idx: int = 0
-            tensor_list: list[torch.Tensor] = []
+            tensor_list: list[torch.Tensor | Any] = []
+            # FP8 outputs: kernel writes int8 storage; return torch FP8 views to caller.
+            fp8_output_storages: dict[int, tuple[torch.Tensor, torch.dtype]] = {}
 
             # Prepare input and output tensors
             for i in range(len(self.params)):
@@ -265,7 +277,12 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                             f"Cannot create output tensor (name={param_name}) - 0-dimensional tensors are not supported. "
                             f"Expected shape: {shape}"
                         )
-                    tensor = torch.empty(*shape, dtype=dtype, device=out_device)
+                    if dtype in _FP8_TORCH_TO_TVM:
+                        storage = torch.empty(*shape, dtype=torch.int8, device=out_device)
+                        tensor = _torch_fp8_to_ffi_view(storage, shape, dtype)
+                        fp8_output_storages[i] = (storage, dtype)
+                    else:
+                        tensor = torch.empty(*shape, dtype=dtype, device=out_device)
                 else:
                     tensor = _torch_tensor_to_ffi_arg(inputs[ins_idx])
                     ins_idx += 1
@@ -273,10 +290,16 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
             executable(*tensor_list)
 
+            def _result_tensor(idx: int) -> torch.Tensor:
+                if idx in fp8_output_storages:
+                    storage, fp8_dtype = fp8_output_storages[idx]
+                    return storage.view(fp8_dtype)
+                return tensor_list[idx]
+
             # Return outputs in the requested form
             if len(self.result_idx) == 1:
-                return tensor_list[self.result_idx[0]]
-            return [tensor_list[i] for i in self.result_idx]
+                return _result_tensor(self.result_idx[0])
+            return [_result_tensor(i) for i in self.result_idx]
 
         return func
 

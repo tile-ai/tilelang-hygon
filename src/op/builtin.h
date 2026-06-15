@@ -39,6 +39,10 @@ inline bool IsMlsLoadTileExternCall(const tir::CallNode *call) {
   return IsCallExternWithPrefix(call, "tl::mls::mls_load_tile");
 }
 
+inline bool IsMlsAsyncLoadExternCall(const tir::CallNode *call) {
+  return IsCallExternWithPrefix(call, "tl::mls::async_load");
+}
+
 inline bool IsDsReadFormatExternCall(const tir::CallNode *call) {
   return IsCallExternWithPrefix(call, "tl::mls::ds_read_format_tensor");
 }
@@ -472,6 +476,14 @@ TVM_DLL const Op &ptx_cp_async_barrier_noinc();
  *
  */
 TVM_DLL const Op &ptx_cp_async();
+
+/*!
+ * \brief Wait for outstanding LDS/LGKM async operations on HIP/HCU.
+ *
+ * async_gld_sld_fence(cnt)
+ *
+ */
+TVM_DLL const Op &async_gld_sld_fence();
 
 /*!
  * \brief Pack two b16 value into a b32 value

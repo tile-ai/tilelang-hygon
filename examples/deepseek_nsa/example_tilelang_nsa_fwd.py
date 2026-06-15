@@ -5,6 +5,8 @@ import tilelang
 from tilelang import language as T
 import tilelang.testing
 
+from hcu_example_utils import block_threads
+
 tilelang.testing.set_random_seed(0)
 
 
@@ -37,7 +39,7 @@ def native_sparse_attention(batch, heads, seq_len, dim, is_causal, scale=None, b
     BS = block_S
     BK = BV = block_T
     num_stages = 2
-    threads = 32
+    threads = block_threads()
 
     @T.prim_func
     def native_sparse_attention(

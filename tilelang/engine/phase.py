@@ -190,6 +190,8 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.PipelinePlanning()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)
     mod = tilelang.transform.Simplify()(mod)
+    # Plan MLS vmcnt on tile-op shared regions (after pipeline split, before lower).
+    mod = tilelang.transform.InsertMlsWaitcnt()(mod)
     # Infer memory layouts for fragments and shared memory
     mod = tilelang.transform.LayoutInference()(mod)
     # Visualize the layout
@@ -279,10 +281,10 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # because the merged allocation site is at the beginning of each device function
     enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
     mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
-    mod = tilelang.transform.InsertMatrixLoadWaitcnt()(mod)
     # InjectFenceProxy is a no-op on targets that lack the TMA / async-proxy
     # programming model; the pass itself checks the PrimFunc's target.
     mod = tilelang.transform.InjectFenceProxy()(mod)
+    mod = tilelang.transform.HoistMlsResource()(mod)
     mod = tilelang.transform.ThreadSync("shared")(mod)
     mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
     # Inject conservative tcgen05 fences on Blackwell (SM100+).

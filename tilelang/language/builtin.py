@@ -1232,6 +1232,15 @@ def cp_async_barrier_noinc(barrier: BarrierType):
     return tir.call_intrin("handle", tir.op.Op.get("tl.ptx_cp_async_barrier_noinc"), barrier)
 
 
+def async_gld_sld_fence(cnt: int = 0):
+    """Wait for outstanding LDS/LGKM async operations (lgkmcnt).
+
+    HIP/HCU only. Lowers to ``tl::async_gld_sld_fence(cnt)`` which issues
+    ``s_waitcnt lgkmcnt(cnt)``.
+    """
+    return tir.call_intrin("void", tir.op.Op.get("tl.async_gld_sld_fence"), tir.IntImm("int32", cnt))
+
+
 def _pack_s_waitcnt_imm(cnt: int, flag: Literal["vmcnt", "lgkmcnt", "expcnt"]) -> int:
     """Pack a named wait counter into the AMD s_waitcnt immediate encoding."""
     if not isinstance(cnt, int):
@@ -1274,6 +1283,17 @@ def s_waitcnt(cnt: int = 0, flag: Literal["vmcnt", "lgkmcnt", "expcnt"] = "vmcnt
     """
     imm = _pack_s_waitcnt_imm(cnt, flag)
     return tir.call_extern("int32", "__builtin_amdgcn_s_waitcnt", tir.IntImm("int32", imm))
+
+
+def sched_barrier(mask: int = 0):
+    """Insert an AMD scheduler barrier.
+
+    HIP/HCU only. Lowers to ``__builtin_amdgcn_sched_barrier(mask)``.
+
+    Args:
+        mask: Scheduler barrier mask immediate. Defaults to 0.
+    """
+    return tir.call_extern("void", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", mask))
 
 
 def tcgen05_mma_arrive(mbar: tir.Buffer | BufferLoad | PrimExpr, arrive_2cta: bool = False):

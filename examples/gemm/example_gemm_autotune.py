@@ -9,6 +9,8 @@ from tilelang.carver.arch import CDNA
 from tilelang.carver.roller.rasterization import NoRasterization
 import torch
 
+from hcu_example_utils import gemm_autotune_seed_config, warp_size
+
 
 def ref_program(A, B):
     """
@@ -72,7 +74,7 @@ def get_configs(M, N, K, with_roller=False, topk=20):
             config["block_N"] = block_n
             config["block_K"] = hint.rstep[0]
             config["num_stages"] = hint.pipeline_stage if hint.pipeline_stage > 1 else 0
-            config["thread_num"] = block_rows * block_cols * 32
+            config["thread_num"] = block_rows * block_cols * warp_size()
             config["enable_rasteration"] = hint.rasterization_plan is not NoRasterization
             configs.append(config)
     else:
@@ -169,6 +171,10 @@ def get_best_config(
 
 
 def get_heuristic_config() -> dict:
+    hcu_cfg = gemm_autotune_seed_config()
+    if hcu_cfg is not None:
+        print(f"HCU heuristic config: {hcu_cfg}")
+        return hcu_cfg
     # Get CUDA device properties
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")

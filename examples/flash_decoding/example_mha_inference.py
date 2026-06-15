@@ -5,6 +5,8 @@ from tilelang.autotuner import *
 import tilelang.language as T
 from functools import partial
 
+from hcu_example_utils import flash_block_mn
+
 num_split = 4
 
 
@@ -241,8 +243,7 @@ def main(BATCH=1, H=32, Q_CTX=128, KV_CTX=8192, D_HEAD=128, causal=False):
     total_flops = 2 * flops_per_matmul
     if causal:
         total_flops *= 0.5
-    BLOCK_M = 128
-    BLOCK_N = 64  # if D_HEAD <= 128 else 32
+    BLOCK_M, BLOCK_N = flash_block_mn(D_HEAD, block_m=128, block_n=64)
     kernel = flashattn(BATCH, H, Q_CTX, KV_CTX, D_HEAD, causal, BLOCK_M, BLOCK_N)
     ref_fn = partial(ref_program, causal=causal)
     profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Normal)
