@@ -241,13 +241,13 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
 
   std::string dtype_str;
   if (src->dtype.is_bfloat16()) {
-    dtype_str = "ck_tile::bfloat16_t";
+    dtype_str = "bfloat16_t";
   } else if (src->dtype.is_float16()) {
     dtype_str = "half_t";
   } else if (src->dtype.is_float8_e4m3fn() || src->dtype.is_float8_e4m3()) {
-    dtype_str = "ck_tile::fp8_t";
+    dtype_str = "tl::fp8_t";
   } else if (src->dtype.is_float8_e5m2() || src->dtype.is_float8_e5m2fnuz()) {
-    dtype_str = "ck_tile::bf8_t";
+    dtype_str = "tl::bf8_t";
   } else {
     LOG(FATAL) << "ds_read_format unsupported dtype: " << src->dtype;
   }
@@ -256,25 +256,25 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   if (gemm_dep_.defined()) {
     const auto *dep = gemm_dep_.get();
     if (dep->feeds_slot == 0) {
-      ss << "tl::mls::ds_read_format_tensor_a<ck_tile::sequence<" << block_mn
-         << ", " << block_k << ">, ck_tile::sequence<" << tile_mn << ", "
+      ss << "tl::mls::ds_read_format_tensor_a<tl::sequence<" << block_mn
+         << ", " << block_k << ">, tl::sequence<" << tile_mn << ", "
          << tile_k << ">, " << w_mn << ", " << w_k << ", "
          << dtype_str << ", 1, " << (ds_trans ? "true" : "false")
-         << ", ck_tile::hcu_target_enum::" << GetHcuArchString(T.target) << ">";
+         << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ">";
     } else {
       int total_warp = block_size / TargetGetWarpSize(T.target);
-      ss << "tl::mls::ds_read_format_tensor_b<ck_tile::sequence<" << block_mn
-         << ", " << block_k << ">, ck_tile::sequence<" << tile_mn << ", "
+      ss << "tl::mls::ds_read_format_tensor_b<tl::sequence<" << block_mn
+         << ", " << block_k << ">, tl::sequence<" << tile_mn << ", "
          << tile_k << ">, " << total_warp << ", " << w_mn << ", " << w_k
          << ", " << dtype_str << ", 1, " << (ds_trans ? "true" : "false")
-         << ", ck_tile::hcu_target_enum::" << GetHcuArchString(T.target) << ">";
+         << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ">";
     }
   } else {
-    ss << "tl::mls::ds_read_format_tensor_common<ck_tile::sequence<"
-       << block_mn << ", " << block_k << ">, ck_tile::sequence<" << tile_mn
+    ss << "tl::mls::ds_read_format_tensor_common<tl::sequence<"
+       << block_mn << ", " << block_k << ">, tl::sequence<" << tile_mn
        << ", " << tile_k << ">, " << w_mn << ", " << w_k << ", "
        << dtype_str << ", 1, " << (ds_trans ? "true" : "false")
-       << ", ck_tile::hcu_target_enum::" << GetHcuArchString(T.target) << ">";
+       << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ">";
   }
 
   Buffer src_buf = T.buffer_remap.count(src) ? T.buffer_remap[src] : src;

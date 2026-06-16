@@ -17,7 +17,7 @@ from tvm.contrib import utils
 from tvm.base import py_str
 from tvm.contrib.rocm import get_rocm_arch, find_rocm_path
 
-from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR, TILELANG_TEMPLATE_PATH, get_hip_compiler
+from tilelang.env import TILELANG_TEMPLATE_PATH, get_hip_compiler
 
 
 def _debug_enabled():
@@ -306,7 +306,6 @@ def tilelang_callback_hip_compile(code, target, pass_config=None):
         options=[
             "-std=c++17",
             "-I" + TILELANG_TEMPLATE_PATH,
-            "-I" + COMPOSABLE_KERNEL_INCLUDE_DIR,
         ],
         pass_config=cfg,
         verbose=False,

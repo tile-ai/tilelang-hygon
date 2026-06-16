@@ -6,18 +6,18 @@
  * Naming: removed "Warp" and "V2".
  */
 
-#include <ck_tile/core.hpp>
+#include <tl_templates/hcu/core.hpp>
 
-#include "tl_dsreadm_format_attribute_impl.hpp"
+#include <tl_templates/hcu/mls/tl_dsreadm_format_attribute_impl.hpp>
 
 namespace tl {
 namespace mls {
 namespace impl {
 
-template <ck_tile::index_t ElemBytes,
-          ck_tile::index_t Row,
-          ck_tile::index_t Col,
-          ck_tile::index_t Alt,
+template <::tl::index_t ElemBytes,
+          ::tl::index_t Row,
+          ::tl::index_t Col,
+          ::tl::index_t Alt,
           bool Trans>
 struct DsreadmFormatDispatcher;
 
@@ -94,10 +94,10 @@ struct DsreadmFormatDispatcher<1, 32, 32, 2, true>
 
 } // namespace impl
 
-template <ck_tile::index_t ElemBytes,
-          ck_tile::index_t Row,
-          ck_tile::index_t Col,
-          ck_tile::index_t Alt,
+template <::tl::index_t ElemBytes,
+          ::tl::index_t Row,
+          ::tl::index_t Col,
+          ::tl::index_t Alt,
           bool Trans>
 using DsreadmFormatDispatcher =
     typename impl::DsreadmFormatDispatcher<ElemBytes, Row, Col, Alt, Trans>::Type;

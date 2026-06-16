@@ -218,24 +218,24 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
 
   std::string dtype_str;
   if (src->dtype.is_bfloat16()) {
-    dtype_str = "ck_tile::bfloat16_t";
+    dtype_str = "bfloat16_t";
   } else if (src->dtype.is_float16()) {
     dtype_str = "half_t";
   } else if (src->dtype.is_float8_e4m3fn() || src->dtype.is_float8_e4m3()) {
-    dtype_str = "ck_tile::fp8_t";
+    dtype_str = "tl::fp8_t";
   } else if (src->dtype.is_float8_e5m2() || src->dtype.is_float8_e5m2fnuz()) {
-    dtype_str = "ck_tile::bf8_t";
+    dtype_str = "tl::bf8_t";
   } else {
     LOG(FATAL) << "matrix_load unsupported dtype: " << src->dtype;
   }
 
   std::stringstream ss;
-  ss << "tl::mls::mls_load_tile<ck_tile::sequence<" << block_mn << ", "
-     << block_k << ">, ck_tile::sequence<" << tile_mn << ", "
+  ss << "tl::mls::mls_load_tile<tl::sequence<" << block_mn << ", "
+     << block_k << ">, tl::sequence<" << tile_mn << ", "
      << tile_k << ">, " << warp_m << ", " << warp_k
      << ", " << dtype_str << ", 1, "
      << (mls_trans ? "true" : "false")
-     << ", ck_tile::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
+     << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
      << (check_last_load ? "true" : "false") << ", "
      << (last_load ? "true" : "false") << ">";
 

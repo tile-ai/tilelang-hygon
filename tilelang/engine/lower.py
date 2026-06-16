@@ -11,7 +11,7 @@ import tvm_ffi
 from tvm.ir import CallingConv
 from tvm.target import Target
 from tilelang.contrib import hipcc, nvcc
-from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR, CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH
+from tilelang.env import CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH
 from tilelang.transform import PassConfigKey
 from tilelang.transform.metal import MarkHostMetalContext
 from tilelang.engine.param import KernelParam, CompiledArtifact
@@ -168,7 +168,6 @@ def tilelang_callback_hip_compile(code, target, pass_config=None):
         options=[
             "-std=c++17",
             "-I" + TILELANG_TEMPLATE_PATH,
-            "-I" + COMPOSABLE_KERNEL_INCLUDE_DIR,
         ],
         pass_config=cfg,
         verbose=False,

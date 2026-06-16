@@ -88,24 +88,23 @@ int GetTileLangCPAsyncTransferBytes(const CallNode *op) {
   return static_cast<int>(total_bytes);
 }
 
-/// CK buffer / LDS helpers expect `ck_tile::bf16_t` in template parameters; generated TileLang
-/// code uses `bfloat16_t` (__bf16). Map only for template args, not for emitted value types.
+/// CK buffer templates use raw ``unsigned short`` for bf16; LDS/MMAC use ``bfloat16_t`` (__bf16).
 std::string HcuCkTemplateElemType(DataType dtype) {
   DataType elem_type = dtype.element_of();
   int elem_bits = elem_type.bits();
   if (elem_bits == 8) {
     if (elem_type.is_float8_e4m3fn() || elem_type.is_float8_e4m3fnuz() ||
         elem_type.is_float8_e4m3() || elem_type.code() == DataType::kFloat8_e4m3b11fnuz) {
-      return "ck_tile::fp8_t";
+      return "tl::fp8_t";
     }
     if (elem_type.is_float8_e5m2() || elem_type.is_float8_e5m2fnuz() ||
         elem_type.code() == DataType::kFloat8_e5m2) {
-      return "ck_tile::bf8_t";
+      return "tl::bf8_t";
     }
     return "int8_t";
   }
   if (elem_bits == 16) {
-    return elem_type.is_bfloat16() ? "ck_tile::bf16_t" : "half_t";
+    return elem_type.is_bfloat16() ? "unsigned short" : "half_t";
   }
   if (elem_bits == 32) {
     return "float";
@@ -123,7 +122,7 @@ std::string HcuCkBufferSrcPtrExpr(DataType dtype, const std::string &wave_ptr_ex
   return "reinterpret_cast<const " + HcuCkTemplateElemType(dtype) + "*>(" + wave_ptr_expr + ")";
 }
 
-/// CK **dst** pointers (`T*`): `reinterpret_cast<ck_tile::bf16_t*>` for `bfloat16_t`, else
+/// CK **dst** pointers (`T*`): `reinterpret_cast<unsigned short*>` for `bfloat16_t`, else
 /// C-style cast to element pointer, e.g. `(float*)buf`.
 std::string HcuCkBufferDstPtrExpr(DataType dtype, const std::string &wave_ptr_expr) {
   return "reinterpret_cast<" + HcuCkTemplateElemType(dtype) + "*>(" + wave_ptr_expr + ")";
@@ -289,7 +288,6 @@ void CodeGenTileLangHCU::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
 
 std::string CodeGenTileLangHCU::Finish() {
   decl_stream << "#include <hip/hip_runtime.h>\n";
-  decl_stream << "#include <ck/utility/amd_buffer_addressing.hpp>\n";
 
   if (enable_fp8_) {
     decl_stream << "#include <tl_templates/hcu/hcu_fp8.h>\n";
@@ -703,7 +701,7 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         ICHECK(name) << "MLS set_window_origin expects a string resource name";
         PrintIndent();
         stream << name->value
-               << ".set_window_origin(ck_tile::make_array<ck_tile::index_t>("
+               << ".set_window_origin(tl::make_array<tl::index_t>("
                << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3]) << "));\n";
         return;
       }
@@ -782,7 +780,7 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
            << stride << ", " << mn_len << ", " << k_len << ");\n";
     PrintIndent();
     stream << obj_name
-           << ".set_window_origin(ck_tile::make_array<ck_tile::index_t>("
+           << ".set_window_origin(tl::make_array<tl::index_t>("
            << mn_base << ", 0));\n";
     PrintIndent();
     stream << obj_name << ".update_base(" << k_base << ");\n";
@@ -835,7 +833,7 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
 
       // Convert the value expression to a thread_buffer using bit_cast.
       // For lanes==1 this becomes thread_buffer<T,1>.
-      std::string src_thread_buffer = "ck_tile::bit_cast<ck_tile::thread_buffer<" +
+      std::string src_thread_buffer = "tl::bit_cast<tl::thread_buffer<" +
                                       HcuCkTemplateElemType(value_dtype) + ", " +
                                       std::to_string(desc.num_elements) + ">>(" +
                                       value + ")";
@@ -1245,7 +1243,7 @@ void CodeGenTileLangHCU::PrintVecStoreWithPredicate(const BufferNode* buffer,
   //   amd_buffer_store<type, num_elements>(src_thread_data, dst_ptr, dst_offset,
   //                                        is_valid, element_space_size)
   // Convert the value expression to a thread_buffer using bit_cast
-  std::string src_thread_buffer = "ck_tile::bit_cast<ck_tile::thread_buffer<" +
+  std::string src_thread_buffer = "tl::bit_cast<tl::thread_buffer<" +
                                   HcuCkTemplateElemType(t) + ", " +
                                   std::to_string(desc.num_elements) + ">>(" + value + ")";
 
