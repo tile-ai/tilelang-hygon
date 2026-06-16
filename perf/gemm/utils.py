@@ -10,6 +10,7 @@ from tilelang.carver.template import MatmulTemplate
 from tilelang.carver.arch import CUDA
 from tilelang.carver.arch import CDNA
 from tilelang.carver.roller.rasterization import NoRasterization
+from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
 
 
 from aiter.ops.triton.gemm_unquantized import gemm_unquantized
@@ -184,8 +185,15 @@ def _run_autotuner(kernel, configs, warmup=3, rep=20, pass_configs=None):
     return autotuner.run(warmup=warmup, rep=rep)
 
 
-def get_heuristic_config(impl: str | None = None) -> dict:
-    """Get a heuristic configuration for GEMM kernels."""
+def get_heuristic_config(impl: str | None = None, version: str | None = None) -> dict:
+    """Get a heuristic configuration for GEMM kernels.
+
+    Args:
+        impl: GEMM implementation family (vanilla, persistent, splitk, streamk).
+        version: Kernel variant within the family (e.g. v1, v2, v3, v4, v5).
+            When set, version-specific tile/thread overrides are applied on top
+            of the base heuristic config.
+    """
     config = {
         #"block_M": 128,
         #"block_N": 256,
@@ -201,6 +209,47 @@ def get_heuristic_config(impl: str | None = None) -> dict:
         #"enable_rasteration": True,
         "wgs_per_cu": 2,
     }
-    if impl in ["vanilla"] :
+
+    version_overrides = {
+        ("persistent", "v4"): {
+            "block_M": 256,
+            "block_N": 256,
+            "block_K": 32,
+            "thread_num": 512,
+        },
+        ("vanilla", "v2"): {
+            "block_M": 256,
+            "block_N": 256,
+            "block_K": 32,
+            "thread_num": 512,
+        },
+    }
+    if impl is not None and version is not None:
+        config.update(version_overrides.get((impl, version), {}))
+
+    if impl in ["vanilla"]:
         config["use_mls"] = True
     return config
+
+
+def _get_compile_target_arch() -> str | None:
+    try:
+        return get_rocm_arch(find_rocm_path())
+    except Exception:
+        return None
+
+
+def get_default_kernel_version(impl: str) -> str | None:
+    """Default kernel variant used by perf/gemm/benchmark.py for each impl family."""
+    arch = _get_compile_target_arch()
+    if arch == "gfx938":
+        defaults = {
+            "persistent": "v4",
+            "vanilla": "v2",
+        }
+    else:
+        defaults = {
+            "persistent": "v3",
+            "vanilla": "v1",
+        }
+    return defaults.get(impl)

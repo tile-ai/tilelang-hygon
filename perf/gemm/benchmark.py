@@ -5,7 +5,7 @@ Benchmark script for all GEMM implementations.
 import argparse
 import torch
 import tilelang as tl
-from perf.gemm.utils import ref_program, get_heuristic_config, triton_gemm
+from perf.gemm.utils import ref_program, get_heuristic_config, get_default_kernel_version, triton_gemm
 from perf.gemm.vanilla_gemm import (
     gemm_vanilla,
     get_best_vanilla_config,
@@ -82,18 +82,37 @@ def main(M: int = 4096,
             raise ValueError(f"Autotune not supported for {impl} implementation. "
                            f"Supported: persistent, vanilla")
     else:
-        config = get_heuristic_config(impl)
+        kernel_version = get_default_kernel_version(impl)
+        config = get_heuristic_config(impl, kernel_version)
 
         if impl == "persistent":
             # kernel = gemm_persistent(M, N, K, dtype=dtype, **config)
             # kernel = gemm_persistent_v1(M, N, K, dtype=dtype, **config)
             # kernel = gemm_persistent_v2(M, N, K, dtype=dtype, **config)
-            kernel = gemm_persistent_v3(M, N, K, dtype=dtype, **config)
+            # kernel = gemm_persistent_v3(M, N, K, dtype=dtype, **config)
             # kernel = gemm_persistent_v4(M, N, K, dtype=dtype, **config)
             # kernel = gemm_persistent_v5(M, N, K, dtype=dtype, **config)
+            persistent_kernels = {
+                "v1": gemm_persistent_v1,
+                "v2": gemm_persistent_v2,
+                "v3": gemm_persistent_v3,
+                "v4": gemm_persistent_v4,
+                "v5": gemm_persistent_v5,
+            }
+            if kernel_version not in persistent_kernels:
+                raise ValueError(f"Unsupported persistent kernel version: {kernel_version}")
+            kernel = persistent_kernels[kernel_version](M, N, K, dtype=dtype, **config)
         elif impl == "vanilla":
             # kernel = gemm_vanilla(M, N, K, dtype=dtype, **config)
-            kernel = gemm_vanilla_v2(M, N, K, dtype=dtype, **config)
+            # kernel = gemm_vanilla_v1(M, N, K, dtype=dtype, **config)
+            # kernel = gemm_vanilla_v2(M, N, K, dtype=dtype, **config)
+            vanilla_kernels = {
+                "v1": gemm_vanilla_v1,
+                "v2": gemm_vanilla_v2,
+            }
+            if kernel_version not in vanilla_kernels:
+                raise ValueError(f"Unsupported vanilla kernel version: {kernel_version}")
+            kernel = vanilla_kernels[kernel_version](M, N, K, dtype=dtype, **config)
         elif impl == "splitk":
             kernel = gemm_splitk(M, N, K, dtype=dtype, **config)
         elif impl == "streamk":
