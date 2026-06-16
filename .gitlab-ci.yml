@@ -1,0 +1,98 @@
+stages:
+  - test
+  - publish
+
+variables:
+  PIP_INDEX_URL: "http://10.16.1.201:9929/nightly/dtk2604/+simple/"
+  PIP_TRUSTED_HOST: "10.16.1.201"
+  DTK_PKG: "/ArchivedFile/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz"
+  DEVPI_URL: "http://10.16.1.201:9929/"
+  CISMI_TIMEOUT: "3600"
+
+.torch_matrix: &torch_matrix
+  - TORCH_VERSION: ["2.10.0"]
+
+default:
+  tags:
+    - nmz
+
+.test_rules: &test_rules
+  - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(release\/|staging)/'
+    when: always
+  - when: never
+
+.publish_rules: &publish_rules
+  - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME =~ /^release\//'
+    when: always
+  - when: never
+
+test:
+  stage: test
+  rules: *test_rules
+  variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+  parallel:
+    matrix: *torch_matrix
+  script:
+    # 安装 DTK
+    - cp -f ${DTK_PKG} /opt/
+    - cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
+    - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
+    # 安装 AICC
+    - latest_run=$(ls /ArchivedFile/ai_cc/nightly/dtk_llvm_*.run 2>/dev/null | sort -t '_' -k4 -nr | head -n1)
+    - '[ -n "${latest_run}" ] && cp ${latest_run} ./ && chmod +x $(basename ${latest_run}) && yes | bash $(basename ${latest_run}) && echo "AICC 安装完成" || echo "跳过 AICC 安装"'
+    # 合并目标分支
+    - git config user.email "ci@tilelang.local" && git config user.name "CI"
+    - git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+    - git merge origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME --no-edit
+    - git submodule update --init --recursive
+    # 编译
+    - pip install torch==${TORCH_VERSION} triton cismi
+    - pip install -r requirements.txt -r requirements-dev.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    - NO_TOOLCHAIN_VERSION=1 NO_GIT_VERSION=1 bash das-build.sh
+    - pip install dist/*.whl
+    - pip install numpy==1.24.3 allure-pytest
+    # 回归测试
+    - git clone -b staging http://gitlab-ci-token:${CI_JOB_TOKEN}@42.228.13.241:10068/dcutoolkit/deeplearing/TileKernels.git /opt/TileKernels
+    - export HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout ${CISMI_TIMEOUT})
+    - >-
+      REPO_DIR=/opt/TileKernels
+      TILELANG_CACHE_DIR=./cache_test
+      TEST_RESULTS_DIR=${CI_PROJECT_DIR}/das-results
+      GENERATE_ALLURE_REPORT=1
+      bash das-regression.sh --junitxml=${CI_PROJECT_DIR}/das-results/allure-results/results.xml
+  artifacts:
+    paths:
+      - dist/*.whl
+      - das-results/allure-results/results.xml
+    reports:
+      junit: das-results/allure-results/results.xml
+    expire_in: 7d
+
+publish:
+  stage: publish
+  rules: *publish_rules
+  variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+  parallel:
+    matrix: *torch_matrix
+  script:
+    # 安装 DTK
+    - cp -f ${DTK_PKG} /opt/
+    - cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
+    - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
+    # 安装 AICC
+    - latest_run=$(ls /ArchivedFile/ai_cc/nightly/dtk_llvm_*.run 2>/dev/null | sort -t '_' -k4 -nr | head -n1)
+    - '[ -n "${latest_run}" ] && cp ${latest_run} ./ && chmod +x $(basename ${latest_run}) && yes | bash $(basename ${latest_run}) && echo "AICC 安装完成" || echo "跳过 AICC 安装"'
+    - git submodule update --init --recursive
+    # 编译
+    - pip install torch==${TORCH_VERSION} ciupload
+    - pip install -r requirements.txt -r requirements-dev.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    - NO_TOOLCHAIN_VERSION=1 NO_GIT_VERSION=1 bash das-build.sh
+    # repair wheel
+    - DTK_VER=$(echo ${DTK_PKG} | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
+    - TORCH_VER=$(echo ${TORCH_VERSION} | tr -d '.')
+    - LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(git rev-parse --short=6 HEAD)"
+    - CIUpload --repair --torch_version ${TORCH_VERSION} --set_local_version ${LOCAL_VER} --outputdir output -f dist/*.whl
+    # upload
+    - CIUpload --devpi_url ${DEVPI_URL} --devpi_user ${devpi_nightly_user} --devpi_password ${devpi_nightly_password} --dtk_pkg_name $(basename ${DTK_PKG}) -f output/*.whl
