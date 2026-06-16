@@ -141,6 +141,7 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
             "-mllvm=-disable-machine-sink=True",
             "-mllvm=-check-valu-data-forward-hazards=0",
             "-mllvm=-disable-cluster-lds-memops=true",
+            # "-mllvm=-amdgpu-disable-backoff-barrier=false",
         ]
         if _pass_config_truthy(pass_configs, PassConfigKey.TL_ENABLE_FAST_MATH):
             flags.append("-mllvm=-enable-hcu-approx-func-fp-math=true")

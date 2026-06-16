@@ -185,6 +185,11 @@ def main(M=4096, N=4096, K=4096):
 
 
 def run_regression_perf(M=4096, N=4096, K=4096):
+    import torch
+
+    if torch.version.hip is not None:
+        return 0.0  # CUDA TensorCore intrinsic; skipped on HIP/HCU
+
     in_dtype, out_dtype, accum_dtype = "float16", "float16", "float32"
     kernel = tl_matmul(M, N, K, in_dtype, out_dtype, accum_dtype)
     profiler = kernel.get_profiler()

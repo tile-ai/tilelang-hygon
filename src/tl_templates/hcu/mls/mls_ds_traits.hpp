@@ -6,20 +6,20 @@
  * MlsAtom: tl::mls::gfx938_* or tl::mls::gfx946_* from mls_atom_for_tile.
  */
 
-#include <ck_tile/core.hpp>
+#include <tl_templates/hcu/core.hpp>
 
-#include "tl_dsreadm_format_dispatcher.hpp"
+#include <tl_templates/hcu/mls/tl_dsreadm_format_dispatcher.hpp>
 
 namespace tl {
 namespace mls {
 
-template <typename MlsAtom, ck_tile::index_t ElemBytes, ck_tile::index_t Alt>
+template <typename MlsAtom, ::tl::index_t ElemBytes, ::tl::index_t Alt>
 struct mls_ds_traits;
 
 #if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx938__)
-#include "tl_mls_atom_gfx938.hpp"
+#include <tl_templates/hcu/mls/tl_mls_atom_gfx938.hpp>
 // gfx938 b16 (ElemBytes=2)
-template <ck_tile::index_t Alt>
+template <::tl::index_t Alt>
 struct mls_ds_traits<tl::mls::gfx938_mls_32x16_b16, 2, Alt>
 {
     using Type = DsreadmFormatDispatcher<2, 32, 16, Alt, false>;
@@ -37,7 +37,7 @@ struct mls_ds_traits<tl::mls::gfx938_mls_16x32_trans_b16, 2, 2>
     using Type = DsreadmFormatDispatcher<2, 16, 32, 2, true>;
 };
 
-template <ck_tile::index_t Alt>
+template <::tl::index_t Alt>
 struct mls_ds_traits<tl::mls::gfx938_mls_32x32_b16, 2, Alt>
 {
     using Type = DsreadmFormatDispatcher<2, 32, 16, Alt, false>;
@@ -55,7 +55,7 @@ struct mls_ds_traits<tl::mls::gfx938_mls_32x32_trans_b16, 2, 2>
     using Type = DsreadmFormatDispatcher<2, 16, 32, 2, true>;
 };
 
-template <ck_tile::index_t Alt>
+template <::tl::index_t Alt>
 struct mls_ds_traits<tl::mls::gfx938_mls_64x16_b16, 2, Alt>
 {
     using Type = DsreadmFormatDispatcher<2, 32, 16, Alt, false>;
@@ -172,9 +172,9 @@ struct mls_ds_traits<tl::mls::gfx938_mls_32x64_trans_b8, 1, 4>
 #endif
 
 #if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx946__)
-#include "tl_mls_atom_gfx946.hpp"
+#include <tl_templates/hcu/mls/tl_mls_atom_gfx946.hpp>
 
-template <ck_tile::index_t Alt>
+template <::tl::index_t Alt>
 struct mls_ds_traits<tl::mls::gfx946_mls_32x16_b16, 2, Alt>
 {
     using Type = DsreadmFormatDispatcher<2, 32, 16, Alt, false>;
@@ -192,7 +192,7 @@ struct mls_ds_traits<tl::mls::gfx946_mls_16x32_trans_b16, 2, 2>
     using Type = DsreadmFormatDispatcher<2, 16, 32, 2, true>;
 };
 
-template <ck_tile::index_t Alt>
+template <::tl::index_t Alt>
 struct mls_ds_traits<tl::mls::gfx946_mls_32x32_b16, 2, Alt>
 {
     using Type = DsreadmFormatDispatcher<2, 32, 16, Alt, false>;
@@ -210,7 +210,7 @@ struct mls_ds_traits<tl::mls::gfx946_mls_32x32_trans_b16, 2, 2>
     using Type = DsreadmFormatDispatcher<2, 16, 32, 2, true>;
 };
 
-template <ck_tile::index_t Alt>
+template <::tl::index_t Alt>
 struct mls_ds_traits<tl::mls::gfx946_mls_64x16_b16, 2, Alt>
 {
     using Type = DsreadmFormatDispatcher<2, 32, 16, Alt, false>;
@@ -279,7 +279,7 @@ struct mls_ds_traits<tl::mls::gfx946_mls_32x64_trans_b8, 1, 4>
 #endif
 
 // Primary: no specialization for (MlsAtom, ElemBytes, Alt)
-template <typename MlsAtom, ck_tile::index_t ElemBytes, ck_tile::index_t Alt>
+template <typename MlsAtom, ::tl::index_t ElemBytes, ::tl::index_t Alt>
 struct mls_ds_traits
 {
     static_assert(sizeof(MlsAtom) == 0,

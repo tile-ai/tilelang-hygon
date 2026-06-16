@@ -499,7 +499,7 @@ def gemm_persistent_v4(M, N, K, block_M, block_N, block_K,
                         base = 2 * (k + 1)
                         # T.sched_barrier()
                         T.s_waitcnt(0, flag="lgkmcnt")
-                        # T.sync_warp()
+                        T.sync_warp()
                         T.sched_barrier()
                         T.matrix_load(A[by * block_M, base * block_K], A_shared[0, :, :])
                         T.matrix_load(B[bx * block_N, base * block_K], B_shared_0[0, :, :])
@@ -519,7 +519,7 @@ def gemm_persistent_v4(M, N, K, block_M, block_N, block_K,
                         T.sched_barrier()
 
                         T.s_waitcnt(0, flag="lgkmcnt")
-                        # T.sync_warp()
+                        T.sync_warp()
                         T.sched_barrier()
                         T.matrix_load(A[by * block_M, (base+1) * block_K], A_shared[1, :, :])
                         T.matrix_load(B[bx * block_N, (base+1) * block_K], B_shared_0[1, :, :])

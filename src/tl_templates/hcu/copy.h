@@ -1,9 +1,9 @@
 #pragma once
 
-#include "common.h"
+#include <tl_templates/hcu/common.h>
 #include <cstdint>
 
-#include <ck_tile/core/arch/amd_buffer_addressing.hpp>
+#include <tl_templates/hcu/core/arch/amd_buffer_addressing.hpp>
 
 using f32 = float;
 // using f16 = _Float16;
@@ -14,32 +14,7 @@ using u32 = std::uint32_t;
 
 using index_t = u32;
 
-using ck_tile::int32x4_t;
-
-struct __attribute__((packed)) buffer_resource {
-  const void *ptr;
-  uint32_t range;
-  uint32_t config;
-};
-
-CK_TILE_DEVICE int32x4_t make_wave_buffer_resource(const void *ptr,
-                                                   uint32_t size = 0xffffffff) {
-  buffer_resource res{ptr, size, CK_TILE_BUFFER_RESOURCE_3RD_DWORD};
-  int32x4_t r = __builtin_bit_cast(int32x4_t, res);
-  r.x = __builtin_amdgcn_readfirstlane(r.x);
-  r.y = __builtin_amdgcn_readfirstlane(r.y);
-  r.z = __builtin_amdgcn_readfirstlane(r.z);
-  r.w = __builtin_amdgcn_readfirstlane(r.w);
-  return r;
-}
-
-__device__ void init_m0(uint32_t m0_value) {
-  asm volatile("s_mov_b32 m0, %0" : : "s"(m0_value) : "memory");
-}
-
-__device__ void inc_m0(uint32_t m0_inc) {
-  asm volatile("s_add_u32 m0, %0, m0" : : "n"(m0_inc) : "memory");
-}
+using tl::int32x4_t;
 
 namespace tl {
 
@@ -205,46 +180,46 @@ TL_DEVICE void cp_async_gs_conditional(void *lds_base_ptr,
 
 // amd_buffer_load for tilelang
 template <typename T,
-          ck_tile::index_t N,
+          tl::index_t N,
           bool oob_conditional_check = true>
-CK_TILE_DEVICE ck_tile::thread_buffer<T, N>
+TL_DEVICE tl::thread_buffer<T, N>
 amd_buffer_load(const T *p_src_wave,
-                ck_tile::index_t src_thread_element_offset,
+                tl::index_t src_thread_element_offset,
                 bool src_thread_element_valid,
-                ck_tile::index_t src_element_space_size) {
+                tl::index_t src_element_space_size) {
   const int32x4_t src_wave_buffer_resource = make_wave_buffer_resource(p_src_wave);
 
-    ck_tile::index_t src_thread_addr_offset = [&]() {
+    tl::index_t src_thread_addr_offset = [&]() {
       if constexpr (oob_conditional_check)
         return src_thread_element_valid ? src_thread_element_offset * sizeof(T) : 0xffffffff;
       else
         return src_thread_element_offset * sizeof(T);
     }();
-  return ck_tile::amd_buffer_load_impl<T, N>(
+  return tl::amd_buffer_load_impl<T, N>(
       src_wave_buffer_resource, src_thread_addr_offset, 0);
 
 }
 
 // amd_buffer_store for tilelang
 template <typename T,
-          ck_tile::index_t N,
+          tl::index_t N,
           bool oob_conditional_check = true>
-CK_TILE_DEVICE void amd_buffer_store(
-    const ck_tile::thread_buffer<T, N> &src_thread_data, T *p_dst_wave,
-    const ck_tile::index_t dst_thread_element_offset,
+TL_DEVICE void amd_buffer_store(
+    const tl::thread_buffer<T, N> &src_thread_data, T *p_dst_wave,
+    const tl::index_t dst_thread_element_offset,
     const bool dst_thread_element_valid,
-    const ck_tile::index_t dst_element_space_size) {
+    const tl::index_t dst_element_space_size) {
   const int32x4_t dst_wave_buffer_resource =
       make_wave_buffer_resource(p_dst_wave);
 
-  ck_tile::index_t dst_thread_addr_offset = [&]() {
+  tl::index_t dst_thread_addr_offset = [&]() {
     if constexpr (oob_conditional_check)
       return dst_thread_element_valid ? dst_thread_element_offset * sizeof(T)
                                       : 0xffffffff;
     else
       return dst_thread_element_offset * sizeof(T);
   }();
-  ck_tile::amd_buffer_store_impl<T, N>(
+  tl::amd_buffer_store_impl<T, N>(
       src_thread_data, dst_wave_buffer_resource, dst_thread_addr_offset, 0);
 }
 

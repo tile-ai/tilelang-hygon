@@ -1,6 +1,6 @@
 #pragma once
 
-#include "common.h"
+#include <tl_templates/hcu/common.h>
 
 namespace tl {
 
