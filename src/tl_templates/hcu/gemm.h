@@ -1,7 +1,7 @@
 #pragma once
 
 #include <type_traits>
-#include "common.h"
+#include <tl_templates/hcu/common.h>
 
 namespace tl {
 
@@ -37,7 +37,7 @@ template <> struct MmacTraits<half> {
   }
 };
 
-// Specialization for bfloat16_t
+// Specialization for bfloat16_t (__bf16, TileLang device type)
 template <> struct MmacTraits<bfloat16_t> {
   template <typename AccType>
   static TL_DEVICE void mmac_op(const bfloat16_t *b, const bfloat16_t *a,
@@ -229,10 +229,10 @@ public:
       for (int j = 0; j < warp_cols; ++j) {
         float permuted_vec[4];
         auto acc_ptr = ((float32x4 *)C_local) + ((i * warp_cols) + j);
-        permuted_vec[0] = ck_tile::warp_shuffle(((C_type*)acc_ptr)[0], (lane + 16) % warp_size);
-        //permuted_vec[1] = ck_tile::warp_shuffle(acc_ptr[0], (lane + 32) % warp_size);
-        //permuted_vec[2] = ck_tile::warp_shuffle(acc_ptr[0], (lane + 48) % warp_size);
-        //permuted_vec[3] = ck_tile::warp_shuffle(acc_ptr[0], (lane + 64) % warp_size);
+        permuted_vec[0] = tl::warp_shuffle(((C_type*)acc_ptr)[0], (lane + 16) % warp_size);
+        //permuted_vec[1] = tl::warp_shuffle(acc_ptr[0], (lane + 32) % warp_size);
+        //permuted_vec[2] = tl::warp_shuffle(acc_ptr[0], (lane + 48) % warp_size);
+        //permuted_vec[3] = tl::warp_shuffle(acc_ptr[0], (lane + 64) % warp_size);
         ((C_type*)acc_ptr)[0] = permuted_vec[0];
        }
     }

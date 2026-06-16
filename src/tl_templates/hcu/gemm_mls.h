@@ -1,9 +1,9 @@
 #pragma once
 
-#include <ck_tile/core.hpp>
+#include <tl_templates/hcu/core.hpp>
 
-#include "gemm.h"
-#include "mls/tilelang_ds_read_format.hpp"
+#include <tl_templates/hcu/gemm.h>
+#include <tl_templates/hcu/mls/tilelang_ds_read_format.hpp>
 
 namespace tl {
 
@@ -15,8 +15,8 @@ namespace tl {
  *   num_warp_m, num_warp_n: warp partitioning
  *   TransposeA, TransposeB: matrix layout (gemm convention)
  *   kPack: K packing factor
- *   MlsTileA: ck_tile::sequence<MlsTileM, MlsTileKA> - MLS tile for A (BlockSize = M x K)
- *   MlsTileB: ck_tile::sequence<MlsTileN, MlsTileKB> - MLS tile for B (BlockSize = N x K)
+ *   MlsTileA: tl::sequence<MlsTileM, MlsTileKA> - MLS tile for A (BlockSize = M x K)
+ *   MlsTileB: tl::sequence<MlsTileN, MlsTileKB> - MLS tile for B (BlockSize = N x K)
  *   AltA, AltB: MLS format (Alt in ds_read sense).
  *   TransA, TransB derived: TransA=!TransposeA, TransB=TransposeB
  *   A_type, B_type, C_type, AccDataType: data types
@@ -35,18 +35,18 @@ template <int M,
           int kPack,
           typename MlsTileA,
           typename MlsTileB,
-          ck_tile::index_t AltA,
-          ck_tile::index_t AltB,
+          tl::index_t AltA,
+          tl::index_t AltB,
           typename A_type,
           typename B_type,
           typename C_type,
           typename AccDataType = float,
-          ck_tile::hcu_target_enum HcuArch = ck_tile::hcu_target_enum::gfx938>
+          tl::hcu_target_enum HcuArch = tl::hcu_target_enum::gfx938>
 class GemmMlsTensorOpAB
 {
     static constexpr bool TransA = !TransposeA;
     static constexpr bool TransB = TransposeB;
-    static constexpr ck_tile::index_t kMinNPerWarp = TransB ? 16 : 32;
+    static constexpr tl::index_t kMinNPerWarp = TransB ? 16 : 32;
 
     using GemmOp = GemmTensorOp<M,
                                N,
@@ -72,7 +72,7 @@ public:
     static constexpr int warp_rows    = GemmOp::warp_rows;
     static constexpr int warp_cols    = GemmOp::warp_cols;
 
-    using ATraits = tl::mls::ds_read_format_traits<ck_tile::sequence<M, K>,
+    using ATraits = tl::mls::ds_read_format_traits<tl::sequence<M, K>,
                                                    MlsTileA,
                                                    num_warp_m,
                                                    1,
@@ -80,11 +80,11 @@ public:
                                                    AltA,
                                                    TransA,
                                                    HcuArch>;
-    static constexpr ck_tile::index_t A_local_size = ATraits::GemmTensorSize;
+    static constexpr tl::index_t A_local_size = ATraits::GemmTensorSize;
 
-    static constexpr ck_tile::index_t WarpN_no_recompute =
+    static constexpr tl::index_t WarpN_no_recompute =
         std::min(num_warp_n, N / kMinNPerWarp);
-    using BTraits = tl::mls::ds_read_format_traits<ck_tile::sequence<N, K>,
+    using BTraits = tl::mls::ds_read_format_traits<tl::sequence<N, K>,
                                                    MlsTileB,
                                                    WarpN_no_recompute,
                                                    1,
@@ -92,7 +92,7 @@ public:
                                                    AltB,
                                                    TransB,
                                                    HcuArch>;
-    static constexpr ck_tile::index_t B_local_size = BTraits::GemmTensorSize;
+    static constexpr tl::index_t B_local_size = BTraits::GemmTensorSize;
 
     static_assert(kPack == 1, "gemm_mls currently requires kPack=1");
     static_assert(A_local_size == inner_k * warp_rows * vec_size,
@@ -105,14 +105,14 @@ public:
      * A_lds, B_lds: MLS-formatted LDS pointers (block-level).
      * C_local: output accumulator (caller-allocated).
      */
-    static TL_DEVICE void body(CK_TILE_LDS_ADDR A_type* A_lds,
-                              CK_TILE_LDS_ADDR B_type* B_lds,
+    static TL_DEVICE void body(TL_LDS_ADDR A_type* A_lds,
+                              TL_LDS_ADDR B_type* B_lds,
                               C_type* C_local)
     {
         A_type A_local[A_local_size];
         B_type B_local[B_local_size];
 
-        tl::mls::ds_read_format_tensor_a<ck_tile::sequence<M, K>,
+        tl::mls::ds_read_format_tensor_a<tl::sequence<M, K>,
                                          MlsTileA,
                                          num_warp_m,
                                          1,
@@ -121,7 +121,7 @@ public:
                                          TransA,
                                          HcuArch>(A_lds, A_local);
 
-        tl::mls::ds_read_format_tensor_b<ck_tile::sequence<N, K>,
+        tl::mls::ds_read_format_tensor_b<tl::sequence<N, K>,
                                          MlsTileB,
                                          num_warp_m * num_warp_n,
                                          num_warp_n,
@@ -150,15 +150,15 @@ template <int M,
           int kPack,
           typename MlsTileA,
           typename MlsTileB,
-          ck_tile::index_t AltA,
-          ck_tile::index_t AltB,
+          tl::index_t AltA,
+          tl::index_t AltB,
           typename A_type,
           typename B_type,
           typename C_type,
           typename AccDataType = float,
-          ck_tile::hcu_target_enum HcuArch = ck_tile::hcu_target_enum::gfx938>
-TL_DEVICE void gemm_mls_mls(CK_TILE_LDS_ADDR A_type* A_lds,
-                              CK_TILE_LDS_ADDR B_type* B_lds,
+          tl::hcu_target_enum HcuArch = tl::hcu_target_enum::gfx938>
+TL_DEVICE void gemm_mls_mls(TL_LDS_ADDR A_type* A_lds,
+                              TL_LDS_ADDR B_type* B_lds,
                               C_type* C_local)
 {
     GemmMlsTensorOpAB<M,
@@ -185,7 +185,7 @@ TL_DEVICE void gemm_mls_mls(CK_TILE_LDS_ADDR A_type* A_lds,
  *
  * body_r_mls: A from register, B from MLS LDS.
  * body_s_mls: A from swizzle LDS, B from MLS LDS.
- * MlsTileB: ck_tile::sequence<MlsTileN, MlsTileKB> - MLS tile for B.
+ * MlsTileB: tl::sequence<MlsTileN, MlsTileKB> - MLS tile for B.
  */
 template <int M,
           int N,
@@ -196,16 +196,16 @@ template <int M,
           bool TransposeB,
           int kPack,
           typename MlsTileB,
-          ck_tile::index_t AltB,
+          tl::index_t AltB,
           typename A_type,
           typename B_type,
           typename C_type,
           typename AccDataType = float,
-          ck_tile::hcu_target_enum HcuArch = ck_tile::hcu_target_enum::gfx938>
+          tl::hcu_target_enum HcuArch = tl::hcu_target_enum::gfx938>
 class GemmMlsTensorOpB
 {
     static constexpr bool TransB = TransposeB;
-    static constexpr ck_tile::index_t kMinNPerWarp = TransB ? 16 : 32;
+    static constexpr tl::index_t kMinNPerWarp = TransB ? 16 : 32;
 
     using GemmOp = GemmTensorOp<M,
                                N,
@@ -230,9 +230,9 @@ public:
     static constexpr int warp_cols    = GemmOp::warp_cols;
     static constexpr int vec_size     = GemmOp::vec_size;
 
-    static constexpr ck_tile::index_t WarpN_no_recompute =
+    static constexpr tl::index_t WarpN_no_recompute =
         std::min(num_warp_n, N / kMinNPerWarp);
-    using BTraits = tl::mls::ds_read_format_traits<ck_tile::sequence<N, K>,
+    using BTraits = tl::mls::ds_read_format_traits<tl::sequence<N, K>,
                                                    MlsTileB,
                                                    WarpN_no_recompute,
                                                    1,
@@ -240,10 +240,10 @@ public:
                                                    AltB,
                                                    TransB,
                                                    HcuArch>;
-    static constexpr ck_tile::index_t B_local_size = BTraits::GemmTensorSize;
+    static constexpr tl::index_t B_local_size = BTraits::GemmTensorSize;
 
     static_assert(kPack == 1, "gemm_mls currently requires kPack=1");
-    static constexpr ck_tile::index_t A_local_size =
+    static constexpr tl::index_t A_local_size =
         inner_k * warp_rows * vec_size;
     static_assert(B_local_size == inner_k * warp_cols * vec_size,
                   "B GemmTensorSize must match gemm body_rr layout");
@@ -252,11 +252,11 @@ public:
      * body_r_mls: A from register, B from MLS LDS.
      */
     static TL_DEVICE void body_r_mls(A_type* A_local,
-                                  CK_TILE_LDS_ADDR B_type* B_lds,
+                                  TL_LDS_ADDR B_type* B_lds,
                                   C_type* C_local)
     {
         B_type B_local[B_local_size];
-        tl::mls::ds_read_format_tensor_b<ck_tile::sequence<N, K>,
+        tl::mls::ds_read_format_tensor_b<tl::sequence<N, K>,
                                          MlsTileB,
                                          num_warp_m * num_warp_n,
                                          num_warp_n,
@@ -271,8 +271,8 @@ public:
     /*
      * body_s_mls: A from swizzle LDS, B from MLS LDS.
      */
-    static TL_DEVICE void body_s_mls(CK_TILE_LDS_ADDR A_type* A_shared,
-                                  CK_TILE_LDS_ADDR B_type* B_lds,
+    static TL_DEVICE void body_s_mls(TL_LDS_ADDR A_type* A_shared,
+                                  TL_LDS_ADDR B_type* B_lds,
                                   C_type* C_local)
     {
         constexpr int local_size_a =
@@ -334,14 +334,14 @@ template <int M,
           bool TransposeB,
           int kPack,
           typename MlsTileB,
-          ck_tile::index_t AltB,
+          tl::index_t AltB,
           typename A_type,
           typename B_type,
           typename C_type,
           typename AccDataType = float,
-          ck_tile::hcu_target_enum HcuArch = ck_tile::hcu_target_enum::gfx938>
+          tl::hcu_target_enum HcuArch = tl::hcu_target_enum::gfx938>
 TL_DEVICE void gemm_r_mls(A_type* A_local,
-                          CK_TILE_LDS_ADDR B_type* B_lds,
+                          TL_LDS_ADDR B_type* B_lds,
                           C_type* C_local)
 {
     GemmMlsTensorOpB<M,
@@ -373,14 +373,14 @@ template <int M,
           bool TransposeB,
           int kPack,
           typename MlsTileB,
-          ck_tile::index_t AltB,
+          tl::index_t AltB,
           typename A_type,
           typename B_type,
           typename C_type,
           typename AccDataType = float,
-          ck_tile::hcu_target_enum HcuArch = ck_tile::hcu_target_enum::gfx938>
-TL_DEVICE void gemm_s_mls(CK_TILE_LDS_ADDR A_type* A_shared,
-                          CK_TILE_LDS_ADDR B_type* B_lds,
+          tl::hcu_target_enum HcuArch = tl::hcu_target_enum::gfx938>
+TL_DEVICE void gemm_s_mls(TL_LDS_ADDR A_type* A_shared,
+                          TL_LDS_ADDR B_type* B_lds,
                           C_type* C_local)
 {
     GemmMlsTensorOpB<M,

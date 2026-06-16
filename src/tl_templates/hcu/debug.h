@@ -1,7 +1,7 @@
 #pragma once
 #include <hip/hip_runtime.h>
 
-#include "hcu_fp8.h"
+#include <tl_templates/hcu/hcu_fp8.h>
 
 template <typename T> struct PrintTraits {
   static __device__ void print_var(const char *msg, T val) {
@@ -39,7 +39,7 @@ template <typename T> struct PrintTraits {
 
 DEFINE_PRINT_TRAIT(char, "char", "%d", int);
 DEFINE_PRINT_TRAIT(signed char, "signed char", "%d", int);
-// Do not specialize unsigned char: ck_tile::fp8_t / bf8_t (fp8_e4_t / fp8_e5_t) may
+// Do not specialize unsigned char: tl::fp8_t / bf8_t (fp8_e4_t / fp8_e5_t) may
 // alias to uint8_t (unsigned char). One trait for fp8_e4_t covers that storage type;
 // do not add a separate fp8_e5_t trait when it would duplicate the same underlying type.
 DEFINE_PRINT_TRAIT(short, "short", "%d", int);

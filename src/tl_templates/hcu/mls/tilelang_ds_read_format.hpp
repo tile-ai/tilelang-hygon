@@ -1,10 +1,10 @@
 #pragma once
 
 #include <algorithm>
-#include <ck_tile/core.hpp>
+#include <tl_templates/hcu/core.hpp>
 
-#include "mls_ds_traits.hpp"
-#include "mls_param_traits.hpp"
+#include <tl_templates/hcu/mls/mls_ds_traits.hpp>
+#include <tl_templates/hcu/mls/mls_param_traits.hpp>
 
 namespace tl {
 namespace mls {
@@ -19,18 +19,18 @@ namespace mls {
  */
 template <typename BlockSize,
           typename MlsTileSize,
-          ck_tile::index_t WarpMN,
-          ck_tile::index_t WarpK,
+          ::tl::index_t WarpMN,
+          ::tl::index_t WarpK,
           typename DataType,
-          ck_tile::index_t Alt,
+          ::tl::index_t Alt,
           bool Trans,
-          ck_tile::hcu_target_enum HcuArch>
+          ::tl::hcu_target_enum HcuArch>
 struct ds_read_format_traits
 {
-    static constexpr ck_tile::index_t BlockSizeMN = BlockSize::at(ck_tile::number<0>{});
-    static constexpr ck_tile::index_t BlockSizeK  = BlockSize::at(ck_tile::number<1>{});
+    static constexpr ::tl::index_t BlockSizeMN = BlockSize::at(::tl::number<0>{});
+    static constexpr ::tl::index_t BlockSizeK  = BlockSize::at(::tl::number<1>{});
 
-    static constexpr ck_tile::index_t Bits = sizeof(DataType) * 8;
+    static constexpr ::tl::index_t Bits = sizeof(DataType) * 8;
 
     using LdsTraits = mls_lds_desc_param_traits<BlockSize, MlsTileSize, Bits, Alt, Trans, HcuArch>;
     using MlsAtom   = typename LdsTraits::MlsAtom;
@@ -40,33 +40,33 @@ struct ds_read_format_traits
     static constexpr auto LdsDesc = LdsTraits::get_tile_lds_desc();
 
     // Per-warp chunk size
-    static constexpr ck_tile::index_t PerWarpMN = BlockSizeMN / WarpMN;
-    static constexpr ck_tile::index_t PerWarpK  = BlockSizeK / WarpK;
+    static constexpr ::tl::index_t PerWarpMN = BlockSizeMN / WarpMN;
+    static constexpr ::tl::index_t PerWarpK  = BlockSizeK / WarpK;
 
     // Iterations per warp (tiles of DsFormatInst::kMN x DsFormatInst::kK)
-    static constexpr ck_tile::index_t MNIterPerWarp = PerWarpMN / DsFormatInst::kMN;
-    static constexpr ck_tile::index_t KIterPerWarp  = PerWarpK / DsFormatInst::kK;
+    static constexpr ::tl::index_t MNIterPerWarp = PerWarpMN / DsFormatInst::kMN;
+    static constexpr ::tl::index_t KIterPerWarp  = PerWarpK / DsFormatInst::kK;
 
     static_assert(PerWarpMN % DsFormatInst::kMN == 0,
                   "PerWarpMN must be divisible by DsFormatInst::kMN");
     static_assert(PerWarpK % DsFormatInst::kK == 0,
                   "PerWarpK must be divisible by DsFormatInst::kK");
 
-    using SFC = ck_tile::space_filling_curve<ck_tile::sequence<MNIterPerWarp, KIterPerWarp>,
-                                             ck_tile::sequence<1, 0>,
-                                             ck_tile::sequence<1, 1>,
+    using SFC = ::tl::space_filling_curve<::tl::sequence<MNIterPerWarp, KIterPerWarp>,
+                                             ::tl::sequence<1, 0>,
+                                             ::tl::sequence<1, 1>,
                                              false>;
 
-    static constexpr ck_tile::index_t NumAccess = SFC::get_num_of_access();
+    static constexpr ::tl::index_t NumAccess = SFC::get_num_of_access();
 
     // Gemm layout: (ki, Mi) -> offset (ki * warp_rows + Mi) * vec_size
     // Matches gemm.h body_rr: a_ptr = A_local + (ki * warp_rows + Mi) * vec_size
-    static constexpr ck_tile::index_t MmacMNSize = 16;
-    static constexpr ck_tile::index_t MmacKSize = 32 / sizeof(DataType);  // for b16/fp16
-    static constexpr ck_tile::index_t GemmWarpRows = PerWarpMN / MmacMNSize;
-    static constexpr ck_tile::index_t GemmInnerK   = PerWarpK / MmacKSize;
-    static constexpr ck_tile::index_t VecSize      = 8 / sizeof(DataType);
-    static constexpr ck_tile::index_t GemmTensorSize =
+    static constexpr ::tl::index_t MmacMNSize = 16;
+    static constexpr ::tl::index_t MmacKSize = 32 / sizeof(DataType);  // for b16/fp16
+    static constexpr ::tl::index_t GemmWarpRows = PerWarpMN / MmacMNSize;
+    static constexpr ::tl::index_t GemmInnerK   = PerWarpK / MmacKSize;
+    static constexpr ::tl::index_t VecSize      = 8 / sizeof(DataType);
+    static constexpr ::tl::index_t GemmTensorSize =
         GemmInnerK * GemmWarpRows * VecSize;
 };
 
@@ -82,17 +82,17 @@ struct ds_read_format_traits
  */
 template <typename BlockSize,
           typename MlsTileSize,
-          ck_tile::index_t WarpMN,
-          ck_tile::index_t WarpK,
+          ::tl::index_t WarpMN,
+          ::tl::index_t WarpK,
           typename DataType,
-          ck_tile::index_t Alt,
+          ::tl::index_t Alt,
           bool Trans,
-          ck_tile::hcu_target_enum HcuArch>
-CK_TILE_DEVICE void ds_read_format_tensor(
-    CK_TILE_LDS_ADDR DataType* smem_ptr,
+          ::tl::hcu_target_enum HcuArch>
+TL_DEVICE void ds_read_format_tensor(
+    TL_LDS_ADDR DataType* smem_ptr,
     DataType* target,
-    ck_tile::index_t warp_mn_idx,
-    ck_tile::index_t warp_k_idx)
+    ::tl::index_t warp_mn_idx,
+    ::tl::index_t warp_k_idx)
 {
     using Traits = ds_read_format_traits<BlockSize,
                                         MlsTileSize,
@@ -104,40 +104,40 @@ CK_TILE_DEVICE void ds_read_format_tensor(
                                         HcuArch>;
 
     using DsFormatInst = typename Traits::DsFormatInst;
-    using vector_t    = ck_tile::ext_vector_t<DataType, DsFormatInst::kVectorLength>;
+    using vector_t    = ::tl::ext_vector_t<DataType, DsFormatInst::kVectorLength>;
 
-    constexpr ck_tile::index_t NumMMAC_MN = DsFormatInst::kMN / Traits::MmacMNSize;
-    constexpr ck_tile::index_t NumMMAC_K  = DsFormatInst::kK / Traits::MmacKSize;
-    constexpr ck_tile::index_t NumMMACPerRead = NumMMAC_MN * NumMMAC_K;
+    constexpr ::tl::index_t NumMMAC_MN = DsFormatInst::kMN / Traits::MmacMNSize;
+    constexpr ::tl::index_t NumMMAC_K  = DsFormatInst::kK / Traits::MmacKSize;
+    constexpr ::tl::index_t NumMMACPerRead = NumMMAC_MN * NumMMAC_K;
 
     static_assert(DsFormatInst::kVectorLength == NumMMACPerRead * Traits::VecSize,
                   "DsFormatInst vector length must match mmac blocks * vec_size");
 
-    const ck_tile::index_t warp_lds_elem_offset =
+    const ::tl::index_t warp_lds_elem_offset =
         Traits::LdsDesc.calculate_offset(
-            ck_tile::make_multi_index(warp_mn_idx * Traits::PerWarpMN,
+            ::tl::make_multi_index(warp_mn_idx * Traits::PerWarpMN,
                                       warp_k_idx * Traits::PerWarpK));
 
-    ck_tile::static_for<0, Traits::NumAccess, 1>{}([&](auto i) {
+    ::tl::static_for<0, Traits::NumAccess, 1>{}([&](auto i) {
         constexpr auto idx = Traits::SFC::get_index(i);
 
-        constexpr auto mn_iter = idx.at(ck_tile::number<0>{});
-        constexpr auto k_iter  = idx.at(ck_tile::number<1>{});
+        constexpr auto mn_iter = idx.at(::tl::number<0>{});
+        constexpr auto k_iter  = idx.at(::tl::number<1>{});
 
         constexpr auto immed_offset =
             Traits::LdsDesc.calculate_offset(
-                ck_tile::make_multi_index(mn_iter * DsFormatInst::kMN,
+                ::tl::make_multi_index(mn_iter * DsFormatInst::kMN,
                                          k_iter * DsFormatInst::kK)) *
             sizeof(DataType);
 
         auto ret = DsFormatInst{}(smem_ptr + warp_lds_elem_offset,
-                                 ck_tile::number<immed_offset>{});
-        vector_t vec_value = ret.template get_as<vector_t>()[ck_tile::number<0>{}];
+                                 ::tl::number<immed_offset>{});
+        vector_t vec_value = ret.template get_as<vector_t>()[::tl::number<0>{}];
 
         // Scatter each mmac block to target.
         // DsFormatInst vector order: row dim first. Trans=false -> row=MN;
         // Trans=true -> row=K.
-        ck_tile::static_for<0, NumMMACPerRead, 1>{}([&](auto block_idx) {
+        ::tl::static_for<0, NumMMACPerRead, 1>{}([&](auto block_idx) {
             constexpr auto mmac_k = [](auto idx) {
                 if constexpr (Trans) return idx % NumMMAC_K;
                 else return idx / NumMMAC_MN;
@@ -157,7 +157,7 @@ CK_TILE_DEVICE void ds_read_format_tensor(
 #if defined(__HIP__) || defined(__CUDA_ARCH__)
             #pragma unroll
 #endif
-            for (ck_tile::index_t j = 0; j < Traits::VecSize; j++) {
+            for (::tl::index_t j = 0; j < Traits::VecSize; j++) {
                 target[target_offset + j] = vec_value[vec_offset + j];
             }
         });
@@ -168,24 +168,24 @@ CK_TILE_DEVICE void ds_read_format_tensor(
  * ds_read_format_tensor_a: load A (BlockSize = M x K) in gemm layout.
  * Warp id (gemm.h): warp_m = warp_id % WarpM.
  * WarpK must be 1 (warp_k_idx = 0).
- * MlsTileA: ck_tile::sequence<MlsTileM, MlsTileKA> - MLS tile for A.
+ * MlsTileA: ::tl::sequence<MlsTileM, MlsTileKA> - MLS tile for A.
  * target: output buffer, must have at least GemmTensorSize elements (caller-allocated).
  */
 template <typename BlockSize,
           typename MlsTileA,
-          ck_tile::index_t WarpM,
-          ck_tile::index_t WarpK,
+          ::tl::index_t WarpM,
+          ::tl::index_t WarpK,
           typename DataType,
-          ck_tile::index_t Alt,
+          ::tl::index_t Alt,
           bool Trans,
-          ck_tile::hcu_target_enum HcuArch>
-CK_TILE_DEVICE void ds_read_format_tensor_a(CK_TILE_LDS_ADDR DataType* smem_ptr,
+          ::tl::hcu_target_enum HcuArch>
+TL_DEVICE void ds_read_format_tensor_a(TL_LDS_ADDR DataType* smem_ptr,
                                             DataType* target)
 {
     static_assert(WarpK == 1, "WarpK must be 1");
-    const ck_tile::index_t warp_id    = ck_tile::get_warp_id();
-    const ck_tile::index_t warp_m_idx = warp_id % WarpM;
-    const ck_tile::index_t warp_k_idx = 0;
+    const ::tl::index_t warp_id    = ::tl::get_warp_id();
+    const ::tl::index_t warp_m_idx = warp_id % WarpM;
+    const ::tl::index_t warp_k_idx = 0;
     ds_read_format_tensor<BlockSize,
                                  MlsTileA,
                                  WarpM,
@@ -205,29 +205,29 @@ CK_TILE_DEVICE void ds_read_format_tensor_a(CK_TILE_LDS_ADDR DataType* smem_ptr,
  */
 template <typename BlockSize,
           typename MlsTileSize,
-          ck_tile::index_t WarpMN,
-          ck_tile::index_t WarpK,
+          ::tl::index_t WarpMN,
+          ::tl::index_t WarpK,
           typename DataType,
-          ck_tile::index_t Alt,
+          ::tl::index_t Alt,
           bool Trans,
-          ck_tile::hcu_target_enum HcuArch>
-CK_TILE_DEVICE void ds_read_format_tensor_common(CK_TILE_LDS_ADDR DataType* smem_ptr,
+          ::tl::hcu_target_enum HcuArch>
+TL_DEVICE void ds_read_format_tensor_common(TL_LDS_ADDR DataType* smem_ptr,
                                                  DataType* target)
 {
-    static constexpr ck_tile::index_t BlockSizeMN = BlockSize::at(ck_tile::number<0>{});
-    static constexpr ck_tile::index_t Bits        = sizeof(DataType) * 8;
+    static constexpr ::tl::index_t BlockSizeMN = BlockSize::at(::tl::number<0>{});
+    static constexpr ::tl::index_t Bits        = sizeof(DataType) * 8;
 
     using LdsTraits = mls_lds_desc_param_traits<BlockSize, MlsTileSize, Bits, Alt, Trans, HcuArch>;
     using MlsAtom   = typename LdsTraits::MlsAtom;
     using DsFormatInst =
         typename mls_ds_traits<MlsAtom, sizeof(DataType), Alt>::Type;
 
-    static constexpr ck_tile::index_t WarpMN_no_recompute =
+    static constexpr ::tl::index_t WarpMN_no_recompute =
         std::min(WarpMN, BlockSizeMN / DsFormatInst::kMN);
 
-    const ck_tile::index_t warp_id  = ck_tile::get_warp_id();
-    ck_tile::index_t warp_mn_idx   = warp_id % WarpMN_no_recompute;
-    ck_tile::index_t warp_k_idx    = warp_id / WarpMN_no_recompute;
+    const ::tl::index_t warp_id  = ::tl::get_warp_id();
+    ::tl::index_t warp_mn_idx   = warp_id % WarpMN_no_recompute;
+    ::tl::index_t warp_k_idx    = warp_id / WarpMN_no_recompute;
     if constexpr (WarpMN_no_recompute != WarpMN) {
         warp_k_idx = warp_k_idx % WarpK;
     }
@@ -250,30 +250,30 @@ CK_TILE_DEVICE void ds_read_format_tensor_common(CK_TILE_LDS_ADDR DataType* smem
  * MinNPerWarp: Trans=true -> 16; Trans=false (B_from_mls && !B_mls_trans) -> 32.
  * When WarpN_no_recompute != WarpN: pass WarpN_no_recompute as WarpMN.
  * WarpK must be 1 (warp_k_idx = 0).
- * MlsTileB: ck_tile::sequence<MlsTileN, MlsTileKB> - MLS tile for B.
+ * MlsTileB: ::tl::sequence<MlsTileN, MlsTileKB> - MLS tile for B.
  * target: output buffer, must have at least GemmTensorSize elements (caller-allocated).
  */
 template <typename BlockSize,
           typename MlsTileB,
-          ck_tile::index_t TotalWarp,
-          ck_tile::index_t WarpN,
-          ck_tile::index_t WarpK,
+          ::tl::index_t TotalWarp,
+          ::tl::index_t WarpN,
+          ::tl::index_t WarpK,
           typename DataType,
-          ck_tile::index_t Alt,
+          ::tl::index_t Alt,
           bool Trans,
-          ck_tile::hcu_target_enum HcuArch>
-CK_TILE_DEVICE void ds_read_format_tensor_b(CK_TILE_LDS_ADDR DataType* smem_ptr,
+          ::tl::hcu_target_enum HcuArch>
+TL_DEVICE void ds_read_format_tensor_b(TL_LDS_ADDR DataType* smem_ptr,
                                             DataType* target)
 {
     static_assert(WarpK == 1, "WarpK must be 1");
-    static constexpr ck_tile::index_t WarpM = TotalWarp / (WarpN * WarpK);
-    const ck_tile::index_t warp_id    = ck_tile::get_warp_id();
-    const ck_tile::index_t warp_k_idx = 0;
+    static constexpr ::tl::index_t WarpM = TotalWarp / (WarpN * WarpK);
+    const ::tl::index_t warp_id    = ::tl::get_warp_id();
+    const ::tl::index_t warp_k_idx = 0;
 
-    ck_tile::index_t warp_n_idx = warp_id / WarpM;
-    constexpr ck_tile::index_t BlockN = BlockSize::at(ck_tile::number<0>{});
-    constexpr ck_tile::index_t MinNPerWarp = Trans ? 16 : 32;
-    constexpr ck_tile::index_t WarpN_no_recompute =
+    ::tl::index_t warp_n_idx = warp_id / WarpM;
+    constexpr ::tl::index_t BlockN = BlockSize::at(::tl::number<0>{});
+    constexpr ::tl::index_t MinNPerWarp = Trans ? 16 : 32;
+    constexpr ::tl::index_t WarpN_no_recompute =
         std::min(WarpN, BlockN / MinNPerWarp);
     if constexpr (WarpN_no_recompute != WarpN) {
         warp_n_idx = warp_n_idx % WarpN_no_recompute;

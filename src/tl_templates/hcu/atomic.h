@@ -4,7 +4,7 @@
 // standalone header). Trailing `memory_order` matches lowering; HIP
 // intrinsics ignore it. half_t uses __hip_atomic_*; AtomicLoad/AtomicStore
 // are HCU-oriented helpers.
-#include "common.h"
+#include <tl_templates/hcu/common.h>
 
 template <typename T> struct normalize_atomic_type {
   using type = T;

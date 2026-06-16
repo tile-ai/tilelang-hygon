@@ -63,7 +63,6 @@ def _make_obj(
         "-O3",
         "-std=c++17",
         f"--offload-arch={arch}",
-        "-I" + env.COMPOSABLE_KERNEL_INCLUDE_DIR,
         "-I" + env.TILELANG_TEMPLATE_PATH,
         src_path,
         "-o",

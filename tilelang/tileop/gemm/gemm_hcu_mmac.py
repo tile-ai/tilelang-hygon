@@ -84,7 +84,7 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
 
 
 def _hcu_mls_ab_dtype_str(dtype) -> str:
-    """Map TIR / buffer dtype to ck_tile C++ type names for MLS templates.
+    """Map TIR / buffer dtype to tl C++ type names for MLS templates.
 
     Note: ``from tvm import DataType`` is the tvm_ffi lightweight ``dtype`` object
     (not the legacy IR helper with ``is_bfloat16()``), so classify by string.
@@ -95,7 +95,7 @@ def _hcu_mls_ab_dtype_str(dtype) -> str:
     if "e5m2" in s:
         return "fp8_e5_t"
     if "bfloat16" in s or s == "bf16":
-        return "ck_tile::bfloat16_t"
+        return "bfloat16_t"
     if ("float16" in s or s in ("fp16", "half")) and "float8" not in s:
         return "half_t"
     raise ValueError(f"gemm_mls unsupported dtype for HCU template: {dtype}")
@@ -268,17 +268,17 @@ class GemmHCUMMAC(GemmBase):
             parts.append(f", {int(self.k_pack)}")
             if a_from_mls and b_from_mls:
                 parts.append(
-                    f", ck_tile::sequence<{tm}, {tka}>, ck_tile::sequence<{tn}, {tkb}>, 1, 1"
+                    f", tl::sequence<{tm}, {tka}>, tl::sequence<{tn}, {tkb}>, 1, 1"
                 )
             elif b_from_mls:
-                parts.append(f", ck_tile::sequence<{tn}, {tkb}>, 1")
+                parts.append(f", tl::sequence<{tn}, {tkb}>, 1")
             else:
-                parts.append(f", ck_tile::sequence<{tm}, {tka}>, ck_tile::sequence<0, 0>, 1")
+                parts.append(f", tl::sequence<{tm}, {tka}>, tl::sequence<0, 0>, 1")
             parts.append(", ")
             parts.append(_hcu_mls_ab_dtype_str(self.A.dtype))
             parts.append(", ")
             parts.append(_hcu_mls_ab_dtype_str(self.B.dtype))
-            parts.append(", float, float, ck_tile::hcu_target_enum::")
+            parts.append(", float, float, tl::hcu_target_enum::")
             parts.append(get_hcu_arch_string(target))
         else:
             parts.append(", ")

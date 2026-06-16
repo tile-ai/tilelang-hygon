@@ -93,8 +93,6 @@ class LibraryGenerator:
             ]
 
         elif is_hip_target(target):
-            from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR
-
             src = tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False)  # noqa: SIM115
             libpath = src.name.replace(".cpp", ".so")
             rocm_path = find_rocm_path()
@@ -108,9 +106,6 @@ class LibraryGenerator:
                 src.name,
             ]
             command += get_hcu_compile_flags(arch, self.pass_configs or {})
-            command += [
-                "-I" + COMPOSABLE_KERNEL_INCLUDE_DIR,
-            ]
         elif is_cpu_target(target):
             from tilelang.contrib.cc import get_cplus_compiler
 

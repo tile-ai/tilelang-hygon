@@ -1,6 +1,6 @@
 #pragma once
 
-#include <ck_tile/core.hpp>
+#include <tl_templates/hcu/core.hpp>
 #include <hip/amd_detail/amd_warp_functions.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -24,7 +24,6 @@
 #define uchar unsigned char
 #define ushort unsigned short
 
-#define TL_DEVICE __forceinline__ __device__
 #define TL_DEVICE_NOINLINE __noinline__ __device__
 
 #define TILELANG_CHECK(stmt)                                                   \
