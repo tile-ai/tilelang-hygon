@@ -39,9 +39,7 @@ def _assert_each_waitcnt_followed_by_sync(source: str) -> None:
             source,
         )
     )
-    assert sync_after_waits == len(waits), (
-        f"expected waitcnt+sync pairs for all {len(waits)} waits, got {sync_after_waits}"
-    )
+    assert sync_after_waits == len(waits), f"expected waitcnt+sync pairs for all {len(waits)} waits, got {sync_after_waits}"
 
 
 def _assert_mls_direct_stage1_waitcnt(source: str) -> None:
@@ -689,6 +687,7 @@ def test_gemm_shared_A_False_mls_B_True_1():
         num_threads=128,
     )
 
+
 def test_gemm_mls_A_False_B_True_1():
     """trans_A=False, trans_B=True. Single block: A(32,64), B(32,64), C(32,32)."""
     run_gemm_mls(
@@ -816,6 +815,7 @@ def test_gemm_mls_A_True_B_False_1():
         num_threads=128,
     )
 
+
 # AN BT
 def test_gemm_mls_A_True_B_False_2():
     """trans_A=True, trans_B=False. Multi-block: A(64,64), B(64,64), C(64,64), block 32x32x64."""
@@ -942,6 +942,7 @@ def test_gemm_mls_A_True_B_True_2():
         num_threads=128,
     )
 
+
 def test_gemm_mls_A_True_B_True_3():
     """trans_A=True, trans_B=True. Non-power-of-2, multi-loop: M=96, N=96, K=192 (2x2x2 blocks)."""
     run_gemm_mls(
@@ -959,9 +960,11 @@ def test_gemm_mls_A_True_B_True_3():
         num_threads=128,
     )
 
+
 # -------------------------------------
 # AN/BT matrix_load_64x16_b8 cases
 # -------------------------------------
+
 
 # NOTE: actually Compiler would choose matrix_load_64x32_b8
 #       to test this, please comment out 64x32 in kMlsTileConfigsB8NonTrans table
@@ -982,9 +985,11 @@ def test_gemm_mls_A_True_mls_B_False_64x16_SingleBlock_fp8():
         num_threads=64,
     )
 
+
 # -------------------------------------
 # AN/BT matrix_load_64x32_b8 cases
 # -------------------------------------
+
 
 def test_gemm_mls_A_True_mls_B_False_64x32_SingleBlock_fp8():
     """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
@@ -1003,6 +1008,7 @@ def test_gemm_mls_A_True_mls_B_False_64x32_SingleBlock_fp8():
         num_threads=64,
     )
 
+
 def test_gemm_mls_A_True_mls_B_False_64x16_SingleBlock_KMask_fp8():
     """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
     run_gemm_mls(
@@ -1019,6 +1025,7 @@ def test_gemm_mls_A_True_mls_B_False_64x16_SingleBlock_KMask_fp8():
         block_K=32,
         num_threads=64,
     )
+
 
 def test_gemm_mls_A_True_mls_B_False_64x32_MultiBlock_fp8():
     """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
@@ -1037,9 +1044,11 @@ def test_gemm_mls_A_True_mls_B_False_64x32_MultiBlock_fp8():
         num_threads=64,
     )
 
+
 # -------------------------------------
 # AN/BT matrix_load_128x16_b8 cases
 # -------------------------------------
+
 
 def test_gemm_mls_A_True_mls_B_False_128x16_SingleBlock_fp8():
     """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
@@ -1058,6 +1067,7 @@ def test_gemm_mls_A_True_mls_B_False_128x16_SingleBlock_fp8():
         num_threads=64,
     )
 
+
 def test_gemm_mls_A_True_mls_B_False_128x16_MultiBlock_fp8():
     """trans_A=True, trans_B=False. Multi block float8 test: A(32,256), B(32,256), C(64,64)."""
     run_gemm_mls(
@@ -1074,6 +1084,7 @@ def test_gemm_mls_A_True_mls_B_False_128x16_MultiBlock_fp8():
         block_K=32,
         num_threads=64,
     )
+
 
 def test_gemm_mls_A_True_mls_B_False_128x16_MultiTile_fp8():
     """trans_A=True, trans_B=False. Multi block float8 test: A(32,256), B(32,256), C(64,64)."""
@@ -1092,9 +1103,11 @@ def test_gemm_mls_A_True_mls_B_False_128x16_MultiTile_fp8():
         num_threads=128,
     )
 
+
 # -----------------------------------------
 # AT/BN  matrix_load_trans_64x16_b8 cases
 # -----------------------------------------
+
 
 def test_gemm_mls_A_False_mls_B_True_16x64_SingleBlock_fp8():
     """trans_A=False, trans_B=True. Single block float8 test: A(16,64), B(16,64), C(16,16)."""
@@ -1113,6 +1126,7 @@ def test_gemm_mls_A_False_mls_B_True_16x64_SingleBlock_fp8():
         num_threads=64,
     )
 
+
 def test_gemm_mls_A_False_mls_B_True_16x64_MultiBlock_fp8():
     """trans_A=False, trans_B=True. Multi block_MN float8 test: A(32,64), B(32,64), C(32,32)."""
     run_gemm_mls(
@@ -1130,9 +1144,11 @@ def test_gemm_mls_A_False_mls_B_True_16x64_MultiBlock_fp8():
         num_threads=64,
     )
 
+
 # -----------------------------------------
 # AT/BN matrix_load_trans_64x32_b8 cases
 # -----------------------------------------
+
 
 def test_gemm_mls_A_False_B_True_1_32x64_SingleBlock_fp8():
     """trans_A=True, trans_B=False. Both A and B from mls + ds_read_format -> gemm."""
@@ -1169,9 +1185,11 @@ def test_gemm_mls_A_False_B_True_1_32x64_MultiBlock():
         num_threads=128,
     )
 
+
 # -----------------------------------------
 # AT/BN matrix_load_trans_128x16_b8 cases
 # -----------------------------------------
+
 
 def test_gemm_mls_A_True_mls_B_False_16x128_SingleBlock_fp8():
     """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
@@ -1190,6 +1208,7 @@ def test_gemm_mls_A_True_mls_B_False_16x128_SingleBlock_fp8():
         num_threads=64,
     )
 
+
 def test_gemm_mls_A_True_mls_B_False_16x128_MultiBlock_fp8():
     """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
     run_gemm_mls(
@@ -1206,6 +1225,7 @@ def test_gemm_mls_A_True_mls_B_False_16x128_MultiBlock_fp8():
         block_K=128,
         num_threads=64,
     )
+
 
 def test_gemm_mls_A_True_mls_B_False_16x128_MultiTile_fp8():
     """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
@@ -1260,6 +1280,7 @@ def test_gemm_mls_ds_A_True_B_True_2():
         num_threads=128,
     )
 
+
 def test_gemm_mls_ds_A_True_B_False_1():
     """trans_A=True, trans_B=False. Both A and B from mls + ds_read_format -> gemm."""
     run_gemm_mls_ds_read_format(
@@ -1276,6 +1297,7 @@ def test_gemm_mls_ds_A_True_B_False_1():
         block_K=32,
         num_threads=128,
     )
+
 
 def test_gemm_mls_ds_A_False_B_True_1():
     """trans_A=False, trans_B=True. Both A and B from mls + ds_read_format -> gemm."""
@@ -1392,6 +1414,7 @@ def test_gemm_mls_ds_A_True_B_False_64x32_SingleBlock_fp8():
         num_threads=64,
     )
 
+
 def test_gemm_mls_ds_A_True_B_False_128x16_SingleBlock_fp8():
     """trans_A=True, trans_B=False. FP8 ds_read_format coverage for 128x16 b8 shape."""
     run_gemm_mls_ds_read_format(
@@ -1408,6 +1431,7 @@ def test_gemm_mls_ds_A_True_B_False_128x16_SingleBlock_fp8():
         block_K=32,
         num_threads=64,
     )
+
 
 def test_gemm_mls_ds_A_False_B_True_16x64_SingleBlock_fp8():
     """trans_A=False, trans_B=True. FP8 ds_read_format coverage for 16x64 b8 shape (alt=1)."""
@@ -1426,6 +1450,7 @@ def test_gemm_mls_ds_A_False_B_True_16x64_SingleBlock_fp8():
         num_threads=64,
     )
 
+
 def test_gemm_mls_ds_A_False_B_True_32x64_SingleBlock_fp8():
     """trans_A=False, trans_B=True. FP8 ds_read_format coverage for 32x64 b8 shape."""
     run_gemm_mls_ds_read_format(
@@ -1443,6 +1468,7 @@ def test_gemm_mls_ds_A_False_B_True_32x64_SingleBlock_fp8():
         num_threads=64,
     )
 
+
 def test_gemm_mls_ds_A_False_B_True_16x128_SingleBlock_fp8():
     """trans_A=False, trans_B=True. FP8 ds_read_format coverage for 16x128 b8 shape."""
     run_gemm_mls_ds_read_format(
@@ -1459,6 +1485,7 @@ def test_gemm_mls_ds_A_False_B_True_16x128_SingleBlock_fp8():
         block_K=128,
         num_threads=64,
     )
+
 
 def test_gemm_mls_ds_mul_scale_1():
     """Both A and B from mls + ds_read_format + mul scale -> gemm."""

@@ -40,8 +40,9 @@ template <typename T> struct PrintTraits {
 DEFINE_PRINT_TRAIT(char, "char", "%d", int);
 DEFINE_PRINT_TRAIT(signed char, "signed char", "%d", int);
 // Do not specialize unsigned char: tl::fp8_t / bf8_t (fp8_e4_t / fp8_e5_t) may
-// alias to uint8_t (unsigned char). One trait for fp8_e4_t covers that storage type;
-// do not add a separate fp8_e5_t trait when it would duplicate the same underlying type.
+// alias to uint8_t (unsigned char). One trait for fp8_e4_t covers that storage
+// type; do not add a separate fp8_e5_t trait when it would duplicate the same
+// underlying type.
 DEFINE_PRINT_TRAIT(short, "short", "%d", int);
 // Do not specialize unsigned short: on CK/HCU, bfloat16_t (bf16_t) aliases to
 // unsigned short; a second trait would duplicate PrintTraits<unsigned short>.
@@ -56,8 +57,8 @@ DEFINE_PRINT_TRAIT(double, "double", "%lf", double);
 DEFINE_PRINT_TRAIT(half_t, "half_t", "%f", float);
 DEFINE_PRINT_TRAIT(bfloat16_t, "bfloat16_t", "%f", float);
 
-// fp8_e5_t often shares the same underlying type as fp8_e4_t on CK (both uint8);
-// defining both would re-specialize PrintTraits<unsigned char>.
+// fp8_e5_t often shares the same underlying type as fp8_e4_t on CK (both
+// uint8); defining both would re-specialize PrintTraits<unsigned char>.
 DEFINE_PRINT_TRAIT(fp8_e4_t, "fp8_e4_t", "%f", float);
 
 //

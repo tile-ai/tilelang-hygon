@@ -14,7 +14,7 @@ from tilelang.utils.tensor import (
 from tilelang.engine.param import KernelParam
 from tilelang.jit.adapter import BaseKernelAdapter
 from tilelang.profiler.bench import do_bench
-from tilelang.profiler.bench import do_bench_cudagraph
+from tilelang.profiler.bench import do_bench_cudagraph  # noqa: F401
 from tvm import tir
 
 

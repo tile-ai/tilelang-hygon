@@ -187,7 +187,8 @@ std::string ReduceOpNode::MakeCodegenReducer() const {
   }
 }
 
-Stmt ReduceOpNode::LowerWarpReduce(const LowerArgs &T, arith::Analyzer *analyzer) const {
+Stmt ReduceOpNode::LowerWarpReduce(const LowerArgs &T,
+                                   arith::Analyzer *analyzer) const {
   ICHECK(this->src.scope() == "local.fragment" &&
          this->dst.scope() == "local.fragment")
       << "Reduce for shared memory not implemented.";
@@ -204,7 +205,8 @@ Stmt ReduceOpNode::LowerWarpReduce(const LowerArgs &T, arith::Analyzer *analyzer
   size_t dst_dim = dst_layout->InputDim();
 
   // Warp-level reduce: src_dim == dst_dim, reduce across warps
-  ICHECK(src_dim == dst_dim) << "Warp reduce requires same input/output dimensions.";
+  ICHECK(src_dim == dst_dim)
+      << "Warp reduce requires same input/output dimensions.";
 
   Array<IterVar> dst_vars;
   for (size_t i = 0; i < dst_dim; i++) {
@@ -224,43 +226,48 @@ Stmt ReduceOpNode::LowerWarpReduce(const LowerArgs &T, arith::Analyzer *analyzer
   Buffer clear_buffer = dst_buffer;
 
   bool clear_buffer_same_as_src = clear_buffer->data.same_as(src_buffer->data);
-  // Warp-level reduce: iterate over all register positions and reduce across warps
-  // For warp reduce, we directly reduce from src to dst for each register position
-  // No local reduce needed since src and dst have the same dimensions
+  // Warp-level reduce: iterate over all register positions and reduce across
+  // warps For warp reduce, we directly reduce from src to dst for each register
+  // position No local reduce needed since src and dst have the same dimensions
   // Check that target is HCU
   ICHECK(TargetIsHCU(T.target))
       << "Warp reduce (dim=-1) is only supported on HCU target.";
 
   // Get the number of register positions
   // For warp reduce, we iterate over all physical register positions
-  // Use src_layout->OutputShape() to get the number of registers per thread/warp
-  // This is consistent with how normal reduce gets register count via CompressIterator
+  // Use src_layout->OutputShape() to get the number of registers per
+  // thread/warp This is consistent with how normal reduce gets register count
+  // via CompressIterator
   auto output_shape = src_layout->OutputShape();
-  ICHECK(output_shape.size() > 0) << "Warp reduce requires at least one output dimension.";
+  ICHECK(output_shape.size() > 0)
+      << "Warp reduce requires at least one output dimension.";
   PrimExpr num_registers = output_shape[0];
 
   // Calculate warp size (typically 64 for HCU)
   int warp_size = TargetGetWarpSize(T.target);
   auto all_threads_int = as_const_int(T.thread_bounds->extent);
-  ICHECK(all_threads_int) << "Thread bounds extent must be constant for warp reduce.";
+  ICHECK(all_threads_int)
+      << "Thread bounds extent must be constant for warp reduce.";
   int all_threads = *all_threads_int;
 
   // Analyze thread mapping to determine reduce pattern
   // For warp reduce:
   // - reducing_threads = total number of threads (all_threads)
-  // - scale = number of threads per output replica (all_threads / ReplicateExtent)
+  // - scale = number of threads per output replica (all_threads /
+  // ReplicateExtent)
   //   This represents how many threads work together to compute one output copy
   int reducing_threads = all_threads;
-  
+
   // Calculate scale based on ReplicateExtent
-  // If ReplicateExtent = 2, it means there are 2 replicas (e.g., wave0+wave1 and wave2+wave3)
-  // Each replica has all_threads / ReplicateExtent threads
+  // If ReplicateExtent = 2, it means there are 2 replicas (e.g., wave0+wave1
+  // and wave2+wave3) Each replica has all_threads / ReplicateExtent threads
   auto rep_extent = as_const_int(dst_layout->ReplicateExtent());
   ICHECK(rep_extent) << "ReplicateExtent must be constant for warp reduce.";
   int scale = all_threads / (*rep_extent);
 
-  ICHECK(scale >= warp_size) << "Scale must be greater than or equal to warp size for warp reduce.";
-  ICHECK(all_threads % (*rep_extent) == 0) 
+  ICHECK(scale >= warp_size)
+      << "Scale must be greater than or equal to warp size for warp reduce.";
+  ICHECK(all_threads % (*rep_extent) == 0)
       << "Total threads must be divisible by ReplicateExtent for warp reduce.";
   // Create loop variable for register index
   Var rv = Var("rv");
@@ -271,22 +278,24 @@ Stmt ReduceOpNode::LowerWarpReduce(const LowerArgs &T, arith::Analyzer *analyzer
   Array<PrimExpr> register_dst_indices;
   // For multi-dimensional output, we need to map rv to the correct indices
   // This is complex and depends on the layout, so for now we assume 1D
-  ICHECK(dst_layout->OutputDim() == 1) 
+  ICHECK(dst_layout->OutputDim() == 1)
       << "Warp reduce currently only supports 1D output layout.";
   register_dst_indices = {rv};
 
   // Build the body for each register position
   Stmt warp_reduce_body;
 
-  // If all_threads == scale, no need for AllReduce (all threads work on same replica)
+  // If all_threads == scale, no need for AllReduce (all threads work on same
+  // replica)
   bool need_allreduce = (all_threads != scale);
 
   if (clear_buffer_same_as_src) {
     // If clear_buffer == src_buffer, prepare value
-    // For abs operations, need to convert clear_buffer value to absolute value first
+    // For abs operations, need to convert clear_buffer value to absolute value
+    // first
     PrimExpr clear_value = BufferLoad(clear_buffer, register_dst_indices);
     if (this->type->isAbsSum() || this->type->isAbsMax()) {
-      clear_value = Max(clear_value, -clear_value);  // abs(clear_value)
+      clear_value = Max(clear_value, -clear_value); // abs(clear_value)
     }
 
     if (need_allreduce) {
@@ -298,8 +307,8 @@ Stmt ReduceOpNode::LowerWarpReduce(const LowerArgs &T, arith::Analyzer *analyzer
       std::stringstream ss;
       auto thread_offset = T.thread_bounds->min;
       ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-          << reducing_threads << ", " << scale << ", " << thread_offset
-          << ">::run";
+         << reducing_threads << ", " << scale << ", " << thread_offset
+         << ">::run";
 
       allreduce_args.insert(allreduce_args.begin(), StringImm(ss.str()));
 
@@ -309,10 +318,8 @@ Stmt ReduceOpNode::LowerWarpReduce(const LowerArgs &T, arith::Analyzer *analyzer
           register_dst_indices);
     } else {
       // No AllReduce needed, just store the value
-      warp_reduce_body = BufferStore(
-          clear_buffer,
-          clear_value,
-          register_dst_indices);
+      warp_reduce_body =
+          BufferStore(clear_buffer, clear_value, register_dst_indices);
     }
   } else {
     // If clear_buffer != src_buffer, handle differently based on reduce type
@@ -320,30 +327,26 @@ Stmt ReduceOpNode::LowerWarpReduce(const LowerArgs &T, arith::Analyzer *analyzer
     bool need_clear = this->clear;
     if (this->type->isSum() || this->type->isAbsSum()) {
       // If clear_buffer != src_buffer, this->clear must be true
-      ICHECK(this->clear) << "Warp reduce requires clear=true when src_buffer != dst_buffer for sum/abssum reduce.";
+      ICHECK(this->clear) << "Warp reduce requires clear=true when src_buffer "
+                             "!= dst_buffer for sum/abssum reduce.";
     }
 
     if (need_clear) {
-      Stmt clear_stmt = BufferStore(
-          clear_buffer,
-          this->MakeInitValue(),
-          register_dst_indices);
+      Stmt clear_stmt = BufferStore(clear_buffer, this->MakeInitValue(),
+                                    register_dst_indices);
 
-      init_stmt = SeqStmt({
-          clear_stmt,
-          BufferStore(
-              clear_buffer,
-              this->MakeReduce(
-                  BufferLoad(clear_buffer, register_dst_indices),
-                  BufferLoad(src_buffer, register_dst_indices)),
-              register_dst_indices)
-      });
+      init_stmt = SeqStmt(
+          {clear_stmt,
+           BufferStore(
+               clear_buffer,
+               this->MakeReduce(BufferLoad(clear_buffer, register_dst_indices),
+                                BufferLoad(src_buffer, register_dst_indices)),
+               register_dst_indices)});
     } else {
       init_stmt = BufferStore(
           clear_buffer,
-          this->MakeReduce(
-              BufferLoad(clear_buffer, register_dst_indices),
-              BufferLoad(src_buffer, register_dst_indices)),
+          this->MakeReduce(BufferLoad(clear_buffer, register_dst_indices),
+                           BufferLoad(src_buffer, register_dst_indices)),
           register_dst_indices);
     }
 
@@ -358,8 +361,8 @@ Stmt ReduceOpNode::LowerWarpReduce(const LowerArgs &T, arith::Analyzer *analyzer
       std::stringstream ss;
       auto thread_offset = T.thread_bounds->min;
       ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-          << reducing_threads << ", " << scale << ", " << thread_offset
-          << ">::run";
+         << reducing_threads << ", " << scale << ", " << thread_offset
+         << ">::run";
 
       allreduce_args.insert(allreduce_args.begin(), StringImm(ss.str()));
 
@@ -377,10 +380,10 @@ Stmt ReduceOpNode::LowerWarpReduce(const LowerArgs &T, arith::Analyzer *analyzer
   }
 
   // Wrap in loop over register positions
-  Stmt warp_reduce_loop = For(rv, 0, num_registers, ForKind::kUnrolled,
-                              warp_reduce_body, std::nullopt,
-                              {{tir::attr::pragma_unroll_explicit, Bool(false)}});
- 
+  Stmt warp_reduce_loop =
+      For(rv, 0, num_registers, ForKind::kUnrolled, warp_reduce_body,
+          std::nullopt, {{tir::attr::pragma_unroll_explicit, Bool(false)}});
+
   stmts.push_back(warp_reduce_loop);
   Stmt body = stmts.size() > 1 ? SeqStmt(stmts) : stmts[0];
 
@@ -471,7 +474,8 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     return buf;
   };
 
-  // dim == -1: warp-level reduce (HCU); must run before normal path indexes dim.
+  // dim == -1: warp-level reduce (HCU); must run before normal path indexes
+  // dim.
   if (this->dim == -1) {
     return LowerWarpReduce(T, analyzer);
   }

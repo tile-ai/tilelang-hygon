@@ -67,8 +67,10 @@ def make_swizzled_layout(buffer: BufferLikeType, k_major: bool = True, allow_pad
     buf, _, _ = _get_buffer_info(buffer)
     return _ffi_api.make_swizzled_layout(buf, k_major, allow_pad)
 
+
 def make_hcu_swizzled_layout(buffer: tvm.tir.Buffer, major_pack: int = 1):
     return _ffi_api.make_hcu_swizzled_layout(buffer, major_pack)
+
 
 # for Volta Intrinsics
 def make_volta_swizzled_layout(buffer: BufferLikeType, is_a: bool = True, k_inner: bool = True):

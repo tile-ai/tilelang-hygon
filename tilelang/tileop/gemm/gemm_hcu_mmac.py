@@ -6,7 +6,7 @@ from tilelang import _ffi_api
 from tilelang import language as T
 from tilelang.layout.swizzle import make_hcu_swizzled_layout
 from tilelang.transform.simplify import _Simplify
-from tilelang.utils.language import is_fragment, is_shared, is_shared_dynamic, retrieve_ptr, retrieve_stride
+from tilelang.utils.language import is_fragment, is_shared, is_shared_dynamic, retrieve_ptr
 from tilelang.utils.target import get_hcu_arch_string, target_has_mmac_lit_lts, target_is_hcu
 from tvm import DataType, tir
 from tvm.ir import Range
@@ -14,6 +14,7 @@ from tvm.target import Target
 
 from .gemm_base import GemmBase
 from .inst import GemmInst
+
 
 def _int_annotation(annotations, key: str, default: int = 0) -> int:
     if not annotations:
@@ -42,10 +43,10 @@ def _mls_block_dims(shape, mls_trans: bool) -> tuple[int, int]:
     return int(shape[-1]), int(shape[-2])
 
 
-def _compute_mls_tiles(trans: bool, block_mn: int, block_k: int, block_size: int, target: Target,
-                       elem_bits: int) -> tuple[int, int]:
+def _compute_mls_tiles(trans: bool, block_mn: int, block_k: int, block_size: int, target: Target, elem_bits: int) -> tuple[int, int]:
     warp_mn, warp_k, tile_mn, tile_k = _ffi_api.ComputeMlsWarpPartition(
-        bool(trans), int(block_mn), int(block_k), int(block_size), target, int(elem_bits))
+        bool(trans), int(block_mn), int(block_k), int(block_size), target, int(elem_bits)
+    )
     _ = warp_mn
     _ = warp_k
     return int(tile_mn), int(tile_k)
@@ -64,12 +65,10 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
     mls_tile_m = mls_tile_ka = mls_tile_n = mls_tile_kb = -1
     if a_from_mls:
         block_mn, block_k = _mls_block_dims(A.shape, a_mls_trans)
-        mls_tile_m, mls_tile_ka = _compute_mls_tiles(
-            a_mls_trans, block_mn, block_k, block_size, target, DataType(A.dtype).bits)
+        mls_tile_m, mls_tile_ka = _compute_mls_tiles(a_mls_trans, block_mn, block_k, block_size, target, DataType(A.dtype).bits)
     if b_from_mls:
         block_mn, block_k = _mls_block_dims(B.shape, b_mls_trans)
-        mls_tile_n, mls_tile_kb = _compute_mls_tiles(
-            b_mls_trans, block_mn, block_k, block_size, target, DataType(B.dtype).bits)
+        mls_tile_n, mls_tile_kb = _compute_mls_tiles(b_mls_trans, block_mn, block_k, block_size, target, DataType(B.dtype).bits)
 
     return SimpleNamespace(
         a_from_mls=a_from_mls,
@@ -143,13 +142,9 @@ class GemmHCUMMAC(GemmBase):
         min_n_per_warp = 32 if (b_from_mls and not b_mls_trans) else 16
         elem_bits_c = int(DataType(self.C.dtype).bits)
         if target_has_mmac_lit_lts(target):
-            frag_c = _ffi_api.make_gemm_fragment_hcu_lit(
-                int(self.M), int(self.N), warp_m, warp_n, warp_k, elem_bits_c, min_n_per_warp
-            )
+            frag_c = _ffi_api.make_gemm_fragment_hcu_lit(int(self.M), int(self.N), warp_m, warp_n, warp_k, elem_bits_c, min_n_per_warp)
         else:
-            frag_c = _ffi_api.make_gemm_fragment_hcu(
-                int(self.M), int(self.N), warp_m, warp_n, warp_k, elem_bits_c, min_n_per_warp
-            )
+            frag_c = _ffi_api.make_gemm_fragment_hcu(int(self.M), int(self.N), warp_m, warp_n, warp_k, elem_bits_c, min_n_per_warp)
         out = {self.C: frag_c}
         if _is_shared_like(self.A):
             out[self.A] = make_hcu_swizzled_layout(self.A, int(self.k_pack))
@@ -224,9 +219,7 @@ class GemmHCUMMAC(GemmBase):
         warp_n = int(self.policy.n_warp)
         warp_k = int(self.policy.k_warp)
 
-        use_gemm_mls = (a_from_mls and not is_fragment(self.A)) or (
-            b_from_mls and not is_fragment(self.B)
-        )
+        use_gemm_mls = (a_from_mls and not is_fragment(self.A)) or (b_from_mls and not is_fragment(self.B))
         if use_gemm_mls:
             if int(self.k_pack) != 1:
                 raise ValueError("gemm_mls does not support kPack > 1")
@@ -267,9 +260,7 @@ class GemmHCUMMAC(GemmBase):
                 tkb = int(meta.mls_tile_kb)
             parts.append(f", {int(self.k_pack)}")
             if a_from_mls and b_from_mls:
-                parts.append(
-                    f", tl::sequence<{tm}, {tka}>, tl::sequence<{tn}, {tkb}>, 1, 1"
-                )
+                parts.append(f", tl::sequence<{tm}, {tka}>, tl::sequence<{tn}, {tkb}>, 1, 1")
             elif b_from_mls:
                 parts.append(f", tl::sequence<{tn}, {tkb}>, 1")
             else:
@@ -295,8 +286,7 @@ class GemmHCUMMAC(GemmBase):
                 raise ValueError("HCU gemm: use_tf32=True is not supported for gemm_mls (MLS) path")
             if self.A.dtype != T.float32 or self.B.dtype != T.float32:
                 raise ValueError(
-                    "HCU gemm: use_tf32=True requires float32 A and B dtypes, got "
-                    f"A.dtype={self.A.dtype}, B.dtype={self.B.dtype}"
+                    f"HCU gemm: use_tf32=True requires float32 A and B dtypes, got A.dtype={self.A.dtype}, B.dtype={self.B.dtype}"
                 )
 
         parts.append(">")

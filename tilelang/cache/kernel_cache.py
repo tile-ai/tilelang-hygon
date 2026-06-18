@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 import sys
 from hashlib import sha256
-from typing import Callable, Literal, Optional
+from typing import Callable, Literal
 
 import cloudpickle
 from tvm.target import Target
@@ -68,32 +68,26 @@ def _make_obj(
         "-o",
         obj_file_path,
     ]
-    match fmt:
-        case "asm":
-            command += ["-S", "-g"]
-        case "llir":
-            command += ["-S", "-g", "-emit-llvm"]
-        case "so":
-            command += ["--shared", "-fPIC"]
-        case _:
-            return None
+    if fmt == "asm":
+        command += ["-S", "-g"]
+    elif fmt == "llir":
+        command += ["-S", "-g", "-emit-llvm"]
+    elif fmt == "so":
+        command += ["--shared", "-fPIC"]
+    else:
+        return None
 
     command += get_hcu_compile_flags(arch, pass_configs)
 
     try:
         ret = subprocess.run(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             check=False,
         )
         if ret.returncode != 0:
-            raise RuntimeError(
-                f"{fmt} compilation failed!\n"
-                f"Command: {' '.join(command)}\n"
-                f"Stdout:\n{ret.stdout}\nStderr:\n{ret.stderr}"
-            )
+            raise RuntimeError(f"{fmt} compilation failed!\nCommand: {' '.join(command)}\nStdout:\n{ret.stdout}\nStderr:\n{ret.stderr}")
         with open(obj_file_path, mode) as f:
             return f.read()
     except Exception as e:
@@ -595,9 +589,7 @@ class KernelCache:
             return None
 
         # Load the kernel source file (optional)
-        device_kernel_source, host_kernel_source = self._load_kernel_source(
-            device_kernel_path, host_kernel_path, verbose
-        )
+        device_kernel_source, host_kernel_source = self._load_kernel_source(device_kernel_path, host_kernel_path, verbose)
 
         # Load kernel parameters
         kernel_params: list[KernelParam] | None = None

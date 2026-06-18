@@ -63,8 +63,7 @@ def hcu_recompute_from_source(code: str, _target: Target) -> str:
     symbols = _extract_hip_kernel_symbols(code)
     if not symbols:
         warnings.warn(
-            "HIP device source override env is set but no "
-            '`extern "C" __global__` kernels matched; skipping override.',
+            'HIP device source override env is set but no `extern "C" __global__` kernels matched; skipping override.',
             stacklevel=2,
         )
         return code
@@ -107,8 +106,7 @@ def hcu_recompute_from_source(code: str, _target: Target) -> str:
 
     if not _override_declares_symbols(override, symbols):
         warnings.warn(
-            "HIP device source override must declare every codegen kernel symbol "
-            f"{symbols!r}; skipping.",
+            f"HIP device source override must declare every codegen kernel symbol {symbols!r}; skipping.",
             stacklevel=2,
         )
         return code

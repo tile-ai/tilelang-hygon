@@ -35,9 +35,7 @@ def buffer_load_to_tile_region(buffer_load: tir.BufferLoad, access_type: str, ex
     ``region`` directly without this min(·,1) clamp — MLS helpers keep the same clamp rule as
     ``buffer_region_to_tile_region`` for a synthetic extent-1 region per axis.
     """
-    ranges = [
-        ir.Range.from_min_extent(idx, tir.const(1, idx.dtype)) for idx in buffer_load.indices
-    ]
+    ranges = [ir.Range.from_min_extent(idx, tir.const(1, idx.dtype)) for idx in buffer_load.indices]
     br = tir.BufferRegion(buffer_load.buffer, ranges)
     return buffer_region_to_tile_region(br, access_type, extents)
 

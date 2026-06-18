@@ -1,17 +1,16 @@
+from __future__ import annotations
 from tilelang import tvm as tvm
 import tilelang.language as T
-from typing import Tuple
 from tvm import DataType
 from tvm.tir import PrimExpr
 from tvm.runtime import convert
-from typing import Optional
 from tvm.target import Target
 from tilelang.utils.target import target_has_mmac_lit_lts, determine_target
 
 lift = convert
 
 
-class HCUMatrixCoreIntrinEmitter(object):
+class HCUMatrixCoreIntrinEmitter:
     """
     To eliminate Python syntax within TIR Macro.
     """
@@ -49,9 +48,9 @@ class HCUMatrixCoreIntrinEmitter(object):
         chunk: int = 16,
         reduce_k: int = 1,
         num_elems_per_byte: int = 1,
-        k_pack: Optional[int] = None,
-        is_m_first: Optional[bool] = False,
-        b_preshuffle: Optional[bool] = False,
+        k_pack: int | None = None,
+        is_m_first: bool | None = False,
+        b_preshuffle: bool | None = False,
     ):
         self.a_dtype = a_dtype
         self.b_dtype = b_dtype
@@ -78,7 +77,7 @@ class HCUMatrixCoreIntrinEmitter(object):
         self.warp_rows = warp_row_tiles // self.micro_size_x
         self.warp_cols = warp_col_tiles // self.micro_size_y
         self.reduce_k = reduce_k
-        self.threads = (self.WARP_SIZE * (block_row_warps * block_col_warps) * reduce_k)
+        self.threads = self.WARP_SIZE * (block_row_warps * block_col_warps) * reduce_k
         self.num_elems_per_byte = num_elems_per_byte
 
     def _initialize_k_dim(self, a_dtype="float16"):
@@ -112,12 +111,7 @@ class HCUMatrixCoreIntrinEmitter(object):
     def _initialize_mmac_prefix(self, k_dim=16):
         in_dtype, out_dtype = self.a_dtype, self.accum_dtype
         M_DIM, N_DIM = self.M_DIM, self.N_DIM
-        out_dtype_abbrv = {
-            "float16": "f16",
-            "float32": "f32",
-            "int8": "i8",
-            "int32": "i32"
-        }[out_dtype]
+        out_dtype_abbrv = {"float16": "f16", "float32": "f32", "int8": "i8", "int32": "i32"}[out_dtype]
 
         in_dtype_abbrv = {
             "float16": "f16",
@@ -142,7 +136,7 @@ class HCUMatrixCoreIntrinEmitter(object):
             elif in_dtype_abbrv == "f32":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_f32_lit_lts"
             else:
-                assert False, f"Unsupported in_dtype_abbrv = {in_dtype_abbrv}"
+                raise AssertionError(f"Unsupported in_dtype_abbrv = {in_dtype_abbrv}")
         else:
             if in_dtype_abbrv == "fp8":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_fp8_fp8"
@@ -155,22 +149,22 @@ class HCUMatrixCoreIntrinEmitter(object):
             elif in_dtype_abbrv == "f32":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_f32"
             else:
-                assert False, f"Unsupported in_dtype_abbrv = {in_dtype_abbrv}"
+                raise AssertionError(f"Unsupported in_dtype_abbrv = {in_dtype_abbrv}")
 
     def _initialize_micro_size(self, m_dim=16, n_dim=16, k_dim=16):
         self.micro_size_x = m_dim
         self.micro_size_y = n_dim
         self.micro_size_k = k_dim
 
-    def _initialize_k_pack(self, k_pack: Optional[int] = None):
+    def _initialize_k_pack(self, k_pack: int | None = None):
         if k_pack is not None:
             self.k_pack = k_pack
 
-    def _initialize_is_m_first(self, is_m_first: Optional[bool] = False):
+    def _initialize_is_m_first(self, is_m_first: bool | None = False):
         if is_m_first is not None:
             self.is_m_first = is_m_first
 
-    def _initialize_b_preshuffle(self, b_preshuffle: Optional[bool] = False):
+    def _initialize_b_preshuffle(self, b_preshuffle: bool | None = False):
         if b_preshuffle is not None:
             self.b_preshuffle = b_preshuffle
 
@@ -201,28 +195,42 @@ class HCUMatrixCoreIntrinEmitter(object):
             reverse_index_map = thread_id_shared_access_64x1_to_16x4_layout_A
             if is_b:
                 index_map = shared_16x4_to_local_64x1_layout_A if transposed else shared_4x16_to_local_64x1_layout_B
-                reverse_index_map = thread_id_shared_access_64x1_to_16x4_layout_A if transposed else thread_id_shared_access_64x1_to_4x16_layout_B
+                reverse_index_map = (
+                    thread_id_shared_access_64x1_to_16x4_layout_A if transposed else thread_id_shared_access_64x1_to_4x16_layout_B
+                )
         elif k_dim == 16:
             index_map = shared_16x16_to_local_64x4_layout_B if transposed else shared_16x16_to_local_64x4_layout_A
-            reverse_index_map = thread_id_shared_access_64x4_to_16x16_layout_B if transposed else thread_id_shared_access_64x4_to_16x16_layout_A
+            reverse_index_map = (
+                thread_id_shared_access_64x4_to_16x16_layout_B if transposed else thread_id_shared_access_64x4_to_16x16_layout_A
+            )
 
             if is_b:
                 index_map = shared_16x16_to_local_64x4_layout_A if transposed else shared_16x16_to_local_64x4_layout_B
-                reverse_index_map = thread_id_shared_access_64x4_to_16x16_layout_A if transposed else thread_id_shared_access_64x4_to_16x16_layout_B
+                reverse_index_map = (
+                    thread_id_shared_access_64x4_to_16x16_layout_A if transposed else thread_id_shared_access_64x4_to_16x16_layout_B
+                )
         elif k_dim == 32:
             index_map = shared_16x32_to_local_64x8_layout_B if transposed else shared_16x32_to_local_64x8_layout_A
-            reverse_index_map = thread_id_shared_access_64x8_to_16x32_layout_B if transposed else thread_id_shared_access_64x8_to_16x32_layout_A
+            reverse_index_map = (
+                thread_id_shared_access_64x8_to_16x32_layout_B if transposed else thread_id_shared_access_64x8_to_16x32_layout_A
+            )
 
             if is_b:
                 index_map = shared_16x32_to_local_64x8_layout_A if transposed else shared_16x32_to_local_64x8_layout_B
-                reverse_index_map = thread_id_shared_access_64x8_to_16x32_layout_A if transposed else thread_id_shared_access_64x8_to_16x32_layout_B
+                reverse_index_map = (
+                    thread_id_shared_access_64x8_to_16x32_layout_A if transposed else thread_id_shared_access_64x8_to_16x32_layout_B
+                )
         elif k_dim == 64:
             index_map = shared_16x64_to_local_64x16_layout_B if transposed else shared_16x64_to_local_64x16_layout_A
-            reverse_index_map = thread_id_shared_access_64x16_to_16x64_layout_B if transposed else thread_id_shared_access_64x16_to_16x64_layout_A
+            reverse_index_map = (
+                thread_id_shared_access_64x16_to_16x64_layout_B if transposed else thread_id_shared_access_64x16_to_16x64_layout_A
+            )
 
             if is_b:
                 index_map = shared_16x64_to_local_64x16_layout_A if transposed else shared_16x64_to_local_64x16_layout_B
-                reverse_index_map = thread_id_shared_access_64x16_to_16x64_layout_A if transposed else thread_id_shared_access_64x16_to_16x64_layout_B
+                reverse_index_map = (
+                    thread_id_shared_access_64x16_to_16x64_layout_A if transposed else thread_id_shared_access_64x16_to_16x64_layout_B
+                )
         else:
             raise ValueError("k_dim must be 4 or 16 or 32 or 64 currently")
 
@@ -233,6 +241,7 @@ class HCUMatrixCoreIntrinEmitter(object):
             thread_id_shared_access_64x4_to_16x16_layout_C_m_n,
             thread_id_shared_access_64x4_to_16x16_layout_C_m_n_lit,
         )
+
         # use target on current device
         target = self.target
         # check if target has mmac lit lts
@@ -241,14 +250,12 @@ class HCUMatrixCoreIntrinEmitter(object):
         else:
             return thread_id_shared_access_64x4_to_16x16_layout_C_m_n
 
-    def extract_thread_binding(self,
-                               thread_id,
-                               is_m_first=None) -> Tuple[PrimExpr, PrimExpr, PrimExpr]:
-        '''
-            is_m_first: True if the thread binding is in the form of (tx, warp_n, warp_m)
-            which represents [warp_size, block_row_warps (split n), block_col_warps (split m)]
-            Otherwise, it is in the form of [warp_size, block_col_warps (split m), block_row_warps (split n)]
-        '''
+    def extract_thread_binding(self, thread_id, is_m_first=None) -> tuple[PrimExpr, PrimExpr, PrimExpr]:
+        """
+        is_m_first: True if the thread binding is in the form of (tx, warp_n, warp_m)
+        which represents [warp_size, block_row_warps (split n), block_col_warps (split m)]
+        Otherwise, it is in the form of [warp_size, block_col_warps (split m), block_row_warps (split n)]
+        """
         WARP_SIZE = self.WARP_SIZE
         block_row_warps = self.block_row_warps
         block_col_warps = self.block_col_warps
@@ -258,16 +265,18 @@ class HCUMatrixCoreIntrinEmitter(object):
             is_m_first = self.is_m_first
 
         if is_m_first:
-            lane_id, warp_n, warp_m = thread_id % WARP_SIZE, (
-                thread_id //
-                WARP_SIZE) % block_col_warps, (thread_id //
-                                               (WARP_SIZE * block_col_warps)) % block_row_warps,
+            lane_id, warp_n, warp_m = (
+                thread_id % WARP_SIZE,
+                (thread_id // WARP_SIZE) % block_col_warps,
+                (thread_id // (WARP_SIZE * block_col_warps)) % block_row_warps,
+            )
             return lane_id, warp_n, warp_m
         else:
-            lane_id, warp_m, warp_n = thread_id % WARP_SIZE, (
-                thread_id //
-                WARP_SIZE) % block_row_warps, (thread_id //
-                                               (WARP_SIZE * block_row_warps)) % block_col_warps,
+            lane_id, warp_m, warp_n = (
+                thread_id % WARP_SIZE,
+                (thread_id // WARP_SIZE) % block_row_warps,
+                (thread_id // (WARP_SIZE * block_row_warps)) % block_col_warps,
+            )
             return lane_id, warp_n, warp_m
 
     def ldmatrix_a(self, A_local_buf, A_shared_buf, ki, rk=0):
@@ -296,18 +305,14 @@ class HCUMatrixCoreIntrinEmitter(object):
                 for i in T.serial(warp_rows):
                     for local_id in T.vectorized(k_pack * local_size_a):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
-                        l, r = (rk * chunk + ki * (k_pack * micro_size_k),
-                                warp_m * warp_row_tiles + i * micro_size_x)
-                        A_local_buf[i * k_pack * local_size_a + local_id] = A_shared_buf[l + row,
-                                                                                         r + col]
+                        l, r = (rk * chunk + ki * (k_pack * micro_size_k), warp_m * warp_row_tiles + i * micro_size_x)
+                        A_local_buf[i * k_pack * local_size_a + local_id] = A_shared_buf[l + row, r + col]
             else:
                 for i in T.serial(warp_rows):
                     for local_id in T.vectorized(k_pack * local_size_a):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
-                        l, r = (warp_m * warp_row_tiles + i * micro_size_x,
-                                rk * chunk + ki * (k_pack * micro_size_k))
-                        A_local_buf[i * k_pack * local_size_a + local_id] = A_shared_buf[l + row,
-                                                                                         r + col]
+                        l, r = (warp_m * warp_row_tiles + i * micro_size_x, rk * chunk + ki * (k_pack * micro_size_k))
+                        A_local_buf[i * k_pack * local_size_a + local_id] = A_shared_buf[l + row, r + col]
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)
 
@@ -341,8 +346,7 @@ class HCUMatrixCoreIntrinEmitter(object):
                             warp_n * warp_col_tiles + j * micro_size_y,
                             rk * chunk + ki * (k_pack * micro_size_k),
                         )
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_shared_buf[l + row,
-                                                                                         r + col]
+                        B_local_buf[j * k_pack * local_size_b + local_id] = B_shared_buf[l + row, r + col]
 
             else:
                 for j in T.serial(warp_cols):
@@ -352,8 +356,7 @@ class HCUMatrixCoreIntrinEmitter(object):
                             rk * chunk + ki * (k_pack * micro_size_k),
                             warp_n * warp_col_tiles + j * micro_size_y,
                         )
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_shared_buf[l + row,
-                                                                                         r + col]
+                        B_local_buf[j * k_pack * local_size_b + local_id] = B_shared_buf[l + row, r + col]
 
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
 
@@ -418,14 +421,13 @@ class HCUMatrixCoreIntrinEmitter(object):
                 for local_id in T.vectorized(local_size_out):
                     row, col = T.meta_var(mmac_store_index_map(tx, local_id))
                     if C_buf_dims == 2:
-                        C_buf[(warp_m * warp_rows + i) * M_DIM + row,
-                              (warp_n * warp_cols + j) * N_DIM +
-                              col] = C_local_buf[i * (warp_cols * local_size_out) +
-                                                 j * local_size_out + local_id]
+                        C_buf[(warp_m * warp_rows + i) * M_DIM + row, (warp_n * warp_cols + j) * N_DIM + col] = C_local_buf[
+                            i * (warp_cols * local_size_out) + j * local_size_out + local_id
+                        ]
                     else:
-                        C_buf[warp_m * warp_rows + i, warp_n * warp_cols + j, row,
-                              col] = C_local_buf[i * warp_cols * local_size_out +
-                                                 j * local_size_out + local_id]
+                        C_buf[warp_m * warp_rows + i, warp_n * warp_cols + j, row, col] = C_local_buf[
+                            i * warp_cols * local_size_out + j * local_size_out + local_id
+                        ]
 
         @T.macro
         def _warp_stmatrix_global(C_local_buf, C_buf, thread_binding):
@@ -433,18 +435,18 @@ class HCUMatrixCoreIntrinEmitter(object):
             for i, j in T.grid(warp_rows, warp_cols):
                 for local_id in T.vectorized(local_size_out):
                     row, col = T.meta_var(mmac_store_index_map(tx, local_id))
-                    C_buf[(pid_m * BLOCK_M + warp_m * warp_rows + i) * M_DIM + row,
-                          (pid_n * BLOCK_N + warp_n * warp_cols + j) * N_DIM +
-                          col] = C_local_buf[i * warp_cols * local_size_out + j * local_size_out +
-                                             local_id]
+                    C_buf[
+                        (pid_m * BLOCK_M + warp_m * warp_rows + i) * M_DIM + row, (pid_n * BLOCK_N + warp_n * warp_cols + j) * N_DIM + col
+                    ] = C_local_buf[i * warp_cols * local_size_out + j * local_size_out + local_id]
 
-        return _warp_stmatrix_global(C_local_buf, C_buf,
-                                     thread_binding) if is_global else _warp_stmatrix_shared(
-                                         C_local_buf, C_buf, thread_binding)
+        return (
+            _warp_stmatrix_global(C_local_buf, C_buf, thread_binding)
+            if is_global
+            else _warp_stmatrix_shared(C_local_buf, C_buf, thread_binding)
+        )
 
 
 class HCUMatrixCorePreshuffleIntrinEmitter(HCUMatrixCoreIntrinEmitter):
-
     def __init__(
         self,
         a_dtype: str = "float16",
@@ -459,10 +461,10 @@ class HCUMatrixCorePreshuffleIntrinEmitter(HCUMatrixCoreIntrinEmitter):
         chunk: int = 16,
         reduce_k: int = 1,
         num_elems_per_byte: int = 1,
-        k_pack: Optional[int] = None,
-        is_m_first: Optional[bool] = False,
-        a_preshuffle: Optional[bool] = False,
-        b_preshuffle: Optional[bool] = False,
+        k_pack: int | None = None,
+        is_m_first: bool | None = False,
+        a_preshuffle: bool | None = False,
+        b_preshuffle: bool | None = False,
     ):
 
         self.a_dtype = a_dtype
@@ -489,7 +491,7 @@ class HCUMatrixCorePreshuffleIntrinEmitter(HCUMatrixCoreIntrinEmitter):
         self.warp_rows = warp_row_tiles // self.micro_size_x
         self.warp_cols = warp_col_tiles // self.micro_size_y
         self.reduce_k = reduce_k
-        self.threads = (self.WARP_SIZE * (block_row_warps * block_col_warps) * reduce_k)
+        self.threads = self.WARP_SIZE * (block_row_warps * block_col_warps) * reduce_k
         self.num_elems_per_byte = num_elems_per_byte
 
     def _initialize_preshuffle(self, a_preshuffle: bool, b_preshuffle: bool):
@@ -558,20 +560,20 @@ class HCUMatrixCorePreshuffleIntrinEmitter(HCUMatrixCoreIntrinEmitter):
                             rk * (chunk // micro_size_k) + ki,
                             warp_m * warp_rows + i,
                         )
-                        A_local_buf[i * k_pack * local_size_a + local_id] = A_shared_buf[l, r, row,
-                                                                                         col]
+                        A_local_buf[i * k_pack * local_size_a + local_id] = A_shared_buf[l, r, row, col]
             else:
                 print(self.a_preshuffle)
                 for i in T.serial(warp_rows):
                     for local_id in T.vectorized(k_pack * local_size_a):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
                         l, r = (warp_m * warp_rows + i, rk * (chunk // micro_size_k) + ki)
-                        A_local_buf[i * k_pack * local_size_a + local_id] = A_shared_buf[l, r, row,
-                                                                                         col]
+                        A_local_buf[i * k_pack * local_size_a + local_id] = A_shared_buf[l, r, row, col]
 
-        return _warp_ldmatrix_a_global(A_local_buf, A_buf, ki, thread_binding,
-                                       rk) if is_global else _warp_ldmatrix_a_shared(
-                                           A_local_buf, A_buf, ki, thread_binding, rk)
+        return (
+            _warp_ldmatrix_a_global(A_local_buf, A_buf, ki, thread_binding, rk)
+            if is_global
+            else _warp_ldmatrix_a_shared(A_local_buf, A_buf, ki, thread_binding, rk)
+        )
 
     def ldmatrix_b(self, B_local_buf, B_buf, ki, rk=0, pid_m=None, pid_n=None):
         warp_cols = self.warp_cols
@@ -633,8 +635,7 @@ class HCUMatrixCorePreshuffleIntrinEmitter(HCUMatrixCoreIntrinEmitter):
                             warp_n * warp_cols + j,
                             rk * (chunk // micro_size_k) + ki,
                         )
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_shared_buf[l, r, row,
-                                                                                         col]
+                        B_local_buf[j * k_pack * local_size_b + local_id] = B_shared_buf[l, r, row, col]
             else:
                 for j in T.serial(warp_cols):
                     for local_id in T.vectorized(k_pack * local_size_b):
@@ -643,9 +644,10 @@ class HCUMatrixCorePreshuffleIntrinEmitter(HCUMatrixCoreIntrinEmitter):
                             rk * (chunk // micro_size_k) + ki,
                             warp_n * warp_cols + j,
                         )
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_shared_buf[l, r, row,
-                                                                                         col]
+                        B_local_buf[j * k_pack * local_size_b + local_id] = B_shared_buf[l, r, row, col]
 
-        return _warp_ldmatrix_b_global(B_local_buf, B_buf, ki, thread_binding,
-                                       rk) if is_global else _warp_ldmatrix_b_shared(
-                                           B_local_buf, B_buf, ki, thread_binding, rk)
+        return (
+            _warp_ldmatrix_b_global(B_local_buf, B_buf, ki, thread_binding, rk)
+            if is_global
+            else _warp_ldmatrix_b_shared(B_local_buf, B_buf, ki, thread_binding, rk)
+        )

@@ -42,7 +42,7 @@ def _extract_device_bundle_asm(path, temp):
     start_marker = "# __CLANG_OFFLOAD_BUNDLE____START__ hip-amdgcn-amd-amdhsa--"
     end_marker = "# __CLANG_OFFLOAD_BUNDLE____END__ hip-amdgcn-amd-amdhsa--"
 
-    with open(path, "r", encoding="utf-8") as in_file:
+    with open(path, encoding="utf-8") as in_file:
         asm_text = in_file.read()
 
     start_idx = asm_text.find(start_marker)
@@ -72,9 +72,7 @@ def _extract_kernel_names_from_code(code):
     #   extern "C" __global__ void _gemm_kernel(...)
     #   __global__ void __launch_bounds__(512) _gemm_kernel(...)
     #   __global__ void _gemm_kernel(...)
-    pattern = re.compile(
-        r'(?:extern\s+"C"\s+)?__global__\s+void(?:\s+__\w+__\s*\([^)]*\))*\s+([A-Za-z_][A-Za-z0-9_]*)\s*\('
-    )
+    pattern = re.compile(r'(?:extern\s+"C"\s+)?__global__\s+void(?:\s+__\w+__\s*\([^)]*\))*\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(')
     return set(pattern.findall(code))
 
 
@@ -88,16 +86,12 @@ def _parse_asm_map(raw):
         if not item:
             continue
         if "=" not in item:
-            raise RuntimeError(
-                "Invalid TILELANG_HIPCC_ASM_MAP item (missing '='): " + item
-            )
+            raise RuntimeError("Invalid TILELANG_HIPCC_ASM_MAP item (missing '='): " + item)
         kernel_name, asm_path = item.split("=", 1)
         kernel_name = kernel_name.strip()
         asm_path = asm_path.strip()
         if not kernel_name or not asm_path:
-            raise RuntimeError(
-                "Invalid TILELANG_HIPCC_ASM_MAP item (empty key/value): " + item
-            )
+            raise RuntimeError("Invalid TILELANG_HIPCC_ASM_MAP item (empty key/value): " + item)
         mapping[kernel_name] = asm_path
     return mapping
 
@@ -106,13 +100,9 @@ def _normalize_asm_input_path(asm_input, temp):
     """Validate asm path and extract device bundle section when needed."""
     asm_input = os.path.abspath(os.path.expanduser(asm_input))
     if not os.path.exists(asm_input):
-        raise RuntimeError(
-            "TILELANG_HIPCC_ASM_MAP points to missing file: " + asm_input
-        )
+        raise RuntimeError("TILELANG_HIPCC_ASM_MAP points to missing file: " + asm_input)
     if not os.path.isfile(asm_input):
-        raise RuntimeError(
-            "TILELANG_HIPCC_ASM_MAP points to non-file path: " + asm_input
-        )
+        raise RuntimeError("TILELANG_HIPCC_ASM_MAP points to non-file path: " + asm_input)
     return _extract_device_bundle_asm(asm_input, temp)
 
 
@@ -126,15 +116,11 @@ def _resolve_asm_input(code, temp, verbose=False):
             if kernel_name in asm_map:
                 _debug_log(f"asm_map hit: kernel={kernel_name} asm={asm_map[kernel_name]}")
                 if verbose:
-                    print(
-                        f"[TileLang][hipcc] asm override hit kernel '{kernel_name}' -> {asm_map[kernel_name]}"
-                    )
+                    print(f"[TileLang][hipcc] asm override hit kernel '{kernel_name}' -> {asm_map[kernel_name]}")
                 return _normalize_asm_input_path(asm_map[kernel_name], temp)
         _debug_log("asm_map configured but no kernel matched; fallback to source compile")
         if verbose:
-            print(
-                "[TileLang][hipcc] asm map configured but no kernel matched, fallback to source compile"
-            )
+            print("[TileLang][hipcc] asm map configured but no kernel matched, fallback to source compile")
     return None
 
 

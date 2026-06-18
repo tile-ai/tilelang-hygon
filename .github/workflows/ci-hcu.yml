@@ -1,0 +1,157 @@
+# Hygon DCU / HCU self-hosted CI (opt-in).
+#
+# Setup checklist (when runners are ready):
+#   1. Register a GitHub Actions runner on the HCU host or containerized CI environment.
+#   2. Apply runner labels: self-hosted, hcu, hygon  (see RUNNER_LABELS below).
+#   3. Repo variable: Settings → Actions → Variables → HCU_CI_ENABLED = true
+#   4. Optional secret SECRET_PATH_PREFIXES (colon-separated paths to mask in logs).
+#   5. Branch ruleset: require "HCU Tests" after the job is stable.
+#
+# Manual smoke test (before enabling PR gates):
+#   Actions → HCU CI → Run workflow
+name: HCU CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      pytest_path:
+        description: Pytest path relative to repo root
+        required: false
+        default: testing/python/hcu
+      install_project:
+        description: pip install -e . before tests
+        type: boolean
+        required: false
+        default: true
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hcu-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Runner label tuple — keep in sync with runs-on below.
+  RUNNER_LABELS: '["self-hosted", "hcu", "hygon"]'
+  PYTHONDEVMODE: "1"
+  PYTHONUNBUFFERED: "1"
+  PYTHONPATH: ""
+  PIP_USER: ""
+  COLUMNS: "100"
+  FORCE_COLOR: "1"
+  CLICOLOR_FORCE: "1"
+  TILELANG_TARGET: hip
+  # Self-hosted cache root (overridden in setup-self-hosted step).
+  XDG_CACHE_HOME: ${{ github.workspace }}/.cache
+  PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+  UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
+
+jobs:
+  hcu-tests:
+    name: HCU Tests
+    # PR/push: only after HCU_CI_ENABLED=true. workflow_dispatch always runs.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      vars.HCU_CI_ENABLED == 'true'
+    runs-on: [self-hosted, hcu, hygon]
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Enable when TVM submodule is required on runner:
+          # submodules: recursive
+
+      - name: Setup self-hosted environment
+        run: |
+          if [[ -n "${{ secrets.SECRET_PATH_PREFIXES }}" ]]; then
+            echo "::add-mask::${{ secrets.SECRET_PATH_PREFIXES }}"
+            for secret in $(echo "${{ secrets.SECRET_PATH_PREFIXES }}" | tr ':' '\n'); do
+              echo "::add-mask::${secret}"
+            done
+          fi
+
+          export XDG_CACHE_HOME="${{ runner.tool_cache }}/.ci-cache-${{ github.workflow }}"
+          echo "XDG_CACHE_HOME=${XDG_CACHE_HOME}" | tee -a "${GITHUB_ENV}"
+          echo "PIP_CACHE_DIR=${XDG_CACHE_HOME}/pip" | tee -a "${GITHUB_ENV}"
+          echo "UV_CACHE_DIR=${XDG_CACHE_HOME}/uv" | tee -a "${GITHUB_ENV}"
+
+          if [[ ! -x "$(command -v hipcc)" ]]; then
+            export PATH="/opt/dtk/bin:/opt/rocm/bin:${PATH}"
+            export LD_LIBRARY_PATH="/opt/dtk/lib:/opt/rocm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+            echo "PATH=${PATH}" | tee -a "${GITHUB_ENV}"
+            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" | tee -a "${GITHUB_ENV}"
+          fi
+
+          echo "USE_ROCM=ON" | tee -a "${GITHUB_ENV}"
+          echo "ROCM_PATH=${ROCM_PATH:-/opt/dtk}" | tee -a "${GITHUB_ENV}"
+
+      - name: GPU smoke check
+        run: |
+          if command -v hy-smi >/dev/null 2>&1; then
+            hy-smi || true
+          elif command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi || true
+          else
+            echo "::warning::No hy-smi/rocm-smi in PATH; continuing."
+          fi
+          if command -v hipcc >/dev/null 2>&1; then
+            hipcc --version
+          else
+            echo "::warning::hipcc not found; ensure DTK/ROCm is on the runner."
+          fi
+
+      - name: Setup Python and uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          activate-environment: true
+          enable-cache: false
+          prune-cache: false
+          cache-local-path: ${{ env.UV_CACHE_DIR }}
+
+      - name: Install test dependencies
+        run: |
+          set -o pipefail
+          uv pip install --upgrade pip setuptools wheel
+          uv pip install -v -r requirements-test.txt
+          INSTALL_PROJECT=true
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.install_project }}" != "true" ]]; then
+            INSTALL_PROJECT=false
+          fi
+          if [[ "${INSTALL_PROJECT}" == "true" ]]; then
+            uv pip install -v -e .
+          fi
+          echo "import torch; print('torch:', torch.__version__)" | uv run --no-project --script -
+          uv run --no-project -m -- torch.utils.collect_env || true
+
+      - name: Clean stale /tmp artifacts
+        run: |
+          rm -f /tmp/tmp*.so /tmp/tmp*.cu /tmp/tmp*.cubin /tmp/tmp*.cpp
+          rm -rf /tmp/tvm-debug-mode-tempdirs /tmp/tilelang_cutedsl_*
+
+      - name: Run HCU pytest
+        run: |
+          PYTEST_PATH="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.pytest_path || 'testing/python/hcu' }}"
+          cd testing
+          uv run --no-project -m -- pytest \
+            --verbose --color=yes --durations=0 --showlocals --cache-clear \
+            --maxfail=3 \
+            "../${PYTEST_PATH}"
+
+      - name: List generated files
+        if: ${{ !cancelled() }}
+        run: |
+          find . -type f -name '*.py[co]' -delete
+          find . -depth -type d -name __pycache__ -exec rm -r "{}" +
+          git status --ignored --porcelain || true

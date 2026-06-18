@@ -1,0 +1,67 @@
+# Hygon mirror CI: format / static checks only (GitHub-hosted, no GPU).
+# Upstream full CI lives on tile-ai/tilelang (.github/workflows/ci.yml).
+name: Lint
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHONDEVMODE: "1"
+  PYTHONUNBUFFERED: "1"
+  PYTHONPATH: ""
+  PIP_USER: ""
+  COLUMNS: "100"
+  FORCE_COLOR: "1"
+  CLICOLOR_FORCE: "1"
+  XDG_CACHE_HOME: ${{ github.workspace }}/.cache
+  PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+  PRE_COMMIT_HOME: ${{ github.workspace }}/.cache/pip/.pre-commit
+
+jobs:
+  quick-lint:
+    name: Quick Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Lint excludes 3rdparty/; no submodule fetch needed.
+
+      - name: Setup Python 3.9
+        id: setup-pylowest
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements*.txt
+            .pre-commit-config.yaml
+
+      - name: Check AST with Python 3.9
+        run: |
+          "${{ steps.setup-pylowest.outputs.python-path }}" -m compileall -q -f tilelang
+
+      - name: Pre-commit Lint
+        run: |
+          if ! pipx run pre-commit run --all-files --color=always --show-diff-on-failure; then
+            echo "::error::Pre-commit checks failed. Run 'pre-commit run --all-files' locally."
+            exit 1
+          fi

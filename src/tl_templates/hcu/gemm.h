@@ -1,7 +1,7 @@
 #pragma once
 
-#include <type_traits>
 #include <tl_templates/hcu/common.h>
+#include <type_traits>
 
 namespace tl {
 
@@ -16,7 +16,8 @@ template <> struct MmacTraits<int8_t> {
     int32x2 *b_packed = reinterpret_cast<int32x2 *>(const_cast<int8_t *>(b));
 #if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
     // default: lit en, clamp disable, lts disable
-    *c = __builtin_hcu_mmac_i32_16x16x32_i8_lit_clamp_lts(*a_packed, *b_packed, *c, 1, 0, 0);
+    *c = __builtin_hcu_mmac_i32_16x16x32_i8_lit_clamp_lts(*a_packed, *b_packed,
+                                                          *c, 1, 0, 0);
 #else
     *c = __builtin_hcu_mmac_i32_16x16x32_i8(*a_packed, *b_packed, *c);
 #endif
@@ -28,8 +29,8 @@ template <> struct MmacTraits<half> {
   template <typename AccType>
   static TL_DEVICE void mmac_op(const half *b, const half *a, AccType *c) {
 #if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
-    *c = __builtin_hcu_mmac_f32_16x16x16_f16_lit_lts(*((float16x4 *)a),
-                                             *((float16x4 *)b), *c, 1, 0);
+    *c = __builtin_hcu_mmac_f32_16x16x16_f16_lit_lts(
+        *((float16x4 *)a), *((float16x4 *)b), *c, 1, 0);
 #else
     *c = __builtin_hcu_mmac_f32_16x16x16_f16(*((float16x4 *)a),
                                              *((float16x4 *)b), *c);
@@ -68,12 +69,13 @@ template <> struct MmacTraits<float> {
   template <typename AccType>
   static TL_DEVICE void mmac_op(const float *b, const float *a, AccType *c) {
 #if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
-    // default: lit en, lts disable (aligned with tvm_mfma f32_16x16x8_f32_lit_lts)
+    // default: lit en, lts disable (aligned with tvm_mfma
+    // f32_16x16x8_f32_lit_lts)
     *c = __builtin_hcu_mmac_16x16x8_f32_lit_lts(*((float32x2 *)a),
-                                                   *((float32x2 *)b), *c, 1, 0);
+                                                *((float32x2 *)b), *c, 1, 0);
 #else
-    *c = __builtin_hcu_mmac_16x16x8_f32(*((float32x2 *)a),
-                                        *((float32x2 *)b), *c);
+    *c = __builtin_hcu_mmac_16x16x8_f32(*((float32x2 *)a), *((float32x2 *)b),
+                                        *c);
 #endif
   }
 };
@@ -83,12 +85,13 @@ template <> struct MmacTraits<int> {
   template <typename AccType>
   static TL_DEVICE void mmac_op(const int *b, const int *a, AccType *c) {
 #if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
-    // default: lit en, lts disable (aligned with tvm_mfma f32_16x16x8_f32_lit_lts)
+    // default: lit en, lts disable (aligned with tvm_mfma
+    // f32_16x16x8_f32_lit_lts)
     *c = __builtin_hcu_mmac_f32_16x16x8_tf32_lit_lts(*((int32x2 *)a),
-                                                   *((int32x2 *)b), *c, 1, 0);
+                                                     *((int32x2 *)b), *c, 1, 0);
 #else
-    *c = __builtin_hcu_mmac_f32_16x16x8_tf32(*((int32x2 *)a),
-                                        *((int32x2 *)b), *c);
+    *c = __builtin_hcu_mmac_f32_16x16x8_tf32(*((int32x2 *)a), *((int32x2 *)b),
+                                             *c);
 #endif
   }
 };
@@ -101,10 +104,13 @@ template <> struct MmacTraits<fp8_e4_t> {
                                 AccType *c) {
     int32x2 a_val = *reinterpret_cast<const int32x2 *>(a);
     int32x2 b_val = *reinterpret_cast<const int32x2 *>(b);
-#if defined(__HIP_DEVICE_COMPILE__) && (!defined(__gfx938__) && !defined(__gfx92a__) && !defined(__gfx946__))
-#error "fp8_e4_t MMAC operations are only supported on gfx938, gfx92a, and gfx946 architectures"
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (!defined(__gfx938__) && !defined(__gfx92a__) && !defined(__gfx946__))
+#error                                                                         \
+    "fp8_e4_t MMAC operations are only supported on gfx938, gfx92a, and gfx946 architectures"
 #elif defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
-    *c = __builtin_hcu_mmac_f32_16x16x32_fp8_fp8_lit_lts(a_val, b_val, *c, 1, 0);
+    *c =
+        __builtin_hcu_mmac_f32_16x16x32_fp8_fp8_lit_lts(a_val, b_val, *c, 1, 0);
 #endif
   }
 };
@@ -116,10 +122,13 @@ template <> struct MmacTraits<fp8_e5_t> {
                                 AccType *c) {
     int32x2 a_val = *reinterpret_cast<const int32x2 *>(a);
     int32x2 b_val = *reinterpret_cast<const int32x2 *>(b);
-#if defined(__HIP_DEVICE_COMPILE__) && (!defined(__gfx938__) && !defined(__gfx92a__) && !defined(__gfx946__))
-#error "fp8_e5_t MMAC operations are only supported on gfx938, gfx92a, and gfx946 architectures"
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (!defined(__gfx938__) && !defined(__gfx92a__) && !defined(__gfx946__))
+#error                                                                         \
+    "fp8_e5_t MMAC operations are only supported on gfx938, gfx92a, and gfx946 architectures"
 #elif defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
-    *c = __builtin_hcu_mmac_f32_16x16x32_bf8_bf8_lit_lts(a_val, b_val, *c, 1, 0);
+    *c =
+        __builtin_hcu_mmac_f32_16x16x32_bf8_bf8_lit_lts(a_val, b_val, *c, 1, 0);
 #endif
   }
 };
@@ -153,7 +162,8 @@ public:
 
   static constexpr int inner_k = K_Tile / (micro_size_k * kPack);
   static constexpr int warp_rows = M_Tile / (block_row_warps * micro_size_x);
-  static constexpr int warp_cols = N_Tile / (block_col_warps_no_recompute * micro_size_y);
+  static constexpr int warp_cols =
+      N_Tile / (block_col_warps_no_recompute * micro_size_y);
 
   // The kPadA, kPadB, kPadC & kBlockPerCu should also come from the Codegen
   // part.
@@ -403,7 +413,7 @@ public:
   }
 
   static TL_DEVICE void body_sr(A_type *A_shared, B_type *B_local,
-                             C_type *C_local) {
+                                C_type *C_local) {
     auto tid = threadIdx.x;
     auto warp_id = tid / warp_size;
     auto warp_m = warp_id % block_row_warps;
@@ -478,8 +488,7 @@ public:
   static constexpr int warp_k = K_Tile / num_warp_k;
   static constexpr int inner_k = warp_k / (micro_size_k * kPack);
   static constexpr int warp_rows = M_Tile / (block_row_warps * micro_size_x);
-  static constexpr int warp_cols =
-      N_Tile / (block_col_warps * micro_size_y);
+  static constexpr int warp_cols = N_Tile / (block_col_warps * micro_size_y);
 
   static constexpr bool kPadA = true;
   static constexpr bool kPadB = true;
@@ -543,7 +552,8 @@ public:
     auto tid = threadIdx.x;
     auto warp_id = tid / warp_size;
 
-    // Warp id traversal order: warp_m -> warp_n -> warp_k (innermost to outermost)
+    // Warp id traversal order: warp_m -> warp_n -> warp_k (innermost to
+    // outermost)
     auto warp_m = warp_id % block_row_warps;
     auto warp_n = (warp_id / block_row_warps) % block_col_warps;
     auto warp_k_idx = warp_id / (block_row_warps * block_col_warps);
@@ -563,7 +573,8 @@ public:
 
     B_type B_local[warp_cols * kPack * local_size_b];
 
-    // Each warp handles K / num_warp_k, so we need to offset by warp_k_idx * warp_k
+    // Each warp handles K / num_warp_k, so we need to offset by warp_k_idx *
+    // warp_k
     const int k_offset = warp_k_idx * warp_k;
 
     for (int ki = 0; ki < inner_k; ki++) {
@@ -635,7 +646,8 @@ public:
     auto tid = threadIdx.x;
     auto warp_id = tid / warp_size;
 
-    // Warp id traversal order: warp_m -> warp_n -> warp_k (innermost to outermost)
+    // Warp id traversal order: warp_m -> warp_n -> warp_k (innermost to
+    // outermost)
     auto warp_m = warp_id % block_row_warps;
     auto warp_n = (warp_id / block_row_warps) % block_col_warps;
     auto warp_k_idx = warp_id / (block_row_warps * block_col_warps);
@@ -656,7 +668,8 @@ public:
     A_type A_local[warp_rows * kPack * local_size_a];
     B_type B_local[warp_cols * kPack * local_size_b];
 
-    // Each warp handles K / num_warp_k, so we need to offset by warp_k_idx * warp_k
+    // Each warp handles K / num_warp_k, so we need to offset by warp_k_idx *
+    // warp_k
     const int k_offset = warp_k_idx * warp_k;
 
     for (int ki = 0; ki < inner_k; ki++) {
@@ -719,18 +732,19 @@ public:
 
 namespace tl {
 
-// Type tag for warp_k partitioning: distinguishes from bool (trans_A) to avoid overload ambiguity
-template <int N>
-struct WarpKParam { static constexpr int value = N; };
+// Type tag for warp_k partitioning: distinguishes from bool (trans_A) to avoid
+// overload ambiguity
+template <int N> struct WarpKParam {
+  static constexpr int value = N;
+};
 
 template <int M, int N, int K, int num_warp_m, int num_warp_n, bool trans_A,
           bool trans_B, bool clear_accum, int kPack, int min_n_per_warp = 16,
           typename A_type, typename B_type, typename C_type>
 TL_DEVICE void gemm_ss(A_type *pA, B_type *pB, C_type *accum) {
-  using Compute =
-      GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A, trans_B,
-                   clear_accum, kPack, A_type, B_type, C_type, float,
-                   min_n_per_warp>;
+  using Compute = GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A,
+                               trans_B, clear_accum, kPack, A_type, B_type,
+                               C_type, float, min_n_per_warp>;
   Compute::body(pA, pB, accum);
 }
 
@@ -738,10 +752,9 @@ template <int M, int N, int K, int num_warp_m, int num_warp_n, bool trans_A,
           bool trans_B, bool clear_accum, int kPack, int min_n_per_warp = 16,
           typename A_type, typename B_type, typename C_type>
 TL_DEVICE void gemm_rs(A_type *pA, B_type *pB, C_type *accum) {
-  using Compute =
-      GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A, trans_B,
-                   clear_accum, kPack, A_type, B_type, C_type, float,
-                   min_n_per_warp>;
+  using Compute = GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A,
+                               trans_B, clear_accum, kPack, A_type, B_type,
+                               C_type, float, min_n_per_warp>;
   Compute::body_rs(pA, pB, accum);
 }
 
@@ -749,10 +762,9 @@ template <int M, int N, int K, int num_warp_m, int num_warp_n, bool trans_A,
           bool trans_B, bool clear_accum, int kPack, int min_n_per_warp = 16,
           typename A_type, typename B_type, typename C_type>
 TL_DEVICE void gemm_rr(A_type *pA, B_type *pB, C_type *accum) {
-  using Compute =
-      GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A, trans_B,
-                   clear_accum, kPack, A_type, B_type, C_type, float,
-                   min_n_per_warp>;
+  using Compute = GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A,
+                               trans_B, clear_accum, kPack, A_type, B_type,
+                               C_type, float, min_n_per_warp>;
   Compute::body_rr(pA, pB, accum);
 }
 
@@ -760,49 +772,50 @@ template <int M, int N, int K, int num_warp_m, int num_warp_n, bool trans_A,
           bool trans_B, bool clear_accum, int kPack, int min_n_per_warp = 16,
           typename A_type, typename B_type, typename C_type>
 TL_DEVICE void gemm_sr(A_type *pA, B_type *pB, C_type *accum) {
-  using Compute =
-      GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A, trans_B,
-                   clear_accum, kPack, A_type, B_type, C_type, float,
-                   min_n_per_warp>;
+  using Compute = GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A,
+                               trans_B, clear_accum, kPack, A_type, B_type,
+                               C_type, float, min_n_per_warp>;
   Compute::body_sr(pA, pB, accum);
 }
 
-// gemm_rs with warp_k partitioning (WarpKParam<N> as 6th param distinguishes from bool trans_A in gemm_rs no k partition)
+// gemm_rs with warp_k partitioning (WarpKParam<N> as 6th param distinguishes
+// from bool trans_A in gemm_rs no k partition)
 template <int M, int N, int K, int num_warp_m, int num_warp_n,
-          typename WarpKTag,  // WarpKParam<num_warp_k>
-          bool trans_A, bool trans_B, bool clear_accum, int kPack, typename A_type,
-          typename B_type, typename C_type>
+          typename WarpKTag, // WarpKParam<num_warp_k>
+          bool trans_A, bool trans_B, bool clear_accum, int kPack,
+          typename A_type, typename B_type, typename C_type>
 TL_DEVICE void gemm_rs(A_type *pA, B_type *pB, C_type *accum) {
   constexpr int num_warp_k = WarpKTag::value;
   using Compute =
-      GemmTensorOpKPartition<M, N, K, num_warp_m, num_warp_n, num_warp_k, trans_A, trans_B,
-                   clear_accum, kPack, A_type, B_type, C_type>;
+      GemmTensorOpKPartition<M, N, K, num_warp_m, num_warp_n, num_warp_k,
+                             trans_A, trans_B, clear_accum, kPack, A_type,
+                             B_type, C_type>;
   Compute::body_rs(pA, pB, accum);
 }
 
 // gemm_ss with warp_k partitioning
 template <int M, int N, int K, int num_warp_m, int num_warp_n,
-          typename WarpKTag,
-          bool trans_A, bool trans_B, bool clear_accum, int kPack, typename A_type,
-          typename B_type, typename C_type>
+          typename WarpKTag, bool trans_A, bool trans_B, bool clear_accum,
+          int kPack, typename A_type, typename B_type, typename C_type>
 TL_DEVICE void gemm_ss(A_type *pA, B_type *pB, C_type *accum) {
   constexpr int num_warp_k = WarpKTag::value;
   using Compute =
-      GemmTensorOpKPartition<M, N, K, num_warp_m, num_warp_n, num_warp_k, trans_A, trans_B,
-                   clear_accum, kPack, A_type, B_type, C_type>;
+      GemmTensorOpKPartition<M, N, K, num_warp_m, num_warp_n, num_warp_k,
+                             trans_A, trans_B, clear_accum, kPack, A_type,
+                             B_type, C_type>;
   Compute::body_ss(pA, pB, accum);
 }
 
 // gemm_rr with warp_k partitioning
 template <int M, int N, int K, int num_warp_m, int num_warp_n,
-          typename WarpKTag,
-          bool trans_A, bool trans_B, bool clear_accum, int kPack, typename A_type,
-          typename B_type, typename C_type>
+          typename WarpKTag, bool trans_A, bool trans_B, bool clear_accum,
+          int kPack, typename A_type, typename B_type, typename C_type>
 TL_DEVICE void gemm_rr(A_type *pA, B_type *pB, C_type *accum) {
   constexpr int num_warp_k = WarpKTag::value;
   using Compute =
-      GemmTensorOpKPartition<M, N, K, num_warp_m, num_warp_n, num_warp_k, trans_A, trans_B,
-                   clear_accum, kPack, A_type, B_type, C_type>;
+      GemmTensorOpKPartition<M, N, K, num_warp_m, num_warp_n, num_warp_k,
+                             trans_A, trans_B, clear_accum, kPack, A_type,
+                             B_type, C_type>;
   Compute::body_rr(pA, pB, accum);
 }
 

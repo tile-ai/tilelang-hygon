@@ -20,11 +20,11 @@
 #include "../layout/layout.h"
 #include "../layout/utils.h"
 #include "../op/builtin.h"
-#include "../op/operator.h"
 #include "../op/copy.h"
 #include "../op/ds_read_format.h"
 #include "../op/gemm.h"
 #include "../op/mls.h"
+#include "../op/operator.h"
 #include "../op/parallel.h"
 #include "../op/region.h"
 #include "../op/utils.h"
@@ -44,8 +44,8 @@ namespace tl {
 namespace {
 
 /*!
- * \brief Z3 limits for arith::Analyzer during tl.LayoutInference (per-pass default
- *        and optional TILELANG_Z3_RLIMIT / TILELANG_Z3_TIMEOUT_MS).
+ * \brief Z3 limits for arith::Analyzer during tl.LayoutInference (per-pass
+ * default and optional TILELANG_Z3_RLIMIT / TILELANG_Z3_TIMEOUT_MS).
  */
 void ApplyLayoutInferenceZ3ResourceLimits(arith::Analyzer *analyzer) {
   if (!analyzer)
@@ -148,7 +148,7 @@ public:
 
   void RunInferStep(int cur_infer_id, InferLevel level, bool update_queue,
                     LayoutMap &layout_map, const LayoutMap &strict_layout_map,
-                  std::deque<int> &q, std::vector<bool> &in_queue) {
+                    std::deque<int> &q, std::vector<bool> &in_queue) {
     auto num_infer = infer_list_.size();
 
     // Range check for cur_infer_id
@@ -185,13 +185,8 @@ public:
 
     // Run InferLayout
     auto updates = next->InferLayout(
-        LayoutInferArgs{target_,
-                        thread_bounds,
-                        layout_map,
-                        cur_analyzer,
-                        buffer_oob,
-                        Map<Buffer, Buffer>{},
-                        let_var_to_expr_,
+        LayoutInferArgs{target_, thread_bounds, layout_map, cur_analyzer,
+                        buffer_oob, Map<Buffer, Buffer>{}, let_var_to_expr_,
                         false},
         level);
     // Process the returned updates

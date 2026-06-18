@@ -41,8 +41,9 @@ void LogMessageImpl(const std::string &file, int lineno, int level,
   throw InternalError(file, lineno, message);
 }
 
-// TVM_LOG_CUSTOMIZE=1 skips these in 3rdparty/tvm/src/runtime/logging.cc; TVM_LOG_DEBUG on
-// tilelang_objs still needs them (same logic as TVM when TVM_LOG_CUSTOMIZE==0).
+// TVM_LOG_CUSTOMIZE=1 skips these in 3rdparty/tvm/src/runtime/logging.cc;
+// TVM_LOG_DEBUG on tilelang_objs still needs them (same logic as TVM when
+// TVM_LOG_CUSTOMIZE==0).
 
 namespace {
 constexpr const char *kSrcPrefix = "/src/";
@@ -50,15 +51,17 @@ constexpr const size_t kSrcPrefixLength = 5;
 constexpr const char *kDefaultKeyword = "DEFAULT";
 
 std::string FileToVLogMapKey(const std::string &filename) {
-  size_t last_src = filename.rfind(kSrcPrefix, std::string::npos, kSrcPrefixLength);
+  size_t last_src =
+      filename.rfind(kSrcPrefix, std::string::npos, kSrcPrefixLength);
   if (last_src == std::string::npos) {
     std::string no_slash_src{kSrcPrefix + 1};
     if (filename.substr(0, no_slash_src.size()) == no_slash_src) {
       return filename.substr(no_slash_src.size());
     }
   }
-  return (last_src == std::string::npos) ? filename
-                                         : filename.substr(last_src + kSrcPrefixLength);
+  return (last_src == std::string::npos)
+             ? filename
+             : filename.substr(last_src + kSrcPrefixLength);
 }
 } // namespace
 
@@ -114,8 +117,8 @@ TvmLogDebugSettings TvmLogDebugSettings::ParseSpec(const char *opt_spec) {
                  << ": invalid level: \"" << level << "\"";
       return settings;
     }
-    LOG(INFO) << "TVM_LOG_DEBUG enables VLOG statements in '" << name << "' up to level "
-              << level;
+    LOG(INFO) << "TVM_LOG_DEBUG enables VLOG statements in '" << name
+              << "' up to level " << level;
     settings.vlog_level_map_.emplace(name, level_val);
   }
   return settings;

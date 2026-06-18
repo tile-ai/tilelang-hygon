@@ -1193,9 +1193,9 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            [](int block_m, int block_n, int block_k, int num_warp_m,
               int num_warp_n, int num_warp_k, int element_bits, int k_pack,
               bool transposed, int min_n_per_warp) {
-             return makeGemmFragmentBHCU(
-                 block_m, block_n, block_k, num_warp_m, num_warp_n, num_warp_k,
-                 element_bits, k_pack, transposed, min_n_per_warp);
+             return makeGemmFragmentBHCU(block_m, block_n, block_k, num_warp_m,
+                                         num_warp_n, num_warp_k, element_bits,
+                                         k_pack, transposed, min_n_per_warp);
            })
       .def("tl.make_linear_layout",
            [](Array<PrimExpr> shape) { return makeLinearLayout(shape); })

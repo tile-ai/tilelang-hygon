@@ -27,15 +27,18 @@ bool TargetIsSM120(Target target);
 bool TargetIsCDNA(Target target);
 bool TargetIsHCU(Target target);
 bool TargetHasMmacLitLts(Target target);
-/// Return mcpu string for HCU target (e.g. "gfx938"). Caller adds prefix as needed.
+/// Return mcpu string for HCU target (e.g. "gfx938"). Caller adds prefix as
+/// needed.
 std::string GetHcuArchString(Target target);
 bool TargetIsRDNA(Target target);
 bool TargetIsGfx950(Target target);
 
 bool TargetHasAsyncCopy(Target target);
-/// HCU mcpu whitelist for default T.copy auto async (wave-safe per-thread path).
+/// HCU mcpu whitelist for default T.copy auto async (wave-safe per-thread
+/// path).
 bool IsHCUEnableAutoAsyncCopyTarget(Target target);
-/// Default for tl.enable_async_copy / tir.use_async_copy when pass config unset.
+/// Default for tl.enable_async_copy / tir.use_async_copy when pass config
+/// unset.
 bool DefaultEnableAutoAsyncCopy(Target target);
 bool TargetHasLdmatrix(Target target);
 bool TargetHasStmatrix(Target target);

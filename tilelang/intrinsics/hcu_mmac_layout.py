@@ -4,7 +4,7 @@ import tilelang.language as T
 
 
 def shared_16x4_to_local_64x1_layout_A(i, j):
-    thread_id = (j * 16 + i)
+    thread_id = j * 16 + i
     return thread_id, convert(0)
 
 
@@ -15,7 +15,7 @@ def thread_id_shared_access_64x1_to_16x4_layout_A(thread_id, local_id):
 
 
 def shared_4x16_to_local_64x1_layout_B(i, j):
-    thread_id = (i * 16 + j)
+    thread_id = i * 16 + j
     return thread_id, convert(0)
 
 
@@ -27,7 +27,7 @@ def thread_id_shared_access_64x1_to_4x16_layout_B(thread_id, local_id):
 
 def shared_16x16_to_local_64x4_layout_C(i, j):
     thread_id = j + (i // 4) * 16
-    local = (i % 4)
+    local = i % 4
     return thread_id, local
 
 
@@ -45,7 +45,7 @@ def thread_id_shared_access_64x4_to_16x16_layout_A(thread_id, local_id):
 
 def shared_16x16_to_local_64x4_layout_A(i, j):
     thread_id = i + 16 * (j // 4)
-    local = (j % 4)
+    local = j % 4
     return thread_id, local
 
 
@@ -57,7 +57,7 @@ def thread_id_shared_access_64x4_to_16x16_layout_B(thread_id, local_id):
 
 def shared_16x16_to_local_64x4_layout_B(i, j):
     thread_id = j + (i // 4) * 16
-    local = (i % 4)
+    local = i % 4
     return thread_id, local
 
 
@@ -77,6 +77,7 @@ def thread_id_shared_access_64x4_to_16x16_layout_C_n_m(thread_id, local_id):
     i = local_id * 4 + (thread_id // 16)
     j = thread_id % 16
     return i, j
+
 
 # lit: 4 interleaved
 def thread_id_shared_access_64x4_to_16x16_layout_C_m_n_lit(thread_id, local_id):
@@ -99,7 +100,7 @@ def thread_id_shared_access_64x8_to_16x32_layout_A(thread_id, local_id):
 
 def shared_16x32_to_local_64x8_layout_A(i, j):
     thread_id = i + 16 * (j // 8)
-    local = (j % 8)
+    local = j % 8
     return thread_id, local
 
 
@@ -111,7 +112,7 @@ def thread_id_shared_access_64x8_to_16x32_layout_B(thread_id, local_id):
 
 def shared_16x32_to_local_64x8_layout_B(i, j):
     thread_id = j + (i // 8) * 16
-    local = (i % 8)
+    local = i % 8
     return thread_id, local
 
 
@@ -123,7 +124,7 @@ def thread_id_shared_access_64x16_to_16x64_layout_A(thread_id, local_id):
 
 def shared_16x64_to_local_64x16_layout_A(i, j):
     thread_id = i + 16 * (j // 16)
-    local = (j % 16)
+    local = j % 16
     return thread_id, local
 
 
@@ -135,7 +136,7 @@ def thread_id_shared_access_64x16_to_16x64_layout_B(thread_id, local_id):
 
 def shared_16x64_to_local_64x16_layout_B(i, j):
     thread_id = i + 16 * (j // 16)
-    local = (j % 16)
+    local = j % 16
     return thread_id, local
 
 

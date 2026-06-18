@@ -7,15 +7,11 @@ import torch
 import tilelang as tl
 from perf.gemm.utils import ref_program, get_heuristic_config, get_default_kernel_version, triton_gemm
 from perf.gemm.vanilla_gemm import (
-    gemm_vanilla,
     get_best_vanilla_config,
     gemm_vanilla_v1,
     gemm_vanilla_v2,
 )
-from perf.gemm.persistent_gemm import gemm_persistent, get_best_persistent_config
 from perf.gemm.persistent_gemm import (
-    get_best_persistent_config,
-    gemm_persistent,
     get_best_persistent_config_v1,
     gemm_persistent_v1,
     gemm_persistent_v2,
@@ -27,8 +23,8 @@ from perf.gemm.splitk_gemm import gemm_splitk
 from perf.gemm.streamk_gemm import gemm_streamk
 from perf.utils.device import get_free_devices
 
-import triton
 import triton.testing as triton_testing
+
 
 def normalize_dtype(dtype_str: str) -> str:
     """Convert dtype string to torch dtype string."""
@@ -43,15 +39,16 @@ def normalize_dtype(dtype_str: str) -> str:
     return dtype_map.get(dtype_str.lower(), "float16")
 
 
-def main(M: int = 4096,
-         N: int = 4096,
-         K: int = 4096,
-         dtype: str = "fp16",
-         autotune: bool = False,
-         impl: str = "persistent",
-         with_roller: bool = False,
-         device: int = -1,
-         ):
+def main(
+    M: int = 4096,
+    N: int = 4096,
+    K: int = 4096,
+    dtype: str = "fp16",
+    autotune: bool = False,
+    impl: str = "persistent",
+    with_roller: bool = False,
+    device: int = -1,
+):
     """
     Main benchmark function for GEMM implementations.
 
@@ -79,8 +76,7 @@ def main(M: int = 4096,
             print(f"Best config: {result.config}")
             kernel = result.kernel
         else:
-            raise ValueError(f"Autotune not supported for {impl} implementation. "
-                           f"Supported: persistent, vanilla")
+            raise ValueError(f"Autotune not supported for {impl} implementation. Supported: persistent, vanilla")
     else:
         kernel_version = get_default_kernel_version(impl)
         config = get_heuristic_config(impl, kernel_version)
@@ -119,8 +115,7 @@ def main(M: int = 4096,
             # streamk doesn't need additional config parameters
             kernel = gemm_streamk(M, N, K, dtype=dtype, **config)
         else:
-            raise ValueError(f"Unknown implementation: {impl}. "
-                           f"Supported: vanilla, persistent, splitk, streamk")
+            raise ValueError(f"Unknown implementation: {impl}. Supported: vanilla, persistent, splitk, streamk")
 
     free_hcus = get_free_devices()
     if len(free_hcus) == 0:
@@ -178,28 +173,18 @@ if __name__ == "__main__":
         type=str,
         choices=["fp16", "bf16", "fp32", "float16", "bfloat16", "float32"],
         default="fp16",
-        help="Data type (default: fp16)")
+        help="Data type (default: fp16)",
+    )
+    parser.add_argument("--autotune", action="store_true", default=False, help="Whether to use autotune for GEMM configs")
+    parser.add_argument("-d", "--device", type=int, default=-1, help="Device ID (default: auto find free device)")
     parser.add_argument(
-        "--autotune",
-        action="store_true",
-        default=False,
-        help="Whether to use autotune for GEMM configs")
-    parser.add_argument(
-        "-d", "--device",
-        type=int,
-        default=-1,
-        help="Device ID (default: auto find free device)")
-    parser.add_argument(
-        "-i", "--impl",
+        "-i",
+        "--impl",
         type=str,
         choices=["vanilla", "persistent", "splitk", "streamk"],
         default="persistent",
-        help="GEMM implementation (default: persistent)")
-    parser.add_argument(
-        "--with_roller",
-        action="store_true",
-        default=False,
-        help="Whether to enable BitBLAS roller for search space")
+        help="GEMM implementation (default: persistent)",
+    )
+    parser.add_argument("--with_roller", action="store_true", default=False, help="Whether to enable BitBLAS roller for search space")
     args = parser.parse_args()
-    main(args.m, args.n, args.k, args.dtype, args.autotune, args.impl,
-         args.with_roller, args.device)
+    main(args.m, args.n, args.k, args.dtype, args.autotune, args.impl, args.with_roller, args.device)

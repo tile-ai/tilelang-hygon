@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Common utility functions for GEMM implementations.
 """
@@ -15,6 +17,7 @@ from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
 
 from aiter.ops.triton.gemm_unquantized import gemm_unquantized
 
+
 def triton_gemm(A, B):
     """
     Compute the matrix product of A and the transpose of B.
@@ -22,7 +25,7 @@ def triton_gemm(A, B):
     A and B are expected to be 2-D tensors where A has shape (M, K) and B has shape (N, K).
     The result is a tensor with shape (M, N) equal to A @ B.T, using the inputs' dtypes.
     """
-    return  gemm_unquantized(A, B, torch.float16)
+    return gemm_unquantized(A, B, torch.float16)
 
 
 def ref_program(A, B):
@@ -49,10 +52,7 @@ def _generate_configs_from_product(param_dict):
     key_order = list(param_dict.keys())
     param_lists = [param_dict[key] for key in key_order]
     _configs = list(itertools.product(*param_lists))
-    return [
-        {key_order[i]: c[i] for i in range(len(key_order))}
-        for c in _configs
-    ]
+    return [{key_order[i]: c[i] for i in range(len(key_order))} for c in _configs]
 
 
 def _get_roller_configs(M, N, K, topk=20):
@@ -91,14 +91,16 @@ def _get_roller_configs(M, N, K, topk=20):
         warp_m, warp_n = hint.warp
         # block_rows, block_cols represents warp partitioning
         block_rows, block_cols = block_m // warp_m, block_n // warp_n
-        configs.append({
-            "block_M": block_m,
-            "block_N": block_n,
-            "block_K": hint.rstep[0],
-            "num_stages": hint.pipeline_stage if hint.pipeline_stage > 1 else 0,
-            "thread_num": block_rows * block_cols * 32,
-            "enable_rasteration": hint.rasterization_plan is not NoRasterization,
-        })
+        configs.append(
+            {
+                "block_M": block_m,
+                "block_N": block_n,
+                "block_K": hint.rstep[0],
+                "num_stages": hint.pipeline_stage if hint.pipeline_stage > 1 else 0,
+                "thread_num": block_rows * block_cols * 32,
+                "enable_rasteration": hint.rasterization_plan is not NoRasterization,
+            }
+        )
     return configs
 
 
@@ -154,17 +156,19 @@ def _create_autotuner(kernel, configs, pass_configs=None):
     Returns:
         Configured AutoTuner instance
     """
-    return AutoTuner.from_kernel(
-        kernel=kernel, configs=configs
-    ).set_compile_args(
-        out_idx=[-1],
-        target="auto",
-        verbose=True,
-        pass_configs=pass_configs,
-    ).set_profile_args(
-        supply_type=tl.TensorSupplyType.Integer,
-        ref_prog=ref_program,
-        skip_check=False,
+    return (
+        AutoTuner.from_kernel(kernel=kernel, configs=configs)
+        .set_compile_args(
+            out_idx=[-1],
+            target="auto",
+            verbose=True,
+            pass_configs=pass_configs,
+        )
+        .set_profile_args(
+            supply_type=tl.TensorSupplyType.Integer,
+            ref_prog=ref_program,
+            skip_check=False,
+        )
     )
 
 
@@ -195,18 +199,18 @@ def get_heuristic_config(impl: str | None = None, version: str | None = None) ->
             of the base heuristic config.
     """
     config = {
-        #"block_M": 128,
-        #"block_N": 256,
-        #"block_K": 32,
+        # "block_M": 128,
+        # "block_N": 256,
+        # "block_K": 32,
         "block_M": 128,
         "block_N": 256,
         "block_K": 64,
         "num_stages": 0,
-        #"thread_num": 128,
+        # "thread_num": 128,
         "thread_num": 256,
         # "thread_num": 512,
         "group_size": 1,  # Enable group swizzling optimization
-        #"enable_rasteration": True,
+        # "enable_rasteration": True,
         "wgs_per_cu": 2,
     }
 

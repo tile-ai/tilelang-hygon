@@ -109,17 +109,13 @@ del _init_logger
 def _libtorch_cuda_present(lib_dir: Path) -> bool:
     if sys.platform.startswith("win32"):
         return (lib_dir / "torch_cuda.dll").is_file()
-    return (lib_dir / "libtorch_cuda.so").is_file() or bool(
-        next(lib_dir.glob("libtorch_cuda*.so"), None)
-    )
+    return (lib_dir / "libtorch_cuda.so").is_file() or bool(next(lib_dir.glob("libtorch_cuda*.so"), None))
 
 
 def _libtorch_hip_present(lib_dir: Path) -> bool:
     if sys.platform.startswith("win32"):
         return (lib_dir / "torch_hip.dll").is_file()
-    return (lib_dir / "libtorch_hip.so").is_file() or bool(
-        next(lib_dir.glob("libtorch_hip*.so"), None)
-    )
+    return (lib_dir / "libtorch_hip.so").is_file() or bool(next(lib_dir.glob("libtorch_hip*.so"), None))
 
 
 def _maybe_disable_torch_c_dlpack() -> None:

@@ -15,9 +15,9 @@ Block(0,1) -> Block(1,1) -> Block(2,1) ...
 
 **Issue:**
 When a kernel computes a large matrix multiplication (GEMM) or convolution, it typically tiles the input matrices.
-*   **Block(N,0)** uses data from the far right of Matrix A and top of Matrix B.
-*   **Block(0,1)** (the very next block executed) uses data from the far left of Matrix A and slightly lower in Matrix B.
-*   **Result:** Data cached in L2 for the right side of the grid is flushed before it can be reused by the next row, leading to **poor L2 cache hit rates** and lower performance ("DRAM bound").
+- **Block(N,0)** uses data from the far right of Matrix A and top of Matrix B.
+- **Block(0,1)** (the very next block executed) uses data from the far left of Matrix A and slightly lower in Matrix B.
+- **Result:** Data cached in L2 for the right side of the grid is flushed before it can be reused by the next row, leading to **poor L2 cache hit rates** and lower performance ("DRAM bound").
 
 ## 2. The Solution: Swizzled (Zig-Zag) Traversal
 
@@ -152,21 +152,21 @@ TileLang provides two primary swizzling templates in `src/tl_templates/hip/threa
 
 This function creates **horizontal panels** (strips) and zig-zags within them.
 
-*   **Best for:** Workloads where reusing data along the row (horizontal axis) is critical, or generally for standard GEMM where $M$ dimension tiling favors horizontal traversal.
-*   **Logic:**
-    1.  Divide the grid into horizontal strips of height `panel_width`.
-    2.  Inside a strip, fill columns top-to-bottom.
-    3.  Traverse strips Left $\to$ Right for even panels, Right $\to$ Left for odd panels.
+- **Best for:** Workloads where reusing data along the row (horizontal axis) is critical, or generally for standard GEMM where $M$ dimension tiling favors horizontal traversal.
+- **Logic:**
+    1. Divide the grid into horizontal strips of height `panel_width`.
+    2. Inside a strip, fill columns top-to-bottom.
+    3. Traverse strips Left $\to$ Right for even panels, Right $\to$ Left for odd panels.
 
 ```cpp
 template <int panel_width> TL_DEVICE dim3 rasterization2DRow() {
   // 1. Calculate linear ID
   const unsigned int block_idx = blockIdx.x + blockIdx.y * gridDim.x;
-  
+
   // 2. Determine which "Panel" (horizontal strip) we are in
   const unsigned int panel_size = panel_width * gridDim.x;
   const unsigned int panel_idx = block_idx / panel_size;
-  
+
   // 3. Calculate internal coordinates
   // ... (See source for full stride math) ...
 
@@ -174,7 +174,7 @@ template <int panel_width> TL_DEVICE dim3 rasterization2DRow() {
   const unsigned int col_idx = (panel_idx & 1)
       ? gridDim.x - 1 - panel_offset / stride
       : panel_offset / stride;
-      
+
   return {col_idx, row_idx, blockIdx.z};
 }
 ```
@@ -183,11 +183,11 @@ template <int panel_width> TL_DEVICE dim3 rasterization2DRow() {
 
 This function creates **vertical panels** (strips) and zig-zags within them.
 
-*   **Best for:** Workloads where reusing data along the column (vertical axis) is more important.
-*   **Logic:**
-    1.  Divide the grid into vertical strips of width `panel_width`.
-    2.  Inside a strip, fill rows left-to-right.
-    3.  Traverse strips Top $\to$ Bottom for even panels, Bottom $\to$ Top for odd panels.
+- **Best for:** Workloads where reusing data along the column (vertical axis) is more important.
+- **Logic:**
+    1. Divide the grid into vertical strips of width `panel_width`.
+    2. Inside a strip, fill rows left-to-right.
+    3. Traverse strips Top $\to$ Bottom for even panels, Bottom $\to$ Top for odd panels.
 
 ```cpp
 template <int panel_width> TL_DEVICE dim3 rasterization2DColumn() {
@@ -221,8 +221,8 @@ Imagine a grid of blocks. The numbers represent the execution order.
 ```
 
 **Swizzled (Row):**
-*   Panel 0 (Rows 0-1): Left->Right
-*   Panel 1 (Rows 2-3): Right->Left
+- Panel 0 (Rows 0-1): Left->Right
+- Panel 1 (Rows 2-3): Right->Left
 
 ```
 0  2  4  6   (Inner order fills vertical pairs first)
@@ -244,9 +244,9 @@ import tilelang.language as tl
 tl.use_swizzle(panel_size=10, order="row", enable=True)
 ```
 
-*   **`panel_size`**: Corresponds to `panel_width` in the C++ template.
-*   **`order="row"`**: Selects `rasterization2DRow`.
-*   **`order="col"`**: Selects `rasterization2DColumn`.
+- **`panel_size`**: Corresponds to `panel_width` in the C++ template.
+- **`order="row"`**: Selects `rasterization2DRow`.
+- **`order="col"`**: Selects `rasterization2DColumn`.
 
 This annotation injects the C++ call `tl::rasterization2D{Row|Column}<panel_size>()` at the start of the generated kernel, automatically overriding `blockIdx`.
 
@@ -315,15 +315,15 @@ def main(...):
     grid_size = factor * num_sms
     waves = T.ceildiv(total_tiles, grid_size)
     group_size = 8
-    
+
     with T.Kernel(grid_size, ...) as (block_id,):
         for w in T.serial(waves):
             tile_id = grid_size * w + block_id
-            
+
             # Group swizzling: map linear tile_id to 2D coordinates
             bx = (tile_id // group_size) % m_blocks
             by = (tile_id % group_size) + (tile_id // group_size) // m_blocks * group_size
-            
+
             # Process tile at (bx, by)
             ...
 ```
