@@ -1983,6 +1983,12 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string c_bias = this->PrintExpr(op->args[11]);
     ICHECK(A_layout == "row" || B_layout == "row")
         << "Matrix core only support row major";
+    bool hcu_tf32_ab = false;
+    auto ab_hint = op->annotations.find("tl.hcu_tf32_ab");
+    if (ab_hint != op->annotations.end()) {
+      const auto *imm = (*ab_hint).second.as<IntImmNode>();
+      hcu_tf32_ab = imm && imm->value != 0;
+    }
     // TVM dtype -> C type for __builtin_hcu_mmac_*; packed A/B must match
     // tl_templates/hcu/gemm.h (int8 / FP8 MMAC pass int32x2 to builtins).
     std::unordered_map<std::string, std::string> dtype_map = {
@@ -1990,6 +1996,7 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
         {"int32", "int"},
         {"int8x4", "int32_t"},
         {"int8x8", "int32x2"},
+        {"int32x2", "int32x2"},
         {"int32x4", "int32x4"},
         {"float16", "half"},
         {"float32", "float"},
@@ -2000,14 +2007,20 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
         {"bfloat16x8", "bfloat16x8_vec"},
         {"float32x2", "float32x2"},
         {"float32x4", "float32x4"},
-        {"float8_e4m3fnuzx4", "fp8_e4_4_t"},
+        {"float8_e4m3", "fp8_e4_t"},
+        {"float8_e4m3x4", "fp8_e4_4_t"},
+        {"float8_e4m3x8", "int32x2"},
+        {"float8_e4m3fn", "fp8_e4_t"},
         {"float8_e4m3fnx4", "fp8_e4_4_t"},
-        {"float8_e4m3fnuzx8", "int32x2"},
         {"float8_e4m3fnx8", "int32x2"},
-        {"float8_e5m2fnuzx4", "fp8_e5_4_t"},
-        {"float8_e5m2fnuzx8", "int32x2"},
+        {"float8_e4m3fnuz", "fp8_e4_t"},
+        {"float8_e4m3fnuzx4", "fp8_e4_4_t"},
+        {"float8_e4m3fnuzx8", "int32x2"},
+        {"float8_e5m2", "fp8_e5_t"},
         {"float8_e5m2x4", "fp8_e5_4_t"},
         {"float8_e5m2x8", "int32x2"},
+        {"float8_e5m2fnuzx4", "fp8_e5_4_t"},
+        {"float8_e5m2fnuzx8", "int32x2"},
         {"float32x16", "float32x16"},
         {"float32x32", "float32x32"}};
 
@@ -2024,11 +2037,11 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       lts = ", 0";
     }
 
-    std::string call_mfma_code = R"({
-      *((({C_dtype}*){c_ref}) + {c_bias}) = {mfma_buildin}(*((({A_dtype}*){a_ref}) + {a_bias}),
-                    *((({B_dtype}*){b_ref}) + {b_bias}),
-                    *((({C_dtype}*){c_ref}) + {c_bias}){lit_suffix}{clamp_suffix}{lts_suffix});
-    })";
+    std::string call_mfma_code =
+        "*((({C_dtype}*){c_ref}) + {c_bias}) = {mfma_buildin}("
+        "*((({A_dtype}*){a_ref_cast}) + {a_bias}), "
+        "*((({B_dtype}*){b_ref_cast}) + {b_bias}), "
+        "*((({C_dtype}*){c_ref}) + {c_bias}){lit_suffix}{clamp_suffix}{lts_suffix})";
     std::string mfma_buildin = "__builtin_hcu_mmac_" + prefix;
     Replacer replacer;
 
@@ -2036,9 +2049,13 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("{A_dtype}", dtype_map[A_dtype]);
     replacer.register_rule("{B_dtype}", dtype_map[B_dtype]);
     replacer.register_rule("{C_dtype}", dtype_map[C_dtype]);
-    replacer.register_rule("{a_ref}", a_ref);
+    replacer.register_rule(
+        "{a_ref_cast}",
+        hcu_tf32_ab ? ("reinterpret_cast<int *>(" + a_ref + ")") : a_ref);
+    replacer.register_rule(
+        "{b_ref_cast}",
+        hcu_tf32_ab ? ("reinterpret_cast<int *>(" + b_ref + ")") : b_ref);
     replacer.register_rule("{a_bias}", a_bias);
-    replacer.register_rule("{b_ref}", b_ref);
     replacer.register_rule("{b_bias}", b_bias);
     replacer.register_rule("{c_ref}", c_ref);
     replacer.register_rule("{c_bias}", c_bias);

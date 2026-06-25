@@ -51,7 +51,7 @@ test:
     - pip install -r requirements.txt -r requirements-dev.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     - NO_TOOLCHAIN_VERSION=1 NO_GIT_VERSION=1 bash das-build.sh
     - pip install dist/*.whl
-    - pip install numpy==1.24.3 allure-pytest
+    - pip install numpy==1.24.3 allure-pytest pytest-xdist
     # 回归测试
     - git clone -b staging http://gitlab-ci-token:${CI_JOB_TOKEN}@42.228.13.241:10068/dcutoolkit/deeplearing/TileKernels.git /opt/TileKernels
     - export HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout ${CISMI_TIMEOUT})
@@ -82,8 +82,10 @@ publish:
     - cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
     - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
     # 安装 AICC
-    - latest_run=$(ls /ArchivedFile/ai_cc/nightly/dtk_llvm_*.run 2>/dev/null | sort -t '_' -k4 -nr | head -n1)
-    - '[ -n "${latest_run}" ] && cp ${latest_run} ./ && chmod +x $(basename ${latest_run}) && yes | bash $(basename ${latest_run}) && echo "AICC 安装完成" || echo "跳过 AICC 安装"'
+    - src_dir="/ArchivedFile/ai_cc/nightly"
+    - latest_run=$(cd "$src_dir" && ls dtk_llvm_*.run 2>/dev/null | sed 's/\.run$//' | sort -t '_' -k4 -nr | head -n1)
+    - 'echo "完整安装包路径: ${src_dir}/${latest_run}.run"'
+    - test -n "${latest_run}" && cp "${src_dir}/${latest_run}.run" ./ && chmod +x "${latest_run}.run" && yes | bash "${latest_run}.run" && echo "AICC 安装完成" || echo "跳过 AICC 安装"
     - git submodule update --init --recursive
     # 编译
     - pip install torch==${TORCH_VERSION} ciupload

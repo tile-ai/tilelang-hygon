@@ -1,3 +1,4 @@
+import pytest
 import torch
 import tilelang.testing
 from tilelang import tvm as tvm
@@ -5,6 +6,7 @@ import tilelang.language as T
 from tilelang.intrinsics import make_mmac_swizzle_layout as make_swizzle_layout
 from tilelang.intrinsics.hcu_mmac_macro_generator import HCUMatrixCoreIntrinEmitter as MatrixCoreIntrinEmitter
 from tilelang.transform import simplify_prim_func
+from hcu_test_utils import target_supports_fp8_mmac
 
 tilelang.testing.set_random_seed(0)
 
@@ -68,9 +70,6 @@ def tl_matmul(
     local_size_a = (k_pack * micro_size_x * micro_size_k) // warp_size
     local_size_b = (k_pack * micro_size_y * micro_size_k) // warp_size
     local_size_c = (micro_size_x * micro_size_y) // warp_size
-    warp_rows = warp_row_tiles // micro_size_x
-    warp_cols = warp_col_tiles // micro_size_y
-
     # MMA Wrapper to Auto Generate Code for MMA
     mmac_emitter = MatrixCoreIntrinEmitter(
         a_dtype=in_dtype,
@@ -80,11 +79,13 @@ def tl_matmul(
         b_transposed=b_transposed,
         block_row_warps=block_row_warps,
         block_col_warps=block_col_warps,
-        warp_row_tiles=warp_row_tiles,
-        warp_col_tiles=warp_col_tiles,
+        block_m=block_M,
+        block_n=block_N,
         chunk=chunk,
         k_pack=k_pack,
     )
+    warp_rows = mmac_emitter.warp_rows
+    warp_cols = mmac_emitter.warp_cols
 
     @T.prim_func
     def main(
@@ -229,6 +230,11 @@ def test_assert_tl_matmul():
     assert_tl_matmul_correctness(128, 256, 256, "int8", "int32", accum_dtype="int32", k_pack=2)
     assert_tl_matmul_correctness(128, 256, 256, "int8", "int32", b_transposed=False, accum_dtype="int32")
     assert_tl_matmul_correctness(128, 256, 256, "int8", "int32", b_transposed=False, accum_dtype="int32", k_pack=2)
+
+
+@tilelang.testing.requires_rocm
+@pytest.mark.skipif(not target_supports_fp8_mmac(), reason="FP8 MMAC not supported on this target")
+def test_assert_tl_matmul_fp8():
     assert_tl_matmul_correctness(128, 128, 128, "float8_e4m3fn", "float16")
     assert_tl_matmul_correctness(128, 256, 256, "float8_e4m3fn", "float32")
     assert_tl_matmul_correctness(128, 256, 256, "float8_e4m3fn", "float32", k_pack=2)

@@ -76,9 +76,6 @@ def tl_matmul(
     local_size_a = (k_pack * micro_size_x * micro_size_k) // warp_size
     local_size_b = (k_pack * micro_size_y * micro_size_k) // warp_size
     local_size_c = (micro_size_x * micro_size_y) // warp_size
-    warp_rows = warp_row_tiles // micro_size_x
-    warp_cols = warp_col_tiles // micro_size_y
-
     # MMA Wrapper to Auto Generate Code for MMA
     mmac_emitter = MatrixCorePreshuffleIntrinEmitter(
         a_dtype=in_dtype,
@@ -88,12 +85,14 @@ def tl_matmul(
         b_transposed=b_transposed,
         block_row_warps=block_row_warps,
         block_col_warps=block_col_warps,
-        warp_row_tiles=warp_row_tiles,
-        warp_col_tiles=warp_col_tiles,
+        block_m=block_M,
+        block_n=block_N,
         chunk=chunk,
         k_pack=k_pack,
         b_preshuffle=b_preshuffle,
     )
+    warp_rows = mmac_emitter.warp_rows
+    warp_cols = mmac_emitter.warp_cols
 
     @T.prim_func
     def main(
