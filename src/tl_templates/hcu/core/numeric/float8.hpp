@@ -399,9 +399,14 @@ TL_HOST_DEVICE DstT run_cast_to_f8(SrcT src, unsigned int rng = 0)
         }
         mantissa += (1u << SrcT_mant); // Add the implicit 1 into mantissa
     }
+    // OCP e4m3 has one extra denorm exponent step compared with the generic
+    // cutoff implied by DstT_mant alone. Without this adjustment, values in
+    // [2^-10, 2^-9) are incorrectly flushed to zero instead of quantizing to
+    // the smallest subnormal (0x01 / 0x81).
+    constexpr int zero_cutoff = DstT_mant + ((!is_fnuz && DstT_exp == 4) ? 1 : 0);
     // The value is smaller than min f8 denormal and results in zero (the early exit also prevents
     // an undefined behavior of bit shifts >= type width).
-    if(exponent_diff > DstT_mant)
+    if(exponent_diff > zero_cutoff)
     {
         return is_fnuz ? 0 : (sign << (DstT_exp + DstT_mant));
     }

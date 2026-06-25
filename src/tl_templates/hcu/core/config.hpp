@@ -289,7 +289,7 @@
 // #else
 // #define TL_USE_OCP_FP8 0
 // #endif
-#elif  defined(__gfx938__) || defined(__gfx950__) || defined(__gfx12__) // for GPU code
+#elif defined(__gfx936__) || defined(__gfx938__) || defined(__gfx950__) || defined(__gfx12__) // for GPU code
 #define TL_USE_OCP_FP8 1
 #else // for GPU code
 #define TL_USE_OCP_FP8 0

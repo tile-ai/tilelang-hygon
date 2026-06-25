@@ -3,24 +3,18 @@
 import re
 
 import pytest
-from tilelang import tvm as tvm
 import tilelang as tl
 import tilelang.language as T
 import tilelang.testing
-from tilelang.utils.target import determine_target, target_is_hcu
+from hcu_test_utils import target_supports_mls
 
 
-def _is_hcu_target_available() -> bool:
-    try:
-        return target_is_hcu(tvm.target.Target(determine_target("auto")))
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _is_hcu_target_available(),
-    reason="matrix_load tests require an HCU target",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not target_supports_mls(),
+        reason="matrix_load tests require an MLS-supported HCU target",
+    ),
+]
 
 
 def _waitcnt_imms(source: str) -> list[int]:
@@ -43,17 +37,13 @@ def _assert_each_waitcnt_followed_by_sync(source: str) -> None:
 
 
 def _assert_mls_direct_stage1_waitcnt(source: str) -> None:
-    """Stage1 direct LDS: wait all outstanding MLS before each gemm_mls_mls consumer."""
+    """Stage1 direct LDS: wait all outstanding MLS before each gemm consumer."""
     waits = _waitcnt_imms(source)
     assert waits == [16368, 16368], f"unexpected direct stage1 waitcnt sequence: {waits}"
-    assert "gemm_mls_mls" in source
-    assert "ds_read_format" not in source
+    assert source.count("ds_read_format_tensor_a") >= 2
+    assert source.count("ds_read_format_tensor_b") >= 2
+    assert "__builtin_hcu_mmac" in source
     _assert_each_waitcnt_followed_by_sync(source)
-    assert re.search(
-        r"__builtin_amdgcn_s_waitcnt\(16368\);\s*\n\s*__syncthreads\(\);\s*\n\s*\{?\s*\n\s*"
-        r"tl::gemm_mls_mls",
-        source,
-    )
 
 
 def _assert_mls_ds_stage1_waitcnt(source: str) -> None:
@@ -79,17 +69,10 @@ def _assert_mls_direct_stage2_waitcnt(source: str) -> None:
     waits = _waitcnt_imms(source)
     keeps = [_vmcnt_keep(w) for w in waits]
     assert keeps == [2, 0], f"unexpected direct stage2 vmcnt keep sequence: {keeps}"
-    assert "gemm_mls_mls" in source
-    assert "ds_read_format" not in source
+    assert source.count("ds_read_format_tensor_a") >= 2
+    assert source.count("ds_read_format_tensor_b") >= 2
+    assert "__builtin_hcu_mmac" in source
     _assert_each_waitcnt_followed_by_sync(source)
-    gemm_waits = len(
-        re.findall(
-            r"__builtin_amdgcn_s_waitcnt\(\d+\);\s*\n\s*__syncthreads\(\);\s*\n\s*\{?\s*\n?\s*"
-            r"tl::gemm_mls_mls",
-            source,
-        )
-    )
-    assert gemm_waits == 2, f"expected wait+sync before 2 gemm consumers, got {gemm_waits}"
 
 
 def _assert_mls_ds_stage2_waitcnt(source: str) -> None:
@@ -117,7 +100,7 @@ def _assert_mls_copy_a_mls_b_ds_stage1_waitcnt(source: str) -> None:
     assert keeps == [0, 0], f"unexpected mixed ds stage1 vmcnt keep sequence: {keeps}"
     assert "ds_read_format_tensor_b" in source
     assert "ds_read_format_tensor_a" not in source
-    assert "gemm_rr" in source
+    assert "__builtin_hcu_mmac" in source
     _assert_each_waitcnt_followed_by_sync(source)
     ds_waits = len(
         re.findall(
@@ -136,7 +119,7 @@ def _assert_mls_copy_a_mls_b_ds_stage2_waitcnt(source: str) -> None:
     assert keeps == [1, 1, 0], f"unexpected mixed ds stage2 vmcnt keep sequence: {keeps}"
     assert "ds_read_format_tensor_b" in source
     assert "ds_read_format_tensor_a" not in source
-    assert "gemm_rr" in source
+    assert "__builtin_hcu_mmac" in source
     _assert_each_waitcnt_followed_by_sync(source)
     ds_waits = len(
         re.findall(

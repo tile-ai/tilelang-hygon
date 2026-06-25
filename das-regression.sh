@@ -4,11 +4,16 @@ set -euo pipefail
 
 export HIPBLASLT_ALLOW_TF32=1
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-/workspace/TileKernels}"
+TILELANG_REPO_DIR="${TILELANG_REPO_DIR:-${SCRIPT_DIR}}"
 TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR:-./cache_regression}"
 TEST_RESULTS_DIR="${TEST_RESULTS_DIR:-${REPO_DIR}/test-results}"
+PYTEST_ROOTDIR="${PYTEST_ROOTDIR:-$(dirname "${REPO_DIR}")}"
+PRECOMPILE_TEST_KERNELS="${PRECOMPILE_TEST_KERNELS:-1}"
+PRECOMPILE_JOBS="${PRECOMPILE_JOBS:-4}"
 
-NODEIDS=(
+TILE_KERNEL_NODEIDS=(
   # mhc_pre_big_fuse
   "tests/mhc/test_pre_big_fuse.py::test_correctness[4-4096-1]"
   "tests/mhc/test_pre_big_fuse.py::test_correctness[4-4096-577]"
@@ -92,11 +97,121 @@ NODEIDS=(
   # Transpose correctness coverage
   "tests/transpose/test_transpose.py::test_transpose[num_tokens=4032-hidden=7168-dtype=bf16]"
   "tests/transpose/test_transpose.py::test_batched_transpose[num_tokens=4032-hidden=2048-num_experts=8-dtype=bf16]"
+
 )
 
-echo "Running ${#NODEIDS[@]} selected pytest cases in ${REPO_DIR}"
+TILELANG_NODEIDS=(
+  # HCU coverage from the tilelang repository itself. Keep these relative to
+  # REPO_DIR so pytest progress output shows stable file paths after cd.
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/testing/python/hcu/test_tilelang_gemm_mls.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/testing/python/hcu/test_tilelang_gemm_mmac_intrinsic.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/testing/python/hcu/test_tilelang_gemm_mmac_preshuffle.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/testing/python/hcu/test_tilelang_test_gemm_hcu.py")"
+)
 
-cd "${REPO_DIR}"
+TILELANG_EXAMPLES_NODEIDS=(
+  # Example coverage from the tilelang repository itself. Keep these relative
+  # to REPO_DIR for stable pytest progress output after cd.
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/analyze/test_example_analyze.py")"
+  # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/attention_sink/test_example_attention_sink.py")"
+  # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/blocksparse_attention/test_example_blocksparse_attention.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/blocksparse_gemm/test_example_blocksparse_gemm.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/cast/test_example_cast.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/convolution/test_example_convolution.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/deepseek_deepgemm/test_example_deepgemm_fp8_2xAcc.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/deepseek_mhc/test_example_mhc.py")"
+  # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/deepseek_mla/test_example_mla_decode.py")"
+  # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/deepseek_nsa/test_example_tilelang_nsa.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/deepseek_v32/test_tilelang_example_deepseek_v32.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/dequantize_gemm/test_example_dequantize_gemm.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/elementwise/test_example_elementwise.py")"
+  # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/flash_attention/test_example_flash_attention.py")"
+  # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/flash_decoding/test_example_flash_decoding.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/fusedmoe/test_example_fusedmoe.py")"
+  # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/gdn/test_example_gdn_compilation.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/gdn/test_utils.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/gemm/test_example_gemm.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/gemm_fp8/test_example_gemm_fp8.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/gemm_sp/test_example_gemm_sp.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/gemm_splitk/test_example_gemm_splitk.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/gemm_streamk/test_example_tilelang_gemm_streamk.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/gemv/test_example_gemv.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/grouped_gemm/test_example_grouped_gemm.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/kda/test_utils_kda.py")"
+  # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/linear_attention/test_linear_attn.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/minference/test_vs_sparse_attn.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/norm/test_rms_norm.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/seer_attention/test_block_sparse_attn_tilelang.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/sparse_tensorcore/test_example_sparse_tensorcore.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/topk/test_topk_tilelang.py")"
+  # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/warp_specialize/test_example_warp_specialize.py")"
+)
+
+ALL_NODEIDS=("${TILE_KERNEL_NODEIDS[@]}" "${TILELANG_NODEIDS[@]}" "${TILELANG_EXAMPLES_NODEIDS[@]}")
+
+dedupe_param_nodeids_by_func() {
+  local input_name="$1"
+  local output_name="$2"
+  local -n input_ref="${input_name}"
+  local -n output_ref="${output_name}"
+  local nodeid key
+  local -A seen=()
+
+  output_ref=()
+  for nodeid in "${input_ref[@]}"; do
+    key="${nodeid%%[*}"
+    if [[ -z "${seen[${key}]+x}" ]]; then
+      seen["${key}"]=1
+      output_ref+=("${nodeid}")
+    fi
+  done
+}
+
+absolute_collected_nodeid() {
+  local nodeid="$1"
+  local path_part test_part
+
+  if [[ "${nodeid}" != *::* ]]; then
+    printf '%s\n' "${nodeid}"
+    return
+  fi
+
+  path_part="${nodeid%%::*}"
+  test_part="${nodeid#*::}"
+  if [[ "${path_part}" == /* ]]; then
+    printf '%s::%s\n' "${path_part}" "${test_part}"
+  else
+    printf '%s/%s::%s\n' "${PYTEST_ROOTDIR}" "${path_part}" "${test_part}"
+  fi
+}
+
+collect_first_nodeids_by_func() {
+  local input_name="$1"
+  local output_name="$2"
+  local confcutdir="$3"
+  local -n input_ref="${input_name}"
+  local -n output_ref="${output_name}"
+  local line key
+  local -A seen=()
+
+  output_ref=()
+  while IFS= read -r line; do
+    [[ "${line}" == *"::"* ]] || continue
+    key="${line%%[*}"
+    if [[ -z "${seen[${key}]+x}" ]]; then
+      seen["${key}"]=1
+      output_ref+=("$(absolute_collected_nodeid "${line}")")
+    fi
+  done < <(
+    PYTHONPATH="${TILELANG_REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+      TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR}" \
+      python -m pytest -p no:warnings --rootdir="${PYTEST_ROOTDIR}" \
+        --collect-only -q --confcutdir="${confcutdir}" \
+        "${input_ref[@]}" 2>/dev/null || true
+  )
+}
+
+echo "Running ${#ALL_NODEIDS[@]} selected pytest cases"
 
 ALLURE_RESULTS_DIR="${ALLURE_RESULTS_DIR:-${TEST_RESULTS_DIR}/allure-results}"
 ALLURE_REPORT_DIR="${ALLURE_REPORT_DIR:-${TEST_RESULTS_DIR}/allure-report}"
@@ -116,10 +231,70 @@ else
   echo "allure-pytest plugin not available, skipping --alluredir" >&2
 fi
 
-total=${#NODEIDS[@]}
+echo "Running ${#ALL_NODEIDS[@]} test cases from ${REPO_DIR}"
+cd "${REPO_DIR}"
 
-echo "Running ${total} test cases"
-TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR}" python -m pytest -p no:warnings "${extra_pytest_args[@]}" "${allure_args[@]}" "${NODEIDS[@]}" || true
+if [[ "${PRECOMPILE_TEST_KERNELS}" == "1" ]]; then
+  xdist_args=()
+  precompile_status=0
+  TILE_KERNEL_PRECOMPILE_NODEIDS=()
+  TILELANG_PRECOMPILE_NODEIDS=()
+  TILELANG_EXAMPLES_PRECOMPILE_NODEIDS=()
+  if grep -q -- "--numprocesses" "${pytest_help_file}"; then
+    xdist_args=(-n "${PRECOMPILE_JOBS}")
+  else
+    echo "pytest-xdist plugin not available, precompiling serially" >&2
+  fi
+
+  dedupe_param_nodeids_by_func TILE_KERNEL_NODEIDS TILE_KERNEL_PRECOMPILE_NODEIDS
+  collect_first_nodeids_by_func TILELANG_NODEIDS TILELANG_PRECOMPILE_NODEIDS "${TILELANG_REPO_DIR}/testing/python/hcu"
+  collect_first_nodeids_by_func TILELANG_EXAMPLES_NODEIDS TILELANG_EXAMPLES_PRECOMPILE_NODEIDS "${TILELANG_REPO_DIR}/examples"
+
+  echo "Precompiling ${#TILE_KERNEL_PRECOMPILE_NODEIDS[@]} TileKernels test cases from ${#TILE_KERNEL_NODEIDS[@]} selected nodeids with ${PRECOMPILE_JOBS} workers"
+  if ((${#TILE_KERNEL_PRECOMPILE_NODEIDS[@]} > 0)); then
+    PYTHONPATH="${TILELANG_REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+      TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR}" \
+      TILELANG_COMPILE_ONLY=1 \
+      TILEKERNELS_PRECOMPILE_ONLY=1 \
+      python -m pytest -p no:warnings "${xdist_args[@]}" "${TILE_KERNEL_PRECOMPILE_NODEIDS[@]}" || precompile_status=$?
+  else
+    echo "No TileKernels test cases collected for precompile; skipping" >&2
+  fi
+
+  echo "Precompiling ${#TILELANG_PRECOMPILE_NODEIDS[@]} tilelang HCU test functions from ${#TILELANG_NODEIDS[@]} selected files with ${PRECOMPILE_JOBS} workers"
+  if ((${#TILELANG_PRECOMPILE_NODEIDS[@]} > 0)); then
+    PYTHONPATH="${TILELANG_REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+      TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR}" \
+      TILELANG_COMPILE_ONLY=1 \
+      TILEKERNELS_PRECOMPILE_ONLY=1 \
+      python -m pytest -p no:warnings "${xdist_args[@]}" \
+        --confcutdir="${TILELANG_REPO_DIR}/testing/python/hcu" \
+        "${TILELANG_PRECOMPILE_NODEIDS[@]}" || precompile_status=$?
+  else
+    echo "No tilelang HCU test functions collected for precompile; skipping" >&2
+  fi
+
+  echo "Precompiling ${#TILELANG_EXAMPLES_PRECOMPILE_NODEIDS[@]} tilelang example test functions from ${#TILELANG_EXAMPLES_NODEIDS[@]} selected files with ${PRECOMPILE_JOBS} workers"
+  if ((${#TILELANG_EXAMPLES_PRECOMPILE_NODEIDS[@]} > 0)); then
+    PYTHONPATH="${TILELANG_REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+      TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR}" \
+      TILELANG_COMPILE_ONLY=1 \
+      TILEKERNELS_PRECOMPILE_ONLY=1 \
+      python -m pytest -p no:warnings "${xdist_args[@]}" \
+        --confcutdir="${TILELANG_REPO_DIR}/examples" \
+        "${TILELANG_EXAMPLES_PRECOMPILE_NODEIDS[@]}" || precompile_status=$?
+  else
+    echo "No tilelang example test functions collected for precompile; skipping" >&2
+  fi
+
+  if [[ "${precompile_status}" != "0" ]]; then
+    echo "Precompile failed with status ${precompile_status}; continuing to formal pytest" >&2
+  fi
+fi
+
+PYTHONPATH="${TILELANG_REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}" TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR}" \
+  python -m pytest -p no:warnings --rootdir="${PYTEST_ROOTDIR}" \
+    "${extra_pytest_args[@]}" "${allure_args[@]}" "${ALL_NODEIDS[@]}" || true
 
 if [[ "${GENERATE_ALLURE_REPORT}" == "1" ]]; then
   if command -v allure >/dev/null 2>&1; then

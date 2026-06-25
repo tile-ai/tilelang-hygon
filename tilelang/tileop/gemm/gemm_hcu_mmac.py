@@ -4,10 +4,16 @@ from types import SimpleNamespace
 
 from tilelang import _ffi_api
 from tilelang import language as T
+from tilelang.intrinsics.hcu_mmac_layout import (
+    make_gemm_fragment_a_hcu,
+    make_gemm_fragment_b_hcu,
+    make_gemm_fragment_hcu,
+)
+from tilelang.intrinsics.hcu_mmac_macro_generator import HCUMatrixCoreIntrinEmitter
 from tilelang.layout.swizzle import make_hcu_swizzled_layout
 from tilelang.transform.simplify import _Simplify
-from tilelang.utils.language import is_fragment, is_shared, is_shared_dynamic, retrieve_ptr
-from tilelang.utils.target import get_hcu_arch_string, target_has_mmac_lit_lts, target_is_hcu
+from tilelang.utils.language import is_fragment, is_full_region, is_shared, is_shared_dynamic
+from tilelang.utils.target import target_has_mmac_lit_lts, target_is_hcu
 from tvm import DataType, tir
 from tvm.ir import Range
 from tvm.target import Target
@@ -82,34 +88,58 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
     )
 
 
-def _hcu_mls_ab_dtype_str(dtype) -> str:
-    """Map TIR / buffer dtype to tl C++ type names for MLS templates.
+def _compute_hcu_warp_partition(gemm, thread_nums: int, target: Target, meta) -> tuple[int, int, int]:
+    element_byte_size = DataType(gemm.in_dtype).bits // 8
+    _ffi_api.GemmWarpPolicyComputeWarpPartitionHCU(
+        gemm.policy,
+        int(gemm.M),
+        int(gemm.N),
+        int(gemm.K),
+        int(gemm.k_pack),
+        int(element_byte_size),
+        int(thread_nums),
+        target,
+        int(GemmInst.HCUMMAC),
+        bool(meta.a_from_mls),
+        bool(meta.b_from_mls),
+        bool(meta.a_mls_trans),
+        bool(meta.b_mls_trans),
+    )
+    return int(gemm.policy.m_warp), int(gemm.policy.n_warp), int(gemm.policy.k_warp)
 
-    Note: ``from tvm import DataType`` is the tvm_ffi lightweight ``dtype`` object
-    (not the legacy IR helper with ``is_bfloat16()``), so classify by string.
-    """
-    s = str(dtype).lower()
-    if "e4m3" in s:
-        return "fp8_e4_t"
-    if "e5m2" in s:
-        return "fp8_e5_t"
-    if "bfloat16" in s or s == "bf16":
-        return "bfloat16_t"
-    if ("float16" in s or s in ("fp16", "half")) and "float8" not in s:
-        return "half_t"
-    raise ValueError(f"gemm_mls unsupported dtype for HCU template: {dtype}")
 
-
-def _clear_accum_template_flag(expr) -> str:
-    if isinstance(expr, tir.IntImm):
-        if expr.dtype == "bool":
-            return "true" if expr.value else "false"
-        return "true" if expr.value != 0 else "false"
-    raise ValueError(f"clear_accum must be a constant for HCU tl_gemm, got {expr}")
+def _make_hcu_emitter(
+    gemm: GemmHCUMMAC,
+    warp_m: int,
+    warp_n: int,
+    warp_k: int,
+    meta,
+    target: Target,
+    thread_var: tir.Var,
+) -> HCUMatrixCoreIntrinEmitter:
+    min_n_per_warp = 32 if (meta.b_from_mls and not meta.b_mls_trans) else 16
+    return HCUMatrixCoreIntrinEmitter(
+        a_dtype=gemm.in_dtype,
+        b_dtype=gemm.in_dtype,
+        accum_dtype=gemm.accum_dtype,
+        a_transposed=gemm.trans_A,
+        b_transposed=gemm.trans_B,
+        block_row_warps=warp_m,
+        block_col_warps=warp_n,
+        block_m=int(gemm.M),
+        block_n=int(gemm.N),
+        chunk=gemm.chunk,
+        k_pack=gemm.k_pack,
+        block_k_warps=warp_k,
+        target=target,
+        thread_var=thread_var,
+        min_n_per_warp=min_n_per_warp,
+        use_tf32=gemm.use_tf32,
+    )
 
 
 class GemmHCUMMAC(GemmBase):
-    """HCU matrix core GEMM: layout in Python, lowering via ``tl.tl_gemm`` + C++ templates."""
+    """HCU matrix core GEMM: layout and lowering via Python ``HCUMatrixCoreIntrinEmitter``."""
 
     def infer_layout(self, target: Target, thread_nums: int):
         if not target_is_hcu(target):
@@ -120,36 +150,24 @@ class GemmHCUMMAC(GemmBase):
         a_mls_trans = bool(meta.a_mls_trans)
         b_mls_trans = bool(meta.b_mls_trans)
         block_size = int(thread_nums)
-        element_byte_size = DataType(self.in_dtype).bits // 8
-        _ffi_api.GemmWarpPolicyComputeWarpPartitionHCU(
-            self.policy,
-            int(self.M),
-            int(self.N),
-            int(self.K),
-            int(self.k_pack),
-            int(element_byte_size),
-            int(block_size),
-            target,
-            int(GemmInst.HCUMMAC),
-            bool(a_from_mls),
-            bool(b_from_mls),
-            bool(a_mls_trans),
-            bool(b_mls_trans),
-        )
-        warp_m = int(self.policy.m_warp)
-        warp_n = int(self.policy.n_warp)
-        warp_k = int(self.policy.k_warp)
+        warp_m, warp_n, warp_k = _compute_hcu_warp_partition(self, block_size, target, meta)
         min_n_per_warp = 32 if (b_from_mls and not b_mls_trans) else 16
         elem_bits_c = int(DataType(self.C.dtype).bits)
-        if target_has_mmac_lit_lts(target):
-            frag_c = _ffi_api.make_gemm_fragment_hcu_lit(int(self.M), int(self.N), warp_m, warp_n, warp_k, elem_bits_c, min_n_per_warp)
-        else:
-            frag_c = _ffi_api.make_gemm_fragment_hcu(int(self.M), int(self.N), warp_m, warp_n, warp_k, elem_bits_c, min_n_per_warp)
+        frag_c = make_gemm_fragment_hcu(
+            int(self.M),
+            int(self.N),
+            warp_m,
+            warp_n,
+            warp_k,
+            elem_bits_c,
+            min_n_per_warp,
+            lit=target_has_mmac_lit_lts(target),
+        )
         out = {self.C: frag_c}
         if _is_shared_like(self.A):
             out[self.A] = make_hcu_swizzled_layout(self.A, int(self.k_pack))
         elif is_fragment(self.A):
-            out[self.A] = _ffi_api.make_gemm_fragment_a_hcu(
+            out[self.A] = make_gemm_fragment_a_hcu(
                 int(self.M),
                 int(self.N),
                 int(self.K),
@@ -165,7 +183,7 @@ class GemmHCUMMAC(GemmBase):
         if _is_shared_like(self.B):
             out[self.B] = make_hcu_swizzled_layout(self.B, int(self.k_pack))
         elif is_fragment(self.B):
-            out[self.B] = _ffi_api.make_gemm_fragment_b_hcu(
+            out[self.B] = make_gemm_fragment_b_hcu(
                 int(self.M),
                 int(self.N),
                 int(self.K),
@@ -190,124 +208,166 @@ class GemmHCUMMAC(GemmBase):
         mbar_phase_expr: tir.PrimExpr | None = None,
     ):
         _ = layout_map
-        _ = thread_var
         _ = mbar_phase_expr
         if not target_is_hcu(target):
             raise ValueError("GemmHCUMMAC lowering requires an HCU target")
+
         thread_nums = int(thread_bounds.extent)
         meta = _resolve_hcu_mls_meta(self.gemm_node, self.A, self.B, thread_nums, target)
         a_from_mls = int(meta.a_from_mls)
         b_from_mls = int(meta.b_from_mls)
-        b_mls_trans = bool(meta.b_mls_trans)
-        element_byte_size = DataType(self.in_dtype).bits // 8
-        _ffi_api.GemmWarpPolicyComputeWarpPartitionHCU(
-            self.policy,
-            int(self.M),
-            int(self.N),
-            int(self.K),
-            int(self.k_pack),
-            int(element_byte_size),
-            int(thread_nums),
-            target,
-            int(GemmInst.HCUMMAC),
-            bool(a_from_mls),
-            bool(b_from_mls),
-            bool(meta.a_mls_trans),
-            bool(b_mls_trans),
+        warp_m, warp_n, warp_k = _compute_hcu_warp_partition(self, thread_nums, target, meta)
+        emitter = _make_hcu_emitter(self, warp_m, warp_n, warp_k, meta, target, thread_var)
+
+        k_pack = emitter.k_pack
+        in_dtype = self.in_dtype
+        inner_k = emitter.inner_k_per_warp()
+        block_K = emitter.chunk
+        micro_size_k = emitter.micro_size_k
+        local_size_a = emitter.local_size_a
+        local_size_b = emitter.local_size_b
+
+        A_region = self.ARegion
+        B_region = self.BRegion
+        C_region = self.CRegion
+        A_buf = A_region.buffer
+        B_buf = B_region.buffer
+        C_buf = C_region.buffer
+        clear_accum = self.clear_accum
+
+        assert block_K >= micro_size_k * k_pack, (
+            f"block_K ({block_K}) must be >= micro_size_k ({micro_size_k}) * k_pack ({k_pack})"
         )
-        warp_m = int(self.policy.m_warp)
-        warp_n = int(self.policy.n_warp)
-        warp_k = int(self.policy.k_warp)
+        assert block_K % (micro_size_k * k_pack) == 0, (
+            f"block_K ({block_K}) must be divisible by micro_size_k ({micro_size_k}) * k_pack ({k_pack})"
+        )
+        assert is_full_region(C_region), "Fragment output C must be a full region"
 
         use_gemm_mls = (a_from_mls and not is_fragment(self.A)) or (b_from_mls and not is_fragment(self.B))
         if use_gemm_mls:
-            if int(self.k_pack) != 1:
+            if k_pack != 1:
                 raise ValueError("gemm_mls does not support kPack > 1")
             if warp_k != 1:
                 raise ValueError("gemm_mls does not support warp on K")
-
-        if use_gemm_mls:
-            if a_from_mls and b_from_mls:
-                op_name = "tl::gemm_mls_mls"
-            elif b_from_mls:
-                op_name = "tl::gemm_r_mls" if is_fragment(self.A) else "tl::gemm_s_mls"
-            elif a_from_mls:
-                raise NotImplementedError("gemm_mls_s (A mls, B r or s) not implemented")
-            else:
-                raise RuntimeError("internal: use_gemm_mls but no MLS inputs")
-        elif is_fragment(self.A):
-            op_name = "tl::gemm_rr" if is_fragment(self.B) else "tl::gemm_rs"
-        elif is_fragment(self.B):
-            op_name = "tl::gemm_sr"
-        elif _is_shared_like(self.A) and _is_shared_like(self.B):
-            op_name = "tl::gemm_ss"
-        else:
-            raise ValueError("Unsupported HCU gemm operand scopes for tl_gemm")
-
-        parts: list[str] = []
-        parts.append(f"{op_name}<{self.M}, {self.N}, {self.K}, {warp_m}, {warp_n}, ")
-        if warp_k > 1:
-            parts.append(f"tl::WarpKParam<{warp_k}>, ")
-        parts.append(f"{int(self.trans_A)}, {int(self.trans_B)}")
-
-        if use_gemm_mls:
-            tm = tn = tka = tkb = 0
-            if a_from_mls:
-                tm = int(meta.mls_tile_m)
-                tka = int(meta.mls_tile_ka)
-            if b_from_mls:
-                tn = int(meta.mls_tile_n)
-                tkb = int(meta.mls_tile_kb)
-            parts.append(f", {int(self.k_pack)}")
-            if a_from_mls and b_from_mls:
-                parts.append(f", tl::sequence<{tm}, {tka}>, tl::sequence<{tn}, {tkb}>, 1, 1")
-            elif b_from_mls:
-                parts.append(f", tl::sequence<{tn}, {tkb}>, 1")
-            else:
-                parts.append(f", tl::sequence<{tm}, {tka}>, tl::sequence<0, 0>, 1")
-            parts.append(", ")
-            parts.append(_hcu_mls_ab_dtype_str(self.A.dtype))
-            parts.append(", ")
-            parts.append(_hcu_mls_ab_dtype_str(self.B.dtype))
-            parts.append(", float, float, tl::hcu_target_enum::")
-            parts.append(get_hcu_arch_string(target))
-        else:
-            parts.append(", ")
-            parts.append(_clear_accum_template_flag(self.clear_accum))
-            parts.append(f", {int(self.k_pack)}")
-            if b_from_mls and not b_mls_trans:
-                parts.append(", 32")
-            if int(self.wg_wait) != 0:
-                raise ValueError("wg_wait must be 0 for HCU gemm")
-
-        use_tf32 = self.use_tf32
-        if use_tf32:
-            if use_gemm_mls:
+            if self.use_tf32:
                 raise ValueError("HCU gemm: use_tf32=True is not supported for gemm_mls (MLS) path")
-            if self.A.dtype != T.float32 or self.B.dtype != T.float32:
-                raise ValueError(
-                    f"HCU gemm: use_tf32=True requires float32 A and B dtypes, got A.dtype={self.A.dtype}, B.dtype={self.B.dtype}"
-                )
 
-        parts.append(">")
-        template = "".join(parts)
+        if use_gemm_mls and a_from_mls and b_from_mls:
 
-        Aptr = retrieve_ptr(self.ARegion, "r")
-        Bptr = retrieve_ptr(self.BRegion, "r")
-        Cptr = retrieve_ptr(self.CRegion, "rw")
-        gemm_op = tir.op.Op.get("tl.tl_gemm")
+            @T.prim_func
+            def _gemm_mls_mls() -> None:
+                A_local = T.alloc_local(emitter.local_elems_a(full_k=True), in_dtype)
+                B_local = T.alloc_local(emitter.local_elems_b(full_k=True), in_dtype)
+                if clear_accum:
+                    T.clear(C_buf)
+                emitter.ldmatrix_mls_a(A_local, A_region)
+                emitter.ldmatrix_mls_b(B_local, B_region)
+                for ki in T.serial(0, inner_k):
+                    emitter.mmac(A_local, B_local, C_buf, ki)
 
-        @T.prim_func
-        def _hcu_tl_gemm() -> None:
-            tf32_ann = {"tl.hcu_tf32_ab": 1} if use_tf32 else None
-            T.call_intrin(
-                "handle",
-                gemm_op,
-                template,
-                Aptr,
-                Bptr,
-                Cptr,
-                annotations=tf32_ann,
-            )
+            return _Simplify(_gemm_mls_mls, inline_let=True)
 
-        return _Simplify(_hcu_tl_gemm, inline_let=True)
+        elif use_gemm_mls and b_from_mls:
+            if a_from_mls:
+                raise NotImplementedError("gemm_mls_s (A mls, B r or s) not implemented")
+
+            if is_fragment(self.A):
+                assert is_full_region(A_region), "Fragment input A must be a full region"
+
+                @T.prim_func
+                def _gemm_r_mls() -> None:
+                    B_local = T.alloc_local(emitter.local_elems_b(full_k=True), in_dtype)
+                    if clear_accum:
+                        T.clear(C_buf)
+                    emitter.ldmatrix_mls_b(B_local, B_region)
+                    for ki in T.serial(0, inner_k):
+                        emitter.mmac(A_buf, B_local, C_buf, ki)
+
+                return _Simplify(_gemm_r_mls, inline_let=True)
+
+            elif _is_shared_like(self.A):
+
+                @T.prim_func
+                def _gemm_s_mls() -> None:
+                    A_local = T.alloc_local(emitter.local_elems_a(), in_dtype)
+                    B_local = T.alloc_local(emitter.local_elems_b(full_k=True), in_dtype)
+                    if clear_accum:
+                        T.clear(C_buf)
+                    emitter.ldmatrix_mls_b(B_local, B_region)
+                    for ki in T.serial(0, inner_k):
+                        emitter.ldmatrix_a(A_local, A_region, ki)
+                        emitter.mmac(A_local, B_local, C_buf, ki)
+
+                return _Simplify(_gemm_s_mls, inline_let=True)
+
+            raise ValueError(f"Unsupported A scope for HCU gemm_mls: {self.A.scope()}")
+
+        elif _is_shared_like(self.A) and _is_shared_like(self.B):
+
+            @T.prim_func
+            def _gemm_ss() -> None:
+                A_local = T.alloc_local(emitter.warp_rows * local_size_a * k_pack, in_dtype)
+                B_local = T.alloc_local(emitter.warp_cols * local_size_b * k_pack, in_dtype)
+                if clear_accum:
+                    T.clear(C_buf)
+                for ki in T.serial(0, inner_k):
+                    emitter.ldmatrix_a(A_local, A_region, ki)
+                    emitter.ldmatrix_b(B_local, B_region, ki)
+                    emitter.mmac(A_local, B_local, C_buf, ki)
+
+            return _Simplify(_gemm_ss, inline_let=True)
+
+        elif _is_shared_like(self.A) and is_fragment(self.B):
+            assert is_full_region(B_region), "Fragment input B must be a full region"
+
+            @T.prim_func
+            def _gemm_sr() -> None:
+                A_local = T.alloc_local(emitter.warp_rows * local_size_a * k_pack, in_dtype)
+                if clear_accum:
+                    T.clear(C_buf)
+                for ki in T.serial(0, inner_k):
+                    emitter.ldmatrix_a(A_local, A_region, ki)
+                    emitter.mmac(A_local, B_buf, C_buf, ki)
+
+            return _Simplify(_gemm_sr, inline_let=True)
+
+        elif is_fragment(self.A) and _is_shared_like(self.B):
+            assert is_full_region(A_region), "Fragment input A must be a full region"
+
+            @T.prim_func
+            def _gemm_rs() -> None:
+                B_local = T.alloc_local(emitter.warp_cols * local_size_b * k_pack, in_dtype)
+                if clear_accum:
+                    T.clear(C_buf)
+                for ki in T.serial(0, inner_k):
+                    emitter.ldmatrix_b(B_local, B_region, ki)
+                    emitter.mmac(A_buf, B_local, C_buf, ki)
+
+            return _Simplify(_gemm_rs, inline_let=True)
+
+        elif is_fragment(self.A) and is_fragment(self.B):
+            assert is_full_region(A_region), "Fragment input A must be a full region"
+            assert is_full_region(B_region), "Fragment input B must be a full region"
+
+            @T.prim_func
+            def _gemm_rr() -> None:
+                if clear_accum:
+                    T.clear(C_buf)
+                for ki in T.serial(0, inner_k):
+                    emitter.mmac(A_buf, B_buf, C_buf, ki)
+
+            return _Simplify(_gemm_rr, inline_let=True)
+
+        raise ValueError(f"Unsupported HCU gemm operand scopes: A={self.A.scope()}, B={self.B.scope()}")
+
+    def is_gemm_ss(self) -> bool:
+        return _is_shared_like(self.A) and _is_shared_like(self.B)
+
+    def is_gemm_sr(self) -> bool:
+        return _is_shared_like(self.A) and is_fragment(self.B)
+
+    def is_gemm_rs(self) -> bool:
+        return is_fragment(self.A) and _is_shared_like(self.B)
+
+    def is_gemm_rr(self) -> bool:
+        return is_fragment(self.A) and is_fragment(self.B)

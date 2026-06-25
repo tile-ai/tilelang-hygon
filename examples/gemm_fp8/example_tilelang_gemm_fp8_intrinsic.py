@@ -97,8 +97,8 @@ def tl_matmul(
             b_transposed=True,
             block_row_warps=block_row_warps,
             block_col_warps=block_col_warps,
-            warp_row_tiles=warp_row_tiles,
-            warp_col_tiles=warp_col_tiles,
+            block_m=block_M,
+            block_n=block_N,
             chunk=chunk,
         )
         shared_scope = "shared"
