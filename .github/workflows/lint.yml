@@ -1,8 +1,8 @@
 # Hygon mirror CI: format / static checks only (self-hosted container, no GPU/DTK).
 # Upstream full CI lives on tile-ai/tilelang (.github/workflows/ci.yml).
 #
-# Runs in a slim Python container so workspace ownership matches HCU CI container jobs
-# (both write the shared runner workspace as the same container user).
+# Uses the same Harbor dev image as HCU CI (already on nmz runners). Do not use
+# library/python images — Docker Hub pulls fail on internal runners.
 name: Lint
 
 on:
@@ -36,14 +36,13 @@ env:
   PRE_COMMIT_HOME: ${{ github.workspace }}/.cache/pip/.pre-commit
   PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
   PIP_TRUSTED_HOST: mirrors.aliyun.com
-
 jobs:
   quick-lint:
     name: Quick Lint
     runs-on: self-hosted
     timeout-minutes: 30
     container:
-      image: python:3.9-bookworm
+      image: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -53,13 +52,10 @@ jobs:
 
       - name: Install lint toolchain
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends git
-          rm -rf /var/lib/apt/lists/*
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements-lint.txt
 
-      - name: Check AST with Python 3.9
+      - name: Check AST with Python 3.10
         run: python3 -m compileall -q -f tilelang
 
       - name: Pre-commit Lint
