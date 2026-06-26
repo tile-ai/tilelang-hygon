@@ -20,10 +20,7 @@ def mls_block_mn_k_from_region(region: tir.BufferRegion, mls_trans: bool) -> tup
     if isinstance(ext0, tir.IntImm) and isinstance(ext1, tir.IntImm):
         mn0, mn1 = int(ext0.value), int(ext1.value)
     else:
-        raise ValueError(
-            "ldmatrix_mls requires static MN/K tile extents on the last two region dims, "
-            f"got {ext0}, {ext1}"
-        )
+        raise ValueError(f"ldmatrix_mls requires static MN/K tile extents on the last two region dims, got {ext0}, {ext1}")
     if mls_trans:
         return mn0, mn1
     return mn1, mn0

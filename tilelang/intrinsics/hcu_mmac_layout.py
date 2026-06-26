@@ -312,9 +312,7 @@ def make_gemm_fragment_hcu(
 
     base = _micro_c_fragment(lit=lit).repeat([1, 1], repeat_on_thread=False)
     warp_layout = base.repeat([warp_m // 16, warp_n // 16], repeat_on_thread=False, lower_dim_first=True)
-    block_layout = warp_layout.repeat(
-        [block_m // warp_m, block_n // warp_n], repeat_on_thread=True, lower_dim_first=False
-    )
+    block_layout = warp_layout.repeat([block_m // warp_m, block_n // warp_n], repeat_on_thread=True, lower_dim_first=False)
     if n_recompute > 1 or num_warp_k > 1:
         block_layout = block_layout.replicate(n_recompute * num_warp_k)
     return block_layout
@@ -391,15 +389,13 @@ def make_gemm_fragment_b_hcu(
     base = _micro_ab_fragment(element_bits, k_pack, spatial_leading=spatial_leading).repeat([1, 1], repeat_on_thread=False)
     if transposed:
         warp_layout = base.repeat([warp_n // 16, warp_k // mk], repeat_on_thread=False, lower_dim_first=False)
-        block_layout = (
-            warp_layout.replicate(num_warp_m)
-            .repeat([warp_n_no_recompute, num_warp_k], repeat_on_thread=True, lower_dim_first=False)
+        block_layout = warp_layout.replicate(num_warp_m).repeat(
+            [warp_n_no_recompute, num_warp_k], repeat_on_thread=True, lower_dim_first=False
         )
     else:
         warp_layout = base.repeat([warp_k // mk, warp_n // 16], repeat_on_thread=False, lower_dim_first=True)
-        block_layout = (
-            warp_layout.replicate(num_warp_m)
-            .repeat([num_warp_k, warp_n_no_recompute], repeat_on_thread=True, lower_dim_first=True)
+        block_layout = warp_layout.replicate(num_warp_m).repeat(
+            [num_warp_k, warp_n_no_recompute], repeat_on_thread=True, lower_dim_first=True
         )
     if n_recompute > 1:
         block_layout = block_layout.replicate(n_recompute)

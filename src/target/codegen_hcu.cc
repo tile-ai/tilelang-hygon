@@ -2041,7 +2041,8 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
         "*((({C_dtype}*){c_ref}) + {c_bias}) = {mfma_buildin}("
         "*((({A_dtype}*){a_ref_cast}) + {a_bias}), "
         "*((({B_dtype}*){b_ref_cast}) + {b_bias}), "
-        "*((({C_dtype}*){c_ref}) + {c_bias}){lit_suffix}{clamp_suffix}{lts_suffix})";
+        "*((({C_dtype}*){c_ref}) + "
+        "{c_bias}){lit_suffix}{clamp_suffix}{lts_suffix})";
     std::string mfma_buildin = "__builtin_hcu_mmac_" + prefix;
     Replacer replacer;
 

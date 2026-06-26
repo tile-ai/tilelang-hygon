@@ -145,9 +145,7 @@ class GemmHCUMMAC(GemmBase):
         if not target_is_hcu(target):
             raise ValueError("GemmHCUMMAC requires an HCU target")
         meta = _resolve_hcu_mls_meta(self.gemm_node, self.A, self.B, int(thread_nums), target)
-        a_from_mls = int(meta.a_from_mls)
         b_from_mls = int(meta.b_from_mls)
-        a_mls_trans = bool(meta.a_mls_trans)
         b_mls_trans = bool(meta.b_mls_trans)
         block_size = int(thread_nums)
         warp_m, warp_n, warp_k = _compute_hcu_warp_partition(self, block_size, target, meta)
@@ -235,9 +233,7 @@ class GemmHCUMMAC(GemmBase):
         C_buf = C_region.buffer
         clear_accum = self.clear_accum
 
-        assert block_K >= micro_size_k * k_pack, (
-            f"block_K ({block_K}) must be >= micro_size_k ({micro_size_k}) * k_pack ({k_pack})"
-        )
+        assert block_K >= micro_size_k * k_pack, f"block_K ({block_K}) must be >= micro_size_k ({micro_size_k}) * k_pack ({k_pack})"
         assert block_K % (micro_size_k * k_pack) == 0, (
             f"block_K ({block_K}) must be divisible by micro_size_k ({micro_size_k}) * k_pack ({k_pack})"
         )
