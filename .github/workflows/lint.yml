@@ -1,0 +1,70 @@
+# Hygon mirror CI: format / static checks only (self-hosted container, no GPU/DTK).
+# Upstream full CI lives on tile-ai/tilelang (.github/workflows/ci.yml).
+#
+# Runs in a slim Python container so workspace ownership matches HCU CI container jobs
+# (both write the shared runner workspace as the same container user).
+name: Lint
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHONDEVMODE: "1"
+  PYTHONUNBUFFERED: "1"
+  PYTHONPATH: ""
+  PIP_USER: ""
+  COLUMNS: "100"
+  FORCE_COLOR: "1"
+  CLICOLOR_FORCE: "1"
+  XDG_CACHE_HOME: ${{ github.workspace }}/.cache
+  PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+  PRE_COMMIT_HOME: ${{ github.workspace }}/.cache/pip/.pre-commit
+  PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+  PIP_TRUSTED_HOST: mirrors.aliyun.com
+
+jobs:
+  quick-lint:
+    name: Quick Lint
+    runs-on: self-hosted
+    timeout-minutes: 30
+    container:
+      image: python:3.9-bookworm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          # Lint excludes 3rdparty/; no submodule fetch needed.
+
+      - name: Install lint toolchain
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git
+          rm -rf /var/lib/apt/lists/*
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-lint.txt
+
+      - name: Check AST with Python 3.9
+        run: python3 -m compileall -q -f tilelang
+
+      - name: Pre-commit Lint
+        run: |
+          if ! pre-commit run --all-files --color=always --show-diff-on-failure; then
+            echo "::error::Pre-commit checks failed. Run 'pre-commit run --all-files' locally."
+            exit 1
+          fi
