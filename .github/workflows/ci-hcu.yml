@@ -71,7 +71,7 @@ jobs:
       options: --privileged --ipc=host --shm-size=64g --group-add=video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ulimit stack=-1:-1 --ulimit memlock=-1:-1 --device=/dev/kfd --device=/dev/dri -v /usr/local/hyhal:/usr/local/hyhal:ro -v /opt/hyhal:/opt/hyhal:ro
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           submodules: recursive
