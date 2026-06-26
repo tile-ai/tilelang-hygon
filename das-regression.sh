@@ -4,6 +4,20 @@ set -euo pipefail
 
 export HIPBLASLT_ALLOW_TF32=1
 
+finish_pytest_status() {
+  local status="$1"
+  local phase="$2"
+  if [[ "${status}" == "5" ]]; then
+    echo "${phase}: pytest collected no tests (exit 5)" >&2
+    return 5
+  fi
+  if [[ "${status}" != "0" ]]; then
+    echo "${phase}: pytest failed with exit ${status}" >&2
+    return "${status}"
+  fi
+  return 0
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-/workspace/TileKernels}"
 TILELANG_REPO_DIR="${TILELANG_REPO_DIR:-${SCRIPT_DIR}}"
@@ -292,9 +306,10 @@ if [[ "${PRECOMPILE_TEST_KERNELS}" == "1" ]]; then
   fi
 fi
 
+pytest_status=0
 PYTHONPATH="${TILELANG_REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}" TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR}" \
   python -m pytest -p no:warnings --rootdir="${PYTEST_ROOTDIR}" \
-    "${extra_pytest_args[@]}" "${allure_args[@]}" "${ALL_NODEIDS[@]}" || true
+    "${extra_pytest_args[@]}" "${allure_args[@]}" "${ALL_NODEIDS[@]}" || pytest_status=$?
 
 if [[ "${GENERATE_ALLURE_REPORT}" == "1" ]]; then
   if command -v allure >/dev/null 2>&1; then
@@ -306,4 +321,4 @@ if [[ "${GENERATE_ALLURE_REPORT}" == "1" ]]; then
   fi
 fi
 
-exit 0
+finish_pytest_status "${pytest_status}" "das-regression"

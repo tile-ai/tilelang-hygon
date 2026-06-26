@@ -1,25 +1,22 @@
 # Hygon DCU / HCU self-hosted CI (opt-in).
 #
-# Setup checklist (when runners are ready):
-#   1. Register a GitHub Actions runner on the HCU host or containerized CI environment.
-#   2. Apply runner labels: self-hosted, hcu, hygon  (see RUNNER_LABELS below).
-#   3. Repo variable: Settings → Actions → Variables → HCU_CI_ENABLED = true
-#   4. Optional secret SECRET_PATH_PREFIXES (colon-separated paths to mask in logs).
-#   5. Branch ruleset: require "HCU Tests" after the job is stable.
+# Aligns with GitLab (.gitlab-ci.yml): nmz runner + dev base image, das-build.sh, wheel install.
+# GitLab does not set `image:` in-repo; runner tag `nmz` binds the same Harbor dev image.
 #
-# Manual smoke test (before enabling PR gates):
-#   Actions → HCU CI → Run workflow
+# Setup checklist:
+#   1. Self-hosted runner with Docker and label: self-hosted
+#   2. Job container must include --privileged (required for hy-smi/CIsmi in bridge network; nmz27 tested)
+#   3. Do not pass --network=host in options (conflicts with GHA github_network_*)
+#   4. DTK/AICC via PKG_BASE_URL download into container /opt/dtk
+#   5. Runner can pull job image and reach http://10.16.1.201:8000
+#   6. Repo variable HCU_CI_ENABLED=true enables PR/push auto-runs
 name: HCU CI
 
 on:
   workflow_dispatch:
     inputs:
-      pytest_path:
-        description: Pytest path relative to repo root
-        required: false
-        default: testing/python/hcu
       install_project:
-        description: pip install -e . before tests
+        description: Build tilelang wheel and install before tests
         type: boolean
         required: false
         default: true
@@ -40,114 +37,216 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Runner label tuple — keep in sync with runs-on below.
-  RUNNER_LABELS: '["self-hosted", "hcu", "hygon"]'
   PYTHONDEVMODE: "1"
   PYTHONUNBUFFERED: "1"
   PYTHONPATH: ""
-  PIP_USER: ""
   COLUMNS: "100"
   FORCE_COLOR: "1"
   CLICOLOR_FORCE: "1"
   TILELANG_TARGET: hip
-  # Self-hosted cache root (overridden in setup-self-hosted step).
+  # Match GitLab CI variables (.gitlab-ci.yml)
+  PIP_INDEX_URL: "http://10.16.1.201:9929/nightly/dtk2604/+simple/"
+  PIP_TRUSTED_HOST: "10.16.1.201"
+  PKG_BASE_URL: "http://10.16.1.201:8000"
+  DTK_VERSION: "dtk26.04"
+  DTK_PKG_NAME: "DTK-26.04-rc4-centos8-x86_64.tar.gz"
+  TORCH_VERSION: "2.10.0"
+  CISMI_TIMEOUT: "3600"
+  TILEKERNELS_REF: "staging"
+  TILEKERNELS_DIR: "/opt/TileKernels"
   XDG_CACHE_HOME: ${{ github.workspace }}/.cache
   PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
-  UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
 
 jobs:
   hcu-tests:
     name: HCU Tests
-    # PR/push: only after HCU_CI_ENABLED=true. workflow_dispatch always runs.
     if: |
       github.event_name == 'workflow_dispatch' ||
       vars.HCU_CI_ENABLED == 'true'
-    runs-on: [self-hosted, hcu, hygon]
-    timeout-minutes: 120
+    runs-on: self-hosted
+    timeout-minutes: 180
+    container:
+      image: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
+      # --privileged required for hy-smi/CIsmi; verified on nmz27 Harbor image + bridge network
+      options: --privileged --ipc=host --shm-size=64g --group-add=video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ulimit stack=-1:-1 --ulimit memlock=-1:-1 --device=/dev/kfd --device=/dev/dri -v /usr/local/hyhal:/usr/local/hyhal:ro -v /opt/hyhal:/opt/hyhal:ro
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          # Enable when TVM submodule is required on runner:
-          # submodules: recursive
+          submodules: recursive
 
-      - name: Setup self-hosted environment
+      - name: Install DTK
         run: |
-          if [[ -n "${{ secrets.SECRET_PATH_PREFIXES }}" ]]; then
-            echo "::add-mask::${{ secrets.SECRET_PATH_PREFIXES }}"
-            for secret in $(echo "${{ secrets.SECRET_PATH_PREFIXES }}" | tr ':' '\n'); do
-              echo "::add-mask::${secret}"
-            done
+          export_dtk_env() {
+            # shellcheck disable=SC1091
+            source /opt/dtk/env.sh
+            {
+              echo "PATH=${PATH}"
+              echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+              echo "ROCM_PATH=${ROCM_PATH:-/opt/dtk}"
+              echo "USE_ROCM=ON"
+              echo "HIP_PATH=${HIP_PATH:-/opt/dtk/hip}"
+              echo "HYHAL_PATH=${HYHAL_PATH:-/opt/hyhal}"
+              [[ -n "${CPLUS_INCLUDE_PATH:-}" ]] && echo "CPLUS_INCLUDE_PATH=${CPLUS_INCLUDE_PATH}"
+              [[ -n "${C_INCLUDE_PATH:-}" ]] && echo "C_INCLUDE_PATH=${C_INCLUDE_PATH}"
+              [[ -n "${CMAKE_PREFIX_PATH:-}" ]] && echo "CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}"
+              [[ -n "${LIBRARY_PATH:-}" ]] && echo "LIBRARY_PATH=${LIBRARY_PATH}"
+            } >> "${GITHUB_ENV}"
+          }
+
+          install_dtk_from_tar() {
+            local tar_path="$1"
+            cp -f "${tar_path}" /opt/ || mv "${tar_path}" /opt/
+            cd /opt && tar -xzf "$(basename "${tar_path}")" && mv dtk-* dtk
+            export_dtk_env
+          }
+
+          local_archived="/ArchivedFile/dtk-pkg/${DTK_VERSION}/${DTK_PKG_NAME}"
+          if [[ -f "${local_archived}" ]]; then
+            echo "Using local DTK: ${local_archived}"
+            install_dtk_from_tar "${local_archived}"
+          elif [[ -f /opt/dtk/env.sh ]]; then
+            echo "Using existing /opt/dtk"
+            export_dtk_env
+          else
+            dtk_url="${PKG_BASE_URL}/dtk-pkg/${DTK_VERSION}/${DTK_PKG_NAME}"
+            echo "Downloading DTK from ${dtk_url}"
+            curl -fL --retry 3 --retry-delay 5 -o "/tmp/${DTK_PKG_NAME}" "${dtk_url}"
+            install_dtk_from_tar "/tmp/${DTK_PKG_NAME}"
           fi
 
-          export XDG_CACHE_HOME="${{ runner.tool_cache }}/.ci-cache-${{ github.workflow }}"
-          echo "XDG_CACHE_HOME=${XDG_CACHE_HOME}" | tee -a "${GITHUB_ENV}"
-          echo "PIP_CACHE_DIR=${XDG_CACHE_HOME}/pip" | tee -a "${GITHUB_ENV}"
-          echo "UV_CACHE_DIR=${XDG_CACHE_HOME}/uv" | tee -a "${GITHUB_ENV}"
-
-          if [[ ! -x "$(command -v hipcc)" ]]; then
-            export PATH="/opt/dtk/bin:/opt/rocm/bin:${PATH}"
-            export LD_LIBRARY_PATH="/opt/dtk/lib:/opt/rocm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-            echo "PATH=${PATH}" | tee -a "${GITHUB_ENV}"
-            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" | tee -a "${GITHUB_ENV}"
-          fi
-
-          echo "USE_ROCM=ON" | tee -a "${GITHUB_ENV}"
-          echo "ROCM_PATH=${ROCM_PATH:-/opt/dtk}" | tee -a "${GITHUB_ENV}"
-
-      - name: GPU smoke check
+      - name: Install AICC
         run: |
-          if command -v hy-smi >/dev/null 2>&1; then
-            hy-smi || true
-          elif command -v rocm-smi >/dev/null 2>&1; then
-            rocm-smi || true
+          install_aicc_run() {
+            local run_file="$1"
+            cp "${run_file}" ./
+            chmod +x "$(basename "${run_file}")"
+            yes | bash "$(basename "${run_file}")"
+            echo "AICC install done: $(basename "${run_file}")"
+          }
+
+          local_run=$(ls /ArchivedFile/ai_cc/nightly/dtk_llvm_*.run 2>/dev/null | sort -t '_' -k4 -nr | head -n1)
+          if [[ -n "${local_run}" ]]; then
+            echo "Using local AICC: ${local_run}"
+            install_aicc_run "${local_run}"
           else
-            echo "::warning::No hy-smi/rocm-smi in PATH; continuing."
-          fi
-          if command -v hipcc >/dev/null 2>&1; then
-            hipcc --version
-          else
-            echo "::warning::hipcc not found; ensure DTK/ROCm is on the runner."
+            aicc_base="${PKG_BASE_URL}/ai_cc/nightly"
+            latest_run=$(curl -fsSL "${aicc_base}/" | grep -oE 'dtk_llvm_[^"]+\.run' | sort -t '_' -k4 -nr | head -n1)
+            if [[ -z "${latest_run}" ]]; then
+              echo "Skip AICC install (no dtk_llvm_*.run on ${aicc_base})"
+              exit 0
+            fi
+            echo "Downloading AICC: ${aicc_base}/${latest_run}"
+            curl -fL --retry 3 --retry-delay 5 -o "/tmp/${latest_run}" "${aicc_base}/${latest_run}"
+            install_aicc_run "/tmp/${latest_run}"
           fi
 
-      - name: Setup Python and uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.12"
-          activate-environment: true
-          enable-cache: false
-          prune-cache: false
-          cache-local-path: ${{ env.UV_CACHE_DIR }}
+      - name: Sync submodules
+        run: |
+          for i in $(seq 0 9); do
+            echo "submodule sync attempt ${i}"
+            git submodule sync --recursive
+            if git submodule update --init --recursive; then
+              echo "download submodule success"
+              break
+            fi
+            if [[ "${i}" -eq 9 ]]; then
+              echo "::error::Failed to sync submodules after 10 attempts"
+              exit 1
+            fi
+            sleep 5
+          done
+          test -f 3rdparty/tvm/CMakeLists.txt
 
-      - name: Install test dependencies
+      - name: Install dependencies and build
         run: |
           set -o pipefail
-          uv pip install --upgrade pip setuptools wheel
-          uv pip install -v -r requirements-test.txt
+          echo "PY=$(command -v python3)" >> "${GITHUB_ENV}"
+          python3 --version
+          pip3 install --upgrade pip setuptools wheel
+          # GitLab test job order (.gitlab-ci.yml)
+          pip3 install "torch==${TORCH_VERSION}" triton cismi
+          # Generic deps from public mirror (avoid slow/missing pkgs on internal devpi)
+          pip3 install -r requirements.txt -r requirements-dev.txt \
+            --index-url https://mirrors.aliyun.com/pypi/simple/ \
+            --trusted-host mirrors.aliyun.com
+          python3 -c "import z3; print('z3:', z3.__path__[0])"
           INSTALL_PROJECT=true
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.install_project }}" != "true" ]]; then
             INSTALL_PROJECT=false
           fi
           if [[ "${INSTALL_PROJECT}" == "true" ]]; then
-            uv pip install -v -e .
+            # shellcheck disable=SC1091
+            [[ -f /opt/dtk/env.sh ]] && source /opt/dtk/env.sh
+            export USE_HCU=ON
+            export USE_CUDA=OFF
+            export LD_LIBRARY_PATH="/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
+            test -f /opt/dtk/include/hsa/hsa.h || test -f /opt/hyhal/include/hsa/hsa.h
+            NO_TOOLCHAIN_VERSION=1 NO_GIT_VERSION=1 bash das-build.sh
+            pip3 install dist/*.whl
           fi
-          echo "import torch; print('torch:', torch.__version__)" | uv run --no-project --script -
-          uv run --no-project -m -- torch.utils.collect_env || true
+          # GitLab test job: regression deps (not full requirements-test.txt)
+          pip3 install numpy==1.24.3 allure-pytest pytest-xdist \
+            --index-url https://mirrors.aliyun.com/pypi/simple/ \
+            --trusted-host mirrors.aliyun.com
+          python3 -c "import torch; print('torch:', torch.__version__)"
+          python3 -m torch.utils.collect_env || true
 
       - name: Clean stale /tmp artifacts
         run: |
           rm -f /tmp/tmp*.so /tmp/tmp*.cu /tmp/tmp*.cubin /tmp/tmp*.cpp
           rm -rf /tmp/tvm-debug-mode-tempdirs /tmp/tilelang_cutedsl_*
 
-      - name: Run HCU pytest
+      - name: Clone TileKernels
         run: |
-          PYTEST_PATH="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.pytest_path || 'testing/python/hcu' }}"
-          cd testing
-          uv run --no-project -m -- pytest \
-            --verbose --color=yes --durations=0 --showlocals --cache-clear \
-            --maxfail=3 \
-            "../${PYTEST_PATH}"
+          rm -rf "${TILEKERNELS_DIR}"
+          clone_host="42.228.13.241:10068"
+          clone_path="dcutoolkit/deeplearing/TileKernels.git"
+          if [[ -n "${{ secrets.TILEKERNELS_GIT_TOKEN }}" ]]; then
+            git clone -b "${TILEKERNELS_REF}" \
+              "http://gitlab-ci-token:${{ secrets.TILEKERNELS_GIT_TOKEN }}@${clone_host}/${clone_path}" \
+              "${TILEKERNELS_DIR}"
+          else
+            git clone -b "${TILEKERNELS_REF}" \
+              "http://${clone_host}/${clone_path}" \
+              "${TILEKERNELS_DIR}"
+          fi
+
+      - name: Acquire GPU
+        run: |
+          set -eo pipefail
+          # shellcheck disable=SC1091
+          [[ -f /opt/dtk/env.sh ]] && source /opt/dtk/env.sh
+          echo "Waiting for 1 GPU via CIsmi (timeout=${CISMI_TIMEOUT}s)..."
+          if acquired="$(CIsmi need 1 --timeout "${CISMI_TIMEOUT}")"; then
+            echo "CIsmi allocated GPU(s): ${acquired}"
+          else
+            echo "::error::CIsmi need 1 failed (hy-smi JSON/device access). Check runner ROCm/CIsmi on host."
+            exit 1
+          fi
+          echo "HIP_VISIBLE_DEVICES=${acquired}" >> "${GITHUB_ENV}"
+          echo "Acquired HIP_VISIBLE_DEVICES=${acquired}"
+          if command -v hy-smi >/dev/null 2>&1; then
+            hy-smi || true
+          elif command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi || true
+          fi
+          python3 -c "import torch; assert torch.cuda.is_available(), 'torch.cuda.is_available() is False'"
+
+      - name: Run das-regression
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          [[ -f /opt/dtk/env.sh ]] && source /opt/dtk/env.sh
+          mkdir -p "${GITHUB_WORKSPACE}/das-results/allure-results"
+          : "${HIP_VISIBLE_DEVICES:?HIP_VISIBLE_DEVICES must be set by Acquire GPU step}"
+          REPO_DIR="${TILEKERNELS_DIR}" \
+            TILELANG_REPO_DIR="${GITHUB_WORKSPACE}" \
+            TILELANG_CACHE_DIR="${GITHUB_WORKSPACE}/cache_test" \
+            TEST_RESULTS_DIR="${GITHUB_WORKSPACE}/das-results" \
+            GENERATE_ALLURE_REPORT=1 \
+            bash das-regression.sh --junitxml="${GITHUB_WORKSPACE}/das-results/allure-results/results.xml"
 
       - name: List generated files
         if: ${{ !cancelled() }}

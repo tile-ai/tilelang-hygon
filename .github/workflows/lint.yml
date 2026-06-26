@@ -1,4 +1,4 @@
-# Hygon mirror CI: format / static checks only (GitHub-hosted, no GPU).
+# Hygon mirror CI: format / static checks only (self-hosted, no GPU).
 # Upstream full CI lives on tile-ai/tilelang (.github/workflows/ci.yml).
 name: Lint
 
@@ -35,33 +35,38 @@ env:
 jobs:
   quick-lint:
     name: Quick Lint
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           # Lint excludes 3rdparty/; no submodule fetch needed.
 
-      - name: Setup Python 3.9
-        id: setup-pylowest
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.9"
-          cache: pip
-          cache-dependency-path: |
-            pyproject.toml
-            requirements*.txt
-            .pre-commit-config.yaml
+      - name: Select Python interpreters
+        id: python
+        run: |
+          PYTHON39="$(command -v python3.9)"
+          PYTHON312="$(command -v python3.12)"
+          "${PYTHON39}" --version
+          "${PYTHON312}" --version
+          echo "python39-path=${PYTHON39}" >> "${GITHUB_OUTPUT}"
+          echo "python312-path=${PYTHON312}" >> "${GITHUB_OUTPUT}"
 
       - name: Check AST with Python 3.9
         run: |
-          "${{ steps.setup-pylowest.outputs.python-path }}" -m compileall -q -f tilelang
+          "${{ steps.python.outputs.python39-path }}" -m compileall -q -f tilelang
 
       - name: Pre-commit Lint
         run: |
-          if ! pipx run pre-commit run --all-files --color=always --show-diff-on-failure; then
+          PY312="${{ steps.python.outputs.python312-path }}"
+          export PATH="${HOME}/.local/bin:${PATH}"
+          if ! "${PY312}" -m pip --version >/dev/null 2>&1; then
+            "${PY312}" -m ensurepip --user --upgrade
+          fi
+          "${PY312}" -m pip install --user pre-commit
+          if ! "${PY312}" -m pre_commit run --all-files --color=always --show-diff-on-failure; then
             echo "::error::Pre-commit checks failed. Run 'pre-commit run --all-files' locally."
             exit 1
           fi
