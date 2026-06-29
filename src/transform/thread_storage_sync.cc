@@ -1519,13 +1519,13 @@ private:
 
   // Prove loop-carried write->write is disjoint by fixing the loop var to each
   // constant iteration (e.g. unroll(4) stores) and reusing the same-thread WAW
-  // index disjointness check. This avoids treating relaxed loop touched ranges as one
-  // whole merged sub-buffer view.
+  // index disjointness check. This avoids treating relaxed loop touched ranges
+  // as one whole merged sub-buffer view.
   static bool BufferIndicesProvablyDisjointAtLoopStep(const AccessEntry &prev,
-                                                  const AccessEntry &curr,
-                                                  const ForNode *loop,
-                                                  int64_t loop_k,
-                                                  int64_t loop_step) {
+                                                      const AccessEntry &curr,
+                                                      const ForNode *loop,
+                                                      int64_t loop_k,
+                                                      int64_t loop_step) {
     ICHECK(prev.buffer_indices.size() == curr.buffer_indices.size());
     arith::Analyzer analyzer;
     ConstrSet prev_cset{prev.cset};
@@ -1544,19 +1544,23 @@ private:
     curr_cset.Substitute(curr_sub).Populate(analyzer);
 
     PrimExpr loop_k_expr = make_const(loop->loop_var.dtype(), loop_k);
-    PrimExpr loop_k_next = make_const(loop->loop_var.dtype(), loop_k + loop_step);
+    PrimExpr loop_k_next =
+        make_const(loop->loop_var.dtype(), loop_k + loop_step);
 
     for (size_t dim = 0; dim < prev.buffer_indices.size(); ++dim) {
       const auto &prev_dtype = prev.dtype;
       const auto &curr_dtype = curr.dtype;
-      PrimExpr prev_idx = Substitute(prev.buffer_indices[dim], {{loop->loop_var, loop_k_expr}});
+      PrimExpr prev_idx =
+          Substitute(prev.buffer_indices[dim], {{loop->loop_var, loop_k_expr}});
       PrimExpr curr_idx =
           Substitute(curr.buffer_indices[dim], {{loop->loop_var, loop_k_next}});
       prev_idx = Substitute(prev_idx, prev_sub);
       curr_idx = Substitute(curr_idx, curr_sub);
 
-      PrimExpr prev_idx_bytes = analyzer.Simplify(prev_idx * prev_dtype.bytes());
-      PrimExpr curr_idx_bytes = analyzer.Simplify(curr_idx * curr_dtype.bytes());
+      PrimExpr prev_idx_bytes =
+          analyzer.Simplify(prev_idx * prev_dtype.bytes());
+      PrimExpr curr_idx_bytes =
+          analyzer.Simplify(curr_idx * curr_dtype.bytes());
 
       if (const RampNode *prev_ramp = prev_idx_bytes.as<RampNode>()) {
         DataType prev_index_dtype = prev_ramp->base.dtype();
@@ -1571,7 +1575,8 @@ private:
         curr_idx_bytes = curr_ramp->base + curr_lane * curr_ramp->stride;
       }
 
-      if (prev_idx_bytes.dtype().is_scalar() && curr_idx_bytes.dtype().is_scalar()) {
+      if (prev_idx_bytes.dtype().is_scalar() &&
+          curr_idx_bytes.dtype().is_scalar()) {
         if (prev_idx_bytes.dtype() != curr_idx_bytes.dtype()) {
           if (prev_idx_bytes.dtype().bits() < curr_idx_bytes.dtype().bits()) {
             prev_idx_bytes = tir::Cast(curr_idx_bytes.dtype(), prev_idx_bytes);
@@ -1599,8 +1604,8 @@ private:
   }
 
   static bool LoopCarriedWriteIndicesDisjoint(const AccessEntry &prev,
-                                             const AccessEntry &curr,
-                                             const ForNode *loop) {
+                                              const AccessEntry &curr,
+                                              const ForNode *loop) {
     if (loop == nullptr) {
       return false;
     }
