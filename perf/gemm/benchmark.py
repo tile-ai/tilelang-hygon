@@ -79,7 +79,7 @@ def main(
             raise ValueError(f"Autotune not supported for {impl} implementation. Supported: persistent, vanilla")
     else:
         kernel_version = get_default_kernel_version(impl)
-        config = get_heuristic_config(impl, kernel_version)
+        config = get_heuristic_config(impl, kernel_version, M, N, K)
 
         if impl == "persistent":
             # kernel = gemm_persistent(M, N, K, dtype=dtype, **config)

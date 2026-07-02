@@ -146,7 +146,7 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
         if arch in ["gfx938", "gfx92a", "gfx946"]:
             flags.append("-mllvm=-hcu-update-wait-by-reverse-search=true")
             flags.append("-mllvm=-hcu-pre-emit-load-store-opt=false")
-            # enable this flag when clang supports it
+            # Pending upstream clang release; re-enable when -hcu-trust-special-waitcnt-for-lds-dma ships.
             # flags.append("-mllvm=-hcu-trust-special-waitcnt-for-lds-dma=true")
         return flags
     else:
