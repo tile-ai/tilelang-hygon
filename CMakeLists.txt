@@ -78,25 +78,9 @@ set(TILELANG_BACKEND_DOC_ROCM "Enable ROCm backend (ON/OFF/or ROCm SDK path)")
 set(TILELANG_BACKEND_DOC_METAL "Enable Metal backend")
 set(TILELANG_BACKEND_DOC_HCU "Enable HCU backend (requires ROCm; ON/OFF)")
 
-# Seed USE_* from the environment so e.g. `USE_HCU=ON USE_CUDA=OFF pip install ...`
-# matches compile.sh without passing -DUSE_* to CMake.
-if(DEFINED ENV{USE_HCU})
-  string(TOUPPER "$ENV{USE_HCU}" _env_use_hcu)
-  if(_env_use_hcu MATCHES "^(1|ON|TRUE|YES)$")
-    set(USE_HCU ON)
-    set(USE_ROCM ON)
-  elseif(_env_use_hcu MATCHES "^(0|OFF|FALSE|NO)$")
-    set(USE_HCU OFF)
-  endif()
-endif()
-if(DEFINED ENV{USE_CUDA})
-  string(TOUPPER "$ENV{USE_CUDA}" _env_use_cuda)
-  if(_env_use_cuda MATCHES "^(0|OFF|FALSE|NO)$")
-    set(USE_CUDA OFF)
-  elseif(_env_use_cuda MATCHES "^(1|ON|TRUE|YES)$")
-    set(USE_CUDA ON)
-  endif()
-endif()
+set(USE_HCU ON)
+set(USE_ROCM ON)
+set(USE_CUDA OFF)
 
 # TVM's config.cmake redefines USE_* options later, so we cache the user's choice
 # (including explicit -DUSE_XXX arguments) before we include TVM and restore it
