@@ -16,7 +16,7 @@ tilelang-hygon supports almost all upstream TileLang syntax.
 
 ## Latest News
 
-- **0.1.9+hygon** — Based on TileLang 0.1.9 for Hygon DCU. Use `build.sh` for source builds.
+- **v0.1.9-release** — Based on TileLang 0.1.9 for Hygon DCU. Use `build.sh` for source builds.
 
 ## Tested Devices
 
