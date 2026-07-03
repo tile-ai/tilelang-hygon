@@ -1,6 +1,12 @@
 # Hygon mirror CI: format / static checks only (self-hosted container, no GPU/DTK).
 # Upstream full CI lives on tile-ai/tilelang (.github/workflows/ci.yml).
 #
+# Branch gating (GitHub → Settings → Secrets and variables → Actions → Variables):
+#   LINT_PUSH_BRANCHES      comma-separated push targets, e.g. main,v0.1.9-release,staging
+#   LINT_PR_BASE_BRANCHES   comma-separated PR base branches, e.g. main,v0.1.9-release,staging
+# Add a branch name in the web UI to enable lint; no workflow edit required.
+# workflow_dispatch always runs.
+#
 # Uses the same Harbor dev image as HCU CI (already on nmz runners). Do not use
 # library/python images — Docker Hub pulls fail on internal runners.
 name: Lint
@@ -12,8 +18,6 @@ on:
       - synchronize
       - reopened
   push:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
@@ -39,6 +43,14 @@ env:
 jobs:
   quick-lint:
     name: Quick Lint
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+        vars.LINT_PUSH_BRANCHES != '' &&
+        contains(format(',{0},', vars.LINT_PUSH_BRANCHES), format(',{0},', github.ref_name))) ||
+      (github.event_name == 'pull_request' &&
+        vars.LINT_PR_BASE_BRANCHES != '' &&
+        contains(format(',{0},', vars.LINT_PR_BASE_BRANCHES), format(',{0},', github.base_ref)))
     runs-on: self-hosted
     timeout-minutes: 30
     container:

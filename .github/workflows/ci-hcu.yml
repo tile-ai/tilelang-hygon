@@ -9,7 +9,11 @@
 #   3. Do not pass --network=host in options (conflicts with GHA github_network_*)
 #   4. DTK/AICC via PKG_BASE_URL download into container /opt/dtk
 #   5. Runner can pull job image and reach http://10.16.1.201:8000
-#   6. Repo variable HCU_CI_ENABLED=true enables PR/push auto-runs
+#   6. Set repo variables (Settings → Actions → Variables) to enable auto-runs:
+#        HCU_CI_PUSH_BRANCHES=main,v0.1.9-release
+#        HCU_CI_PR_BASE_BRANCHES=main,v0.1.9-release
+#      Add branch names in the web UI without editing this workflow.
+#      workflow_dispatch always runs.
 name: HCU CI
 
 on:
@@ -26,8 +30,6 @@ on:
       - synchronize
       - reopened
   push:
-    branches:
-      - main
 
 permissions:
   contents: read
@@ -62,7 +64,12 @@ jobs:
     name: HCU Tests
     if: |
       github.event_name == 'workflow_dispatch' ||
-      vars.HCU_CI_ENABLED == 'true'
+      (github.event_name == 'push' &&
+        vars.HCU_CI_PUSH_BRANCHES != '' &&
+        contains(format(',{0},', vars.HCU_CI_PUSH_BRANCHES), format(',{0},', github.ref_name))) ||
+      (github.event_name == 'pull_request' &&
+        vars.HCU_CI_PR_BASE_BRANCHES != '' &&
+        contains(format(',{0},', vars.HCU_CI_PR_BASE_BRANCHES), format(',{0},', github.base_ref)))
     runs-on: self-hosted
     timeout-minutes: 180
     container:
