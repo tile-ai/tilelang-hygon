@@ -70,7 +70,7 @@ jobs:
       (github.event_name == 'pull_request' &&
         vars.HCU_CI_PR_BASE_BRANCHES != '' &&
         contains(format(',{0},', vars.HCU_CI_PR_BASE_BRANCHES), format(',{0},', github.base_ref)))
-    runs-on: self-hosted
+    runs-on: nmz4-test
     timeout-minutes: 180
     container:
       image: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
