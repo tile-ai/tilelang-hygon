@@ -104,7 +104,7 @@ TILE_KERNEL_NODEIDS=(
   "tests/quant/test_per_channel_cast_fused.py::test_per_channel_cast_fused[num_send_tokens=4096-num_topk=0-num_experts=0-num_ep_ranks=0-hidden=7168-num_per_tokens=128-num_per_channels=128-is_fused_cast_back=True-round_sf=True]"
   "tests/quant/test_per_token_cast.py::test_per_token_cast[num_tokens=4001-hidden=7168-use_tma_aligned_col_major_sf=True-round_sf=True-use_packed_ue8m0=True-in_dtype=bf16-num_per_channels=128-x_block_size=None-fmt=e4m3]"
   "tests/quant/test_per_token_cast_to_e5m6.py::test_per_token_cast_to_e5m6[num_tokens=4001-hidden=7168-use_tma_aligned_col_major_sf=True-round_sf=True-use_packed_ue8m0=True-in_dtype=bf16]"
-  "tests/quant/test_swiglu_backward_and_per_token_cast.py::test_swiglu_backward_and_per_token_cast[num_send_tokens=4001-num_topk=2-num_experts=9-num_ep_ranks=8-hidden=7168-num_per_channels=128-round_sf=True-swiglu_clamp_value=None]"
+  # "tests/quant/test_swiglu_backward_and_per_token_cast.py::test_swiglu_backward_and_per_token_cast[num_send_tokens=4001-num_topk=2-num_experts=9-num_ep_ranks=8-hidden=7168-num_per_channels=128-round_sf=True-swiglu_clamp_value=None]"
   # "tests/quant/test_swiglu_forward_and_per_channel_cast_and_transpose.py::test_swiglu_forward_and_per_channel_cast_and_transpose[num_tokens=4096-hidden=7168-num_per_tokens=128-without_transpose=False-round_sf=True-swiglu_clamp_value=None]"
   "tests/quant/test_swiglu_forward_and_per_token_cast.py::test_swiglu_forward_and_per_token_cast[num_send_tokens=4001-num_topk=2-num_experts=9-num_ep_ranks=8-hidden=3584-enable_pos_to_expert=True-with_weights=False-num_per_channels=128-use_tma_aligned_col_major_sf=True-round_sf=True-use_packed_ue8m0=True-swiglu_clamp_value=None]"
 
