@@ -1,7 +1,7 @@
 #pragma once
 
-#include <tl_templates/hcu/common.h>
 #include <cstdint>
+#include <tl_templates/hcu/common.h>
 
 #include <tl_templates/hcu/core/arch/amd_buffer_addressing.hpp>
 
@@ -30,9 +30,9 @@ TL_DEVICE void hcu_direct_load_global_to_lds_impl_offen(
 
   const int32x4_t src_resource = make_wave_buffer_resource(
       global_base_ptr,
-      static_cast<u32>(static_cast<std::uint64_t>(
-                           static_cast<u32>(src_element_space_size)) *
-                       sizeof(T)));
+      static_cast<u32>(
+          static_cast<std::uint64_t>(static_cast<u32>(src_element_space_size)) *
+          sizeof(T)));
 
   const std::int32_t element_offset_bytes =
       is_valid ? global_offset * static_cast<std::int32_t>(sizeof(T))
@@ -43,46 +43,42 @@ TL_DEVICE void hcu_direct_load_global_to_lds_impl_offen(
       __builtin_amdgcn_readfirstlane(reinterpret_cast<uintptr_t>(lds_ptr));
 
   if constexpr (ReadSize == 4) {
-    asm volatile("s_mov_b32 m0, %0; \n\t"
-                 "buffer_load_dword %1, %2, 0 offen lds;\n\t"
-                 ::"s"(lds_ptr_sgpr),
-                 "v"(element_offset_bytes),
-                 "s"(src_resource)
-                 : "memory");
+    asm volatile(
+        "s_mov_b32 m0, %0; \n\t"
+        "buffer_load_dword %1, %2, 0 offen lds;\n\t" ::"s"(lds_ptr_sgpr),
+        "v"(element_offset_bytes), "s"(src_resource)
+        : "memory");
   } else if constexpr (ReadSize == 8) {
-    asm volatile("s_mov_b32 m0, %0; \n\t"
-                 "buffer_load_dwordx2 %1, %2, 0 offen lds;\n\t"
-                 ::"s"(lds_ptr_sgpr),
-                 "v"(element_offset_bytes),
-                 "s"(src_resource)
-                 : "memory");
+    asm volatile(
+        "s_mov_b32 m0, %0; \n\t"
+        "buffer_load_dwordx2 %1, %2, 0 offen lds;\n\t" ::"s"(lds_ptr_sgpr),
+        "v"(element_offset_bytes), "s"(src_resource)
+        : "memory");
   } else {
-    asm volatile("s_mov_b32 m0, %0; \n\t"
-                 "buffer_load_dwordx4 %1, %2, 0 offen lds;\n\t"
-                 ::"s"(lds_ptr_sgpr),
-                 "v"(element_offset_bytes),
-                 "s"(src_resource)
-                 : "memory");
+    asm volatile(
+        "s_mov_b32 m0, %0; \n\t"
+        "buffer_load_dwordx4 %1, %2, 0 offen lds;\n\t" ::"s"(lds_ptr_sgpr),
+        "v"(element_offset_bytes), "s"(src_resource)
+        : "memory");
   }
 }
 
 } // namespace detail
 
-// 与 codegen_hcu.cc / CK `hcu_direct_load_global_to_lds` 参数语义一致；仅实现 UseIdxenLoad=false。
+// 与 codegen_hcu.cc / CK `hcu_direct_load_global_to_lds` 参数语义一致；仅实现
+// UseIdxenLoad=false。
 template <typename T, int NumElemsPerThread, bool UseIdxenLoad = false>
-TL_DEVICE void hcu_direct_load_global_to_lds(const T *global_base_ptr,
-                                               std::int32_t global_offset,
-                                               T *lds_base_ptr,
-                                               std::int32_t lds_offset,
-                                               bool is_valid,
-                                               std::int32_t src_element_space_size,
-                                               std::uint8_t wave_lds_wrap_offset = 0) {
+TL_DEVICE void hcu_direct_load_global_to_lds(
+    const T *global_base_ptr, std::int32_t global_offset, T *lds_base_ptr,
+    std::int32_t lds_offset, bool is_valid, std::int32_t src_element_space_size,
+    std::uint8_t wave_lds_wrap_offset = 0) {
   static_assert(sizeof(T) * NumElemsPerThread == 4 ||
                     sizeof(T) * NumElemsPerThread == 8 ||
                     sizeof(T) * NumElemsPerThread == 16,
                 "ReadSize must be 4, 8 or 16 bytes");
-  static_assert(!UseIdxenLoad,
-                "tl::hcu_direct_load_global_to_lds: Idxen path not implemented");
+  static_assert(
+      !UseIdxenLoad,
+      "tl::hcu_direct_load_global_to_lds: Idxen path not implemented");
 
   constexpr int kReadSize = sizeof(T) * NumElemsPerThread;
   detail::hcu_direct_load_global_to_lds_impl_offen<T, kReadSize>(
@@ -92,9 +88,10 @@ TL_DEVICE void hcu_direct_load_global_to_lds(const T *global_base_ptr,
 
 namespace detail {
 
-// 与 codegen_hcu.cc 约定：全局/global 传入「本线程区域起点」，须折算为 wave 统一基址 g_wave +
-// 元素偏移 off（buffer_load + readfirstlane）。LDS 侧 impl 会做 lds_ptr = base + lds_offset，
-// 与 (lds_wave, off) 代数上等价于 (l, 0)，故直接传本线程指针 l 与 lds_offset=0 即可。
+// 与 codegen_hcu.cc 约定：全局/global 传入「本线程区域起点」，须折算为 wave
+// 统一基址 g_wave + 元素偏移 off（buffer_load + readfirstlane）。LDS 侧 impl
+// 会做 lds_ptr = base + lds_offset， 与 (lds_wave, off) 代数上等价于 (l,
+// 0)，故直接传本线程指针 l 与 lds_offset=0 即可。
 template <int NumUint32PerThread>
 TL_DEVICE void hcu_cp_async_gs_via_direct_lds(void *lds_base_ptr,
                                               void const *global_base_ptr,
@@ -111,7 +108,8 @@ TL_DEVICE void hcu_cp_async_gs_via_direct_lds(void *lds_base_ptr,
       g - static_cast<size_t>(lane) * static_cast<size_t>(NumUint32PerThread);
   const std::int32_t off = lane * static_cast<std::int32_t>(NumUint32PerThread);
 
-  // dword global→LDS 多数 HCU/gfx 可用；dwordx2/x4 依赖 ISA，不支持时退回同步向量读写以免非法指令或静默错误。
+  // dword global→LDS 多数 HCU/gfx 可用；dwordx2/x4 依赖
+  // ISA，不支持时退回同步向量读写以免非法指令或静默错误。
 #if defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
 #define TL_HCU_GLOBAL_TO_LDS_ASYNC_MULTIDWORD 1
 #else
@@ -164,9 +162,10 @@ template <int N = 0> TL_DEVICE void cp_async_wait() {
 
 template <int N>
 TL_DEVICE void cp_async_gs(void *lds_base_ptr, void const *global_base_ptr) {
-  static_assert(N == 4 || N == 8 || N == 16, "tl::cp_async_gs: only N in {4,8,16}");
+  static_assert(N == 4 || N == 8 || N == 16,
+                "tl::cp_async_gs: only N in {4,8,16}");
   detail::hcu_cp_async_gs_via_direct_lds<N / 4>(lds_base_ptr, global_base_ptr,
-                                                  true);
+                                                true);
 }
 
 template <int N>
@@ -175,40 +174,36 @@ TL_DEVICE void cp_async_gs_conditional(void *lds_base_ptr,
   static_assert(N == 4 || N == 8 || N == 16,
                 "tl::cp_async_gs_conditional: only N in {4,8,16}");
   detail::hcu_cp_async_gs_via_direct_lds<N / 4>(lds_base_ptr, global_base_ptr,
-                                                  cond);
+                                                cond);
 }
 
 // amd_buffer_load for tilelang
-template <typename T,
-          tl::index_t N,
-          bool oob_conditional_check = true>
+template <typename T, tl::index_t N, bool oob_conditional_check = true>
 TL_DEVICE tl::thread_buffer<T, N>
-amd_buffer_load(const T *p_src_wave,
-                tl::index_t src_thread_element_offset,
+amd_buffer_load(const T *p_src_wave, tl::index_t src_thread_element_offset,
                 bool src_thread_element_valid,
                 tl::index_t src_element_space_size) {
-  const int32x4_t src_wave_buffer_resource = make_wave_buffer_resource(p_src_wave);
+  const int32x4_t src_wave_buffer_resource =
+      make_wave_buffer_resource(p_src_wave);
 
-    tl::index_t src_thread_addr_offset = [&]() {
-      if constexpr (oob_conditional_check)
-        return src_thread_element_valid ? src_thread_element_offset * sizeof(T) : 0xffffffff;
-      else
-        return src_thread_element_offset * sizeof(T);
-    }();
-  return tl::amd_buffer_load_impl<T, N>(
-      src_wave_buffer_resource, src_thread_addr_offset, 0);
-
+  tl::index_t src_thread_addr_offset = [&]() {
+    if constexpr (oob_conditional_check)
+      return src_thread_element_valid ? src_thread_element_offset * sizeof(T)
+                                      : 0xffffffff;
+    else
+      return src_thread_element_offset * sizeof(T);
+  }();
+  return tl::amd_buffer_load_impl<T, N>(src_wave_buffer_resource,
+                                        src_thread_addr_offset, 0);
 }
 
 // amd_buffer_store for tilelang
-template <typename T,
-          tl::index_t N,
-          bool oob_conditional_check = true>
-TL_DEVICE void amd_buffer_store(
-    const tl::thread_buffer<T, N> &src_thread_data, T *p_dst_wave,
-    const tl::index_t dst_thread_element_offset,
-    const bool dst_thread_element_valid,
-    const tl::index_t dst_element_space_size) {
+template <typename T, tl::index_t N, bool oob_conditional_check = true>
+TL_DEVICE void amd_buffer_store(const tl::thread_buffer<T, N> &src_thread_data,
+                                T *p_dst_wave,
+                                const tl::index_t dst_thread_element_offset,
+                                const bool dst_thread_element_valid,
+                                const tl::index_t dst_element_space_size) {
   const int32x4_t dst_wave_buffer_resource =
       make_wave_buffer_resource(p_dst_wave);
 
@@ -219,8 +214,8 @@ TL_DEVICE void amd_buffer_store(
     else
       return dst_thread_element_offset * sizeof(T);
   }();
-  tl::amd_buffer_store_impl<T, N>(
-      src_thread_data, dst_wave_buffer_resource, dst_thread_addr_offset, 0);
+  tl::amd_buffer_store_impl<T, N>(src_thread_data, dst_wave_buffer_resource,
+                                  dst_thread_addr_offset, 0);
 }
 
 } // namespace tl

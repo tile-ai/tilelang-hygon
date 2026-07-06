@@ -8,8 +8,7 @@ import tilelang.language as T
 
 
 @tl.jit(out_idx=[-1])
-def gemm_streamk(M, N, K, block_M, block_N, block_K, num_stages, thread_num,
-           dtype="float16", accum_dtype="float"):
+def gemm_streamk(M, N, K, block_M, block_N, block_K, num_stages, thread_num, dtype="float16", accum_dtype="float"):
     """
     Stream-K GEMM implementation that linearizes the iteration space
     to achieve perfect load balancing across CUs.
@@ -23,7 +22,7 @@ def gemm_streamk(M, N, K, block_M, block_N, block_K, num_stages, thread_num,
     # Calculate Stream-K parameters
     streamk_programs = cu_num
     streamk_tiles = total_tiles % streamk_programs
-    if (total_tiles - streamk_tiles > streamk_programs):
+    if total_tiles - streamk_tiles > streamk_programs:
         streamk_tiles += streamk_programs
 
     blocking_tiles = total_tiles - streamk_tiles
@@ -62,16 +61,8 @@ def gemm_streamk(M, N, K, block_M, block_N, block_K, num_stages, thread_num,
             T.clear(C_local)
             for k in T.Pipelined(end_iter[0] - start_iter[0], num_stages=num_stages):
                 k_offset = k + (start_iter[0] % iters_per_tile)
-                T.copy(
-                    A_buf[pid_m * block_M, k_offset * block_K],
-                    A_buf_shared,
-                    coalesced_width=8
-                )
-                T.copy(
-                    B_buf[pid_n * block_N, k_offset * block_K],
-                    B_buf_shared,
-                    coalesced_width=8
-                )
+                T.copy(A_buf[pid_m * block_M, k_offset * block_K], A_buf_shared, coalesced_width=8)
+                T.copy(B_buf[pid_n * block_N, k_offset * block_K], B_buf_shared, coalesced_width=8)
                 T.gemm(A_buf_shared, B_buf_shared, C_local, k_pack=2, transpose_B=True)
 
             # If this is a complete tile (started at iteration 0 and ends at tile boundary)
@@ -109,10 +100,10 @@ def gemm_streamk(M, N, K, block_M, block_N, block_K, num_stages, thread_num,
 
     @T.prim_func
     def _gemm_streamk(
-            A: T.Tensor((M, K), dtype),
-            B: T.Tensor((N, K), dtype),
-            #C: T.Tensor((M, N), dtype),
-            C: T.Tensor((M, N), accum_dtype),
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((N, K), dtype),
+        # C: T.Tensor((M, N), dtype),
+        C: T.Tensor((M, N), accum_dtype),
     ):
         with T.Kernel(streamk_programs, threads=thread_num) as pid:
             A_shared = T.alloc_shared((block_M, block_K), dtype)

@@ -293,7 +293,8 @@ private:
       }
     }
     if (const auto *matrix_load = tile_op.as<MatrixLoadNode>()) {
-      if (IsGlobalLikeBuffer(matrix_load->src) && IsSharedBuffer(matrix_load->dst)) {
+      if (IsGlobalLikeBuffer(matrix_load->src) &&
+          IsSharedBuffer(matrix_load->dst)) {
         is_global_copy_pattern_ = true;
       }
       return;
@@ -434,7 +435,8 @@ private:
       if (dst_region) {
         writes_.push_back(*dst_region);
       }
-      if (src_region && dst_region && (*src_region)->buffer.scope() == "global" &&
+      if (src_region && dst_region &&
+          (*src_region)->buffer.scope() == "global" &&
           ((*dst_region)->buffer.scope() == "shared" ||
            (*dst_region)->buffer.scope() == "shared.dyn")) {
         is_global_copy_pattern_ = true;
@@ -813,7 +815,8 @@ private:
     }
 
     if (const auto *matrix_load = copy_tile_op.value().as<MatrixLoadNode>()) {
-      if (!IsGlobalLikeBuffer(matrix_load->src) || !IsSharedBuffer(matrix_load->dst)) {
+      if (!IsGlobalLikeBuffer(matrix_load->src) ||
+          !IsSharedBuffer(matrix_load->dst)) {
         return;
       }
       pinfo->copy_stage = true;

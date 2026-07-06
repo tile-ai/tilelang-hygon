@@ -136,8 +136,10 @@ def do_bench(
     else:
         raise ValueError(f"Unknown profiler backend: {backend}")
 
+
 def _summarize_statistics(times, quantiles, return_mode):
     import torch
+
     if quantiles is not None:
         ret = torch.quantile(times, torch.tensor(quantiles, dtype=torch.float)).tolist()
         if len(ret) == 1:
@@ -147,12 +149,14 @@ def _summarize_statistics(times, quantiles, return_mode):
         return times.tolist()
     return getattr(torch, return_mode)(times).item()
 
+
 def do_bench_cudagraph(
     fn: Callable,
     rep: float = 20,
     grad_to_none=None,
-    quantiles: Optional[List[float]] = None,
-    return_mode: Literal["min", "max", "mean", "median", "all"] = "mean"):
+    quantiles: list[float] | None = None,
+    return_mode: Literal["min", "max", "mean", "median", "all"] = "mean",
+):
     """
     Benchmark the runtime of the provided function.
 
@@ -166,6 +170,7 @@ def do_bench_cudagraph(
     :type return_mode: str
     """
     import torch
+
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
     with torch.cuda.stream(torch.cuda.Stream()):

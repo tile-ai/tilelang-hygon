@@ -8,10 +8,10 @@
 #define TVM_TL_OP_BUILTIN_H_
 
 #include "operator.h"
+#include <string>
+#include <tvm/ir/transform.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
-#include <tvm/ir/transform.h>
-#include <string>
 
 namespace tvm {
 /*!

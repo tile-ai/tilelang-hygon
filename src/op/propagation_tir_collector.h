@@ -35,22 +35,23 @@ struct CallNodePtrEqual {
 };
 
 /*!
- * \brief One producer event: a tile-op call (or BufferStore) that writes `write`
- * after reading `inputs`, in program order `stmt_order`.
+ * \brief One producer event: a tile-op call (or BufferStore) that writes
+ * `write` after reading `inputs`, in program order `stmt_order`.
  *
  * `stmt_order` is monotonic over the kernel body and is used to pair a
  * ds_read_format (or other reader) with the **first** downstream GEMM that
- * actually consumes the same fragment after that site — even when multiple GEMMs
- * inplace-accumulate into the same `C_local`.
+ * actually consumes the same fragment after that site — even when multiple
+ * GEMMs inplace-accumulate into the same `C_local`.
  */
 struct ProducerRecord {
-  const CallNode *call{nullptr};  // null for pure BufferStore producers
+  const CallNode *call{nullptr}; // null for pure BufferStore producers
   std::vector<Buffer> inputs;
   int stmt_order{0};
 };
 
 /*!
- * \brief A tile-op call that reads `read` (among its inputs) and writes `write`.
+ * \brief A tile-op call that reads `read` (among its inputs) and writes
+ * `write`.
  */
 struct ReaderCallRecord {
   const CallNode *call{nullptr};
@@ -64,7 +65,7 @@ struct ReaderCallRecord {
  * non-TileOperator (e.g. ieee_mul).
  */
 class PropagationTirCollector {
- public:
+public:
   explicit PropagationTirCollector(Map<Var, Buffer> buffer_data_to_buffer);
 
   void Collect(const Stmt &body);
@@ -77,7 +78,8 @@ class PropagationTirCollector {
 
   /*!
    * \brief Tile-op calls that list `buffer` among their inputs.
-   * One entry per producer event (duplicates kept when the same op pattern repeats).
+   * One entry per producer event (duplicates kept when the same op pattern
+   * repeats).
    */
   std::vector<ReaderCallRecord> GetReaderCalls(const Buffer &buffer) const;
 
@@ -85,17 +87,18 @@ class PropagationTirCollector {
    * \brief First GEMM producer of `write_buf` (stmt_order > after_order) whose
    * inputs include `read_buf`. Returns nullopt if none.
    */
-  std::optional<ProducerRecord> FindFirstGemmProducerReading(const Buffer &write_buf,
-                                                             const Buffer &read_buf,
-                                                             int after_order = -1) const;
+  std::optional<ProducerRecord>
+  FindFirstGemmProducerReading(const Buffer &write_buf, const Buffer &read_buf,
+                               int after_order = -1) const;
 
   /*!
    * \brief Last GEMM producer of `write_buf` whose inputs include `read_buf`.
    * Matches the legacy single-producer (last-writer) default when no stmt site
    * is specified.
    */
-  std::optional<ProducerRecord> FindLastGemmProducerReading(const Buffer &write_buf,
-                                                            const Buffer &read_buf) const;
+  std::optional<ProducerRecord>
+  FindLastGemmProducerReading(const Buffer &write_buf,
+                              const Buffer &read_buf) const;
 
   int GetCallStmtOrder(const CallNode *call) const;
 
@@ -109,11 +112,13 @@ class PropagationTirCollector {
    */
   Optional<Call> GetProducerCall(const Buffer &buffer) const;
 
-  Map<Var, Buffer> GetBufferDataToBuffer() const { return buffer_data_to_buffer_; }
+  Map<Var, Buffer> GetBufferDataToBuffer() const {
+    return buffer_data_to_buffer_;
+  }
 
   class Visitor;
 
- private:
+private:
   friend class Visitor;
   void AppendProducerRecord(Buffer write, std::vector<Buffer> inputs,
                             const CallNode *call);
@@ -132,7 +137,7 @@ class PropagationTirCollector {
   int next_stmt_order_{0};
 };
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm
 
-#endif  // TVM_TL_OP_PROPAGATION_TIR_COLLECTOR_H_
+#endif // TVM_TL_OP_PROPAGATION_TIR_COLLECTOR_H_

@@ -95,7 +95,6 @@ public:
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.ReduceOp", ReduceOpNode,
                                     TileOperatorNode);
 
-
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
     refl::ObjectDef<ReduceOpNode>()

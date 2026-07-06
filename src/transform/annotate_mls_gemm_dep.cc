@@ -35,12 +35,13 @@ Map<Var, Buffer> BuildBufferMap(const PrimFunc &f) {
   return buffer_map;
 }
 
-/*! \brief Fast scan for tile-level MLS ops; avoids PropagationTirCollector on non-MLS kernels. */
+/*! \brief Fast scan for tile-level MLS ops; avoids PropagationTirCollector on
+ * non-MLS kernels. */
 class MlsTileOpPresenceChecker : public StmtExprVisitor {
- public:
+public:
   bool found() const { return found_; }
 
- private:
+private:
   void VisitStmt(const Stmt &stmt) final {
     if (found_) {
       return;
@@ -73,10 +74,10 @@ bool ContainsMlsTileOps(const Stmt &body) {
   return checker.found();
 }
 
-}  // namespace
+} // namespace
 
 class AnnotateMlsGemmDepMutator : public StmtExprMutator {
- public:
+public:
   AnnotateMlsGemmDepMutator(PropagationTirCollector *collector, Target target)
       : collector_(collector), target_(std::move(target)) {}
 
@@ -97,7 +98,7 @@ class AnnotateMlsGemmDepMutator : public StmtExprMutator {
     return f;
   }
 
- private:
+private:
   bool LookupSharedMlsTrans(const Buffer &dst, bool *out_trans) {
     auto it = shared_mls_trans_.find(dst);
     if (it != shared_mls_trans_.end()) {
@@ -119,24 +120,28 @@ class AnnotateMlsGemmDepMutator : public StmtExprMutator {
     Op tir_op = Downcast<Op>(call->op);
 
     if (tir_op == MatrixLoad::Get()) {
-      auto mls = Downcast<MatrixLoad>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
+      auto mls =
+          Downcast<MatrixLoad>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
       bool trans = true;
       LookupSharedMlsTrans(mls->dst, &trans);
       auto annotations = call->annotations;
-      annotations.Set(attr::kMlsTrans, IntImm(DataType::Int(32), trans ? 1 : 0));
+      annotations.Set(attr::kMlsTrans,
+                      IntImm(DataType::Int(32), trans ? 1 : 0));
       Call new_call(call->dtype, call->op, call->args, annotations, call->span);
       return Evaluate(new_call);
     }
 
     if (tir_op == DsReadFormat::Get()) {
-      auto ds = Downcast<DsReadFormat>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
+      auto ds =
+          Downcast<DsReadFormat>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
       auto gemm_with_input = PropagateToFindGemmConsumerOpWithInputAfterCall(
           ds->dst, collector_, call);
       if (gemm_with_input) {
         auto meta = BuildMlsGemmDepMeta(*gemm_with_input, collector_);
         auto annotations = call->annotations;
         annotations.Set(attr::kMlsGemmDep, meta);
-        Call new_call(call->dtype, call->op, call->args, annotations, call->span);
+        Call new_call(call->dtype, call->op, call->args, annotations,
+                      call->span);
         return Evaluate(new_call);
       }
       return StmtExprMutator::VisitStmt_(op);
@@ -144,7 +149,8 @@ class AnnotateMlsGemmDepMutator : public StmtExprMutator {
 
     if (tir_op.same_as(Gemm::Get())) {
       auto gemm = Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
-      auto annotations = AnnotateGemmHcuMlsFlags(call->annotations, gemm.get(), collector_);
+      auto annotations =
+          AnnotateGemmHcuMlsFlags(call->annotations, gemm.get(), collector_);
       Call new_call(call->dtype, call->op, call->args, annotations, call->span);
       return Evaluate(new_call);
     }
@@ -154,7 +160,8 @@ class AnnotateMlsGemmDepMutator : public StmtExprMutator {
 
   PropagationTirCollector *collector_;
   Target target_;
-  std::unordered_map<Buffer, bool, ObjectPtrHash, ObjectPtrEqual> shared_mls_trans_;
+  std::unordered_map<Buffer, bool, ObjectPtrHash, ObjectPtrEqual>
+      shared_mls_trans_;
 };
 
 tvm::transform::Pass AnnotateMlsGemmDep() {
@@ -172,5 +179,5 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef().def("tl.transform.AnnotateMlsGemmDep", AnnotateMlsGemmDep);
 }
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm

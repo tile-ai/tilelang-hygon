@@ -36,8 +36,8 @@ public:
   void PrintType(DataType t, std::ostream &os) final; // NOLINT(*)
   std::string GetVecLoad(DataType t, const BufferNode *buffer,
                          PrimExpr base) final;
-  void PrintVecStore(const BufferNode* buffer, DataType t, PrimExpr base,
-                     const std::string& value) final;
+  void PrintVecStore(const BufferNode *buffer, DataType t, PrimExpr base,
+                     const std::string &value) final;
   void PrintVecElemLoad(const std::string &vec, DataType t, int i,
                         std::ostream &os) final; // NOLINT(*)
   void PrintVecElemStore(const std::string &vec, DataType t, int i,
@@ -58,8 +58,8 @@ public:
   void VisitExpr_(const FloatImmNode *op, std::ostream &os) final;
   void VisitExpr_(const CallNode *op, std::ostream &os) final;
   void VisitExpr_(const CastNode *op, std::ostream &os) final;
-  void VisitExpr_(const FloorDivNode* op, std::ostream& os) final; // NOLINT(*)
-  void VisitExpr_(const FloorModNode* op, std::ostream& os) final; // NOLINT(*)
+  void VisitExpr_(const FloorDivNode *op, std::ostream &os) final; // NOLINT(*)
+  void VisitExpr_(const FloorModNode *op, std::ostream &os) final; // NOLINT(*)
   void VisitStmt_(const AllocateNode *op) final;
   void VisitStmt_(const AttrStmtNode *op) final;
   void VisitStmt_(const BlockNode *op) final;
@@ -83,7 +83,7 @@ protected:
 private:
   // Structure to store buffer descriptor for HCU buffer load/store optimization
   struct BufferDesc {
-    std::string wave_ptr;           // wavewise base pointer
+    std::string wave_ptr; // wavewise base pointer
     std::string offset;
     std::string element_space_size;
     std::string data_type;
@@ -100,16 +100,17 @@ private:
 
   BufferDesc GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr base);
   std::string GetVecLoadWithPredicate(DataType t, const BufferNode *buffer,
-                                     PrimExpr base, const std::string &pred);
+                                      PrimExpr base, const std::string &pred);
   void PrintVecStoreWithPredicate(const BufferNode *buffer, DataType t,
-                                 PrimExpr base, const std::string &value,
-                                 const std::string &pred);
+                                  PrimExpr base, const std::string &value,
+                                  const std::string &pred);
   std::string GetCurrentPredicate() const;
   bool IsFoldableIfThenElse(const IfThenElseNode *op) const;
   bool IsCollapsibleRedundantIfElse(const IfThenElseNode *op) const;
-  /// True if expr is literal zero, Cast(zero), Broadcast(zero), or Broadcast(Var)
-  /// where Var's LetStmt RHS was recorded in let_initializer_expr_for_predicate_.
-  /// Used so amd_buffer_load can fold outer if/else into a predicate.
+  /// True if expr is literal zero, Cast(zero), Broadcast(zero), or
+  /// Broadcast(Var) where Var's LetStmt RHS was recorded in
+  /// let_initializer_expr_for_predicate_. Used so amd_buffer_load can fold
+  /// outer if/else into a predicate.
   bool IsProvablyZeroOrZeroBroadcast(const PrimExpr &expr) const;
   bool CanUseVMBufferOps(const BufferNode *buffer, int num_elements) const {
     // Match by param name (robust across Var renaming in later passes)
@@ -122,13 +123,14 @@ private:
     return (value == nullptr || std::atoi(value) != 0) && scope == "global" &&
            (num_elements * buffer->dtype.bits() <= 128);
   }
-  /// True iff lowering consumes predicate_stack_ on this load. Must stay aligned
-  /// with CodeGenTileLangHCU::GetVecLoadWithPredicate / VisitExpr_(BufferLoad)
-  /// in codegen_hcu.cc and CodeGenC::VisitExpr_(BufferLoad) in tvm codegen_c.cc.
-  /// Pass the full RHS (e.g. Cast(BufferLoad)) so outer dtype matches lowering.
+  /// True iff lowering consumes predicate_stack_ on this load. Must stay
+  /// aligned with CodeGenTileLangHCU::GetVecLoadWithPredicate /
+  /// VisitExpr_(BufferLoad) in codegen_hcu.cc and
+  /// CodeGenC::VisitExpr_(BufferLoad) in tvm codegen_c.cc. Pass the full RHS
+  /// (e.g. Cast(BufferLoad)) so outer dtype matches lowering.
   bool LoadWillUseAmdBufferOpsWithPredicate(const PrimExpr &value_expr) const;
-  /// True iff BufferStore lowering consumes predicate_stack_ (same conditions as
-  /// VisitStmt_(BufferStore) amd_buffer_store path + CodeGenC BufferStore →
+  /// True iff BufferStore lowering consumes predicate_stack_ (same conditions
+  /// as VisitStmt_(BufferStore) amd_buffer_store path + CodeGenC BufferStore →
   /// PrintVecStore → PrintVecStoreWithPredicate). Keep in sync with those; see
   /// comments on LoadWillUseAmdBufferOpsWithPredicate.
   bool StoreWillUseAmdBufferOpsWithPredicate(const BufferStoreNode *op) const;
@@ -143,7 +145,8 @@ private:
       auto src_scope = GetPtrStorageScope(buffer_load->buffer->data);
       auto dst_scope = GetPtrStorageScope(buffer_store->buffer->data);
 
-      return src_scope == "global" && (dst_scope == "shared" || dst_scope == "shared.dyn") &&
+      return src_scope == "global" &&
+             (dst_scope == "shared" || dst_scope == "shared.dyn") &&
              (buffer_load->dtype.bits() * buffer_load->dtype.lanes() <= 128);
     }
 
@@ -174,12 +177,14 @@ private:
   // The alignment of the barrier array in shared memory
   // Set to 16 to maintain minimum alignment requirements for async bulk copy
   const int barrier_alignment_bytes_ = 16;
-  std::unordered_map<const VarNode*, bool> direct_to_lds_map_;
+  std::unordered_map<const VarNode *, bool> direct_to_lds_map_;
   std::unordered_set<std::string> buffer_ops_disable_param_names_;
   std::vector<std::string> predicate_stack_;
-  /// LetStmt RHS (PrimExpr); used only by IsProvablyZeroOrZeroBroadcast (IsZeroValue).
-  /// Kept separate from var_idmap_ so we never alter SSA / name resolution behavior.
-  std::unordered_map<const VarNode*, PrimExpr> let_initializer_expr_for_predicate_;
+  /// LetStmt RHS (PrimExpr); used only by IsProvablyZeroOrZeroBroadcast
+  /// (IsZeroValue). Kept separate from var_idmap_ so we never alter SSA / name
+  /// resolution behavior.
+  std::unordered_map<const VarNode *, PrimExpr>
+      let_initializer_expr_for_predicate_;
   int mls_resource_object_counter_{0};
 };
 

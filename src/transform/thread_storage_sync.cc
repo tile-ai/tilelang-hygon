@@ -1516,6 +1516,135 @@ private:
       return;
     syncs_inserted_.insert(obj);
   }
+
+  // Prove loop-carried write->write is disjoint by fixing the loop var to each
+  // constant iteration (e.g. unroll(4) stores) and reusing the same-thread WAW
+  // index disjointness check. This avoids treating relaxed loop touched ranges
+  // as one whole merged sub-buffer view.
+  static bool BufferIndicesProvablyDisjointAtLoopStep(const AccessEntry &prev,
+                                                      const AccessEntry &curr,
+                                                      const ForNode *loop,
+                                                      int64_t loop_k,
+                                                      int64_t loop_step) {
+    ICHECK(prev.buffer_indices.size() == curr.buffer_indices.size());
+    arith::Analyzer analyzer;
+    ConstrSet prev_cset{prev.cset};
+    ConstrSet curr_cset{curr.cset};
+
+    const char *thread_names[] = {"tx", "ty", "tz"};
+    ffi::Map<Var, PrimExpr> prev_sub, curr_sub;
+    for (unsigned idx = 0; idx != 3; ++idx) {
+      Var old_prev_var = prev.threads[prev.threads.size() + idx - 3]->var;
+      Var old_curr_var = curr.threads[curr.threads.size() + idx - 3]->var;
+      Var shared_var(thread_names[idx], old_prev_var.dtype());
+      prev_sub.Set(old_prev_var, shared_var);
+      curr_sub.Set(old_curr_var, shared_var);
+    }
+    prev_cset.Substitute(prev_sub).Populate(analyzer);
+    curr_cset.Substitute(curr_sub).Populate(analyzer);
+
+    PrimExpr loop_k_expr = make_const(loop->loop_var.dtype(), loop_k);
+    PrimExpr loop_k_next =
+        make_const(loop->loop_var.dtype(), loop_k + loop_step);
+
+    for (size_t dim = 0; dim < prev.buffer_indices.size(); ++dim) {
+      const auto &prev_dtype = prev.dtype;
+      const auto &curr_dtype = curr.dtype;
+      PrimExpr prev_idx =
+          Substitute(prev.buffer_indices[dim], {{loop->loop_var, loop_k_expr}});
+      PrimExpr curr_idx =
+          Substitute(curr.buffer_indices[dim], {{loop->loop_var, loop_k_next}});
+      prev_idx = Substitute(prev_idx, prev_sub);
+      curr_idx = Substitute(curr_idx, curr_sub);
+
+      PrimExpr prev_idx_bytes =
+          analyzer.Simplify(prev_idx * prev_dtype.bytes());
+      PrimExpr curr_idx_bytes =
+          analyzer.Simplify(curr_idx * curr_dtype.bytes());
+
+      if (const RampNode *prev_ramp = prev_idx_bytes.as<RampNode>()) {
+        DataType prev_index_dtype = prev_ramp->base.dtype();
+        Var prev_lane("prev_lane", prev_index_dtype);
+        analyzer.Bind(prev_lane, Range::FromMinExtent(0, prev_ramp->lanes));
+        prev_idx_bytes = prev_ramp->base + prev_lane * prev_ramp->stride;
+      }
+      if (const RampNode *curr_ramp = curr_idx_bytes.as<RampNode>()) {
+        DataType curr_index_dtype = curr_ramp->base.dtype();
+        Var curr_lane("curr_lane", curr_index_dtype);
+        analyzer.Bind(curr_lane, Range::FromMinExtent(0, curr_ramp->lanes));
+        curr_idx_bytes = curr_ramp->base + curr_lane * curr_ramp->stride;
+      }
+
+      if (prev_idx_bytes.dtype().is_scalar() &&
+          curr_idx_bytes.dtype().is_scalar()) {
+        if (prev_idx_bytes.dtype() != curr_idx_bytes.dtype()) {
+          if (prev_idx_bytes.dtype().bits() < curr_idx_bytes.dtype().bits()) {
+            prev_idx_bytes = tir::Cast(curr_idx_bytes.dtype(), prev_idx_bytes);
+          } else {
+            curr_idx_bytes = tir::Cast(prev_idx_bytes.dtype(), curr_idx_bytes);
+          }
+        }
+        if (!analyzer.CanProve(tir::NE(prev_idx_bytes, curr_idx_bytes))) {
+          return false;
+        }
+        continue;
+      }
+
+      auto prev_bound = analyzer.const_int_bound(prev_idx_bytes);
+      auto curr_bound = analyzer.const_int_bound(curr_idx_bytes);
+      if (!prev_bound.defined() || !curr_bound.defined()) {
+        return false;
+      }
+      if (!((prev_bound->max_value) < (curr_bound->min_value) ||
+            (curr_bound->max_value) < (prev_bound->min_value))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static bool LoopCarriedWriteIndicesDisjoint(const AccessEntry &prev,
+                                              const AccessEntry &curr,
+                                              const ForNode *loop) {
+    if (loop == nullptr) {
+      return false;
+    }
+    if (prev.type != kWrite || curr.type != kWrite) {
+      return false;
+    }
+    if (prev.is_pointer_access || curr.is_pointer_access) {
+      return false;
+    }
+    if (!prev.buffer.same_as(curr.buffer)) {
+      return false;
+    }
+    if (prev.buffer_indices.size() != curr.buffer_indices.size()) {
+      return false;
+    }
+    if (prev.buffer_indices.empty()) {
+      return false;
+    }
+
+    auto min_opt = as_const_int(loop->min);
+    auto extent_opt = as_const_int(loop->extent);
+    if (!min_opt || !extent_opt) {
+      return false;
+    }
+    const int64_t min_v = *min_opt;
+    const int64_t extent_v = *extent_opt;
+    const int64_t step = 1;
+    if (extent_v <= step) {
+      return false;
+    }
+
+    for (int64_t k = min_v; k < min_v + extent_v - step; k += step) {
+      if (!BufferIndicesProvablyDisjointAtLoopStep(prev, curr, loop, k, step)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool PointerAccessIsDisjoint(const AccessEntry &lhs, const AccessEntry &rhs) {
     if (lhs.touched.size() != 1 || rhs.touched.size() != 1) {
       return false;
@@ -1686,6 +1815,12 @@ private:
     // Inserting a barrier between atomics is unnecessary and can change
     // program behavior (e.g., atomics with return values).
     if (prev.is_atomic && curr.is_atomic) {
+      return false;
+    }
+
+    // Loop-carried WAW: prove consecutive unrolled writes are index-disjoint
+    // before the generic overlap check (sparse_mla S scatter unroll).
+    if (LoopCarriedWriteIndicesDisjoint(prev, curr, loop)) {
       return false;
     }
 

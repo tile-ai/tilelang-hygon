@@ -14,7 +14,7 @@ namespace tl {
 using namespace tir;
 
 MlsGemmDepMeta BuildMlsGemmDepMeta(const GemmWithInput &gwi,
-                                    const PropagationTirCollector *collector) {
+                                   const PropagationTirCollector *collector) {
   auto gemm = gwi.gemm;
   auto *g = gemm.get();
   auto node = tvm::ffi::make_object<MlsGemmDepMetaNode>();
@@ -22,7 +22,8 @@ MlsGemmDepMeta BuildMlsGemmDepMeta(const GemmWithInput &gwi,
     node->feeds_slot = 0;
     node->trans = !g->transA_;
   } else {
-    ICHECK(gwi.input.same_as(g->b_)) << "ds_read_format dst must feed Gemm A or B";
+    ICHECK(gwi.input.same_as(g->b_))
+        << "ds_read_format dst must feed Gemm A or B";
     node->feeds_slot = 1;
     node->trans = g->transB_;
   }
@@ -68,7 +69,8 @@ bool ComputeSharedDstMlsTrans(const Buffer &dst,
     }
     if (auto gemm = op.as<GemmNode>()) {
       ICHECK(gemm->kPack_ == 1)
-          << "MatrixLoad dst Gemm consumer must have kPack=1, got " << gemm->kPack_;
+          << "MatrixLoad dst Gemm consumer must have kPack=1, got "
+          << gemm->kPack_;
       auto cur = MlsTransFromGemmAndBuffer(gemm, dst);
       if (!cur) {
         continue;
@@ -77,7 +79,8 @@ bool ComputeSharedDstMlsTrans(const Buffer &dst,
         mls_trans = *cur;
         found = true;
       } else if (*cur != mls_trans) {
-        LOG(FATAL) << "MatrixLoad dst Gemm consumers must have consistent mls_trans";
+        LOG(FATAL)
+            << "MatrixLoad dst Gemm consumers must have consistent mls_trans";
       }
       continue;
     }
@@ -95,7 +98,8 @@ bool ComputeSharedDstMlsTrans(const Buffer &dst,
         mls_trans = *cur;
         found = true;
       } else if (*cur != mls_trans) {
-        LOG(FATAL) << "MatrixLoad dst Gemm consumers must have consistent mls_trans";
+        LOG(FATAL)
+            << "MatrixLoad dst Gemm consumers must have consistent mls_trans";
       }
     }
   }
@@ -107,8 +111,8 @@ bool ComputeSharedDstMlsTrans(const Buffer &dst,
   return true;
 }
 
-Optional<MlsGemmDepMeta> GetMlsGemmDepFromAnnotations(
-    const Map<String, ObjectRef> &annotations) {
+Optional<MlsGemmDepMeta>
+GetMlsGemmDepFromAnnotations(const Map<String, ObjectRef> &annotations) {
   auto val = annotations.Get(attr::kMlsGemmDep);
   if (!val) {
     return Optional<MlsGemmDepMeta>();
@@ -116,9 +120,10 @@ Optional<MlsGemmDepMeta> GetMlsGemmDepFromAnnotations(
   return Downcast<MlsGemmDepMeta>(val.value());
 }
 
-Map<String, ObjectRef> AnnotateGemmHcuMlsFlags(const Map<String, ObjectRef> &annotations,
-                                               const GemmNode *gemm,
-                                               const PropagationTirCollector *collector) {
+Map<String, ObjectRef>
+AnnotateGemmHcuMlsFlags(const Map<String, ObjectRef> &annotations,
+                        const GemmNode *gemm,
+                        const PropagationTirCollector *collector) {
   Map<String, ObjectRef> out = annotations;
   if (collector == nullptr || gemm == nullptr) {
     return out;
@@ -132,7 +137,8 @@ Map<String, ObjectRef> AnnotateGemmHcuMlsFlags(const Map<String, ObjectRef> &ann
   return out;
 }
 
-Optional<bool> GetMlsTransFromAnnotations(const Map<String, ObjectRef> &annotations) {
+Optional<bool>
+GetMlsTransFromAnnotations(const Map<String, ObjectRef> &annotations) {
   auto val = annotations.Get(attr::kMlsTrans);
   if (!val) {
     return Optional<bool>();
@@ -144,9 +150,7 @@ Optional<bool> GetMlsTransFromAnnotations(const Map<String, ObjectRef> &annotati
   return Optional<bool>();
 }
 
-TVM_FFI_STATIC_INIT_BLOCK() {
-  MlsGemmDepMetaNode::RegisterReflection();
-}
+TVM_FFI_STATIC_INIT_BLOCK() { MlsGemmDepMetaNode::RegisterReflection(); }
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm

@@ -1,0 +1,78 @@
+# Hygon mirror CI: format / static checks only (self-hosted container, no GPU/DTK).
+# Upstream full CI lives on tile-ai/tilelang (.github/workflows/ci.yml).
+#
+# Branch gating (GitHub → Settings → Secrets and variables → Actions → Variables):
+#   LINT_PUSH_BRANCHES      comma-separated push targets, e.g. main,v0.1.9-release,staging
+#   LINT_PR_BASE_BRANCHES   comma-separated PR base branches, e.g. main,v0.1.9-release,staging
+# Add a branch name in the web UI to enable lint; no workflow edit required.
+# workflow_dispatch always runs.
+#
+# Uses the same Harbor dev image as HCU CI (already on nmz runners). Do not use
+# library/python images — Docker Hub pulls fail on internal runners.
+name: Lint
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHONDEVMODE: "1"
+  PYTHONUNBUFFERED: "1"
+  PYTHONPATH: ""
+  PIP_USER: ""
+  COLUMNS: "100"
+  FORCE_COLOR: "1"
+  CLICOLOR_FORCE: "1"
+  XDG_CACHE_HOME: ${{ github.workspace }}/.cache
+  PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+  PRE_COMMIT_HOME: ${{ github.workspace }}/.cache/pip/.pre-commit
+  PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+  PIP_TRUSTED_HOST: mirrors.aliyun.com
+jobs:
+  quick-lint:
+    name: Quick Lint
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+        vars.LINT_PUSH_BRANCHES != '' &&
+        contains(format(',{0},', vars.LINT_PUSH_BRANCHES), format(',{0},', github.ref_name))) ||
+      (github.event_name == 'pull_request' &&
+        vars.LINT_PR_BASE_BRANCHES != '' &&
+        contains(format(',{0},', vars.LINT_PR_BASE_BRANCHES), format(',{0},', github.base_ref)))
+    runs-on: nmz4-lint
+    timeout-minutes: 30
+    container:
+      image: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          # Lint excludes 3rdparty/; no submodule fetch needed.
+
+      - name: Install lint toolchain
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-lint.txt
+
+      - name: Check AST with Python 3.10
+        run: python3 -m compileall -q -f tilelang
+
+      - name: Pre-commit Lint
+        run: |
+          if ! pre-commit run --all-files --color=always --show-diff-on-failure; then
+            echo "::error::Pre-commit checks failed. Run 'pre-commit run --all-files' locally."
+            exit 1
+          fi

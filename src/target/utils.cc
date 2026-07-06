@@ -92,8 +92,7 @@ bool TargetIsCDNA(Target target) {
 bool TargetIsHCU(Target target) {
   // TODO: add more HCU targets
   static const std::set<std::string> hcu_targets = {
-    "gfx928", "gfx936", "gfx938", "gfx92a", "gfx946"
-  };
+      "gfx928", "gfx936", "gfx938", "gfx92a", "gfx946"};
 
   if (!TargetIsRocm(target))
     return false;
@@ -116,9 +115,8 @@ bool TargetIsRDNA(Target target) {
 }
 
 bool TargetHasMmacLitLts(Target target) {
-  static const std::set<std::string> hcu_targets = {
-    "gfx938", "gfx92a", "gfx946"
-  };
+  static const std::set<std::string> hcu_targets = {"gfx938", "gfx92a",
+                                                    "gfx946"};
 
   if (!TargetIsHCU(target))
     return false;
@@ -155,9 +153,8 @@ bool TargetHasAsyncCopy(Target target) {
     int arch = GetArchInt(target);
     return arch >= 80;
   } else if (TargetIsHCU(target)) {
-    static const std::set<std::string> supported_targets = {
-      "gfx936", "gfx938", "gfx946"
-    };
+    static const std::set<std::string> supported_targets = {"gfx936", "gfx938",
+                                                            "gfx946"};
     if (target->attrs.count("mcpu")) {
       std::string mcpu = Downcast<tvm::ffi::String>(target->attrs.at("mcpu"));
       return supported_targets.find(mcpu) != supported_targets.end();
@@ -398,8 +395,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            [](Target target) { return TargetHasBulkCopy(target); })
       .def("tl.TargetGetWarpSize",
            [](Target target) { return TargetGetWarpSize(target); })
-      .def("tl.TargetIsHCU",
-           [](Target target) { return TargetIsHCU(target); })
+      .def("tl.TargetIsHCU", [](Target target) { return TargetIsHCU(target); })
       .def("tl.TargetHasMmacLitLts",
            [](Target target) { return TargetHasMmacLitLts(target); })
       .def("tl.GetHcuArchString", [](Target target) {

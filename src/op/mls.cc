@@ -4,11 +4,11 @@
  */
 
 #include "mls.h"
+#include "../target/utils.h"
+#include "builtin.h"
 #include "mls_gemm_dep.h"
 #include "operator.h"
 #include "region.h"
-#include "../target/utils.h"
-#include "builtin.h"
 #include <algorithm>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/builtin.h>
@@ -19,7 +19,8 @@ namespace tl {
 
 using namespace tir;
 
-/// If expr is constant, return IntImm for compile-time optimization; otherwise return expr as variable.
+/// If expr is constant, return IntImm for compile-time optimization; otherwise
+/// return expr as variable.
 static PrimExpr ToInt64ConstOrVar(const PrimExpr &expr) {
   if (const int64_t *p = as_const_int(expr)) {
     return IntImm(DataType::Int(64), *p);
@@ -27,7 +28,8 @@ static PrimExpr ToInt64ConstOrVar(const PrimExpr &expr) {
   return expr;
 }
 
-MatrixLoad::MatrixLoad(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+MatrixLoad::MatrixLoad(Array<PrimExpr> args,
+                       Map<String, ObjectRef> annotations) {
   ICHECK(args.size() >= 4)
       << "matrix_load expects at least 4 args: src_region, dst_region, "
          "check_last_k_load, last_k_load";
@@ -42,8 +44,8 @@ MatrixLoad::MatrixLoad(Array<PrimExpr> args, Map<String, ObjectRef> annotations)
   auto dst_ranges = dst_region->GetRanges();
 
   ICHECK(dst_ranges.size() >= 2) << "matrix_load dst region must be 2D";
-  ICHECK(src_ranges.size() >= 2)
-      << "matrix_load src region must have at least 2 dims (last 2 match dst MN,K)";
+  ICHECK(src_ranges.size() >= 2) << "matrix_load src region must have at least "
+                                    "2 dims (last 2 match dst MN,K)";
 
   Buffer dst_buf = dst_region->GetBuffer();
   ICHECK(dst_buf.scope() == "shared" || dst_buf.scope() == "shared.dyn")
@@ -54,8 +56,10 @@ MatrixLoad::MatrixLoad(Array<PrimExpr> args, Map<String, ObjectRef> annotations)
   node->dst = dst_buf;
   node->src_ranges = src_ranges;
   node->dst_ranges = dst_ranges;
-  AccessRegion src_access{BufferRegion(node->src, node->src_ranges), kAccessRead};
-  AccessRegion dst_access{BufferRegion(node->dst, node->dst_ranges), kAccessWrite};
+  AccessRegion src_access{BufferRegion(node->src, node->src_ranges),
+                          kAccessRead};
+  AccessRegion dst_access{BufferRegion(node->dst, node->dst_ranges),
+                          kAccessWrite};
   node->SetAccessRegions({src_access, dst_access});
   node->check_last_load = args[2].as<IntImmNode>()->value != 0;
   node->last_load = args[3].as<IntImmNode>()->value != 0;
@@ -80,9 +84,9 @@ struct MlsTileConfig {
 };
 
 struct MlsTileConfigSet {
-  const MlsTileConfig* trans;
+  const MlsTileConfig *trans;
   int trans_count;
-  const MlsTileConfig* non_trans;
+  const MlsTileConfig *non_trans;
   int non_trans_count;
 };
 
@@ -113,48 +117,60 @@ constexpr MlsTileConfig kMlsTileConfigsB8NonTrans[] = {
 constexpr MlsTileConfigSet kMlsTileConfigTable[] = {
     {nullptr, 0, nullptr, 0},
     {kMlsTileConfigsB8Trans,
-     static_cast<int>(sizeof(kMlsTileConfigsB8Trans) / sizeof(kMlsTileConfigsB8Trans[0])),
+     static_cast<int>(sizeof(kMlsTileConfigsB8Trans) /
+                      sizeof(kMlsTileConfigsB8Trans[0])),
      kMlsTileConfigsB8NonTrans,
-     static_cast<int>(sizeof(kMlsTileConfigsB8NonTrans) / sizeof(kMlsTileConfigsB8NonTrans[0]))},
+     static_cast<int>(sizeof(kMlsTileConfigsB8NonTrans) /
+                      sizeof(kMlsTileConfigsB8NonTrans[0]))},
     {kMlsTileConfigsB16Trans,
-     static_cast<int>(sizeof(kMlsTileConfigsB16Trans) / sizeof(kMlsTileConfigsB16Trans[0])),
+     static_cast<int>(sizeof(kMlsTileConfigsB16Trans) /
+                      sizeof(kMlsTileConfigsB16Trans[0])),
      kMlsTileConfigsB16NonTrans,
-     static_cast<int>(sizeof(kMlsTileConfigsB16NonTrans) / sizeof(kMlsTileConfigsB16NonTrans[0]))},
+     static_cast<int>(sizeof(kMlsTileConfigsB16NonTrans) /
+                      sizeof(kMlsTileConfigsB16NonTrans[0]))},
 };
 
 std::pair<int64_t, int64_t> MlsBlockDims(const Buffer &buf, bool mls_trans) {
   ICHECK(buf->shape.size() >= 2);
   size_t nd = buf->shape.size();
   if (mls_trans) {
-    return {*as_const_int(buf->shape[nd - 2]), *as_const_int(buf->shape[nd - 1])};
+    return {*as_const_int(buf->shape[nd - 2]),
+            *as_const_int(buf->shape[nd - 1])};
   }
   return {*as_const_int(buf->shape[nd - 1]), *as_const_int(buf->shape[nd - 2])};
 }
 
-}  // namespace
+} // namespace
 
 /*
  * MLS tile size rules (MN interleave=1, b16):
- * num_warps = block_size / TargetGetWarpSize(target); warp_mn * warp_k = num_warps.
- * One warp group extent in K = warp_k * mlsTilesizeK. If > block_k, warps repeat load.
+ * num_warps = block_size / TargetGetWarpSize(target); warp_mn * warp_k =
+ * num_warps. One warp group extent in K = warp_k * mlsTilesizeK. If > block_k,
+ * warps repeat load.
  */
-void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k, int block_size,
-                            Target target, int elem_bits, int &warp_mn,
-                            int &warp_k, int &mls_tile_mn, int &mls_tile_k) {
+void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
+                             int block_size, Target target, int elem_bits,
+                             int &warp_mn, int &warp_k, int &mls_tile_mn,
+                             int &mls_tile_k) {
   const int elem_bytes = elem_bits / 8;
   ICHECK(elem_bytes == 1 || elem_bytes == 2) << "b16 or b8 only";
 
   int num_warps = block_size / TargetGetWarpSize(target);
   ICHECK(num_warps >= 1) << "num_warps must be >= 1";
 
-  auto try_config = [&](int tile_mn, int tile_k, bool require_no_repeat) -> bool {
-    if (block_k % tile_k != 0 || block_mn % tile_mn != 0) return false;
+  auto try_config = [&](int tile_mn, int tile_k,
+                        bool require_no_repeat) -> bool {
+    if (block_k % tile_k != 0 || block_mn % tile_mn != 0)
+      return false;
     int wm = std::min(block_mn / tile_mn, num_warps);
-    if (num_warps % wm != 0) return false;
+    if (num_warps % wm != 0)
+      return false;
     int wk = num_warps / wm;
     if (require_no_repeat) {
-      if (wm * tile_mn > block_mn || block_mn % (wm * tile_mn) != 0) return false;
-      if (wk * tile_k > block_k || block_k % (wk * tile_k) != 0) return false;
+      if (wm * tile_mn > block_mn || block_mn % (wm * tile_mn) != 0)
+        return false;
+      if (wk * tile_k > block_k || block_k % (wk * tile_k) != 0)
+        return false;
     }
     warp_mn = wm;
     warp_k = wk;
@@ -163,16 +179,20 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k, int block_si
     return true;
   };
 
-  const MlsTileConfigSet& config_set = kMlsTileConfigTable[elem_bytes];
-  const MlsTileConfig* configs = trans ? config_set.trans : config_set.non_trans;
-  int config_count = trans ? config_set.trans_count : config_set.non_trans_count;
+  const MlsTileConfigSet &config_set = kMlsTileConfigTable[elem_bytes];
+  const MlsTileConfig *configs =
+      trans ? config_set.trans : config_set.non_trans;
+  int config_count =
+      trans ? config_set.trans_count : config_set.non_trans_count;
   for (int i = 0; i < config_count; ++i) {
-    const MlsTileConfig& config = configs[i];
-    if (try_config(config.tile_mn, config.tile_k, config.require_no_repeat)) return;
+    const MlsTileConfig &config = configs[i];
+    if (try_config(config.tile_mn, config.tile_k, config.require_no_repeat))
+      return;
   }
-  ICHECK(false) << "No valid MLS tile config for " << (trans ? "trans" : "non-trans")
-                << ": block_mn=" << block_mn << " block_k=" << block_k
-                << " num_warps=" << num_warps << " elem_bits=" << elem_bits;
+  ICHECK(false) << "No valid MLS tile config for "
+                << (trans ? "trans" : "non-trans") << ": block_mn=" << block_mn
+                << " block_k=" << block_k << " num_warps=" << num_warps
+                << " elem_bits=" << elem_bits;
 }
 
 LayoutMap MatrixLoadNode::InferLayout(const LayoutInferArgs &T,
@@ -197,9 +217,9 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   auto [block_mn, block_k] = MlsBlockDims(dst, mls_trans);
   int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
   int tile_mn, tile_k, warp_m, warp_k;
-  ComputeMlsWarpPartition(mls_trans, static_cast<int>(block_mn), static_cast<int>(block_k),
-                          block_size, T.target, src->dtype.bits(), warp_m, warp_k, tile_mn,
-                          tile_k);
+  ComputeMlsWarpPartition(mls_trans, static_cast<int>(block_mn),
+                          static_cast<int>(block_k), block_size, T.target,
+                          src->dtype.bits(), warp_m, warp_k, tile_mn, tile_k);
 
   size_t nr = this->src_ranges.size();
   ICHECK(nr >= 2);
@@ -230,10 +250,9 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   }
 
   std::stringstream ss;
-  ss << "tl::mls::mls_load_tile<tl::sequence<" << block_mn << ", "
-     << block_k << ">, tl::sequence<" << tile_mn << ", "
-     << tile_k << ">, " << warp_m << ", " << warp_k
-     << ", " << dtype_str << ", 1, "
+  ss << "tl::mls::mls_load_tile<tl::sequence<" << block_mn << ", " << block_k
+     << ">, tl::sequence<" << tile_mn << ", " << tile_k << ">, " << warp_m
+     << ", " << warp_k << ", " << dtype_str << ", 1, "
      << (mls_trans ? "true" : "false")
      << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
      << (check_last_load ? "true" : "false") << ", "
@@ -245,7 +264,8 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   PrimExpr leading_elem_offset = IntImm(DataType::Int(32), 0);
   if (nr > 2) {
     ICHECK_EQ(src_buf->shape.size(), nr)
-        << "matrix_load src buffer rank must match src region rank, got shape.size()="
+        << "matrix_load src buffer rank must match src region rank, got "
+           "shape.size()="
         << src_buf->shape.size() << " vs region rank=" << nr;
     Array<PrimExpr> idx_leading;
     DataType idx_dtype = src_buf->DefaultIndexType();
@@ -256,18 +276,21 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
     idx_leading.push_back(make_const(idx_dtype, 0));
     Array<PrimExpr> offs = src_buf.OffsetOf(idx_leading);
     ICHECK_EQ(offs.size(), 1u)
-        << "matrix_load src OffsetOf expects a single flat offset, got size=" << offs.size();
+        << "matrix_load src OffsetOf expects a single flat offset, got size="
+        << offs.size();
     leading_elem_offset = offs[0];
   }
 
-  auto src_ptr = src_buf.access_ptr(1, DataType::Handle(), 1, leading_elem_offset);
+  auto src_ptr =
+      src_buf.access_ptr(1, DataType::Handle(), 1, leading_elem_offset);
 
   size_t dr = this->dst_ranges.size();
   ICHECK(dr >= 2) << "matrix_load dst region must be at least 2D";
   PrimExpr dst_leading_elem_offset = IntImm(DataType::Int(32), 0);
   if (dr > 2) {
     ICHECK_EQ(dst_buf->shape.size(), dr)
-        << "matrix_load dst buffer rank must match dst region rank, got shape.size()="
+        << "matrix_load dst buffer rank must match dst region rank, got "
+           "shape.size()="
         << dst_buf->shape.size() << " vs region rank=" << dr;
     Array<PrimExpr> dst_idx_leading;
     DataType dst_idx_dtype = dst_buf->DefaultIndexType();
@@ -283,7 +306,8 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
     dst_leading_elem_offset = dst_offs[0];
   }
 
-  auto dst_ptr = dst_buf.access_ptr(2, DataType::Handle(), 1, dst_leading_elem_offset);
+  auto dst_ptr =
+      dst_buf.access_ptr(2, DataType::Handle(), 1, dst_leading_elem_offset);
 
   Array<PrimExpr> call_args;
   call_args.push_back(StringImm(ss.str()));
@@ -295,28 +319,29 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   call_args.push_back(block_k_base);
   call_args.push_back(dst_ptr);
 
-  return Evaluate(
-      Call(DataType::Handle(), builtin::call_extern(), call_args));
+  return Evaluate(Call(DataType::Handle(), builtin::call_extern(), call_args));
 }
 
 TIR_REGISTER_TL_TILE_OP(MatrixLoad, matrix_load)
     .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
-                              Integer(CallEffectKind::kOpaque));
+                               Integer(CallEffectKind::kOpaque));
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def(
       "tl.ComputeMlsWarpPartition",
-      [](bool trans, int block_mn, int block_k, int block_size, Target target, int elem_bits) {
+      [](bool trans, int block_mn, int block_k, int block_size, Target target,
+         int elem_bits) {
         int warp_mn = 0;
         int warp_k = 0;
         int mls_tile_mn = 0;
         int mls_tile_k = 0;
-        ComputeMlsWarpPartition(trans, block_mn, block_k, block_size, target, elem_bits, warp_mn,
-                                warp_k, mls_tile_mn, mls_tile_k);
-        return Array<Integer>{Integer(warp_mn), Integer(warp_k), Integer(mls_tile_mn),
-                              Integer(mls_tile_k)};
+        ComputeMlsWarpPartition(trans, block_mn, block_k, block_size, target,
+                                elem_bits, warp_mn, warp_k, mls_tile_mn,
+                                mls_tile_k);
+        return Array<Integer>{Integer(warp_mn), Integer(warp_k),
+                              Integer(mls_tile_mn), Integer(mls_tile_k)};
       });
 }
 

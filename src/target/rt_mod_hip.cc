@@ -85,7 +85,8 @@ ffi::Module BuildTileLangHIP(IRModule mod, Target target) {
   std::string ptx;
 
   if (auto f = Function::GetGlobal("tilelang_callback_hip_compile")) {
-    tvm::transform::PassContext pass_ctx = tvm::transform::PassContext::Current();
+    tvm::transform::PassContext pass_ctx =
+        tvm::transform::PassContext::Current();
     ptx = (*f)(code, target, pass_ctx->config).cast<std::string>();
     if (ptx[0] != '/')
       fmt = "hsaco";
