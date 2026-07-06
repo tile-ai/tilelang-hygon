@@ -202,6 +202,8 @@ class JITKernel(Generic[_P, _T]):
         Any
             The result of the function execution.
         """
+        if os.environ.get("TILELANG_COMPILE_ONLY", "").lower() in ("1", "true", "yes", "on"):
+            raise RuntimeError("TILELANG_COMPILE_ONLY: kernel compiled; launch skipped")
         return self.torch_function(*args, **kwds)
 
     def _compile_and_create_adapter(self, tilelang_func: PrimFunc, out_idx: list[int]) -> BaseKernelAdapter:

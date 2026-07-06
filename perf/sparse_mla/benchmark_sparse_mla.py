@@ -4,19 +4,21 @@ from tilelang.profiler import do_bench_cudagraph
 from perf.sparse_mla.sparse_mla_fwd import tilelang_sparse_fwd, ref_sparse_mla_fwd_interface
 
 
-def test_sparse_mla_fwd(B=1,
-                        S=128,
-                        SKV=8192,
-                        H=16,
-                        HKV=1,
-                        DQK=576,
-                        DV=512,
-                        topk=2048,
-                        dtype=torch.bfloat16,
-                        check_correctness=True,
-                        q_start_s_index=4096,
-                        kv_stride=1,
-                        sm_scale=None):
+def test_sparse_mla_fwd(
+    B=1,
+    S=128,
+    SKV=8192,
+    H=16,
+    HKV=1,
+    DQK=576,
+    DV=512,
+    topk=2048,
+    dtype=torch.bfloat16,
+    check_correctness=True,
+    q_start_s_index=4096,
+    kv_stride=1,
+    sm_scale=None,
+):
     torch.random.manual_seed(0)
 
     q = torch.randn((S, H, DQK), dtype=dtype, device="cuda")
@@ -26,7 +28,7 @@ def test_sparse_mla_fwd(B=1,
     for t in range(S):
         for h in range(HKV):
             i_i = torch.randperm(min(max(1, ((t + q_start_s_index) // kv_stride)), SKV))[:topk]
-            indices[t, h, :len(i_i)] = i_i
+            indices[t, h, : len(i_i)] = i_i
 
     if dtype == torch.bfloat16:
         dtype_str = "bfloat16"
@@ -49,7 +51,8 @@ def test_sparse_mla_fwd(B=1,
 
     if check_correctness:
         ref_out = ref_sparse_mla_fwd_interface(
-            q, kv, indices, dtype, q_start_s_index=q_start_s_index, kv_stride=kv_stride, sm_scale=sm_scale)
+            q, kv, indices, dtype, q_start_s_index=q_start_s_index, kv_stride=kv_stride, sm_scale=sm_scale
+        )
         atol = 1e-2 if dtype_str == "bfloat16" else 1e-2
         torch.testing.assert_close(tl_out, ref_out, atol=atol, rtol=1e-2)
         print("assert_tensors_similar passed")
@@ -60,14 +63,5 @@ if __name__ == "__main__":
     torch.cuda.set_device(device_id)
     for s in [1, 2, 4, 8, 16, 32, 64, 72, 96, 128, 144]:
         test_sparse_mla_fwd(
-            B=1,
-            S=s,
-            SKV=8192,
-            H=16,
-            HKV=1,
-            DQK=576,
-            DV=512,
-            topk=2048,
-            dtype=torch.bfloat16,
-            check_correctness=True,
-            q_start_s_index=2048)
+            B=1, S=s, SKV=8192, H=16, HKV=1, DQK=576, DV=512, topk=2048, dtype=torch.bfloat16, check_correctness=True, q_start_s_index=2048
+        )

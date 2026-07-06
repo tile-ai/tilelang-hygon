@@ -1,8 +1,12 @@
+from __future__ import annotations
+
 """
 Common utility functions for GEMM implementations.
 """
 
 import itertools
+import math
+
 import torch
 import tilelang as tl
 from tilelang.autotuner import AutoTuner
@@ -15,6 +19,7 @@ from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
 
 from aiter.ops.triton.gemm_unquantized import gemm_unquantized
 
+
 def triton_gemm(A, B):
     """
     Compute the matrix product of A and the transpose of B.
@@ -22,7 +27,7 @@ def triton_gemm(A, B):
     A and B are expected to be 2-D tensors where A has shape (M, K) and B has shape (N, K).
     The result is a tensor with shape (M, N) equal to A @ B.T, using the inputs' dtypes.
     """
-    return  gemm_unquantized(A, B, torch.float16)
+    return gemm_unquantized(A, B, torch.float16)
 
 
 def ref_program(A, B):
@@ -49,10 +54,7 @@ def _generate_configs_from_product(param_dict):
     key_order = list(param_dict.keys())
     param_lists = [param_dict[key] for key in key_order]
     _configs = list(itertools.product(*param_lists))
-    return [
-        {key_order[i]: c[i] for i in range(len(key_order))}
-        for c in _configs
-    ]
+    return [{key_order[i]: c[i] for i in range(len(key_order))} for c in _configs]
 
 
 def _get_roller_configs(M, N, K, topk=20):
@@ -91,14 +93,16 @@ def _get_roller_configs(M, N, K, topk=20):
         warp_m, warp_n = hint.warp
         # block_rows, block_cols represents warp partitioning
         block_rows, block_cols = block_m // warp_m, block_n // warp_n
-        configs.append({
-            "block_M": block_m,
-            "block_N": block_n,
-            "block_K": hint.rstep[0],
-            "num_stages": hint.pipeline_stage if hint.pipeline_stage > 1 else 0,
-            "thread_num": block_rows * block_cols * 32,
-            "enable_rasteration": hint.rasterization_plan is not NoRasterization,
-        })
+        configs.append(
+            {
+                "block_M": block_m,
+                "block_N": block_n,
+                "block_K": hint.rstep[0],
+                "num_stages": hint.pipeline_stage if hint.pipeline_stage > 1 else 0,
+                "thread_num": block_rows * block_cols * 32,
+                "enable_rasteration": hint.rasterization_plan is not NoRasterization,
+            }
+        )
     return configs
 
 
@@ -154,17 +158,19 @@ def _create_autotuner(kernel, configs, pass_configs=None):
     Returns:
         Configured AutoTuner instance
     """
-    return AutoTuner.from_kernel(
-        kernel=kernel, configs=configs
-    ).set_compile_args(
-        out_idx=[-1],
-        target="auto",
-        verbose=True,
-        pass_configs=pass_configs,
-    ).set_profile_args(
-        supply_type=tl.TensorSupplyType.Integer,
-        ref_prog=ref_program,
-        skip_check=False,
+    return (
+        AutoTuner.from_kernel(kernel=kernel, configs=configs)
+        .set_compile_args(
+            out_idx=[-1],
+            target="auto",
+            verbose=True,
+            pass_configs=pass_configs,
+        )
+        .set_profile_args(
+            supply_type=tl.TensorSupplyType.Integer,
+            ref_prog=ref_program,
+            skip_check=False,
+        )
     )
 
 
@@ -185,7 +191,98 @@ def _run_autotuner(kernel, configs, warmup=3, rep=20, pass_configs=None):
     return autotuner.run(warmup=warmup, rep=rep)
 
 
-def get_heuristic_config(impl: str | None = None, version: str | None = None) -> dict:
+def _get_cu_num() -> int:
+    try:
+        return torch.cuda.get_device_properties("cuda").multi_processor_count
+    except Exception:
+        return 72
+
+
+def _m_blocks(M: int, block_M: int) -> int:
+    return (M + block_M - 1) // block_M
+
+
+def _n_blocks(N: int, block_N: int) -> int:
+    return (N + block_N - 1) // block_N
+
+
+def get_persistent_group_size(
+    M: int,
+    N: int,
+    block_M: int,
+    block_N: int,
+    *,
+    wgs_per_cu: int = 1,
+    cu_num: int | None = None,
+) -> int:
+    """Pick ``group_size`` for ``T.Persistent`` (M/by strip grouping).
+
+    ``T.Persistent`` maps ``tile_id`` with ``grouped_domain = [m_blocks // gs,
+    n_blocks, gs]`` using truncdiv; **gs must divide** ``m_blocks`` or some
+    output tiles are never scheduled.
+
+    Heuristic (gfx938 sweep, ``wgs_per_cu=1``):
+
+    * ``tile_rounds <= 1``: ``gs=1`` (one tile per block, no cross-tile reuse).
+    * ``tile_rounds == 2``: prefer ``gs=4``, else ``m_blocks // 3``, ``m_blocks // 2``.
+    * ``tile_rounds in [3, 5]``: ``gs=1`` (e.g. 4096³).
+    * ``tile_rounds >= 6``: ``gs = m_blocks // 2`` when divisible (e.g. 5120³).
+    """
+    m_blocks = _m_blocks(M, block_M)
+    n_blocks = _n_blocks(N, block_N)
+    if cu_num is None:
+        cu_num = _get_cu_num()
+    wave_size = wgs_per_cu * cu_num
+    total_tiles = m_blocks * n_blocks
+    tile_rounds = math.ceil(total_tiles / wave_size) if wave_size > 0 else 1
+
+    def divides_m_blocks(gs: int) -> bool:
+        return gs >= 1 and m_blocks % gs == 0
+
+    if tile_rounds <= 1:
+        return 1
+
+    if tile_rounds == 2:
+        for gs in (4, m_blocks // 3, m_blocks // 2, 1):
+            if divides_m_blocks(gs):
+                return gs
+
+    if tile_rounds >= 6:
+        gs = m_blocks // 2
+        if divides_m_blocks(gs):
+            return gs
+
+    return 1
+
+
+def get_swizzle_group_size(
+    M: int | None = None,
+    N: int | None = None,
+    K: int | None = None,
+    *,
+    threshold: int = 4096,
+    large_group_size: int = 8,
+    small_group_size: int = 1,
+) -> int:
+    """Pick threadblock swizzle panel size from GEMM shape.
+
+    When any of M/N/K exceeds ``threshold``, use ``large_group_size`` (L2 tile
+    swizzle); otherwise disable threadblock swizzle via ``small_group_size`` (1).
+    """
+    if M is None or N is None or K is None:
+        return small_group_size
+    if max(M, N, K) > threshold:
+        return large_group_size
+    return small_group_size
+
+
+def get_heuristic_config(
+    impl: str | None = None,
+    version: str | None = None,
+    M: int | None = None,
+    N: int | None = None,
+    K: int | None = None,
+) -> dict:
     """Get a heuristic configuration for GEMM kernels.
 
     Args:
@@ -193,20 +290,23 @@ def get_heuristic_config(impl: str | None = None, version: str | None = None) ->
         version: Kernel variant within the family (e.g. v1, v2, v3, v4, v5).
             When set, version-specific tile/thread overrides are applied on top
             of the base heuristic config.
+        M, N, K: Optional GEMM dimensions; when set, ``group_size`` is chosen by
+            :func:`get_swizzle_group_size` (vanilla) or
+            :func:`get_persistent_group_size` (persistent v4 only).
     """
     config = {
-        #"block_M": 128,
-        #"block_N": 256,
-        #"block_K": 32,
+        # "block_M": 128,
+        # "block_N": 256,
+        # "block_K": 32,
         "block_M": 128,
         "block_N": 256,
         "block_K": 64,
         "num_stages": 0,
-        #"thread_num": 128,
+        # "thread_num": 128,
         "thread_num": 256,
         # "thread_num": 512,
-        "group_size": 1,  # Enable group swizzling optimization
-        #"enable_rasteration": True,
+        "group_size": get_swizzle_group_size(M, N, K),
+        # "enable_rasteration": True,
         "wgs_per_cu": 2,
     }
 
@@ -216,6 +316,7 @@ def get_heuristic_config(impl: str | None = None, version: str | None = None) ->
             "block_N": 256,
             "block_K": 32,
             "thread_num": 512,
+            "wgs_per_cu": 1,
         },
         ("vanilla", "v2"): {
             "block_M": 256,
@@ -226,6 +327,15 @@ def get_heuristic_config(impl: str | None = None, version: str | None = None) ->
     }
     if impl is not None and version is not None:
         config.update(version_overrides.get((impl, version), {}))
+
+    if impl == "persistent" and version == "v4" and M is not None and N is not None:
+        config["group_size"] = get_persistent_group_size(
+            M,
+            N,
+            config["block_M"],
+            config["block_N"],
+            wgs_per_cu=config["wgs_per_cu"],
+        )
 
     if impl in ["vanilla"]:
         config["use_mls"] = True

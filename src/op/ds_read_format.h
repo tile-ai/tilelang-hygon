@@ -15,7 +15,7 @@ namespace tl {
 using namespace tir;
 
 class DsReadFormatNode : public TileOperatorNode {
- public:
+public:
   Buffer src, dst;
   Array<Range> src_ranges;
   Array<Range> dst_ranges;
@@ -33,15 +33,16 @@ class DsReadFormatNode : public TileOperatorNode {
 };
 
 class DsReadFormat : public TileOperator {
- public:
+public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(DsReadFormat, TileOperator,
                                              DsReadFormatNode);
-  TVM_DLL DsReadFormat(Array<PrimExpr> args,
-                       Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+  TVM_DLL
+  DsReadFormat(Array<PrimExpr> args,
+               Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
   static const Op &Get();
 };
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm
 
-#endif  // TVM_TL_OP_DS_READ_FORMAT_H_
+#endif // TVM_TL_OP_DS_READ_FORMAT_H_

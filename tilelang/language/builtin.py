@@ -9,8 +9,8 @@ from tilelang.language.kernel import get_thread_bindings, get_block_extents
 from tilelang.utils.target import check_hip_availability
 from tvm import DataType, tir
 from tvm.runtime import convert
-from typing import Any, Literal, Optional, Union
-from tvm.tir import PrimExpr, Var, Call, Buffer, BufferLoad, BufferRegion
+from typing import Literal
+from tvm.tir import PrimExpr, Var, Call, BufferLoad, BufferRegion
 from tilelang.utils.language import retrieve_ptr
 
 _IS_HIP_AVAILABLE = check_hip_availability()
@@ -874,15 +874,8 @@ def barrier_arrive(mbarrier: BarrierType):
     """
     return mbarrier_arrive(mbarrier)
 
-def activemask():
-    """Return the active mask of the current warp.
-    """
-    if _IS_HIP_AVAILABLE:
-        return tir.call_extern("uint64", "__builtin_amdgcn_read_exec")
-    else:
-        return tir.call_extern("uint32", "__activemask")
 
-def shfl(value: Union[int, PrimExpr, tir.Call], lane: Union[int, PrimExpr, tir.Call]):
+def shfl(value: int | PrimExpr | tir.Call, lane: int | PrimExpr | tir.Call):
     """Perform a shuffle operation.
 
     Args:
@@ -896,7 +889,8 @@ def shfl(value: Union[int, PrimExpr, tir.Call], lane: Union[int, PrimExpr, tir.C
     if _IS_HIP_AVAILABLE:
         return tir.call_extern(value.dtype, "__shfl", value, lane)
     else:
-        return tir.call_extern(value.dtype, "__shfl_sync", 0xffffffff, value, lane)
+        return tir.call_extern(value.dtype, "__shfl_sync", 0xFFFFFFFF, value, lane)
+
 
 # Full-warp mask as a proper uint32 TIR constant so the emitted C/C++ source
 # prints as `0xFFFFFFFFu` instead of `(int64_t)4294967295` after TIR widening.
@@ -1249,18 +1243,17 @@ def _pack_s_waitcnt_imm(cnt: int, flag: Literal["vmcnt", "lgkmcnt", "expcnt"]) -
     if flag == "vmcnt":
         if not 0 <= cnt <= 63:
             raise ValueError(f"vmcnt must be in [0, 63], but got {cnt}.")
-        return ((cnt & 0xF) | (7 << 4) | (1 << 7) | (15 << 8) | (3 << 12) |
-                ((cnt & 0x30) << 10))
+        return (cnt & 0xF) | (7 << 4) | (1 << 7) | (15 << 8) | (3 << 12) | ((cnt & 0x30) << 10)
 
     if flag == "lgkmcnt":
         if not 0 <= cnt <= 15:
             raise ValueError(f"lgkmcnt must be in [0, 15], but got {cnt}.")
-        return (0xF | (7 << 4) | (1 << 7) | (cnt << 8) | (3 << 12))
+        return 0xF | (7 << 4) | (1 << 7) | (cnt << 8) | (3 << 12)
 
     if flag == "expcnt":
         if not 0 <= cnt <= 7:
             raise ValueError(f"expcnt must be in [0, 7], but got {cnt}.")
-        return (0xF | (cnt << 4) | (1 << 7) | (15 << 8) | (3 << 12))
+        return 0xF | (cnt << 4) | (1 << 7) | (15 << 8) | (3 << 12)
 
     raise ValueError(f"Unsupported s_waitcnt flag: {flag}. Expected one of vmcnt, lgkmcnt, expcnt.")
 

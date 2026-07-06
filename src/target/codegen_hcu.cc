@@ -3,13 +3,13 @@
  */
 
 #include "codegen_hcu.h"
+#include "arith/pattern_match.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
 #include <tvm/node/structural_equal.h>
 #include <tvm/tir/index_map.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
-#include "arith/pattern_match.h"
 
 #include <cmath>
 #include <cstdint>
@@ -88,13 +88,15 @@ int GetTileLangCPAsyncTransferBytes(const CallNode *op) {
   return static_cast<int>(total_bytes);
 }
 
-/// CK buffer templates use raw ``unsigned short`` for bf16; LDS/MMAC use ``bfloat16_t`` (__bf16).
+/// CK buffer templates use raw ``unsigned short`` for bf16; LDS/MMAC use
+/// ``bfloat16_t`` (__bf16).
 std::string HcuCkTemplateElemType(DataType dtype) {
   DataType elem_type = dtype.element_of();
   int elem_bits = elem_type.bits();
   if (elem_bits == 8) {
     if (elem_type.is_float8_e4m3fn() || elem_type.is_float8_e4m3fnuz() ||
-        elem_type.is_float8_e4m3() || elem_type.code() == DataType::kFloat8_e4m3b11fnuz) {
+        elem_type.is_float8_e4m3() ||
+        elem_type.code() == DataType::kFloat8_e4m3b11fnuz) {
       return "tl::fp8_t";
     }
     if (elem_type.is_float8_e5m2() || elem_type.is_float8_e5m2fnuz() ||
@@ -116,16 +118,21 @@ std::string HcuCkTemplateElemType(DataType dtype) {
   return "";
 }
 
-/// CK **src** pointers (`const T*`): special-case bf16/i64 mappings, and always cast
-/// generic pointers to `const T*` (some HCU paths materialize tensor handles as `void*`).
-std::string HcuCkBufferSrcPtrExpr(DataType dtype, const std::string &wave_ptr_expr) {
-  return "reinterpret_cast<const " + HcuCkTemplateElemType(dtype) + "*>(" + wave_ptr_expr + ")";
+/// CK **src** pointers (`const T*`): special-case bf16/i64 mappings, and always
+/// cast generic pointers to `const T*` (some HCU paths materialize tensor
+/// handles as `void*`).
+std::string HcuCkBufferSrcPtrExpr(DataType dtype,
+                                  const std::string &wave_ptr_expr) {
+  return "reinterpret_cast<const " + HcuCkTemplateElemType(dtype) + "*>(" +
+         wave_ptr_expr + ")";
 }
 
-/// CK **dst** pointers (`T*`): `reinterpret_cast<unsigned short*>` for `bfloat16_t`, else
-/// C-style cast to element pointer, e.g. `(float*)buf`.
-std::string HcuCkBufferDstPtrExpr(DataType dtype, const std::string &wave_ptr_expr) {
-  return "reinterpret_cast<" + HcuCkTemplateElemType(dtype) + "*>(" + wave_ptr_expr + ")";
+/// CK **dst** pointers (`T*`): `reinterpret_cast<unsigned short*>` for
+/// `bfloat16_t`, else C-style cast to element pointer, e.g. `(float*)buf`.
+std::string HcuCkBufferDstPtrExpr(DataType dtype,
+                                  const std::string &wave_ptr_expr) {
+  return "reinterpret_cast<" + HcuCkTemplateElemType(dtype) + "*>(" +
+         wave_ptr_expr + ")";
 }
 
 } // namespace
@@ -228,7 +235,8 @@ bool CodeGenTileLangHCU::StoreWouldEmitLDSBufferOp(
     const BufferStoreNode *buffer_store) const {
   const auto *buffer_load = buffer_store->value.as<BufferLoadNode>();
   const auto *dst_var = buffer_store->buffer->data.get();
-  // Same as TryToEmitLDSBufferOp: count + lookup. Use at() (const map has no []).
+  // Same as TryToEmitLDSBufferOp: count + lookup. Use at() (const map has no
+  // []).
   if (buffer_load == nullptr || !direct_to_lds_map_.count(dst_var) ||
       !direct_to_lds_map_.at(dst_var))
     return false;
@@ -240,30 +248,34 @@ bool CodeGenTileLangHCU::StoreWouldEmitLDSBufferOp(
          (read_bytes == 4 || read_bytes == 8 || read_bytes == 16);
 }
 
-bool CodeGenTileLangHCU::TryToEmitLDSBufferOp(const BufferStoreNode *buffer_store) {
+bool CodeGenTileLangHCU::TryToEmitLDSBufferOp(
+    const BufferStoreNode *buffer_store) {
   if (!StoreWouldEmitLDSBufferOp(buffer_store))
     return false;
   const auto *buffer_load = buffer_store->value.as<BufferLoadNode>();
   ICHECK(buffer_load != nullptr);
 
   DataType value_dtype = buffer_store->value.dtype();
-  auto store_desc =
-    GetBufferDesc(value_dtype, buffer_store->buffer.get(), buffer_store->indices[0]);
-  auto load_desc =
-    GetBufferDesc(buffer_load->dtype, buffer_load->buffer.get(), buffer_load->indices[0]);
-  std::string lds_base = HcuCkBufferDstPtrExpr(value_dtype, store_desc.wave_ptr);
-  std::string global_base = HcuCkBufferSrcPtrExpr(buffer_load->dtype, load_desc.wave_ptr);
+  auto store_desc = GetBufferDesc(value_dtype, buffer_store->buffer.get(),
+                                  buffer_store->indices[0]);
+  auto load_desc = GetBufferDesc(buffer_load->dtype, buffer_load->buffer.get(),
+                                 buffer_load->indices[0]);
+  std::string lds_base =
+      HcuCkBufferDstPtrExpr(value_dtype, store_desc.wave_ptr);
+  std::string global_base =
+      HcuCkBufferSrcPtrExpr(buffer_load->dtype, load_desc.wave_ptr);
   PrintIndent();
   stream << "ck::hcu_direct_load_global_to_lds<"
          << HcuCkTemplateElemType(buffer_load->dtype) << ", "
-         << value_dtype.lanes() << ", false>("
-         << global_base << ", "              // global_base_ptr
-         << load_desc.offset << ", "                // global_offset (in elements)
-         << lds_base << ", "                        // lds_base_ptr
-         << store_desc.offset << ", "               // lds_offset (in elements)
-         << "true, "                                // is_valid
-         << load_desc.element_space_size << ", "    // src_element_space_size (in elements)
-         << "0);\n";                                // wave_lds_wrap_offset
+         << value_dtype.lanes() << ", false>(" << global_base
+         << ", "                      // global_base_ptr
+         << load_desc.offset << ", "  // global_offset (in elements)
+         << lds_base << ", "          // lds_base_ptr
+         << store_desc.offset << ", " // lds_offset (in elements)
+         << "true, "                  // is_valid
+         << load_desc.element_space_size
+         << ", "     // src_element_space_size (in elements)
+         << "0);\n"; // wave_lds_wrap_offset
 
   return true;
 }
@@ -355,8 +367,8 @@ bool IsSafeValueExpr(const PrimExpr &expr) {
   return false;
 }
 
-// Extract conditions from a chain of if(cond){body} with no else, ending in store.
-// Returns (conditions, store) or (empty, nullptr) if not matching.
+// Extract conditions from a chain of if(cond){body} with no else, ending in
+// store. Returns (conditions, store) or (empty, nullptr) if not matching.
 struct NestedFoldableResult {
   Array<PrimExpr> conditions;
   const BufferStoreNode *store{nullptr};
@@ -384,7 +396,7 @@ NestedFoldableResult ExtractNestedFoldableConditions(const Stmt &stmt) {
   return {{}, nullptr, false};
 }
 
-}  // namespace
+} // namespace
 
 std::string CodeGenTileLangHCU::GetCurrentPredicate() const {
   if (predicate_stack_.empty())
@@ -433,9 +445,10 @@ bool CodeGenTileLangHCU::LoadWillUseAmdBufferOpsWithPredicate(
   PrimExpr index = load->indices[0];
   int lanes = load->dtype.lanes();
 
-  // Align with CodeGenC::VisitExpr_(BufferLoad): GetBufferRef when the *emitted*
-  // value lanes match buffer element lanes. Use outer dtype (e.g. Cast to scalar)
-  // so Cast(vector load)->scalar is not mistaken for GetVecLoad.
+  // Align with CodeGenC::VisitExpr_(BufferLoad): GetBufferRef when the
+  // *emitted* value lanes match buffer element lanes. Use outer dtype (e.g.
+  // Cast to scalar) so Cast(vector load)->scalar is not mistaken for
+  // GetVecLoad.
   if (outer_dtype.lanes() == element_dtype.lanes()) {
     return false;
   }
@@ -458,10 +471,12 @@ bool CodeGenTileLangHCU::LoadWillUseAmdBufferOpsWithPredicate(
 
 bool CodeGenTileLangHCU::StoreWillUseAmdBufferOpsWithPredicate(
     const BufferStoreNode *op) const {
-  // Predicate is only threaded into tl::amd_buffer_store when VisitStmt_(BufferStore)
-  // takes the direct path, or into PrintVecStoreWithPredicate when CodeGenC::VisitStmt_
-  // (BufferStore) calls PrintVecStore (unequal lanes + contiguous ramp, not float4).
-  // TryToEmitLDSBufferOp bypasses predicate_stack_ — gate with StoreWouldEmitLDSBufferOp.
+  // Predicate is only threaded into tl::amd_buffer_store when
+  // VisitStmt_(BufferStore) takes the direct path, or into
+  // PrintVecStoreWithPredicate when CodeGenC::VisitStmt_ (BufferStore) calls
+  // PrintVecStore (unequal lanes + contiguous ramp, not float4).
+  // TryToEmitLDSBufferOp bypasses predicate_stack_ — gate with
+  // StoreWouldEmitLDSBufferOp.
   if (StoreWouldEmitLDSBufferOp(op))
     return false;
 
@@ -478,8 +493,8 @@ bool CodeGenTileLangHCU::StoreWillUseAmdBufferOpsWithPredicate(
     return false;
 
   if (value_dtype.lanes() == element_dtype.lanes()) {
-    // Matches VisitStmt_(BufferStore) before CodeGenC fallback: GetBufferDesc requires
-    // stride-1 ramp when index is a Ramp (else codegen ICHECK).
+    // Matches VisitStmt_(BufferStore) before CodeGenC fallback: GetBufferDesc
+    // requires stride-1 ramp when index is a Ramp (else codegen ICHECK).
     if (index_expr.as<RampNode>()) {
       arith::PVar<PrimExpr> base;
       if (!arith::ramp(base, 1, value_dtype.lanes()).Match(index_expr))
@@ -488,7 +503,8 @@ bool CodeGenTileLangHCU::StoreWillUseAmdBufferOpsWithPredicate(
     return true;
   }
 
-  // Unequal lanes: CodeGenC uses per-lane loop unless ramp(base,1,value_lanes).Match.
+  // Unequal lanes: CodeGenC uses per-lane loop unless
+  // ramp(base,1,value_lanes).Match.
   if (value_dtype.is_float4_e2m1fn())
     return false;
   arith::PVar<PrimExpr> base;
@@ -535,8 +551,10 @@ bool CodeGenTileLangHCU::IsFoldableIfThenElse(const IfThenElseNode *op) const {
 }
 
 // Check if if(cond){store} else {if(c0){if(c1){store}}} with cond == c0 && c1.
-// When true, we can collapse to a single store with predicate cond (else is dead).
-bool CodeGenTileLangHCU::IsCollapsibleRedundantIfElse(const IfThenElseNode *op) const {
+// When true, we can collapse to a single store with predicate cond (else is
+// dead).
+bool CodeGenTileLangHCU::IsCollapsibleRedundantIfElse(
+    const IfThenElseNode *op) const {
   if (!op->else_case)
     return false;
   const auto *then_store = op->then_case.as<BufferStoreNode>();
@@ -551,7 +569,8 @@ bool CodeGenTileLangHCU::IsCollapsibleRedundantIfElse(const IfThenElseNode *op) 
       then_store->indices.size() != else_result.store->indices.size())
     return false;
   for (size_t i = 0; i < then_store->indices.size(); i++) {
-    if (!StructuralEqual()(then_store->indices[i], else_result.store->indices[i]))
+    if (!StructuralEqual()(then_store->indices[i],
+                           else_result.store->indices[i]))
       return false;
   }
   if (!StructuralEqual()(then_store->value, else_result.store->value))
@@ -592,7 +611,8 @@ void CodeGenTileLangHCU::VisitStmt_(const IfThenElseNode *op) {
 }
 
 void CodeGenTileLangHCU::VisitStmt_(const LetStmtNode *op) {
-  // Record Let RHS for predicate folding (IsZeroValue); do not touch var_idmap_.
+  // Record Let RHS for predicate folding (IsZeroValue); do not touch
+  // var_idmap_.
   let_initializer_expr_for_predicate_[op->var.get()] = op->value;
   CodeGenC::VisitStmt_(op);
 }
@@ -604,7 +624,8 @@ bool IsMlsLoadTileCallExtern(const CallNode *call) {
     return false;
   }
   const auto *name = call->args[0].as<StringImmNode>();
-  return name && static_cast<std::string>(name->value).find("tl::mls::mls_load_tile<") == 0;
+  return name && static_cast<std::string>(name->value)
+                         .find("tl::mls::mls_load_tile<") == 0;
 }
 
 std::vector<std::string> SplitTopLevelTemplateArgs(const std::string &text) {
@@ -619,15 +640,19 @@ std::vector<std::string> SplitTopLevelTemplateArgs(const std::string &text) {
       --depth;
     } else if (c == ',' && depth == 0) {
       size_t end = i;
-      while (start < end && text[start] == ' ') ++start;
-      while (end > start && text[end - 1] == ' ') --end;
+      while (start < end && text[start] == ' ')
+        ++start;
+      while (end > start && text[end - 1] == ' ')
+        --end;
       args.push_back(text.substr(start, end - start));
       start = i + 1;
     }
   }
   size_t end = text.size();
-  while (start < end && text[start] == ' ') ++start;
-  while (end > start && text[end - 1] == ' ') --end;
+  while (start < end && text[start] == ' ')
+    ++start;
+  while (end > start && text[end - 1] == ' ')
+    --end;
   args.push_back(text.substr(start, end - start));
   return args;
 }
@@ -636,12 +661,15 @@ std::string MlsBaseTemplateFromLoadTile(const std::string &sym) {
   const std::string prefix = "tl::mls::mls_load_tile<";
   ICHECK(sym.find(prefix) == 0) << "Unexpected MLS symbol: " << sym;
   ICHECK_EQ(sym.back(), '>') << "Malformed MLS template symbol: " << sym;
-  auto args = SplitTopLevelTemplateArgs(sym.substr(prefix.size(), sym.size() - prefix.size() - 1));
-  ICHECK_GE(args.size(), 8U) << "mls_load_tile expects at least 8 template args";
+  auto args = SplitTopLevelTemplateArgs(
+      sym.substr(prefix.size(), sym.size() - prefix.size() - 1));
+  ICHECK_GE(args.size(), 8U)
+      << "mls_load_tile expects at least 8 template args";
   std::ostringstream os;
   os << "tl::mls::tilelang_mls_base<";
   for (size_t i = 0; i < 8; ++i) {
-    if (i != 0) os << ", ";
+    if (i != 0)
+      os << ", ";
     os << args[i];
   }
   os << ">";
@@ -650,24 +678,29 @@ std::string MlsBaseTemplateFromLoadTile(const std::string &sym) {
 
 std::string MlsDataTypeFromLoadTile(const std::string &sym) {
   const std::string prefix = "tl::mls::mls_load_tile<";
-  auto args = SplitTopLevelTemplateArgs(sym.substr(prefix.size(), sym.size() - prefix.size() - 1));
-  ICHECK_GE(args.size(), 5U) << "mls_load_tile expects DataType as template arg 4";
+  auto args = SplitTopLevelTemplateArgs(
+      sym.substr(prefix.size(), sym.size() - prefix.size() - 1));
+  ICHECK_GE(args.size(), 5U)
+      << "mls_load_tile expects DataType as template arg 4";
   return args[4];
 }
 
-std::pair<std::string, std::string> MlsLastLoadTemplateArgs(const std::string &sym) {
+std::pair<std::string, std::string>
+MlsLastLoadTemplateArgs(const std::string &sym) {
   const std::string prefix = "tl::mls::mls_load_tile<";
-  auto args = SplitTopLevelTemplateArgs(sym.substr(prefix.size(), sym.size() - prefix.size() - 1));
+  auto args = SplitTopLevelTemplateArgs(
+      sym.substr(prefix.size(), sym.size() - prefix.size() - 1));
   std::string check_last_load = args.size() > 8 ? args[8] : "true";
   std::string last_load = args.size() > 9 ? args[9] : "false";
   return {check_last_load, last_load};
 }
 
-}  // namespace
+} // namespace
 
 void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
   const auto *call = op->value.as<CallNode>();
-  if (call && call->op.same_as(tir::builtin::call_extern()) && !call->args.empty()) {
+  if (call && call->op.same_as(tir::builtin::call_extern()) &&
+      !call->args.empty()) {
     const auto *extern_sym = call->args[0].as<StringImmNode>();
     if (extern_sym) {
       const std::string sym = extern_sym->value;
@@ -676,20 +709,22 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
       const std::string async_load_mn_prefix = "tl::mls::async_load_mn<";
 
       if (sym.find(resource_init_prefix) == 0) {
-        ICHECK_EQ(call->args.size(), 6U)
-            << "MLS resource_init expects symbol, name, src, stride, mn_len, k_len";
+        ICHECK_EQ(call->args.size(), 6U) << "MLS resource_init expects symbol, "
+                                            "name, src, stride, mn_len, k_len";
         enable_gemm_mls_ = true;
         const auto *name = call->args[1].as<StringImmNode>();
         ICHECK(name) << "MLS resource_init expects a string resource name";
         const std::string obj_name = name->value;
         const std::string base_template =
-            sym.substr(resource_init_prefix.size(), sym.size() - resource_init_prefix.size() - 1);
+            sym.substr(resource_init_prefix.size(),
+                       sym.size() - resource_init_prefix.size() - 1);
         PrintIndent();
         stream << "using " << obj_name << "_t = " << base_template << ";\n";
         PrintIndent();
-        stream << obj_name << "_t " << obj_name << "(" << PrintExpr(call->args[2])
-               << ", " << PrintExpr(call->args[3]) << ", " << PrintExpr(call->args[4])
-               << ", " << PrintExpr(call->args[5]) << ");\n";
+        stream << obj_name << "_t " << obj_name << "("
+               << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3])
+               << ", " << PrintExpr(call->args[4]) << ", "
+               << PrintExpr(call->args[5]) << ");\n";
         return;
       }
 
@@ -702,40 +737,48 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         PrintIndent();
         stream << name->value
                << ".set_window_origin(tl::make_array<tl::index_t>("
-               << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3]) << "));\n";
+               << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3])
+               << "));\n";
         return;
       }
 
       if (sym == "tl::mls::update_base") {
-        ICHECK_EQ(call->args.size(), 3U) << "MLS update_base expects symbol, name, k_base";
+        ICHECK_EQ(call->args.size(), 3U)
+            << "MLS update_base expects symbol, name, k_base";
         enable_gemm_mls_ = true;
         const auto *name = call->args[1].as<StringImmNode>();
         ICHECK(name) << "MLS update_base expects a string resource name";
         PrintIndent();
-        stream << name->value << ".update_base(" << PrintExpr(call->args[2]) << ");\n";
+        stream << name->value << ".update_base(" << PrintExpr(call->args[2])
+               << ");\n";
         return;
       }
 
       if (sym == "tl::mls::update_mn_base") {
-        ICHECK_EQ(call->args.size(), 3U) << "MLS update_mn_base expects symbol, name, mn_base";
+        ICHECK_EQ(call->args.size(), 3U)
+            << "MLS update_mn_base expects symbol, name, mn_base";
         enable_gemm_mls_ = true;
         const auto *name = call->args[1].as<StringImmNode>();
         ICHECK(name) << "MLS update_mn_base expects a string resource name";
         PrintIndent();
-        stream << name->value << ".update_mn_base(" << PrintExpr(call->args[2]) << ");\n";
+        stream << name->value << ".update_mn_base(" << PrintExpr(call->args[2])
+               << ");\n";
         return;
       }
 
       if (sym.find(async_load_prefix) == 0) {
-        ICHECK_EQ(call->args.size(), 4U) << "MLS async_load expects symbol, name, dst, k_base";
+        ICHECK_EQ(call->args.size(), 4U)
+            << "MLS async_load expects symbol, name, dst, k_base";
         enable_gemm_mls_ = true;
         const auto *name = call->args[1].as<StringImmNode>();
         ICHECK(name) << "MLS async_load expects a string resource name";
         const std::string template_args =
-            sym.substr(async_load_prefix.size(), sym.size() - async_load_prefix.size() - 1);
+            sym.substr(async_load_prefix.size(),
+                       sym.size() - async_load_prefix.size() - 1);
         PrintIndent();
-        stream << name->value << ".template async_mls_load_asm<" << template_args
-               << ">(" << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3]) << ");\n";
+        stream << name->value << ".template async_mls_load_asm<"
+               << template_args << ">(" << PrintExpr(call->args[2]) << ", "
+               << PrintExpr(call->args[3]) << ");\n";
         return;
       }
 
@@ -746,17 +789,20 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         const auto *name = call->args[1].as<StringImmNode>();
         ICHECK(name) << "MLS async_load_mn expects a string resource name";
         const std::string template_args =
-            sym.substr(async_load_mn_prefix.size(), sym.size() - async_load_mn_prefix.size() - 1);
+            sym.substr(async_load_mn_prefix.size(),
+                       sym.size() - async_load_mn_prefix.size() - 1);
         PrintIndent();
-        stream << name->value << ".template async_mls_load_asm_mn<" << template_args
-               << ">(" << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3]) << ");\n";
+        stream << name->value << ".template async_mls_load_asm_mn<"
+               << template_args << ">(" << PrintExpr(call->args[2]) << ", "
+               << PrintExpr(call->args[3]) << ");\n";
         return;
       }
     }
   }
   if (call && IsMlsLoadTileCallExtern(call)) {
     ICHECK_EQ(call->args.size(), 8U)
-        << "mls_load_tile extern expects symbol, src, stride, mn_len, k_len, mn_base, k_base, dst";
+        << "mls_load_tile extern expects symbol, src, stride, mn_len, k_len, "
+           "mn_base, k_base, dst";
     enable_gemm_mls_ = true;
     const auto *sym_node = call->args[0].as<StringImmNode>();
     const std::string sym = sym_node->value;
@@ -772,22 +818,22 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
     const std::string k_base = PrintExpr(call->args[6]);
     const std::string dst_ptr = PrintExpr(call->args[7]);
 
-    const std::string obj_name = "_tl_mls_" + std::to_string(mls_resource_object_counter_++);
+    const std::string obj_name =
+        "_tl_mls_" + std::to_string(mls_resource_object_counter_++);
     PrintIndent();
     stream << "using " << obj_name << "_t = " << base_template << ";\n";
     PrintIndent();
-    stream << obj_name << "_t " << obj_name << "(" << src_ptr << ", "
-           << stride << ", " << mn_len << ", " << k_len << ");\n";
+    stream << obj_name << "_t " << obj_name << "(" << src_ptr << ", " << stride
+           << ", " << mn_len << ", " << k_len << ");\n";
     PrintIndent();
-    stream << obj_name
-           << ".set_window_origin(tl::make_array<tl::index_t>("
+    stream << obj_name << ".set_window_origin(tl::make_array<tl::index_t>("
            << mn_base << ", 0));\n";
     PrintIndent();
     stream << obj_name << ".update_base(" << k_base << ");\n";
     PrintIndent();
-    stream << obj_name << ".template async_mls_load_asm<" << data_type
-           << ", " << check_last_load << ", " << last_load << ">("
-           << dst_ptr << ", " << k_base << ");\n";
+    stream << obj_name << ".template async_mls_load_asm<" << data_type << ", "
+           << check_last_load << ", " << last_load << ">(" << dst_ptr << ", "
+           << k_base << ");\n";
     return;
   }
 
@@ -823,31 +869,29 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
   if (TryToEmitLDSBufferOp(op))
     return;
 
-  // Only handle the common case where lanes match; otherwise, fall back to the default
-  // CodeGenC implementation (which may invoke PrintVecStore to emit buffer/vectorized store
-  // instructions).
+  // Only handle the common case where lanes match; otherwise, fall back to the
+  // default CodeGenC implementation (which may invoke PrintVecStore to emit
+  // buffer/vectorized store instructions).
   if (value_dtype.lanes() == element_dtype.lanes()) {
-    BufferDesc desc = GetBufferDesc(value_dtype, op->buffer.get(), op->indices[0]);
+    BufferDesc desc =
+        GetBufferDesc(value_dtype, op->buffer.get(), op->indices[0]);
     if (CanUseVMBufferOps(op->buffer.get(), value_dtype.lanes())) {
       std::string value = PrintExpr(op->value);
 
       // Convert the value expression to a thread_buffer using bit_cast.
       // For lanes==1 this becomes thread_buffer<T,1>.
       std::string src_thread_buffer = "tl::bit_cast<tl::thread_buffer<" +
-                                      HcuCkTemplateElemType(value_dtype) + ", " +
-                                      std::to_string(desc.num_elements) + ">>(" +
-                                      value + ")";
+                                      HcuCkTemplateElemType(value_dtype) +
+                                      ", " + std::to_string(desc.num_elements) +
+                                      ">>(" + value + ")";
 
       std::string pred = GetCurrentPredicate();
       PrintIndent();
-      stream << "tl::amd_buffer_store<"
-             << HcuCkTemplateElemType(value_dtype) << ", "
-             << desc.num_elements << ", "
-             << (pred == "true" ? "false" : "true") << ">("
-             << src_thread_buffer << ", "
-             << HcuCkBufferDstPtrExpr(value_dtype, desc.wave_ptr) << ", "
-             << desc.offset << ", "
-             << pred << ", "
+      stream << "tl::amd_buffer_store<" << HcuCkTemplateElemType(value_dtype)
+             << ", " << desc.num_elements << ", "
+             << (pred == "true" ? "false" : "true") << ">(" << src_thread_buffer
+             << ", " << HcuCkBufferDstPtrExpr(value_dtype, desc.wave_ptr)
+             << ", " << desc.offset << ", " << pred << ", "
              << desc.element_space_size << ");\n";
 
       return;
@@ -1155,7 +1199,8 @@ void CodeGenTileLangHCU::PrintVecBinaryOp(const std::string &op, DataType t,
 }
 
 CodeGenTileLangHCU::BufferDesc
-CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr offset) {
+CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer,
+                                  PrimExpr offset) {
   const VarNode *buffer_var = buffer->data.get();
   std::string scope;
 
@@ -1168,7 +1213,7 @@ CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr
 
   ICHECK_NE(buffer->shape.size(), 0) << "Buffer shape is empty";
   PrimExpr total_size = IntImm(DataType::Int(32), 1);
-  for (const auto& dim : buffer->shape) {
+  for (const auto &dim : buffer->shape) {
     total_size = total_size * dim;
   }
   std::string element_space_size = PrintExpr(total_size);
@@ -1200,21 +1245,18 @@ std::string CodeGenTileLangHCU::GetVecLoad(DataType t, const BufferNode *buffer,
   return GetVecLoadWithPredicate(t, buffer, base, GetCurrentPredicate());
 }
 
-std::string CodeGenTileLangHCU::GetVecLoadWithPredicate(DataType t,
-                                                        const BufferNode *buffer,
-                                                        PrimExpr base,
-                                                        const std::string &pred) {
+std::string CodeGenTileLangHCU::GetVecLoadWithPredicate(
+    DataType t, const BufferNode *buffer, PrimExpr base,
+    const std::string &pred) {
   if (CanUseVMBufferOps(buffer, t.lanes())) {
     auto desc = GetBufferDesc(t, buffer, base);
     std::ostringstream os;
     os << "*(";
     PrintType(t, os);
-    os << "*)&(tl::amd_buffer_load<"
-       << HcuCkTemplateElemType(t) << ", " << desc.num_elements << ", "
-       << (pred == "true" ? "false" : "true") << ">("
-       << HcuCkBufferSrcPtrExpr(t, desc.wave_ptr) << ", " << desc.offset << ", "
-       << pred << ", "
-       << desc.element_space_size << ").get())";
+    os << "*)&(tl::amd_buffer_load<" << HcuCkTemplateElemType(t) << ", "
+       << desc.num_elements << ", " << (pred == "true" ? "false" : "true")
+       << ">(" << HcuCkBufferSrcPtrExpr(t, desc.wave_ptr) << ", " << desc.offset
+       << ", " << pred << ", " << desc.element_space_size << ").get())";
 
     return os.str();
   }
@@ -1223,15 +1265,16 @@ std::string CodeGenTileLangHCU::GetVecLoadWithPredicate(DataType t,
   return CodeGenC::GetVecLoad(t, buffer, base);
 }
 
-void CodeGenTileLangHCU::PrintVecStore(const BufferNode* buffer, DataType t,
-                                       PrimExpr base, const std::string& value) {
+void CodeGenTileLangHCU::PrintVecStore(const BufferNode *buffer, DataType t,
+                                       PrimExpr base,
+                                       const std::string &value) {
   PrintVecStoreWithPredicate(buffer, t, base, value, GetCurrentPredicate());
 }
 
-void CodeGenTileLangHCU::PrintVecStoreWithPredicate(const BufferNode* buffer,
+void CodeGenTileLangHCU::PrintVecStoreWithPredicate(const BufferNode *buffer,
                                                     DataType t, PrimExpr base,
-                                                    const std::string& value,
-                                                    const std::string& pred) {
+                                                    const std::string &value,
+                                                    const std::string &pred) {
   if (!CanUseVMBufferOps(buffer, t.lanes())) {
     CodeGenC::PrintVecStore(buffer, t, base, value);
     return;
@@ -1240,22 +1283,21 @@ void CodeGenTileLangHCU::PrintVecStoreWithPredicate(const BufferNode* buffer,
   auto desc = GetBufferDesc(t, buffer, base);
   // Convert value to thread_buffer and use amd_buffer_store
   // amd_buffer_store signature:
-  //   amd_buffer_store<type, num_elements>(src_thread_data, dst_ptr, dst_offset,
+  //   amd_buffer_store<type, num_elements>(src_thread_data, dst_ptr,
+  //   dst_offset,
   //                                        is_valid, element_space_size)
   // Convert the value expression to a thread_buffer using bit_cast
-  std::string src_thread_buffer = "tl::bit_cast<tl::thread_buffer<" +
-                                  HcuCkTemplateElemType(t) + ", " +
-                                  std::to_string(desc.num_elements) + ">>(" + value + ")";
+  std::string src_thread_buffer =
+      "tl::bit_cast<tl::thread_buffer<" + HcuCkTemplateElemType(t) + ", " +
+      std::to_string(desc.num_elements) + ">>(" + value + ")";
 
   this->PrintIndent();
-  this->stream << "tl::amd_buffer_store<"
-               << HcuCkTemplateElemType(t) << ", " << desc.num_elements << ", "
+  this->stream << "tl::amd_buffer_store<" << HcuCkTemplateElemType(t) << ", "
+               << desc.num_elements << ", "
                << (pred == "true" ? "false" : "true") << ">("
                << src_thread_buffer << ", "
-               << HcuCkBufferDstPtrExpr(t, desc.wave_ptr) << ", "
-               << desc.offset << ", "
-               << pred << ", "
-               << desc.element_space_size << ");\n";
+               << HcuCkBufferDstPtrExpr(t, desc.wave_ptr) << ", " << desc.offset
+               << ", " << pred << ", " << desc.element_space_size << ");\n";
 }
 
 void CodeGenTileLangHCU::PrintVecElemLoad(const std::string &vec, DataType t,
@@ -1412,7 +1454,8 @@ std::string CodeGenTileLangHCU::CastFromTo(std::string value, DataType from,
       os << "u";
     }
     os << "int)";
-  } else if (from.is_float8_e4m3fn() || from.is_float8_e4m3() || target.is_float8_e4m3fn() || target.is_float8_e4m3()) {
+  } else if (from.is_float8_e4m3fn() || from.is_float8_e4m3() ||
+             target.is_float8_e4m3fn() || target.is_float8_e4m3()) {
     os << "(fp8_cvt_t)";
   } else if (from.is_float8_e5m2() || target.is_float8_e5m2()) {
     os << "(bf8_cvt_t)";
@@ -1458,17 +1501,20 @@ void CodeGenTileLangHCU::VisitExpr_(const CastNode *op, std::ostream &os) {
   os << sret;
 }
 
-void CodeGenTileLangHCU::VisitExpr_(const FloorDivNode* op, std::ostream& os) { // NOLINT(*)
+void CodeGenTileLangHCU::VisitExpr_(const FloorDivNode *op,
+                                    std::ostream &os) { // NOLINT(*)
   // Match CUDA codegen behavior: lower FloorDiv to plain Div before printing.
   PrintExpr(tir::Div(op->a, op->b), os);
 }
 
-void CodeGenTileLangHCU::VisitExpr_(const FloorModNode* op, std::ostream& os) { // NOLINT(*)
+void CodeGenTileLangHCU::VisitExpr_(const FloorModNode *op,
+                                    std::ostream &os) { // NOLINT(*)
   // Match CUDA codegen behavior: lower FloorMod to plain Mod before printing.
   PrintExpr(tir::Mod(op->a, op->b), os);
 }
 
-void CodeGenTileLangHCU::PrintCallExtern(Type ret_type, ffi::String global_symbol,
+void CodeGenTileLangHCU::PrintCallExtern(Type ret_type,
+                                         ffi::String global_symbol,
                                          const ffi::Array<PrimExpr> &args,
                                          bool skip_first_arg,
                                          std::ostream &os) { // NOLINT(*)
@@ -1778,14 +1824,14 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string rounding_mode = Downcast<StringImm>(op->args[3])->value;
     ICHECK(rounding_mode == "rn")
         << "HCU only supports tl.ieee_fmaf(..., rounding_mode=\"rn\").";
-    ICHECK(op->dtype.is_float())
-        << "tl.ieee_fmaf on HCU is currently only implemented for float32/float64.";
+    ICHECK(op->dtype.is_float()) << "tl.ieee_fmaf on HCU is currently only "
+                                    "implemented for float32/float64.";
     if (op->dtype.bits() == 32) {
-      os << "fmaf(" << PrintExpr(op->args[0]) << ", "
-         << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2]) << ")";
+      os << "fmaf(" << PrintExpr(op->args[0]) << ", " << PrintExpr(op->args[1])
+         << ", " << PrintExpr(op->args[2]) << ")";
     } else {
-      os << "fma(" << PrintExpr(op->args[0]) << ", "
-         << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2]) << ")";
+      os << "fma(" << PrintExpr(op->args[0]) << ", " << PrintExpr(op->args[1])
+         << ", " << PrintExpr(op->args[2]) << ")";
     }
   } else if (op->op.same_as(tl::add2()) || op->op.same_as(tl::sub2()) ||
              op->op.same_as(tl::mul2()) || op->op.same_as(tl::fma2()) ||
@@ -1937,6 +1983,12 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string c_bias = this->PrintExpr(op->args[11]);
     ICHECK(A_layout == "row" || B_layout == "row")
         << "Matrix core only support row major";
+    bool hcu_tf32_ab = false;
+    auto ab_hint = op->annotations.find("tl.hcu_tf32_ab");
+    if (ab_hint != op->annotations.end()) {
+      const auto *imm = (*ab_hint).second.as<IntImmNode>();
+      hcu_tf32_ab = imm && imm->value != 0;
+    }
     // TVM dtype -> C type for __builtin_hcu_mmac_*; packed A/B must match
     // tl_templates/hcu/gemm.h (int8 / FP8 MMAC pass int32x2 to builtins).
     std::unordered_map<std::string, std::string> dtype_map = {
@@ -1944,6 +1996,7 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
         {"int32", "int"},
         {"int8x4", "int32_t"},
         {"int8x8", "int32x2"},
+        {"int32x2", "int32x2"},
         {"int32x4", "int32x4"},
         {"float16", "half"},
         {"float32", "float"},
@@ -1954,14 +2007,20 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
         {"bfloat16x8", "bfloat16x8_vec"},
         {"float32x2", "float32x2"},
         {"float32x4", "float32x4"},
-        {"float8_e4m3fnuzx4", "fp8_e4_4_t"},
+        {"float8_e4m3", "fp8_e4_t"},
+        {"float8_e4m3x4", "fp8_e4_4_t"},
+        {"float8_e4m3x8", "int32x2"},
+        {"float8_e4m3fn", "fp8_e4_t"},
         {"float8_e4m3fnx4", "fp8_e4_4_t"},
-        {"float8_e4m3fnuzx8", "int32x2"},
         {"float8_e4m3fnx8", "int32x2"},
-        {"float8_e5m2fnuzx4", "fp8_e5_4_t"},
-        {"float8_e5m2fnuzx8", "int32x2"},
+        {"float8_e4m3fnuz", "fp8_e4_t"},
+        {"float8_e4m3fnuzx4", "fp8_e4_4_t"},
+        {"float8_e4m3fnuzx8", "int32x2"},
+        {"float8_e5m2", "fp8_e5_t"},
         {"float8_e5m2x4", "fp8_e5_4_t"},
         {"float8_e5m2x8", "int32x2"},
+        {"float8_e5m2fnuzx4", "fp8_e5_4_t"},
+        {"float8_e5m2fnuzx8", "int32x2"},
         {"float32x16", "float32x16"},
         {"float32x32", "float32x32"}};
 
@@ -1978,11 +2037,12 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       lts = ", 0";
     }
 
-    std::string call_mfma_code = R"({
-      *((({C_dtype}*){c_ref}) + {c_bias}) = {mfma_buildin}(*((({A_dtype}*){a_ref}) + {a_bias}),
-                    *((({B_dtype}*){b_ref}) + {b_bias}),
-                    *((({C_dtype}*){c_ref}) + {c_bias}){lit_suffix}{clamp_suffix}{lts_suffix});
-    })";
+    std::string call_mfma_code =
+        "*((({C_dtype}*){c_ref}) + {c_bias}) = {mfma_buildin}("
+        "*((({A_dtype}*){a_ref_cast}) + {a_bias}), "
+        "*((({B_dtype}*){b_ref_cast}) + {b_bias}), "
+        "*((({C_dtype}*){c_ref}) + "
+        "{c_bias}){lit_suffix}{clamp_suffix}{lts_suffix})";
     std::string mfma_buildin = "__builtin_hcu_mmac_" + prefix;
     Replacer replacer;
 
@@ -1990,9 +2050,13 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("{A_dtype}", dtype_map[A_dtype]);
     replacer.register_rule("{B_dtype}", dtype_map[B_dtype]);
     replacer.register_rule("{C_dtype}", dtype_map[C_dtype]);
-    replacer.register_rule("{a_ref}", a_ref);
+    replacer.register_rule(
+        "{a_ref_cast}",
+        hcu_tf32_ab ? ("reinterpret_cast<int *>(" + a_ref + ")") : a_ref);
+    replacer.register_rule(
+        "{b_ref_cast}",
+        hcu_tf32_ab ? ("reinterpret_cast<int *>(" + b_ref + ")") : b_ref);
     replacer.register_rule("{a_bias}", a_bias);
-    replacer.register_rule("{b_ref}", b_ref);
     replacer.register_rule("{b_bias}", b_bias);
     replacer.register_rule("{c_ref}", c_ref);
     replacer.register_rule("{c_bias}", c_bias);
@@ -2231,7 +2295,9 @@ void CodeGenTileLangHCU::VisitStmt_(const AttrStmtNode *op) {
 
 void CodeGenTileLangHCU::VisitStmt_(const tir::BlockNode *op) {
   if (op->annotations.count(tl::attr::kDirectToLDSMap)) {
-    auto map = op->annotations.Get(tl::attr::kDirectToLDSMap)->as<Map<Var, PrimExpr>>().value();
+    auto map = op->annotations.Get(tl::attr::kDirectToLDSMap)
+                   ->as<Map<Var, PrimExpr>>()
+                   .value();
     for (const auto &[var, enabled] : map) {
       if (auto int_val = enabled.as<IntImmNode>()) {
         direct_to_lds_map_[var.get()] = (int_val->value != 0);
@@ -2550,7 +2616,8 @@ void CodeGenTileLangHCU::PrintVecElemLoadExpr(DataType t, int i,
   }
 
   if ((t.lanes() == 16 || t.lanes() == 32) && t.bits() == 32 && t.is_float()) {
-    // float32x16/x32: compound literal for Clang vector types; no matching make_* in templates.
+    // float32x16/x32: compound literal for Clang vector types; no matching
+    // make_* in templates.
     if (i == 0)
       os << "(float32x" << t.lanes() << "){";
     os << value;

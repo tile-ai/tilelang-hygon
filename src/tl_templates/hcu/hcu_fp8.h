@@ -2,7 +2,8 @@
 
 #include <tl_templates/hcu/common.h>
 
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
 #define HIP_FP8_ENABLED 1
 #endif
 
@@ -35,25 +36,25 @@ struct __align__(1) fp8_cvt_t {
   TL_DEVICE constexpr fp8_cvt_t() : data() {}
 
   // Construct from float - use ck_tile's conversion function
-  TL_DEVICE explicit constexpr fp8_cvt_t(const float& x)
-    : data(tl::float_to_fp8_raw(x)) {}
+  TL_DEVICE explicit constexpr fp8_cvt_t(const float &x)
+      : data(tl::float_to_fp8_raw(x)) {}
 
   // Construct from double - convert to float first, then to fp8
-  TL_DEVICE explicit constexpr fp8_cvt_t(const double& x)
-    : data(tl::float_to_fp8_raw(static_cast<float>(x))) {}
+  TL_DEVICE explicit constexpr fp8_cvt_t(const double &x)
+      : data(tl::float_to_fp8_raw(static_cast<float>(x))) {}
 
   // Construct from int
-  TL_DEVICE explicit constexpr fp8_cvt_t(const int& x)
-    : data(tl::float_to_fp8_raw(static_cast<float>(x))) {}
+  TL_DEVICE explicit constexpr fp8_cvt_t(const int &x)
+      : data(tl::float_to_fp8_raw(static_cast<float>(x))) {}
 
   // Construct from unsigned int
-  TL_DEVICE explicit constexpr fp8_cvt_t(const unsigned int& x)
-    : data(tl::float_to_fp8_raw(static_cast<float>(x))) {}
+  TL_DEVICE explicit constexpr fp8_cvt_t(const unsigned int &x)
+      : data(tl::float_to_fp8_raw(static_cast<float>(x))) {}
 
   // Construct from tl::fp8_t
   // Direct bit_cast since tl::fp8_t may be uint8_t or _BitInt(8)
-  TL_DEVICE constexpr fp8_cvt_t(const tl::fp8_t& v)
-    : data(tl::bit_cast<uint8_t>(v)) {}
+  TL_DEVICE constexpr fp8_cvt_t(const tl::fp8_t &v)
+      : data(tl::bit_cast<uint8_t>(v)) {}
 
   // Cast to float - use ck_tile's conversion function
   TL_DEVICE explicit constexpr operator float() const {
@@ -77,7 +78,7 @@ struct __align__(1) fp8_cvt_t {
   }
 
   // Internal access
-  TL_DEVICE constexpr raw_type& get() { return data; }
+  TL_DEVICE constexpr raw_type &get() { return data; }
   TL_DEVICE constexpr raw_type get() const { return data; }
 };
 
@@ -98,25 +99,25 @@ struct __align__(1) bf8_cvt_t {
   TL_DEVICE constexpr bf8_cvt_t() : data() {}
 
   // Construct from float - use ck_tile's conversion function
-  TL_DEVICE explicit constexpr bf8_cvt_t(const float& x)
-    : data(tl::float_to_bf8_raw(x)) {}
+  TL_DEVICE explicit constexpr bf8_cvt_t(const float &x)
+      : data(tl::float_to_bf8_raw(x)) {}
 
   // Construct from double - convert to float first, then to bf8
-  TL_DEVICE explicit constexpr bf8_cvt_t(const double& x)
-    : data(tl::float_to_bf8_raw(static_cast<float>(x))) {}
+  TL_DEVICE explicit constexpr bf8_cvt_t(const double &x)
+      : data(tl::float_to_bf8_raw(static_cast<float>(x))) {}
 
   // Construct from int
-  TL_DEVICE explicit constexpr bf8_cvt_t(const int& x)
-    : data(tl::float_to_bf8_raw(static_cast<float>(x))) {}
+  TL_DEVICE explicit constexpr bf8_cvt_t(const int &x)
+      : data(tl::float_to_bf8_raw(static_cast<float>(x))) {}
 
   // Construct from unsigned int
-  TL_DEVICE explicit constexpr bf8_cvt_t(const unsigned int& x)
-    : data(tl::float_to_bf8_raw(static_cast<float>(x))) {}
+  TL_DEVICE explicit constexpr bf8_cvt_t(const unsigned int &x)
+      : data(tl::float_to_bf8_raw(static_cast<float>(x))) {}
 
   // Construct from tl::bf8_t
   // Direct bit_cast since tl::bf8_t may be uint8_t or unsigned _BitInt(8)
-  TL_DEVICE constexpr bf8_cvt_t(const tl::bf8_t& v)
-    : data(tl::bit_cast<uint8_t>(v)) {}
+  TL_DEVICE constexpr bf8_cvt_t(const tl::bf8_t &v)
+      : data(tl::bit_cast<uint8_t>(v)) {}
 
   // Cast to float - use ck_tile's conversion function
   TL_DEVICE explicit constexpr operator float() const {
@@ -140,14 +141,14 @@ struct __align__(1) bf8_cvt_t {
   }
 
   // Internal access
-  TL_DEVICE constexpr raw_type& get() { return data; }
+  TL_DEVICE constexpr raw_type &get() { return data; }
   TL_DEVICE constexpr raw_type get() const { return data; }
 };
 
 // Pack four fp8_e4_t values into fp8_e4_4_t
 // Similar to HIP version, using int instead of uint32_t for consistency
 TL_DEVICE fp8_e4_4_t make_fp8_e4_4_t(fp8_e4_t x, fp8_e4_t y, fp8_e4_t z,
-                                      fp8_e4_t w) {
+                                     fp8_e4_t w) {
   // Reinterpret the 4 fp8_e4_t values to uint8_t for bit manipulation
   uint8_t x_val = tl::bit_cast<uint8_t>(x);
   uint8_t y_val = tl::bit_cast<uint8_t>(y);
@@ -156,10 +157,8 @@ TL_DEVICE fp8_e4_4_t make_fp8_e4_4_t(fp8_e4_t x, fp8_e4_t y, fp8_e4_t z,
 
   // Pack into int (matching HIP version which uses int)
   // Cast to int for bit operations (same as HIP's signed char approach)
-  int res = (static_cast<int>(w_val) << 24) |
-            (static_cast<int>(z_val) << 16) |
-            (static_cast<int>(y_val) << 8) |
-            static_cast<int>(x_val);
+  int res = (static_cast<int>(w_val) << 24) | (static_cast<int>(z_val) << 16) |
+            (static_cast<int>(y_val) << 8) | static_cast<int>(x_val);
 
   // Reinterpret as fp8_e4_4_t (tl::fp8x4_t)
   return tl::bit_cast<fp8_e4_4_t>(res);
@@ -167,8 +166,8 @@ TL_DEVICE fp8_e4_4_t make_fp8_e4_4_t(fp8_e4_t x, fp8_e4_t y, fp8_e4_t z,
 
 // Pack eight fp8_e4_t values into fp8_e4_8_t
 TL_DEVICE fp8_e4_8_t make_fp8_e4_8_t(fp8_e4_t x, fp8_e4_t y, fp8_e4_t z,
-                                      fp8_e4_t w, fp8_e4_t v, fp8_e4_t u,
-                                      fp8_e4_t t, fp8_e4_t s) {
+                                     fp8_e4_t w, fp8_e4_t v, fp8_e4_t u,
+                                     fp8_e4_t t, fp8_e4_t s) {
   // Reinterpret the 8 fp8_e4_t values to uint8_t for bit manipulation
   uint8_t x_val = tl::bit_cast<uint8_t>(x);
   uint8_t y_val = tl::bit_cast<uint8_t>(y);
@@ -180,16 +179,12 @@ TL_DEVICE fp8_e4_8_t make_fp8_e4_8_t(fp8_e4_t x, fp8_e4_t y, fp8_e4_t z,
   uint8_t s_val = tl::bit_cast<uint8_t>(s);
 
   // Pack first 4 values into int (matching HIP version which uses int)
-  int a = (static_cast<int>(w_val) << 24) |
-          (static_cast<int>(z_val) << 16) |
-          (static_cast<int>(y_val) << 8) |
-          static_cast<int>(x_val);
+  int a = (static_cast<int>(w_val) << 24) | (static_cast<int>(z_val) << 16) |
+          (static_cast<int>(y_val) << 8) | static_cast<int>(x_val);
 
   // Pack last 4 values into int
-  int b = (static_cast<int>(s_val) << 24) |
-          (static_cast<int>(t_val) << 16) |
-          (static_cast<int>(u_val) << 8) |
-          static_cast<int>(v_val);
+  int b = (static_cast<int>(s_val) << 24) | (static_cast<int>(t_val) << 16) |
+          (static_cast<int>(u_val) << 8) | static_cast<int>(v_val);
 
   tl::int32x2_t packed = {a, b};
 
@@ -199,11 +194,11 @@ TL_DEVICE fp8_e4_8_t make_fp8_e4_8_t(fp8_e4_t x, fp8_e4_t y, fp8_e4_t z,
 
 // Pack sixteen fp8_e4_t values into fp8_e4_16_t
 TL_DEVICE fp8_e4_16_t make_fp8_e4_16_t(fp8_e4_t x, fp8_e4_t y, fp8_e4_t z,
-                                        fp8_e4_t w, fp8_e4_t v, fp8_e4_t u,
-                                        fp8_e4_t t, fp8_e4_t s, fp8_e4_t r,
-                                        fp8_e4_t q, fp8_e4_t p, fp8_e4_t o,
-                                        fp8_e4_t n, fp8_e4_t m, fp8_e4_t l,
-                                        fp8_e4_t k) {
+                                       fp8_e4_t w, fp8_e4_t v, fp8_e4_t u,
+                                       fp8_e4_t t, fp8_e4_t s, fp8_e4_t r,
+                                       fp8_e4_t q, fp8_e4_t p, fp8_e4_t o,
+                                       fp8_e4_t n, fp8_e4_t m, fp8_e4_t l,
+                                       fp8_e4_t k) {
   // Reinterpret the 16 fp8_e4_t values to uint8_t for bit manipulation
   uint8_t x_val = tl::bit_cast<uint8_t>(x);
   uint8_t y_val = tl::bit_cast<uint8_t>(y);
@@ -222,23 +217,16 @@ TL_DEVICE fp8_e4_16_t make_fp8_e4_16_t(fp8_e4_t x, fp8_e4_t y, fp8_e4_t z,
   uint8_t l_val = tl::bit_cast<uint8_t>(l);
   uint8_t k_val = tl::bit_cast<uint8_t>(k);
 
-  // Pack into 4 ints (matching the pattern of make_fp8_e4_4_t and make_fp8_e4_8_t)
-  int a = (static_cast<int>(w_val) << 24) |
-          (static_cast<int>(z_val) << 16) |
-          (static_cast<int>(y_val) << 8) |
-          static_cast<int>(x_val);
-  int b = (static_cast<int>(s_val) << 24) |
-          (static_cast<int>(t_val) << 16) |
-          (static_cast<int>(u_val) << 8) |
-          static_cast<int>(v_val);
-  int c = (static_cast<int>(o_val) << 24) |
-          (static_cast<int>(p_val) << 16) |
-          (static_cast<int>(q_val) << 8) |
-          static_cast<int>(r_val);
-  int d = (static_cast<int>(k_val) << 24) |
-          (static_cast<int>(l_val) << 16) |
-          (static_cast<int>(m_val) << 8) |
-          static_cast<int>(n_val);
+  // Pack into 4 ints (matching the pattern of make_fp8_e4_4_t and
+  // make_fp8_e4_8_t)
+  int a = (static_cast<int>(w_val) << 24) | (static_cast<int>(z_val) << 16) |
+          (static_cast<int>(y_val) << 8) | static_cast<int>(x_val);
+  int b = (static_cast<int>(s_val) << 24) | (static_cast<int>(t_val) << 16) |
+          (static_cast<int>(u_val) << 8) | static_cast<int>(v_val);
+  int c = (static_cast<int>(o_val) << 24) | (static_cast<int>(p_val) << 16) |
+          (static_cast<int>(q_val) << 8) | static_cast<int>(r_val);
+  int d = (static_cast<int>(k_val) << 24) | (static_cast<int>(l_val) << 16) |
+          (static_cast<int>(m_val) << 8) | static_cast<int>(n_val);
 
   tl::int32x4_t packed = {a, b, c, d};
 

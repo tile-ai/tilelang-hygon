@@ -11,11 +11,12 @@ import tilelang.language as T
 # which brings about 1.21x speedup: 73TFlops --> 88TFlops, while both of them under-perform compared
 # to the persistent kernel. So we leave it here as a reference for future optimization but adopt the
 # atomic_direct version by default for the benchmark.
-_USE_ATOMIC_BARRIER=False
+_USE_ATOMIC_BARRIER = False
 
-def gemm_splitk(M, N, K, block_M, block_N, block_K,
-           num_stages, thread_num, enable_rasteration=True, split_k=2,
-           dtype="float16", accum_dtype="float"):
+
+def gemm_splitk(
+    M, N, K, block_M, block_N, block_K, num_stages, thread_num, enable_rasteration=True, split_k=2, dtype="float16", accum_dtype="float"
+):
     N_blocks = T.ceildiv(N, block_N)
     M_blocks = T.ceildiv(M, block_M)
     # The final barrier value when all split_k blocks are done
@@ -24,18 +25,18 @@ def gemm_splitk(M, N, K, block_M, block_N, block_K,
 
     @T.prim_func
     def _gemm_splitk_atomic_barrier(
-            A: T.Tensor((M, K), dtype),
-            B: T.Tensor((N, K), dtype),
-            C_partial: T.Tensor((M_blocks, N_blocks, block_M, block_N, split_k), accum_dtype),
-            C: T.Tensor((M, N), accum_dtype),
-            barriers: T.Tensor((M_blocks, N_blocks, split_k), "uint32"),
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((N, K), dtype),
+        C_partial: T.Tensor((M_blocks, N_blocks, block_M, block_N, split_k), accum_dtype),
+        C: T.Tensor((M, N), accum_dtype),
+        barriers: T.Tensor((M_blocks, N_blocks, split_k), "uint32"),
     ):
         with T.Kernel(N_blocks, M_blocks, split_k + 1, threads=thread_num) as (bx, by, bz):
             if bz != split_k:
                 A_shared = T.alloc_shared((block_M, block_K), dtype)
                 B_shared = T.alloc_shared((block_N, block_K), dtype)
                 C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
-                #T.use_swizzle(panel_size=10, enable=enable_rasteration)
+                # T.use_swizzle(panel_size=10, enable=enable_rasteration)
 
                 # Step 1: Each split-k block computes its partial sum
                 T.clear(C_local)
@@ -64,7 +65,7 @@ def gemm_splitk(M, N, K, block_M, block_N, block_K,
                 # Busy-wait until all split_k blocks for this (by, bx) tile finish
                 # Use acquire memory ordering to ensure we see all updates from other blocks
                 while processed_mask[0] != barrier_final:
-                    #T.print(current_barrier, "current_barrier")
+                    # T.print(current_barrier, "current_barrier")
                     # Check each split_k block
                     for k in T.serial(split_k):
                         current_barrier = T.atomic_load(barriers[by, bx, k], memory_order="acquire")
@@ -84,12 +85,11 @@ def gemm_splitk(M, N, K, block_M, block_N, block_K,
 
     @T.prim_func
     def _gemm_splitk_atomic_direct(
-            A: T.Tensor((M, K), dtype),
-            B: T.Tensor((N, K), dtype),
-            C: T.Tensor((M, N), dtype),
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((N, K), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(
-                N_blocks, M_blocks, split_k, threads=thread_num) as (bx, by, bz):
+        with T.Kernel(N_blocks, M_blocks, split_k, threads=thread_num) as (bx, by, bz):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_N, block_K), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)

@@ -215,68 +215,68 @@ Fragment makeGemmFragmentCCDNA(const int block_m, const int block_n,
 }
 
 Fragment makeGemmFragmentHCU(const int block_m, const int block_n,
-  const int num_warp_m, const int num_warp_n,
-  const int num_warp_k,
-  const int element_size,
-  const int min_n_per_warp) {
-if (element_size == 64)
-  LOG(FATAL) << "Not supported";
+                             const int num_warp_m, const int num_warp_n,
+                             const int num_warp_k, const int element_size,
+                             const int min_n_per_warp) {
+  if (element_size == 64)
+    LOG(FATAL) << "Not supported";
 
-auto warp_m = block_m / num_warp_m;
-auto num_warp_n_no_recompute = std::min(num_warp_n, block_n / min_n_per_warp);
-auto warp_n = block_n / num_warp_n_no_recompute;
-auto n_recompute = num_warp_n / num_warp_n_no_recompute;
-if (num_warp_k > 1) {
-  ICHECK(n_recompute == 1) << "n_recompute must be 1 when num_warp_k > 1 for now.";
-}
+  auto warp_m = block_m / num_warp_m;
+  auto num_warp_n_no_recompute = std::min(num_warp_n, block_n / min_n_per_warp);
+  auto warp_n = block_n / num_warp_n_no_recompute;
+  auto n_recompute = num_warp_n / num_warp_n_no_recompute;
+  if (num_warp_k > 1) {
+    ICHECK(n_recompute == 1)
+        << "n_recompute must be 1 when num_warp_k > 1 for now.";
+  }
 
-ICHECK(block_m % warp_m == 0);
-ICHECK(block_n % warp_n == 0);
-ICHECK(warp_m % 16 == 0) << "warp_m=" << warp_m;
-ICHECK(warp_n % 16 == 0) << "warp_n=" << warp_n;
-auto base_layout = makeGemmFragmentC16x16HCU()->Repeat({1, 1}, false);
-auto warp_layout =
-base_layout->Repeat({warp_m / 16, warp_n / 16}, false, true);
-// warp order in block from inner to outer is M->N->K
-auto block_layout =
-warp_layout->Repeat({block_m / warp_m, block_n / warp_n}, true, false);
-if (n_recompute > 1 || num_warp_k > 1) {
-  block_layout = block_layout->Replicate(n_recompute * num_warp_k);
-}
-return block_layout;
+  ICHECK(block_m % warp_m == 0);
+  ICHECK(block_n % warp_n == 0);
+  ICHECK(warp_m % 16 == 0) << "warp_m=" << warp_m;
+  ICHECK(warp_n % 16 == 0) << "warp_n=" << warp_n;
+  auto base_layout = makeGemmFragmentC16x16HCU()->Repeat({1, 1}, false);
+  auto warp_layout =
+      base_layout->Repeat({warp_m / 16, warp_n / 16}, false, true);
+  // warp order in block from inner to outer is M->N->K
+  auto block_layout =
+      warp_layout->Repeat({block_m / warp_m, block_n / warp_n}, true, false);
+  if (n_recompute > 1 || num_warp_k > 1) {
+    block_layout = block_layout->Replicate(n_recompute * num_warp_k);
+  }
+  return block_layout;
 }
 
 // Lit 4 interleaved
 Fragment makeGemmFragmentHCULit(const int block_m, const int block_n,
-  const int num_warp_m, const int num_warp_n,
-  const int num_warp_k,
-  const int element_size,
-  const int min_n_per_warp) {
-if (element_size == 64)
-  LOG(FATAL) << "Not supported";
+                                const int num_warp_m, const int num_warp_n,
+                                const int num_warp_k, const int element_size,
+                                const int min_n_per_warp) {
+  if (element_size == 64)
+    LOG(FATAL) << "Not supported";
 
-auto warp_m = block_m / num_warp_m;
-auto num_warp_n_no_recompute = std::min(num_warp_n, block_n / min_n_per_warp);
-auto warp_n = block_n / num_warp_n_no_recompute;
-auto n_recompute = num_warp_n / num_warp_n_no_recompute;
-if (num_warp_k > 1) {
-  ICHECK(n_recompute == 1) << "n_recompute must be 1 when num_warp_k > 1 for now.";
-}
+  auto warp_m = block_m / num_warp_m;
+  auto num_warp_n_no_recompute = std::min(num_warp_n, block_n / min_n_per_warp);
+  auto warp_n = block_n / num_warp_n_no_recompute;
+  auto n_recompute = num_warp_n / num_warp_n_no_recompute;
+  if (num_warp_k > 1) {
+    ICHECK(n_recompute == 1)
+        << "n_recompute must be 1 when num_warp_k > 1 for now.";
+  }
 
-ICHECK(block_m % warp_m == 0);
-ICHECK(block_n % warp_n == 0);
-ICHECK(warp_m % 16 == 0) << "warp_m=" << warp_m;
-ICHECK(warp_n % 16 == 0) << "warp_n=" << warp_n;
-auto base_layout = makeGemmFragmentC16x16HCUV2()->Repeat({1, 1}, false);
-auto warp_layout =
-base_layout->Repeat({warp_m / 16, warp_n / 16}, false, true);
-// warp order in block from inner to outer is M->N->K
-auto block_layout =
-warp_layout->Repeat({block_m / warp_m, block_n / warp_n}, true, false);
-if (n_recompute > 1 || num_warp_k > 1) {
-  block_layout = block_layout->Replicate(n_recompute * num_warp_k);
-}
-return block_layout;
+  ICHECK(block_m % warp_m == 0);
+  ICHECK(block_n % warp_n == 0);
+  ICHECK(warp_m % 16 == 0) << "warp_m=" << warp_m;
+  ICHECK(warp_n % 16 == 0) << "warp_n=" << warp_n;
+  auto base_layout = makeGemmFragmentC16x16HCUV2()->Repeat({1, 1}, false);
+  auto warp_layout =
+      base_layout->Repeat({warp_m / 16, warp_n / 16}, false, true);
+  // warp order in block from inner to outer is M->N->K
+  auto block_layout =
+      warp_layout->Repeat({block_m / warp_m, block_n / warp_n}, true, false);
+  if (n_recompute > 1 || num_warp_k > 1) {
+    block_layout = block_layout->Replicate(n_recompute * num_warp_k);
+  }
+  return block_layout;
 }
 
 Fragment makeGemmFragmentCHopper(const int block_m, const int block_n,
@@ -404,10 +404,10 @@ Fragment makeGemmFragmentACDNA(const int block_m, const int block_n,
 }
 
 Fragment makeGemmFragmentAHCU(const int block_m, const int block_n,
-                               const int block_k, const int num_warp_m,
-                               const int num_warp_n, const int num_warp_k,
-                               const int element_size,
-                               const int k_pack, bool transposed) {
+                              const int block_k, const int num_warp_m,
+                              const int num_warp_n, const int num_warp_k,
+                              const int element_size, const int k_pack,
+                              bool transposed) {
   auto warp_m = block_m / num_warp_m;
   auto warp_k = block_k / num_warp_k;
   // assume not transposed
@@ -423,11 +423,11 @@ Fragment makeGemmFragmentAHCU(const int block_m, const int block_n,
         element_size == 16
             ? makeGemmFragmentAB16x16CDNATransposed(k_pack)->Repeat(
                   {1, 1}, false, false)
-            : element_size == 32
-                  ? makeGemmFragmentAB16x8CDNATransposed(k_pack)->Repeat(
-                        {1, 1}, false, false)
-                  : makeGemmFragmentAB16x32CDNATransposed(k_pack)->Repeat(
-                        {1, 1}, false, false);
+        : element_size == 32
+            ? makeGemmFragmentAB16x8CDNATransposed(k_pack)->Repeat({1, 1},
+                                                                   false, false)
+            : makeGemmFragmentAB16x32CDNATransposed(k_pack)->Repeat(
+                  {1, 1}, false, false);
     auto warp_layout =
         base_layout->Repeat({warp_k / mfma_k, warp_m / 16}, false, true);
     // warp order in block from inner to outer is M->N->K
@@ -439,11 +439,9 @@ Fragment makeGemmFragmentAHCU(const int block_m, const int block_n,
     auto base_layout =
         element_size == 16
             ? makeGemmFragmentAB16x16CDNA(k_pack)->Repeat({1, 1}, false, false)
-            : element_size == 32
-                  ? makeGemmFragmentAB16x8CDNA(k_pack)->Repeat({1, 1}, false,
-                                                             false)
-                  : makeGemmFragmentAB16x32CDNA(k_pack)->Repeat({1, 1}, false,
-                                                              false);
+        : element_size == 32
+            ? makeGemmFragmentAB16x8CDNA(k_pack)->Repeat({1, 1}, false, false)
+            : makeGemmFragmentAB16x32CDNA(k_pack)->Repeat({1, 1}, false, false);
     auto warp_layout =
         base_layout->Repeat({warp_m / 16, warp_k / mfma_k}, false, false);
     // warp order in block from inner to outer is M->N->K
@@ -455,11 +453,10 @@ Fragment makeGemmFragmentAHCU(const int block_m, const int block_n,
 }
 
 Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
-                               const int block_k, const int num_warp_m,
-                               const int num_warp_n, const int num_warp_k,
-                               const int element_size,
-                               const int k_pack, bool transposed,
-                               const int min_n_per_warp) {
+                              const int block_k, const int num_warp_m,
+                              const int num_warp_n, const int num_warp_k,
+                              const int element_size, const int k_pack,
+                              bool transposed, const int min_n_per_warp) {
   ICHECK(block_n % min_n_per_warp == 0);
   // for now we only support recompute for N dimension
   auto warp_n_no_recompute = std::min(num_warp_n, block_n / min_n_per_warp);
@@ -467,7 +464,8 @@ Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
   auto n_recompute = num_warp_n / warp_n_no_recompute;
   auto warp_k = block_k / num_warp_k;
   if (num_warp_k > 1) {
-    ICHECK(n_recompute == 1) << "n_recompute must be 1 when num_warp_k > 1 for now.";
+    ICHECK(n_recompute == 1)
+        << "n_recompute must be 1 when num_warp_k > 1 for now.";
   }
 
   ICHECK(block_n % warp_n == 0);
@@ -481,16 +479,15 @@ Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
     auto base_layout =
         element_size == 16
             ? makeGemmFragmentAB16x16CDNA(k_pack)->Repeat({1, 1}, false, false)
-            : element_size == 32
-                  ? makeGemmFragmentAB16x8CDNA(k_pack)->Repeat({1, 1}, false,
-                                                               false)
-                  : makeGemmFragmentAB16x32CDNA(k_pack)->Repeat({1, 1}, false,
-                                                                false);
+        : element_size == 32
+            ? makeGemmFragmentAB16x8CDNA(k_pack)->Repeat({1, 1}, false, false)
+            : makeGemmFragmentAB16x32CDNA(k_pack)->Repeat({1, 1}, false, false);
     auto warp_layout =
         base_layout->Repeat({warp_n / 16, warp_k / mfma_k}, false, false);
     // warp order in block from inner to outer is M->N->K
-    auto block_layout = warp_layout->Replicate(num_warp_m)
-                                      ->Repeat({warp_n_no_recompute, num_warp_k}, true, false);
+    auto block_layout =
+        warp_layout->Replicate(num_warp_m)
+            ->Repeat({warp_n_no_recompute, num_warp_k}, true, false);
     if (n_recompute > 1) {
       block_layout = block_layout->Replicate(n_recompute);
     }
@@ -500,16 +497,17 @@ Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
         element_size == 16
             ? makeGemmFragmentAB16x16CDNATransposed(k_pack)->Repeat(
                   {1, 1}, false, false)
-            : element_size == 32
-                  ? makeGemmFragmentAB16x8CDNATransposed(k_pack)->Repeat(
-                        {1, 1}, false, false)
-                  : makeGemmFragmentAB16x32CDNATransposed(k_pack)->Repeat(
-                        {1, 1}, false, false);
+        : element_size == 32
+            ? makeGemmFragmentAB16x8CDNATransposed(k_pack)->Repeat({1, 1},
+                                                                   false, false)
+            : makeGemmFragmentAB16x32CDNATransposed(k_pack)->Repeat(
+                  {1, 1}, false, false);
     auto warp_layout =
         base_layout->Repeat({warp_k / mfma_k, warp_n / 16}, false, true);
     // warp order in block from inner to outer is M->N->K
-    auto block_layout = warp_layout->Replicate(num_warp_m)
-                                     ->Repeat({num_warp_k, warp_n_no_recompute}, true, true);
+    auto block_layout =
+        warp_layout->Replicate(num_warp_m)
+            ->Repeat({num_warp_k, warp_n_no_recompute}, true, true);
     if (n_recompute > 1) {
       block_layout = block_layout->Replicate(n_recompute);
     }
@@ -518,13 +516,16 @@ Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
 }
 
 Fragment makeDsReadFormatFragmentHCU(const int block_mn, const int block_k,
-                                     const int num_warp_mn, const int num_warp_k,
+                                     const int num_warp_mn,
+                                     const int num_warp_k,
                                      const int element_size,
-                                     const int num_warp_mn_no_recompute, bool trans) {
+                                     const int num_warp_mn_no_recompute,
+                                     bool trans) {
   // trans=true: dst shape (mn, k), layout dims (MN, K).
   // trans=false: dst shape (k, mn), layout dims (K, MN).
   int n = num_warp_mn_no_recompute;
-  if (n < 1) n = 1;
+  if (n < 1)
+    n = 1;
   auto warp_mn = block_mn / n;
   auto mn_recompute = num_warp_mn / n;
   auto warp_k = block_k / num_warp_k;
@@ -534,15 +535,17 @@ Fragment makeDsReadFormatFragmentHCU(const int block_mn, const int block_k,
 
   auto base_layout =
       element_size == 16
-          ? (trans ? makeGemmFragmentAB16x16CDNA(k_pack)->Repeat({1, 1}, false, false)
+          ? (trans ? makeGemmFragmentAB16x16CDNA(k_pack)->Repeat({1, 1}, false,
+                                                                 false)
                    : makeGemmFragmentAB16x16CDNATransposed(k_pack)->Repeat(
                          {1, 1}, false, false))
-          : (trans ? makeGemmFragmentAB16x32CDNA(k_pack)->Repeat({1, 1}, false, false)
+          : (trans ? makeGemmFragmentAB16x32CDNA(k_pack)->Repeat({1, 1}, false,
+                                                                 false)
                    : makeGemmFragmentAB16x32CDNATransposed(k_pack)->Repeat(
                          {1, 1}, false, false));
-  auto warp_layout = trans
-                         ? base_layout->Repeat({warp_mn / 16, warp_k / mfma_k}, false, false)
-                         : base_layout->Repeat({warp_k / mfma_k, warp_mn / 16}, false, true);
+  auto warp_layout =
+      trans ? base_layout->Repeat({warp_mn / 16, warp_k / mfma_k}, false, false)
+            : base_layout->Repeat({warp_k / mfma_k, warp_mn / 16}, false, true);
   auto block_layout = trans ? warp_layout->Repeat({n, num_warp_k}, true, false)
                             : warp_layout->Repeat({num_warp_k, n}, true, true);
   if (mn_recompute > 1) {
@@ -1166,9 +1169,9 @@ Layout makeSwizzledLayout(const Buffer &buffer, bool k_inner, bool allow_pad) {
 
 Layout makeHCUSwizzledLayout(const Buffer &buffer, int kPack) {
   auto info = GetSwizzleShapeInfoChecked(buffer);
-  auto base = makeGemmABLayoutCDNA(
-      static_cast<int>(info.stride), static_cast<int>(info.continuous),
-      info.element_size, kPack);
+  auto base = makeGemmABLayoutCDNA(static_cast<int>(info.stride),
+                                   static_cast<int>(info.continuous),
+                                   info.element_size, kPack);
   return ExpandLayout2D(base, buffer);
 }
 

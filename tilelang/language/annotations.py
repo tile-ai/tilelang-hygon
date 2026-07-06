@@ -139,9 +139,7 @@ def disable_buffer_ops(*buffers):
         else:
             name = getattr(buf, "name_hint", None) or getattr(buf, "name", None)
             if name is None:
-                raise TypeError(
-                    f"disable_buffer_ops expects Buffer or Var, got {type(buf).__name__}"
-                )
+                raise TypeError(f"disable_buffer_ops expects Buffer or Var, got {type(buf).__name__}")
         _disable_map[name] = IntImm("int32", 1)
     return block_attr({"disable_buffer_ops_map": _disable_map})
 

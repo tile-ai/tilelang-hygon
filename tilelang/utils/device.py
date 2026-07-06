@@ -1,6 +1,4 @@
 import torch
-import subprocess
-import re
 
 IS_CUDA = torch.cuda.is_available()
 

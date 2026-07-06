@@ -121,9 +121,9 @@ private:
     // Step 4b. disable_buffer_ops_map: store Map in AttrStmt.node (not
     // convertible to PrimExpr)
     if (auto opt = new_block->annotations.Get(tl::attr::kDisableBufferOpsMap)) {
-      body = AttrStmt(Downcast<Map<String, PrimExpr>>(opt.value()),
-                      tl::attr::kDisableBufferOpsMap, Integer(0),
-                      std::move(body));
+      body =
+          AttrStmt(Downcast<Map<String, PrimExpr>>(opt.value()),
+                   tl::attr::kDisableBufferOpsMap, Integer(0), std::move(body));
     }
     return body;
   }

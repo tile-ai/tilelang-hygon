@@ -146,7 +146,8 @@ def reduce_warp(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, clear: bo
     if list(buffer.shape) != list(out.shape):
         raise ValueError(
             f"Invalid warp reduce output shape, buffer shape is {buffer.shape}, "
-            f"output shape is {out.shape}, they must be the same for warp reduce.")
+            f"output shape is {out.shape}, they must be the same for warp reduce."
+        )
     # Use tl.region (same as reduce) — access_ptr/tvm_access_ptr is not accepted by
     # NormalizeToBufferRegion in ReduceOp::ReduceOp.
     # Use dim = -1 as special marker for warp reduce (not legalized)
@@ -229,6 +230,7 @@ def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
     dim = _legalize_dim(buffer, dim)
     reduce(buffer, out, "sum", dim, clear)
 
+
 def reduce_sum_warp(buffer: tir.Buffer, out: tir.Buffer, clear: bool = True):
     """Perform warp-level reduce sum across multiple warps.
 
@@ -249,6 +251,7 @@ def reduce_sum_warp(buffer: tir.Buffer, out: tir.Buffer, clear: bool = True):
         tir.Call: Handle to the warp-level reduction operation
     """
     return reduce_warp(buffer, out, "sum", clear)
+
 
 def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1) -> None:
     """Perform reduce absolute sum on input buffer, store the result to output buffer.

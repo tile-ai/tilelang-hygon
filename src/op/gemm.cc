@@ -6,11 +6,11 @@
 #include "gemm.h"
 
 #include "builtin.h"
+#include <tuple>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/op_attr_types.h>
 #include <tvm/tir/transform.h>
-#include <tuple>
 
 #include "../target/utils.h"
 #include "tcgen5_meta.h"
@@ -21,7 +21,7 @@ namespace tl {
 
 using namespace tir;
 
-// HCU gemm_mls template dtype strings 
+// HCU gemm_mls template dtype strings
 static inline bool IsFloat8E4Family(DataType dtype) {
   return dtype.is_float8_e4m3fn() || dtype.is_float8_e4m3();
 }
@@ -194,15 +194,16 @@ std::tuple<int, int, int> GemmWarpPolicyNode::computeWarpPartitionHCU(
 
   int num_warps = block_size / TargetGetWarpSize(target);
   int m_warp = 1, n_warp = 1, k_warp = 1;
-  int kMPerWarp = 16;  // Rows processed by a single warp
-  int kNPerWarp = 16;   // Columns processed by a single warp
+  int kMPerWarp = 16; // Rows processed by a single warp
+  int kNPerWarp = 16; // Columns processed by a single warp
   if (A_from_mls && !A_mls_trans) {
-    kMPerWarp = 32;  // min ds_read_format tilesize
+    kMPerWarp = 32; // min ds_read_format tilesize
   }
   if (B_from_mls && !B_mls_trans) {
-    kNPerWarp = 32;  // min ds_read_format tilesize
+    kNPerWarp = 32; // min ds_read_format tilesize
   }
-  ICHECK(element_byte_size == 1 || element_byte_size == 2 || element_byte_size == 4)
+  ICHECK(element_byte_size == 1 || element_byte_size == 2 ||
+         element_byte_size == 4)
       << "element byte width=" << element_byte_size;
   int kKPerWarp = k_pack * (32 / element_byte_size);
 
@@ -241,7 +242,7 @@ std::tuple<int, int, int> GemmWarpPolicyNode::computeWarpPartitionHCU(
       // Use remaining warps for M
       m_warp = num_warps / n_warps_no_recompute;
       if (m_warp == 0)
-          m_warp = 1;
+        m_warp = 1;
       if (M % (m_warp * kMPerWarp) != 0) {
         // let warps is just enough for M
         m_warp = M / kMPerWarp;
@@ -292,28 +293,33 @@ std::tuple<int, int, int> GemmWarpPolicyNode::computeWarpPartitionHCU(
     m_warp = best_m;
     n_warp = best_n * recompute;
   } else if (this->isFullColK()) {
-    ICHECK(!use_mls) << "gemm_mls does not support warp partitioning on K (FullColK policy)";
+    ICHECK(!use_mls)
+        << "gemm_mls does not support warp partitioning on K (FullColK policy)";
     // Try to partition N first
     n_warp = num_warps;
     k_warp = 1;
 
-    // if num_warps is larger than n_warp needed, try to split remaining warps to N
+    // if num_warps is larger than n_warp needed, try to split remaining warps
+    // to N
     if (N % (n_warp * kNPerWarp) != 0) {
       // Calculate how many warps we can use for K
       n_warp = N / kNPerWarp;
       // Use remaining warps for N
       k_warp = num_warps / n_warp;
       if (k_warp == 0)
-          k_warp = 1;
-      // if the remaining warps is too large for K, not support recompute for now.
-      ICHECK(K % (k_warp * kKPerWarp) == 0) << "K must be divisible by " << k_warp << " * " << kKPerWarp;
+        k_warp = 1;
+      // if the remaining warps is too large for K, not support recompute for
+      // now.
+      ICHECK(K % (k_warp * kKPerWarp) == 0)
+          << "K must be divisible by " << k_warp << " * " << kKPerWarp;
     }
   } else {
     ICHECK(0) << "Unknown GemmWarpPolicy";
   }
   ICHECK(m_warp * n_warp * k_warp == num_warps)
       << "m_warp * n_warp must equal num_warps, m_warp: " << m_warp
-      << ", n_warp: " << n_warp << ", k_warp: " << k_warp << ", num_warps: " << num_warps;
+      << ", n_warp: " << n_warp << ", k_warp: " << k_warp
+      << ", num_warps: " << num_warps;
 
   // Store the computed values in the object's member variables
   this->m_warp = m_warp;
@@ -566,9 +572,9 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     if (auto explicit_phase = GetAnnotatedMbarPhaseExpr(annotations_)) {
       mbar_phase = explicit_phase.value();
     }
-    auto prim_func = Downcast<PrimFunc>((*f)(
-        tvm::ffi::GetRef<Gemm>(this), T.layout_map, T.target, T.thread_bounds,
-        T.thread_var, mbar_phase));
+    auto prim_func = Downcast<PrimFunc>(
+        (*f)(tvm::ffi::GetRef<Gemm>(this), T.layout_map, T.target,
+             T.thread_bounds, T.thread_var, mbar_phase));
     ICHECK(prim_func->attrs.defined());
     auto global_symbol =
         prim_func->attrs.GetAttr<tvm::ffi::String>("global_symbol");
@@ -596,7 +602,7 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
               /*name_hint=*/global_symbol.value(), prim_func->body,
               /*init=*/Optional<Stmt>(), /*alloc_buffers=*/{},
               /*match_buffers=*/{}, /*annotations=*/block_annotations));
-}
+  }
   LOG(FATAL) << "No lower function found for gemm";
   return Stmt();
 }

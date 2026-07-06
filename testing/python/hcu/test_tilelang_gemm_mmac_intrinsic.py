@@ -1,3 +1,4 @@
+import pytest
 import torch
 import tilelang.testing
 from tilelang import tvm as tvm
@@ -5,8 +6,10 @@ import tilelang.language as T
 from tilelang.intrinsics import make_mmac_swizzle_layout as make_swizzle_layout
 from tilelang.intrinsics.hcu_mmac_macro_generator import HCUMatrixCoreIntrinEmitter as MatrixCoreIntrinEmitter
 from tilelang.transform import simplify_prim_func
+from hcu_test_utils import target_supports_fp8_mmac
 
 tilelang.testing.set_random_seed(0)
+
 
 @simplify_prim_func
 def tl_matmul(
@@ -67,9 +70,6 @@ def tl_matmul(
     local_size_a = (k_pack * micro_size_x * micro_size_k) // warp_size
     local_size_b = (k_pack * micro_size_y * micro_size_k) // warp_size
     local_size_c = (micro_size_x * micro_size_y) // warp_size
-    warp_rows = warp_row_tiles // micro_size_x
-    warp_cols = warp_col_tiles // micro_size_y
-
     # MMA Wrapper to Auto Generate Code for MMA
     mmac_emitter = MatrixCoreIntrinEmitter(
         a_dtype=in_dtype,
@@ -79,20 +79,21 @@ def tl_matmul(
         b_transposed=b_transposed,
         block_row_warps=block_row_warps,
         block_col_warps=block_col_warps,
-        warp_row_tiles=warp_row_tiles,
-        warp_col_tiles=warp_col_tiles,
+        block_m=block_M,
+        block_n=block_N,
         chunk=chunk,
         k_pack=k_pack,
     )
+    warp_rows = mmac_emitter.warp_rows
+    warp_cols = mmac_emitter.warp_cols
 
     @T.prim_func
     def main(
-            A: T.Tensor(A_shape, in_dtype),
-            B: T.Tensor(B_shape, in_dtype),
-            C: T.Tensor((M, N), out_dtype),
+        A: T.Tensor(A_shape, in_dtype),
+        B: T.Tensor(B_shape, in_dtype),
+        C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-
             A_shared = T.alloc_shared(A_shared_shape, in_dtype, scope=shared_scope)
             B_shared = T.alloc_shared(B_shared_shape, in_dtype, scope=shared_scope)
             C_shared = T.alloc_shared(C_shared_shape, out_dtype, scope=shared_scope)
@@ -100,10 +101,12 @@ def tl_matmul(
             B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
             C_local = T.alloc_local((warp_rows * warp_cols * local_size_c), accum_dtype)
 
-            T.annotate_layout({
-                A_shared: make_swizzle_layout(A_shared),
-                B_shared: make_swizzle_layout(B_shared),
-            })
+            T.annotate_layout(
+                {
+                    A_shared: make_swizzle_layout(A_shared),
+                    B_shared: make_swizzle_layout(B_shared),
+                }
+            )
 
             # Improve L2 Cache
             T.use_swizzle(panel_size=10)
@@ -111,7 +114,6 @@ def tl_matmul(
             T.clear(C_local)
 
             for ko in T.Pipelined((K // block_K), num_stages=0):
-
                 # Load A into shared memory
                 if a_transposed:
                     T.copy(A[ko * block_K, by * block_M], A_shared)
@@ -125,7 +127,6 @@ def tl_matmul(
                     T.copy(B[ko * block_K, bx * block_N], B_shared)
 
                 for ki in T.serial(0, (block_K // (k_pack * micro_size_k))):
-
                     # Load A into fragment
                     mmac_emitter.ldmatrix_a(
                         A_local,
@@ -169,17 +170,8 @@ def tl_matmul(
     return main
 
 
-def assert_tl_matmul_correctness(M,
-                                 N,
-                                 K,
-                                 in_dtype,
-                                 out_dtype,
-                                 accum_dtype="float32",
-                                 a_transposed=False,
-                                 b_transposed=True,
-                                 k_pack=1):
-    matmul = tl_matmul(M, N, K, in_dtype, out_dtype, accum_dtype, a_transposed, b_transposed,
-                       k_pack)
+def assert_tl_matmul_correctness(M, N, K, in_dtype, out_dtype, accum_dtype="float32", a_transposed=False, b_transposed=True, k_pack=1):
+    matmul = tl_matmul(M, N, K, in_dtype, out_dtype, accum_dtype, a_transposed, b_transposed, k_pack)
     print(matmul)
     kernel = tilelang.compile(matmul)
     src_code = kernel.get_kernel_source()
@@ -212,16 +204,13 @@ def assert_tl_matmul_correctness(M,
 
     if a_transposed and b_transposed:
         # Get Reference Result
-        ref_c = torch.matmul(A.T.to(torch.float32),
-                             B.T.to(torch.float32)).to(getattr(torch, out_dtype))
+        ref_c = torch.matmul(A.T.to(torch.float32), B.T.to(torch.float32)).to(getattr(torch, out_dtype))
     elif a_transposed and not b_transposed:
         # Get Reference Result
-        ref_c = torch.matmul(A.T.to(torch.float32),
-                             B.to(torch.float32)).to(getattr(torch, out_dtype))
+        ref_c = torch.matmul(A.T.to(torch.float32), B.to(torch.float32)).to(getattr(torch, out_dtype))
     elif not a_transposed and b_transposed:
         # Get Reference Result
-        ref_c = torch.matmul(A.to(torch.float32),
-                             B.T.to(torch.float32)).to(getattr(torch, out_dtype))
+        ref_c = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(getattr(torch, out_dtype))
     else:
         # Get Reference Result
         ref_c = torch.matmul(A.to(torch.float32), B.to(torch.float32)).to(getattr(torch, out_dtype))
@@ -239,22 +228,24 @@ def test_assert_tl_matmul():
     assert_tl_matmul_correctness(128, 128, 128, "int8", "int32", accum_dtype="int32")
     assert_tl_matmul_correctness(128, 256, 256, "int8", "int32", accum_dtype="int32")
     assert_tl_matmul_correctness(128, 256, 256, "int8", "int32", accum_dtype="int32", k_pack=2)
-    assert_tl_matmul_correctness(
-        128, 256, 256, "int8", "int32", b_transposed=False, accum_dtype="int32")
-    assert_tl_matmul_correctness(
-        128, 256, 256, "int8", "int32", b_transposed=False, accum_dtype="int32", k_pack=2)
+    assert_tl_matmul_correctness(128, 256, 256, "int8", "int32", b_transposed=False, accum_dtype="int32")
+    assert_tl_matmul_correctness(128, 256, 256, "int8", "int32", b_transposed=False, accum_dtype="int32", k_pack=2)
+
+
+@tilelang.testing.requires_rocm
+@pytest.mark.skipif(not target_supports_fp8_mmac(), reason="FP8 MMAC not supported on this target")
+def test_assert_tl_matmul_fp8():
     assert_tl_matmul_correctness(128, 128, 128, "float8_e4m3fn", "float16")
     assert_tl_matmul_correctness(128, 256, 256, "float8_e4m3fn", "float32")
     assert_tl_matmul_correctness(128, 256, 256, "float8_e4m3fn", "float32", k_pack=2)
     assert_tl_matmul_correctness(128, 256, 256, "float8_e4m3fn", "float32", b_transposed=False)
-    assert_tl_matmul_correctness(
-        128, 256, 256, "float8_e4m3fn", "float32", b_transposed=False, k_pack=2)
+    assert_tl_matmul_correctness(128, 256, 256, "float8_e4m3fn", "float32", b_transposed=False, k_pack=2)
     assert_tl_matmul_correctness(128, 128, 128, "float8_e5m2", "float16")
     assert_tl_matmul_correctness(128, 256, 256, "float8_e5m2", "float32")
     assert_tl_matmul_correctness(128, 256, 256, "float8_e5m2", "float32", k_pack=2)
     assert_tl_matmul_correctness(128, 256, 256, "float8_e5m2", "float32", b_transposed=False)
-    assert_tl_matmul_correctness(
-        128, 256, 256, "float8_e5m2", "float32", b_transposed=False, k_pack=2)
+    assert_tl_matmul_correctness(128, 256, 256, "float8_e5m2", "float32", b_transposed=False, k_pack=2)
+
 
 if __name__ == "__main__":
     tilelang.testing.main()

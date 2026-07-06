@@ -3,13 +3,13 @@
  * \brief Lower the tile op for further codegen.
  */
 
+#include <memory>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 #include <tvm/tir/utils.h>
-#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -113,13 +113,14 @@ private:
   Map<Buffer, Layout> layout_remap_;
 };
 
-/// Collects alloc_buffers from all blocks to build buffer_data_to_buffer_ before
-/// the main substituter runs.
+/// Collects alloc_buffers from all blocks to build buffer_data_to_buffer_
+/// before the main substituter runs.
 class AllocBufferCollector : public StmtVisitor {
 public:
   Map<Var, Buffer> &buffer_data_to_buffer;
 
-  explicit AllocBufferCollector(Map<Var, Buffer> &out) : buffer_data_to_buffer(out) {}
+  explicit AllocBufferCollector(Map<Var, Buffer> &out)
+      : buffer_data_to_buffer(out) {}
 
   void Collect(const Stmt &stmt) { VisitStmt(stmt); }
 
@@ -1093,21 +1094,15 @@ private:
       return id;
     };
 
-    auto lowered = tile_op->Lower(
-        LowerArgs{target_,
-                  thread_bounds,
-                  thread_var_->var,
-                  callback,
-                  mbarrier_callback,
-                  layout_map_,
-                  buffer_remap_,
-                  let_var_to_expr,
-                  loop_mbar_phase_stack_.empty()
-                      ? PrimExpr(IntImm(DataType::Int(32), 0))
-                      : loop_mbar_phase_stack_.back(),
-                  &mbarrier_buffer_,
-                  cluster_size_},
-        analyzer_);
+    auto lowered =
+        tile_op->Lower(LowerArgs{target_, thread_bounds, thread_var_->var,
+                                 callback, mbarrier_callback, layout_map_,
+                                 buffer_remap_, let_var_to_expr,
+                                 loop_mbar_phase_stack_.empty()
+                                     ? PrimExpr(IntImm(DataType::Int(32), 0))
+                                     : loop_mbar_phase_stack_.back(),
+                                 &mbarrier_buffer_, cluster_size_},
+                       analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }
 

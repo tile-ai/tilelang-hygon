@@ -231,15 +231,13 @@ Fragment makeGemmFragmentCCDNA(const int block_m, const int block_n,
                                const int warp_m, const int warp_n,
                                const int element_size);
 Fragment makeGemmFragmentHCU(const int block_m, const int block_n,
-                               const int num_warp_m, const int num_warp_n,
-                               const int num_warp_k,
-                               const int element_size,
-                               const int min_n_per_warp = 16);
+                             const int num_warp_m, const int num_warp_n,
+                             const int num_warp_k, const int element_size,
+                             const int min_n_per_warp = 16);
 Fragment makeGemmFragmentHCULit(const int block_m, const int block_n,
-                               const int num_warp_m, const int num_warp_n,
-                               const int num_warp_k,
-                               const int element_size,
-                               const int min_n_per_warp = 16);
+                                const int num_warp_m, const int num_warp_n,
+                                const int num_warp_k, const int element_size,
+                                const int min_n_per_warp = 16);
 Fragment makeGemmFragmentCHopper(const int block_m, const int block_n,
                                  const int warp_m, const int warp_n,
                                  const int element_size);
@@ -257,22 +255,24 @@ Fragment makeGemmFragmentACDNA(const int block_m, const int block_n,
                                const int k_pack, bool transposed = false);
 
 Fragment makeGemmFragmentAHCU(const int block_m, const int block_n,
-                               const int block_k, const int num_warp_m,
-                               const int num_warp_n, const int num_warp_k,
-                               const int element_size,
-                               const int k_pack, bool transposed = false);
+                              const int block_k, const int num_warp_m,
+                              const int num_warp_n, const int num_warp_k,
+                              const int element_size, const int k_pack,
+                              bool transposed = false);
 
 Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
-                               const int block_k, const int num_warp_m,
-                               const int num_warp_n, const int num_warp_k,
-                               const int element_size,
-                               const int k_pack, bool transposed = false,
-                               const int min_n_per_warp = 16);
+                              const int block_k, const int num_warp_m,
+                              const int num_warp_n, const int num_warp_k,
+                              const int element_size, const int k_pack,
+                              bool transposed = false,
+                              const int min_n_per_warp = 16);
 
 Fragment makeDsReadFormatFragmentHCU(const int block_mn, const int block_k,
-                                     const int num_warp_mn, const int num_warp_k,
+                                     const int num_warp_mn,
+                                     const int num_warp_k,
                                      const int element_size,
-                                     const int num_warp_mn_no_recompute, bool trans);
+                                     const int num_warp_mn_no_recompute,
+                                     bool trans);
 
 // Default Memory Layout (row-major linear layout for any dimension)
 Layout makeLinearLayout(Array<PrimExpr> shape);

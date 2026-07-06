@@ -1,5 +1,6 @@
-// TileLang HCU device header umbrella (trimmed from composable_kernel descriptor stack).
-// AMD MIT parts: see vendor/NOTICE.md. HCU MLS/matrix paths live under mls/.
+// TileLang HCU device header umbrella (trimmed from composable_kernel
+// descriptor stack). AMD MIT parts: see vendor/NOTICE.md. HCU MLS/matrix paths
+// live under mls/.
 
 #pragma once
 

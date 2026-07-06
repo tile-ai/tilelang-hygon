@@ -21,16 +21,17 @@ static constexpr const char *kMlsGemmDep = "tl.mls_gemm_dep";
 static constexpr const char *kMlsTrans = "tl.mls_trans";
 static constexpr const char *kHcuAFromMls = "tl.a_from_mls";
 static constexpr const char *kHcuBFromMls = "tl.b_from_mls";
-}  // namespace attr
+} // namespace attr
 
 /*!
  * \brief Minimal GEMM-side facts needed by ds_read_format InferLayout/Lower.
  *
  * feeds_slot: 0 = feeds Gemm A, 1 = feeds Gemm B.
- * trans: MLS/ds_read_format trans for this site (!gemm_trans_a or gemm_trans_b).
+ * trans: MLS/ds_read_format trans for this site (!gemm_trans_a or
+ * gemm_trans_b).
  */
 class MlsGemmDepMetaNode : public Object {
- public:
+public:
   int feeds_slot{0};
   bool trans{true};
   int gemm_m{0};
@@ -43,7 +44,8 @@ class MlsGemmDepMetaNode : public Object {
   bool b_from_mls{false};
   int gemm_policy{0};
 
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.MlsGemmDepMeta", MlsGemmDepMetaNode, Object);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.MlsGemmDepMeta", MlsGemmDepMetaNode,
+                                    Object);
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -63,7 +65,7 @@ class MlsGemmDepMetaNode : public Object {
 };
 
 class MlsGemmDepMeta : public ObjectRef {
- public:
+public:
   explicit MlsGemmDepMeta(ObjectPtr<MlsGemmDepMetaNode> ptr)
       : ObjectRef(std::move(ptr)) {}
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(MlsGemmDepMeta, ObjectRef,
@@ -71,22 +73,25 @@ class MlsGemmDepMeta : public ObjectRef {
 };
 
 MlsGemmDepMeta BuildMlsGemmDepMeta(const GemmWithInput &gwi,
-                                    const PropagationTirCollector *collector);
+                                   const PropagationTirCollector *collector);
 
-bool ComputeSharedDstMlsTrans(const Buffer &dst, const PropagationTirCollector *collector,
-                                bool *out_trans);
+bool ComputeSharedDstMlsTrans(const Buffer &dst,
+                              const PropagationTirCollector *collector,
+                              bool *out_trans);
 
-Optional<MlsGemmDepMeta> GetMlsGemmDepFromAnnotations(
-    const Map<String, ObjectRef> &annotations);
+Optional<MlsGemmDepMeta>
+GetMlsGemmDepFromAnnotations(const Map<String, ObjectRef> &annotations);
 
-Optional<bool> GetMlsTransFromAnnotations(const Map<String, ObjectRef> &annotations);
+Optional<bool>
+GetMlsTransFromAnnotations(const Map<String, ObjectRef> &annotations);
 
 class GemmNode;
-Map<String, ObjectRef> AnnotateGemmHcuMlsFlags(const Map<String, ObjectRef> &annotations,
-                                               const GemmNode *gemm,
-                                               const PropagationTirCollector *collector);
+Map<String, ObjectRef>
+AnnotateGemmHcuMlsFlags(const Map<String, ObjectRef> &annotations,
+                        const GemmNode *gemm,
+                        const PropagationTirCollector *collector);
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm
 
-#endif  // TVM_TL_OP_MLS_GEMM_DEP_H_
+#endif // TVM_TL_OP_MLS_GEMM_DEP_H_

@@ -15,7 +15,7 @@
  * To add new MlsAtom mappings: edit tl_mls_atom_dispatcher.hpp
  */
 
-#include <tl_templates/hcu/mls/tl_mls_atom_dispatcher.hpp>
 #include <tl_templates/hcu/mls/mls_ds_traits.hpp>
 #include <tl_templates/hcu/mls/mls_generic_detail.hpp>
 #include <tl_templates/hcu/mls/mls_param_traits.hpp>
+#include <tl_templates/hcu/mls/tl_mls_atom_dispatcher.hpp>

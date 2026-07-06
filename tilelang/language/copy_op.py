@@ -9,6 +9,7 @@ from tilelang.utils.language import (
     is_shared,
 )
 from tilelang.language.utils import get_extent
+import tilelang.language as T
 from tvm import ir, tir
 from tilelang.language.utils import (
     buffer_region_to_tile_region,
@@ -136,6 +137,7 @@ def ds_read_format(
     Returns:
         tir.Call: A handle to the ds_read_format operation.
     """
+
     def get_extent(data):
         if isinstance(data, tir.Var) and T.has_let_value(data):
             data = T.get_let_value(data)
@@ -158,21 +160,15 @@ def ds_read_format(
         return None
 
     src_buf = get_buffer(src)
-    assert not isinstance(dst, tir.BufferRegion), (
-        "ds_read_format dst must be Buffer or BufferLoad, not BufferRegion"
-    )
+    assert not isinstance(dst, tir.BufferRegion), "ds_read_format dst must be Buffer or BufferLoad, not BufferRegion"
     dst_buf = get_buffer(dst)
     assert src_buf is not None, "ds_read_format src must be Buffer, BufferLoad or BufferRegion"
     assert dst_buf is not None, "ds_read_format dst must be Buffer or BufferLoad"
-    assert is_shared(src_buf), (
-        f"ds_read_format src must be shared memory, got scope={src_buf.scope()}"
-    )
+    assert is_shared(src_buf), f"ds_read_format src must be shared memory, got scope={src_buf.scope()}"
 
     src_extent = get_extent(src)
     dst_extent = get_extent(dst)
-    assert src_extent is not None or dst_extent is not None, (
-        "ds_read_format: src and dst must have at least one with extent"
-    )
+    assert src_extent is not None or dst_extent is not None, "ds_read_format: src and dst must have at least one with extent"
     src_extent = list(src_extent) if src_extent else [1] * len(dst_extent)
     dst_extent = list(dst_extent) if dst_extent else [1] * len(src_extent)
     src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)

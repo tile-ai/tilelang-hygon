@@ -34,7 +34,8 @@ const char *hiprtcGetErrorString(hiprtcResult result);
 hiprtcResult hiprtcVersion(int *major, int *minor);
 hiprtcResult hiprtcCreateProgram(hiprtcProgram *prog, const char *src,
                                  const char *name, int numHeaders,
-                                 const char **headers, const char **includeNames);
+                                 const char **headers,
+                                 const char **includeNames);
 hiprtcResult hiprtcDestroyProgram(hiprtcProgram *prog);
 hiprtcResult hiprtcCompileProgram(hiprtcProgram prog, int numOptions,
                                   const char **options);
@@ -211,8 +212,8 @@ hiprtcDestroyProgram(hiprtcProgram *prog) {
   return api->hiprtcDestroyProgram_(prog);
 }
 
-TILELANG_HIPRTC_STUB_API hiprtcResult hiprtcCompileProgram(
-    hiprtcProgram prog, int numOptions, const char **options) {
+TILELANG_HIPRTC_STUB_API hiprtcResult
+hiprtcCompileProgram(hiprtcProgram prog, int numOptions, const char **options) {
   auto *api = GetHIPRTCAPI();
   if (api->hiprtcCompileProgram_ == nullptr) {
     return MissingLibraryError();
