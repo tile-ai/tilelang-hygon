@@ -14,6 +14,7 @@
 #        HCU_CI_PR_BASE_BRANCHES=main,v0.1.9-release
 #      Add branch names in the web UI without editing this workflow.
 #      workflow_dispatch always runs.
+#   7. Set repo secret TILEKERNELS_GITHUB_TOKEN (fine-grained PAT, Contents read on HYGON-AI/TileKernels-hygon)
 name: HCU CI
 
 on:
@@ -208,17 +209,13 @@ jobs:
       - name: Clone TileKernels
         run: |
           rm -rf "${TILEKERNELS_DIR}"
-          clone_host="42.228.13.241:10068"
-          clone_path="dcutoolkit/deeplearing/TileKernels.git"
-          if [[ -n "${{ secrets.TILEKERNELS_GIT_TOKEN }}" ]]; then
-            git clone -b "${TILEKERNELS_REF}" \
-              "http://gitlab-ci-token:${{ secrets.TILEKERNELS_GIT_TOKEN }}@${clone_host}/${clone_path}" \
-              "${TILEKERNELS_DIR}"
-          else
-            git clone -b "${TILEKERNELS_REF}" \
-              "http://${clone_host}/${clone_path}" \
-              "${TILEKERNELS_DIR}"
+          if [[ -z "${{ secrets.TILEKERNELS_GITHUB_TOKEN }}" ]]; then
+            echo "::error::TILEKERNELS_GITHUB_TOKEN secret is required to clone HYGON-AI/TileKernels-hygon"
+            exit 1
           fi
+          git clone -b "${TILEKERNELS_REF}" \
+            "https://x-access-token:${{ secrets.TILEKERNELS_GITHUB_TOKEN }}@github.com/HYGON-AI/TileKernels-hygon.git" \
+            "${TILEKERNELS_DIR}"
 
       - name: Acquire GPU
         run: |
