@@ -14,7 +14,7 @@
 #        HCU_CI_PR_BASE_BRANCHES=main,v0.1.9-release
 #      Add branch names in the web UI without editing this workflow.
 #      workflow_dispatch always runs.
-#   7. Set repo secret TILEKERNELS_GITHUB_TOKEN (fine-grained PAT, Contents read on HYGON-AI/TileKernels-hygon)
+#   7. Set repo secret TILEKERNELS_GITHUB_TOKEN (fine-grained PAT, Contents read on HYGON-AI/TileKernels-das)
 name: HCU CI
 
 on:
@@ -210,11 +210,11 @@ jobs:
         run: |
           rm -rf "${TILEKERNELS_DIR}"
           if [[ -z "${{ secrets.TILEKERNELS_GITHUB_TOKEN }}" ]]; then
-            echo "::error::TILEKERNELS_GITHUB_TOKEN secret is required to clone HYGON-AI/TileKernels-hygon"
+            echo "::error::TILEKERNELS_GITHUB_TOKEN secret is required to clone HYGON-AI/TileKernels-das"
             exit 1
           fi
           git clone -b "${TILEKERNELS_REF}" \
-            "https://x-access-token:${{ secrets.TILEKERNELS_GITHUB_TOKEN }}@github.com/HYGON-AI/TileKernels-hygon.git" \
+            "https://x-access-token:${{ secrets.TILEKERNELS_GITHUB_TOKEN }}@github.com/HYGON-AI/TileKernels-das.git" \
             "${TILEKERNELS_DIR}"
 
       - name: Acquire GPU
