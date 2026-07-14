@@ -115,8 +115,7 @@ bool TargetIsRDNA(Target target) {
 }
 
 bool TargetHasMmacLitLts(Target target) {
-  static const std::set<std::string> hcu_targets = {"gfx938", "gfx92a",
-                                                    "gfx946"};
+  static const std::set<std::string> hcu_targets = {"gfx938", "gfx946"};
 
   if (!TargetIsHCU(target))
     return false;
@@ -154,7 +153,7 @@ bool TargetHasAsyncCopy(Target target) {
     return arch >= 80;
   } else if (TargetIsHCU(target)) {
     static const std::set<std::string> supported_targets = {"gfx936", "gfx938",
-                                                            "gfx946"};
+                                                            "gfx92a", "gfx946"};
     if (target->attrs.count("mcpu")) {
       std::string mcpu = Downcast<tvm::ffi::String>(target->attrs.at("mcpu"));
       return supported_targets.find(mcpu) != supported_targets.end();

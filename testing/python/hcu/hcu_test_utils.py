@@ -5,7 +5,7 @@ from tilelang.utils.target import determine_target, get_hcu_arch_string, target_
 _FP8_MMAC_SUPPORTED_HCU_ARCHES = frozenset({"gfx938", "gfx92a", "gfx946"})
 
 # HCU gfx validated for MLS matrix_load tests (extend when verified on new arch).
-MLS_SUPPORTED_HCU_ARCHES = frozenset({"gfx938", "gfx92a", "gfx946"})
+MLS_SUPPORTED_HCU_ARCHES = frozenset({"gfx938", "gfx946"})
 
 
 def target_supports_fp8_mmac() -> bool:
