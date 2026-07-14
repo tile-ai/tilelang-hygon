@@ -110,7 +110,8 @@ TL_DEVICE void hcu_cp_async_gs_via_direct_lds(void *lds_base_ptr,
 
   // dword global→LDS 多数 HCU/gfx 可用；dwordx2/x4 依赖
   // ISA，不支持时退回同步向量读写以免非法指令或静默错误。
-#if defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
+#if defined(__gfx936__) || defined(__gfx938__) || defined(__gfx92a__) ||       \
+    defined(__gfx946__)
 #define TL_HCU_GLOBAL_TO_LDS_ASYNC_MULTIDWORD 1
 #else
 #define TL_HCU_GLOBAL_TO_LDS_ASYNC_MULTIDWORD 0

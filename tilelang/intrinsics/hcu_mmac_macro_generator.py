@@ -15,7 +15,7 @@ from tilelang.intrinsics.hcu_mmac_emitter_utils import (
 )
 from tilelang.language.utils import get_buffer_region_from_load
 from tilelang.utils.language import is_fragment, retrieve_ptr
-from tilelang.utils.target import determine_target, target_has_mmac_lit_lts
+from tilelang.utils.target import determine_target, hcu_mmac_k_dim, target_has_mmac_lit_lts
 from tvm import DataType, tir
 from tvm.ir import Range
 from tvm.runtime import convert
@@ -150,21 +150,8 @@ class HCUMatrixCoreIntrinEmitter:
 
     def _initialize_k_dim(self, a_dtype="float16"):
         if isinstance(a_dtype, str):
-            if a_dtype in ["float8_e4m3", "float8_e4m3fnuz", "float8_e4m3fn", "float8_e5m2", "int8"]:
-                self.k_dim = 32
-                return
             a_dtype = DataType(a_dtype)
-
-        if a_dtype.bits == 32:
-            self.k_dim = 8
-        elif a_dtype.bits == 16:
-            self.k_dim = 16
-        elif a_dtype.bits == 8:
-            self.k_dim = 32
-        elif a_dtype.bits == 4:
-            self.k_dim = 64
-        else:
-            raise ValueError(f"Unsupported a_dtype = {a_dtype}")
+        self.k_dim = hcu_mmac_k_dim(self.target, a_dtype.bits, use_tf32=self.use_tf32)
 
     def _initialize_local_size(self, m_dim=16, n_dim=16, k_dim=16, warp_size=32):
         self.local_size_a = (m_dim * k_dim) // warp_size
@@ -197,7 +184,10 @@ class HCUMatrixCoreIntrinEmitter:
         has_lit = target is not None and target_has_mmac_lit_lts(target)
 
         if in_dtype == "float32" and not use_tf32:
-            self.mmac_suffix = "16x16x8_f32_lit_lts" if has_lit else "16x16x8_f32"
+            suffix = f"16x16x{self.k_dim}_f32"
+            if has_lit:
+                suffix += "_lit_lts"
+            self.mmac_suffix = suffix
             return
 
         out_dtype_abbrv = {"float16": "f16", "float32": "f32", "int8": "i8", "int32": "i32"}[out_dtype]
@@ -360,8 +350,10 @@ class HCUMatrixCoreIntrinEmitter:
         k_dim = self.k_dim * self.k_pack
         transposed = self.a_transposed if not is_b else self.b_transposed
         if k_dim == 4:
-            index_map = shared_16x4_to_local_64x1_layout_A
-            reverse_index_map = thread_id_shared_access_64x1_to_16x4_layout_A
+            index_map = shared_4x16_to_local_64x1_layout_B if transposed else shared_16x4_to_local_64x1_layout_A
+            reverse_index_map = (
+                thread_id_shared_access_64x1_to_4x16_layout_B if transposed else thread_id_shared_access_64x1_to_16x4_layout_A
+            )
             if is_b:
                 index_map = shared_16x4_to_local_64x1_layout_A if transposed else shared_4x16_to_local_64x1_layout_B
                 reverse_index_map = (

@@ -276,6 +276,28 @@ def target_has_mmac_lit_lts(target: Target) -> bool:
     return _ffi_api.TargetHasMmacLitLts(target)
 
 
+def hcu_mmac_k_dim(target: Target, element_bits: int, *, use_tf32: bool = False) -> int:
+    """Per-instruction MMAC K along reduction axis (arch/dtype specific)."""
+    bits = int(element_bits)
+    if bits == 16:
+        return 16
+    if bits == 8:
+        return 32
+    if bits == 4:
+        return 64
+    if bits == 32:
+        if use_tf32:
+            return 8
+        if target_is_hcu(target):
+            mcpu = get_hcu_arch_string(target)
+            if mcpu == "gfx938":
+                return 8
+            if mcpu in ("gfx92a", "gfx946"):
+                return 4
+        return 8
+    raise ValueError(f"Unsupported element_bits for HCU MMAC: {element_bits}")
+
+
 def get_hcu_arch_string(target: Target) -> str:
     """Return mcpu token for HCU codegen templates (e.g. ``gfx938``)."""
     return str(_ffi_api.GetHcuArchString(target))

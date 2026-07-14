@@ -5,6 +5,21 @@
 
 namespace tl {
 
+// Per-arch per-dtype K extent for one MMAC along reduction axis.
+template <typename T> struct MmacMicroKDim {
+  static constexpr int value = 32 / sizeof(T);
+};
+
+template <> struct MmacMicroKDim<float> {
+#if defined(__gfx92a__) || defined(__gfx946__)
+  static constexpr int value = 4;
+#elif defined(__gfx938__)
+  static constexpr int value = 8;
+#else
+  static constexpr int value = 8;
+#endif
+};
+
 // Trait to determine the MMAC instruction to use based on data type
 template <typename T> struct MmacTraits;
 
@@ -14,7 +29,7 @@ template <> struct MmacTraits<int8_t> {
   static TL_DEVICE void mmac_op(const int8_t *b, const int8_t *a, AccType *c) {
     int32x2 *a_packed = reinterpret_cast<int32x2 *>(const_cast<int8_t *>(a));
     int32x2 *b_packed = reinterpret_cast<int32x2 *>(const_cast<int8_t *>(b));
-#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
+#if defined(__gfx938__) || defined(__gfx946__)
     // default: lit en, clamp disable, lts disable
     *c = __builtin_hcu_mmac_i32_16x16x32_i8_lit_clamp_lts(*a_packed, *b_packed,
                                                           *c, 1, 0, 0);
@@ -28,7 +43,7 @@ template <> struct MmacTraits<int8_t> {
 template <> struct MmacTraits<half> {
   template <typename AccType>
   static TL_DEVICE void mmac_op(const half *b, const half *a, AccType *c) {
-#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
+#if defined(__gfx938__) || defined(__gfx946__)
     *c = __builtin_hcu_mmac_f32_16x16x16_f16_lit_lts(
         *((float16x4 *)a), *((float16x4 *)b), *c, 1, 0);
 #else
@@ -56,7 +71,7 @@ template <> struct MmacTraits<bfloat16_t> {
     }
 
     // Call the intrinsic and store the result directly to c
-#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
+#if defined(__gfx938__) || defined(__gfx946__)
     *c = __builtin_hcu_mmac_f32_16x16x16_bf16_lit_lts(a_vec, b_vec, *c, 1, 0);
 #else
     *c = __builtin_hcu_mmac_f32_16x16x16_bf16(a_vec, b_vec, *c);
@@ -68,11 +83,13 @@ template <> struct MmacTraits<bfloat16_t> {
 template <> struct MmacTraits<float> {
   template <typename AccType>
   static TL_DEVICE void mmac_op(const float *b, const float *a, AccType *c) {
-#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
-    // default: lit en, lts disable (aligned with tvm_mfma
-    // f32_16x16x8_f32_lit_lts)
+#if defined(__gfx938__)
     *c = __builtin_hcu_mmac_16x16x8_f32_lit_lts(*((float32x2 *)a),
                                                 *((float32x2 *)b), *c, 1, 0);
+#elif defined(__gfx946__)
+    *c = __builtin_hcu_mmac_16x16x4_f32_lit_lts(*a, *b, *c, 1, 0);
+#elif defined(__gfx92a__)
+    *c = __builtin_hcu_mmac_16x16x4_f32(*a, *b, *c);
 #else
     *c = __builtin_hcu_mmac_16x16x8_f32(*((float32x2 *)a), *((float32x2 *)b),
                                         *c);
@@ -84,7 +101,7 @@ template <> struct MmacTraits<float> {
 template <> struct MmacTraits<int> {
   template <typename AccType>
   static TL_DEVICE void mmac_op(const int *b, const int *a, AccType *c) {
-#if defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
+#if defined(__gfx938__) || defined(__gfx946__)
     // default: lit en, lts disable (aligned with tvm_mfma
     // f32_16x16x8_f32_lit_lts)
     *c = __builtin_hcu_mmac_f32_16x16x8_tf32_lit_lts(*((int32x2 *)a),
@@ -108,9 +125,11 @@ template <> struct MmacTraits<fp8_e4_t> {
     (!defined(__gfx938__) && !defined(__gfx92a__) && !defined(__gfx946__))
 #error                                                                         \
     "fp8_e4_t MMAC operations are only supported on gfx938, gfx92a, and gfx946 architectures"
-#elif defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
+#elif defined(__gfx938__) || defined(__gfx946__)
     *c =
         __builtin_hcu_mmac_f32_16x16x32_fp8_fp8_lit_lts(a_val, b_val, *c, 1, 0);
+#elif defined(__gfx92a__)
+    *c = __builtin_hcu_mmac_f32_16x16x32_fp8_fp8(a_val, b_val, *c);
 #endif
   }
 };
@@ -126,9 +145,11 @@ template <> struct MmacTraits<fp8_e5_t> {
     (!defined(__gfx938__) && !defined(__gfx92a__) && !defined(__gfx946__))
 #error                                                                         \
     "fp8_e5_t MMAC operations are only supported on gfx938, gfx92a, and gfx946 architectures"
-#elif defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__)
+#elif defined(__gfx938__) || defined(__gfx946__)
     *c =
         __builtin_hcu_mmac_f32_16x16x32_bf8_bf8_lit_lts(a_val, b_val, *c, 1, 0);
+#elif defined(__gfx92a__)
+    *c = __builtin_hcu_mmac_f32_16x16x32_bf8_bf8(a_val, b_val, *c);
 #endif
   }
 };
@@ -147,8 +168,8 @@ public:
 
   static constexpr int micro_size_x = 16;
   static constexpr int micro_size_y = 16;
-  static constexpr int micro_size_k = 32 / sizeof(A_type);
-  static constexpr int vec_size = 8 / sizeof(A_type);
+  static constexpr int micro_size_k = MmacMicroKDim<A_type>::value;
+  static constexpr int vec_size = micro_size_k / 4;
 
   // This part comes from the Codegen
   static constexpr int M_Tile = M;
@@ -473,8 +494,8 @@ class GemmTensorOpKPartition {
 public:
   static constexpr int micro_size_x = 16;
   static constexpr int micro_size_y = 16;
-  static constexpr int micro_size_k = 32 / sizeof(A_type);
-  static constexpr int vec_size = 8 / sizeof(A_type);
+  static constexpr int micro_size_k = MmacMicroKDim<A_type>::value;
+  static constexpr int vec_size = micro_size_k / 4;
 
   static constexpr int M_Tile = M;
   static constexpr int N_Tile = N;

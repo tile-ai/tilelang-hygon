@@ -15,9 +15,20 @@
 
 #if __has_include(<hip/hiprtc.h>)
 #include <hip/hiprtc.h>
+#if __has_include(<hip/hip_version.h>)
+#include <hip/hip_version.h>
+#endif
 #define TILELANG_HAS_HIPRTC_HEADERS 1
+// HIP 6+ hiprtc.h uses const char* const* for string-array parameters; older
+// DTK/ROCm uses const char**. Match the installed header for stub exports.
+#if defined(HIP_VERSION_MAJOR) && HIP_VERSION_MAJOR >= 7
+#define TILELANG_HIPRTC_STR_LIST const char *const *
+#else
+#define TILELANG_HIPRTC_STR_LIST const char **
+#endif
 #else
 #define TILELANG_HAS_HIPRTC_HEADERS 0
+#define TILELANG_HIPRTC_STR_LIST const char **
 // Minimal fallback definitions to keep this file buildable without ROCm SDK.
 // These are intentionally incomplete; prefer building with real ROCm headers.
 #include <stddef.h>
@@ -194,7 +205,7 @@ TILELANG_HIPRTC_STUB_API hiprtcResult hiprtcVersion(int *major, int *minor) {
 
 TILELANG_HIPRTC_STUB_API hiprtcResult hiprtcCreateProgram(
     hiprtcProgram *prog, const char *src, const char *name, int numHeaders,
-    const char **headers, const char **includeNames) {
+    TILELANG_HIPRTC_STR_LIST headers, TILELANG_HIPRTC_STR_LIST includeNames) {
   auto *api = GetHIPRTCAPI();
   if (api->hiprtcCreateProgram_ == nullptr) {
     return MissingLibraryError();
@@ -212,8 +223,8 @@ hiprtcDestroyProgram(hiprtcProgram *prog) {
   return api->hiprtcDestroyProgram_(prog);
 }
 
-TILELANG_HIPRTC_STUB_API hiprtcResult
-hiprtcCompileProgram(hiprtcProgram prog, int numOptions, const char **options) {
+TILELANG_HIPRTC_STUB_API hiprtcResult hiprtcCompileProgram(
+    hiprtcProgram prog, int numOptions, TILELANG_HIPRTC_STR_LIST options) {
   auto *api = GetHIPRTCAPI();
   if (api->hiprtcCompileProgram_ == nullptr) {
     return MissingLibraryError();

@@ -13,7 +13,7 @@ from tilelang.intrinsics.hcu_mmac_macro_generator import HCUMatrixCoreIntrinEmit
 from tilelang.layout.swizzle import make_hcu_swizzled_layout
 from tilelang.transform.simplify import _Simplify
 from tilelang.utils.language import is_fragment, is_full_region, is_shared, is_shared_dynamic
-from tilelang.utils.target import target_has_mmac_lit_lts, target_is_hcu
+from tilelang.utils.target import hcu_mmac_k_dim, target_has_mmac_lit_lts, target_is_hcu
 from tvm import DataType, tir
 from tvm.ir import Range
 from tvm.target import Target
@@ -151,6 +151,10 @@ class GemmHCUMMAC(GemmBase):
         warp_m, warp_n, warp_k = _compute_hcu_warp_partition(self, block_size, target, meta)
         min_n_per_warp = 32 if (b_from_mls and not b_mls_trans) else 16
         elem_bits_c = int(DataType(self.C.dtype).bits)
+        elem_bits_a = int(DataType(self.A.dtype).bits)
+        elem_bits_b = int(DataType(self.B.dtype).bits)
+        mmac_k_a = hcu_mmac_k_dim(target, elem_bits_a, use_tf32=self.use_tf32)
+        mmac_k_b = hcu_mmac_k_dim(target, elem_bits_b, use_tf32=self.use_tf32)
         frag_c = make_gemm_fragment_hcu(
             int(self.M),
             int(self.N),
@@ -172,9 +176,10 @@ class GemmHCUMMAC(GemmBase):
                 warp_m,
                 warp_n,
                 warp_k,
-                int(DataType(self.A.dtype).bits),
+                elem_bits_a,
                 int(self.k_pack),
                 bool(self.trans_A),
+                mmac_k_dim=mmac_k_a,
             )
         else:
             raise ValueError(f"Unsupported A scope for HCU gemm: {self.A.scope()}")
@@ -188,10 +193,11 @@ class GemmHCUMMAC(GemmBase):
                 warp_m,
                 warp_n,
                 warp_k,
-                int(DataType(self.B.dtype).bits),
+                elem_bits_b,
                 int(self.k_pack),
                 bool(self.trans_B),
                 min_n_per_warp,
+                mmac_k_dim=mmac_k_b,
             )
         else:
             raise ValueError(f"Unsupported B scope for HCU gemm: {self.B.scope()}")

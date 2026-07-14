@@ -12,8 +12,10 @@ from tvm.tir import IndexMap
 
 
 def shared_16x4_to_local_64x1_layout_A(i, j):
-    thread_id = j * 16 + i
-    return thread_id, convert(0)
+    thread_id = i + 16 * j
+    # IndexMap needs PrimExpr for local_id; plain Python 0 is rejected.
+    local = T.int32(0)
+    return thread_id, local
 
 
 def thread_id_shared_access_64x1_to_16x4_layout_A(thread_id, local_id):
@@ -24,7 +26,8 @@ def thread_id_shared_access_64x1_to_16x4_layout_A(thread_id, local_id):
 
 def shared_4x16_to_local_64x1_layout_B(i, j):
     thread_id = i * 16 + j
-    return thread_id, convert(0)
+    local = T.int32(0)
+    return thread_id, local
 
 
 def thread_id_shared_access_64x1_to_4x16_layout_B(thread_id, local_id):
@@ -210,8 +213,14 @@ def make_mmac_swizzle_layout(shared_buf, vecSize=8):
     return T.Layout(shape, transform)
 
 
-def mmac_micro_k(element_bits: int, k_pack: int) -> int:
-    """K extent (elements) of one HCU mmac micro-tile along the reduction axis."""
+def mmac_micro_k(element_bits: int, k_pack: int, *, mmac_k_dim: int | None = None) -> int:
+    """K extent (elements) of one HCU mmac micro-tile along the reduction axis.
+
+    When ``mmac_k_dim`` is set (from ``hcu_mmac_k_dim``), it is the per-instruction
+    K for the operand dtype; otherwise dtype-default K is used.
+    """
+    if mmac_k_dim is not None:
+        return mmac_k_dim * k_pack
     if element_bits == 16:
         return 16 * k_pack
     if element_bits == 32:
@@ -228,6 +237,8 @@ def _micro_to_local_layout_fn(element_bits: int, micro_k: int) -> Callable:
             return shared_16x16_to_local_64x4_layout_A
         return shared_16x32_to_local_64x8_layout_A
     if element_bits == 32:
+        if micro_k <= 4:
+            return shared_16x4_to_local_64x1_layout_A
         if micro_k <= 8:
             return shared_16x8_to_local_64x2_layout_A
         return shared_16x16_to_local_64x4_layout_A
@@ -268,9 +279,9 @@ def _fragment_from_layout_fn(
     )
 
 
-def _micro_ab_fragment(element_bits: int, k_pack: int, *, spatial_leading: bool) -> Fragment:
+def _micro_ab_fragment(element_bits: int, k_pack: int, *, spatial_leading: bool, mmac_k_dim: int | None = None) -> Fragment:
     """One warp AB micro-tile fragment; ``spatial_leading`` selects ``[M/N, K]`` vs ``[K, M/N]``."""
-    micro_k = mmac_micro_k(element_bits, k_pack)
+    micro_k = mmac_micro_k(element_bits, k_pack, mmac_k_dim=mmac_k_dim)
     layout_fn = _micro_to_local_layout_fn(element_bits, micro_k)
     if not spatial_leading:
         layout_fn = _swap_ij_layout_fn(layout_fn)
@@ -328,17 +339,21 @@ def make_gemm_fragment_a_hcu(
     element_bits: int,
     k_pack: int,
     transposed: bool,
+    *,
+    mmac_k_dim: int | None = None,
 ) -> Fragment:
     warp_m = block_m // num_warp_m
     warp_k = block_k // num_warp_k
-    mk = mmac_micro_k(element_bits, k_pack)
+    mk = mmac_micro_k(element_bits, k_pack, mmac_k_dim=mmac_k_dim)
     if block_m % warp_m != 0 or warp_m % 16 != 0:
         raise ValueError(f"invalid A warp_m={warp_m} for block_m={block_m}")
     if warp_k % mk != 0:
         raise ValueError(f"warp_k={warp_k} must be divisible by mmac_micro_k={mk}")
 
     spatial_leading = not transposed
-    base = _micro_ab_fragment(element_bits, k_pack, spatial_leading=spatial_leading).repeat([1, 1], repeat_on_thread=False)
+    base = _micro_ab_fragment(element_bits, k_pack, spatial_leading=spatial_leading, mmac_k_dim=mmac_k_dim).repeat(
+        [1, 1], repeat_on_thread=False
+    )
     if transposed:
         warp_layout = base.repeat([warp_k // mk, warp_m // 16], repeat_on_thread=False, lower_dim_first=True)
         block_layout = (
@@ -367,6 +382,8 @@ def make_gemm_fragment_b_hcu(
     k_pack: int,
     transposed: bool,
     min_n_per_warp: int,
+    *,
+    mmac_k_dim: int | None = None,
 ) -> Fragment:
     if block_n % min_n_per_warp != 0:
         raise ValueError(f"block_n={block_n} must be divisible by min_n_per_warp={min_n_per_warp}")
@@ -380,13 +397,15 @@ def make_gemm_fragment_b_hcu(
 
     if block_n % warp_n != 0 or warp_n % min_n_per_warp != 0:
         raise ValueError(f"invalid B warp_n={warp_n} for block_n={block_n}")
-    mk = mmac_micro_k(element_bits, k_pack)
+    mk = mmac_micro_k(element_bits, k_pack, mmac_k_dim=mmac_k_dim)
     if warp_k % mk != 0:
         raise ValueError(f"warp_k={warp_k} must be divisible by mmac_micro_k={mk}")
 
     # gemm ``TransposeB``: spatial-leading micro-tile when ``transposed=True`` (``gemm_layouts.cc``).
     spatial_leading = transposed
-    base = _micro_ab_fragment(element_bits, k_pack, spatial_leading=spatial_leading).repeat([1, 1], repeat_on_thread=False)
+    base = _micro_ab_fragment(element_bits, k_pack, spatial_leading=spatial_leading, mmac_k_dim=mmac_k_dim).repeat(
+        [1, 1], repeat_on_thread=False
+    )
     if transposed:
         warp_layout = base.repeat([warp_n // 16, warp_k // mk], repeat_on_thread=False, lower_dim_first=False)
         block_layout = warp_layout.replicate(num_warp_m).repeat(
