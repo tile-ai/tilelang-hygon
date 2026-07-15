@@ -615,6 +615,11 @@ def get_warp_idx(
     return tir.call_intrin("int32", tir.op.Op.get("tl.get_warp_idx"), warp_size_expr)
 
 
+def get_wave_id() -> PrimExpr:
+    """Return the hardware wave id for HCU WDRA kernels."""
+    return tir.call_intrin("int32", tir.op.Op.get("tl.get_wave_id"))
+
+
 def get_warp_group_idx(
     warp_size: int | PrimExpr | None = None,
     warps_per_group: int | PrimExpr | None = None,
@@ -873,6 +878,92 @@ def barrier_arrive(mbarrier: BarrierType):
             The memory barrier to arrive at
     """
     return mbarrier_arrive(mbarrier)
+
+
+def abarrier_init(abar_id: int | Var, arrive_waves: int | Var):
+    """Initialize a Hygon gfx946 ABarrier hardware slot.
+
+    Args:
+        abar_id: int | Var
+            Hardware slot id in [0, 15].
+        arrive_waves: int | Var
+            Number of waves required to complete one phase.
+    """
+    return tir.call_intrin("handle", tir.op.Op.get("tl.abarrier_init"), abar_id, arrive_waves)
+
+
+def abarrier_inv(abar_id: int | Var):
+    """Invalidate a Hygon gfx946 ABarrier hardware slot."""
+    return tir.call_intrin("handle", tir.op.Op.get("tl.abarrier_inv"), abar_id)
+
+
+def abarrier_arrive(abar_id: int | Var, wave_count: int | Var = 1):
+    """Arrive at a Hygon gfx946 ABarrier.
+
+    Args:
+        abar_id: int | Var
+            Hardware slot id in [0, 15].
+        wave_count: int | Var
+            Number of waves represented by this arrive (default 1).
+
+    Returns:
+        tir.Call: int32 phase/return value from the hardware arrive.
+    """
+    return tir.call_intrin("int32", tir.op.Op.get("tl.abarrier_arrive"), abar_id, wave_count)
+
+
+def abarrier_try_wait(abar_id: int | Var, phase: int | Var):
+    """Single-shot ABarrier try_wait.
+
+    Blocks up to the hardware default suspend timeout (2^16 * 4 cycles) when
+    the phase is incomplete. Returns non-zero (typically 1) if complete, 0
+    otherwise. This is the primary API for producer-consumer pipelines.
+    """
+    return tir.call_intrin("int32", tir.op.Op.get("tl.abarrier_try_wait"), abar_id, phase)
+
+
+def abarrier_wait(abar_id: int | Var, phase: int | Var):
+    """Wait until ABarrier phase completes (loops on try_wait).
+
+    Intended mainly for debug/maint; most pipelines should use
+    abarrier_try_wait directly.
+    """
+    return tir.call_intrin("handle", tir.op.Op.get("tl.abarrier_wait"), abar_id, phase)
+
+
+def abarrier_test_wait(abar_id: int | Var, phase: int | Var):
+    """Non-blocking ABarrier poll. Returns non-zero if phase is complete."""
+    return tir.call_intrin("int32", tir.op.Op.get("tl.abarrier_test_wait"), abar_id, phase)
+
+
+def abarrier_seq(abar_id: int | Var):
+    """Bind the next memory access to this ABarrier slot."""
+    return tir.call_intrin("handle", tir.op.Op.get("tl.abarrier_seq"), abar_id)
+
+
+def abarrier_expect_tx(abar_id: int | Var, num_bytes: int | Var):
+    """Declare expected transaction byte count on an ABarrier slot."""
+    return tir.call_intrin("handle", tir.op.Op.get("tl.abarrier_expect_tx"), abar_id, num_bytes)
+
+
+def abarrier_complete_tx(abar_id: int | Var, num_bytes: int | Var):
+    """Complete expected transaction byte count on an ABarrier slot."""
+    return tir.call_intrin("handle", tir.op.Op.get("tl.abarrier_complete_tx"), abar_id, num_bytes)
+
+
+def ebarrier_sync(ebar_id: int | Var):
+    """Synchronize all waves in the workgroup on an EBarrier slot."""
+    return tir.call_intrin("handle", tir.op.Op.get("tl.ebarrier_sync"), ebar_id)
+
+
+def ebarrier_sync_cnt(ebar_id: int | Var, wave_count: int | Var):
+    """Synchronize wave_count waves on an EBarrier slot."""
+    return tir.call_intrin("handle", tir.op.Op.get("tl.ebarrier_sync_cnt"), ebar_id, wave_count)
+
+
+def ebarrier_arrive(ebar_id: int | Var, wave_count: int | Var = 1):
+    """Arrive at an EBarrier slot with wave_count waves."""
+    return tir.call_intrin("handle", tir.op.Op.get("tl.ebarrier_arrive"), ebar_id, wave_count)
 
 
 def shfl(value: int | PrimExpr | tir.Call, lane: int | PrimExpr | tir.Call):

@@ -114,6 +114,17 @@ bool TargetIsRDNA(Target target) {
   return false;
 }
 
+bool TargetSupportsHcuWdra(Target target) {
+  if (!TargetIsHCU(target)) {
+    return false;
+  }
+  if (target->attrs.count("mcpu")) {
+    std::string mcpu = Downcast<tvm::ffi::String>(target->attrs.at("mcpu"));
+    return mcpu == "gfx946";
+  }
+  return false;
+}
+
 bool TargetHasMmacLitLts(Target target) {
   static const std::set<std::string> hcu_targets = {"gfx938", "gfx946"};
 
@@ -395,6 +406,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def("tl.TargetGetWarpSize",
            [](Target target) { return TargetGetWarpSize(target); })
       .def("tl.TargetIsHCU", [](Target target) { return TargetIsHCU(target); })
+      .def("tl.TargetSupportsHcuWdra",
+           [](Target target) { return TargetSupportsHcuWdra(target); })
       .def("tl.TargetHasMmacLitLts",
            [](Target target) { return TargetHasMmacLitLts(target); })
       .def("tl.GetHcuArchString", [](Target target) {

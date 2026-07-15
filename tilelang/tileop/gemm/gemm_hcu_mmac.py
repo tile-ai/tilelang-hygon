@@ -108,6 +108,12 @@ def _compute_hcu_warp_partition(gemm, thread_nums: int, target: Target, meta) ->
     return int(gemm.policy.m_warp), int(gemm.policy.n_warp), int(gemm.policy.k_warp)
 
 
+def _thread_bounds_min(thread_bounds: Range) -> int:
+    if isinstance(thread_bounds.min, tir.IntImm):
+        return int(thread_bounds.min.value)
+    return 0
+
+
 def _make_hcu_emitter(
     gemm: GemmHCUMMAC,
     warp_m: int,
@@ -116,6 +122,7 @@ def _make_hcu_emitter(
     meta,
     target: Target,
     thread_var: tir.Var,
+    thread_bounds_min: int = 0,
 ) -> HCUMatrixCoreIntrinEmitter:
     min_n_per_warp = 32 if (meta.b_from_mls and not meta.b_mls_trans) else 16
     return HCUMatrixCoreIntrinEmitter(
@@ -133,6 +140,7 @@ def _make_hcu_emitter(
         block_k_warps=warp_k,
         target=target,
         thread_var=thread_var,
+        thread_bounds_min=thread_bounds_min,
         min_n_per_warp=min_n_per_warp,
         use_tf32=gemm.use_tf32,
     )
@@ -221,7 +229,7 @@ class GemmHCUMMAC(GemmBase):
         a_from_mls = int(meta.a_from_mls)
         b_from_mls = int(meta.b_from_mls)
         warp_m, warp_n, warp_k = _compute_hcu_warp_partition(self, thread_nums, target, meta)
-        emitter = _make_hcu_emitter(self, warp_m, warp_n, warp_k, meta, target, thread_var)
+        emitter = _make_hcu_emitter(self, warp_m, warp_n, warp_k, meta, target, thread_var, _thread_bounds_min(thread_bounds))
 
         k_pack = emitter.k_pack
         in_dtype = self.in_dtype

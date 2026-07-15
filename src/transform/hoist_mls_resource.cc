@@ -187,6 +187,11 @@ std::string ResourceKey(const std::string &base_template,
   for (int i = 1; i <= 5; ++i) {
     os << "|" << ExprKey(call->args[i]);
   }
+  if (call->args.size() == 9U) {
+    os << "|" << ExprKey(call->args[8]);
+  } else {
+    os << "|" << ExprKey(IntImm(DataType::Int(32), 0));
+  }
   return os.str();
 }
 
@@ -200,18 +205,149 @@ Stmt MakeExternStmt(const std::string &symbol,
   return Evaluate(Call(DataType::Int(32), builtin::call_extern(), call_args));
 }
 
+bool UsesThreadOrWavePartition(
+    const PrimExpr &expr,
+    const std::unordered_set<const VarNode *> &thread_vars,
+    const std::unordered_set<const VarNode *> &thread_alias_vars,
+    const std::unordered_set<const VarNode *> &seq_thread_aliases) {
+  bool found = false;
+  tir::PostOrderVisit(expr, [&](const ObjectRef &node) {
+    if (found) {
+      return;
+    }
+    if (const auto *var = node.as<VarNode>()) {
+      if (thread_vars.count(var) || thread_alias_vars.count(var) ||
+          seq_thread_aliases.count(var)) {
+        found = true;
+      }
+      return;
+    }
+    if (const auto *call = node.as<CallNode>()) {
+      if (call->op.same_as(get_wave_id()) || call->op.same_as(get_warp_idx()) ||
+          call->op.same_as(get_warp_idx_sync()) ||
+          call->op.same_as(get_lane_idx()) ||
+          call->op.same_as(get_warp_group_idx())) {
+        found = true;
+      }
+    }
+  });
+  return found;
+}
+
+bool IsThreadWavePartitionIf(
+    const IfThenElseNode *op,
+    const std::unordered_set<const VarNode *> &thread_vars,
+    const std::unordered_set<const VarNode *> &thread_alias_vars,
+    const std::unordered_set<const VarNode *> &seq_thread_aliases) {
+  return UsesThreadOrWavePartition(op->condition, thread_vars,
+                                   thread_alias_vars, seq_thread_aliases);
+}
+
+void CollectSeqThreadAliases(
+    const SeqStmtNode *op,
+    const std::unordered_set<const VarNode *> &thread_vars,
+    std::unordered_set<const VarNode *> *seq_thread_aliases) {
+  for (const Stmt &stmt : op->seq) {
+    if (const auto *let = stmt.as<LetStmtNode>()) {
+      if (const auto *v = let->value.as<VarNode>()) {
+        if (thread_vars.count(v)) {
+          seq_thread_aliases->insert(let->var.get());
+        }
+      }
+    }
+  }
+}
+
+Stmt BuildHoistEligibleSeqPrefix(
+    const SeqStmtNode *op,
+    const std::unordered_set<const VarNode *> &thread_vars,
+    const std::unordered_set<const VarNode *> &thread_alias_vars,
+    const std::unordered_set<const VarNode *> &seq_thread_aliases) {
+  Array<Stmt> prefix;
+  for (const Stmt &stmt : op->seq) {
+    if (const auto *if_node = stmt.as<IfThenElseNode>()) {
+      if (IsThreadWavePartitionIf(if_node, thread_vars, thread_alias_vars,
+                                  seq_thread_aliases)) {
+        break;
+      }
+    }
+    prefix.push_back(stmt);
+  }
+  if (prefix.empty()) {
+    return Stmt();
+  }
+  return prefix.size() == 1 ? prefix[0] : SeqStmt(prefix);
+}
+
 } // namespace
 
 class HoistMlsResourceMutator : public StmtMutator {
 public:
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tir::attr::thread_extent) {
+      IterVar iv = Downcast<IterVar>(op->node);
+      const std::string &tag = iv->thread_tag;
+      if (tag.rfind("threadIdx", 0) == 0) {
+        thread_vars_.insert(iv->var.get());
+        Stmt body = StmtMutator::VisitStmt_(op);
+        thread_vars_.erase(iv->var.get());
+        return body;
+      }
+    }
+    return StmtMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const LetStmtNode *op) final {
+    const VarNode *alias = nullptr;
+    if (const auto *v = op->value.as<VarNode>()) {
+      if (thread_vars_.count(v)) {
+        alias = op->var.get();
+        thread_alias_vars_.insert(alias);
+      }
+    }
+    Stmt body = VisitStmt(op->body);
+    if (alias != nullptr) {
+      thread_alias_vars_.erase(alias);
+    }
+    return LetStmt(op->var, op->value, body);
+  }
+
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    if (!IsThreadWavePartitionIf(op, thread_vars_, thread_alias_vars_,
+                                 seq_thread_aliases_)) {
+      return StmtMutator::VisitStmt_(op);
+    }
+    ++scope_depth_;
+    Stmt then_case = VisitStmt(op->then_case);
+    ExpireScopes();
+    Optional<Stmt> else_case = op->else_case;
+    if (else_case.defined()) {
+      else_case = VisitStmt(else_case.value());
+      ExpireScopes();
+    }
+    --scope_depth_;
+    return IfThenElse(op->condition, then_case, else_case);
+  }
+
   Stmt VisitStmt_(const SeqStmtNode *op) final {
     std::vector<Stmt> prelude;
     std::unordered_set<const VarNode *> nested_loop_vars;
-    CollectForLoopVars(tvm::ffi::GetRef<Stmt>(op), &nested_loop_vars);
+
+    std::unordered_set<const VarNode *> saved_seq_aliases = seq_thread_aliases_;
+    seq_thread_aliases_.clear();
+    CollectSeqThreadAliases(op, thread_vars_, &seq_thread_aliases_);
+
+    Stmt hoist_region = BuildHoistEligibleSeqPrefix(
+        op, thread_vars_, thread_alias_vars_, seq_thread_aliases_);
+    if (hoist_region.defined()) {
+      CollectForLoopVars(hoist_region, &nested_loop_vars);
+    }
 
     ++scope_depth_;
-    PredeclareMlsResources(tvm::ffi::GetRef<Stmt>(op), /*loop_var=*/nullptr,
-                           &prelude, &nested_loop_vars);
+    if (hoist_region.defined()) {
+      PredeclareMlsResources(hoist_region, /*loop_var=*/nullptr, &prelude,
+                             &nested_loop_vars);
+    }
 
     Array<Stmt> seq;
     seq.reserve(op->seq.size() + prelude.size());
@@ -224,6 +360,7 @@ public:
 
     ExpireScopes();
     --scope_depth_;
+    seq_thread_aliases_ = saved_seq_aliases;
     return SeqStmt(seq);
   }
 
@@ -257,9 +394,9 @@ public:
     if (call == nullptr || !IsMlsLoadTileCall(call)) {
       return StmtMutator::VisitStmt_(op);
     }
-    ICHECK_EQ(call->args.size(), 8U)
+    ICHECK(call->args.size() == 8U || call->args.size() == 9U)
         << "mls_load_tile extern expects symbol, src, stride, mn_len, k_len, "
-           "mn_base, k_base, dst";
+           "mn_base, k_base, dst[, warp_id_offset]";
 
     const auto *sym_node = call->args[0].as<StringImmNode>();
     const std::string sym = sym_node->value;
@@ -332,9 +469,9 @@ private:
     std::vector<const CallNode *> calls;
     CollectMlsLoadTileCalls(body, &calls);
     for (const CallNode *call : calls) {
-      ICHECK_EQ(call->args.size(), 8U)
+      ICHECK(call->args.size() == 8U || call->args.size() == 9U)
           << "mls_load_tile extern expects symbol, src, stride, mn_len, k_len, "
-             "mn_base, k_base, dst";
+             "mn_base, k_base, dst[, warp_id_offset]";
       if ((loop_var != nullptr && (ExprUsesVar(call->args[1], loop_var) ||
                                    ExprUsesVar(call->args[2], loop_var) ||
                                    ExprUsesVar(call->args[3], loop_var) ||
@@ -357,10 +494,12 @@ private:
           "_tl_mls_h_" + std::to_string(resource_counter_++);
       resource_names_[key] = obj_name;
       resource_scopes_[key] = scope_depth_;
-      prelude->push_back(
-          MakeExternStmt(kMlsResourceInitPrefix + base_template.substr(0) + ">",
-                         {StringImm(obj_name), call->args[1], call->args[2],
-                          call->args[3], call->args[4]}));
+      prelude->push_back(MakeExternStmt(
+          kMlsResourceInitPrefix + base_template.substr(0) + ">",
+          {StringImm(obj_name), call->args[1], call->args[2], call->args[3],
+           call->args[4],
+           call->args.size() == 9U ? call->args[8]
+                                   : PrimExpr(IntImm(DataType::Int(32), 0))}));
     }
   }
 
@@ -480,6 +619,9 @@ private:
   std::unordered_map<std::string, int> update_mn_scopes_;
   std::unordered_map<std::string, int> updated_mn_scopes_;
   std::vector<std::pair<tir::Var, Range>> active_loop_ranges_;
+  std::unordered_set<const VarNode *> thread_vars_;
+  std::unordered_set<const VarNode *> thread_alias_vars_;
+  std::unordered_set<const VarNode *> seq_thread_aliases_;
   int scope_depth_{0};
   int resource_counter_{0};
 };

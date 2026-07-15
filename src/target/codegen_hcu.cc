@@ -281,6 +281,10 @@ bool CodeGenTileLangHCU::TryToEmitLDSBufferOp(
 }
 
 void CodeGenTileLangHCU::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
+  if (auto waves = f->GetAttr<Integer>(tl::attr::kHcuWdraWavesPerTg)) {
+    stream << " __attribute__((hcu_wdra_waves_per_tg(" << waves.value()->value
+           << ")))";
+  }
   LaunchConfigExtractor extractor;
   extractor(f->body);
   arith::Analyzer analyzer;
@@ -317,6 +321,7 @@ std::string CodeGenTileLangHCU::Finish() {
   decl_stream << "#include <tl_templates/hcu/ldsm.h>\n";
   decl_stream << "#include <tl_templates/hcu/threadblock_swizzle.h>\n";
   decl_stream << "#include <tl_templates/hcu/debug.h>\n";
+  decl_stream << "#include <tl_templates/hcu/barrier.h>\n";
   decl_stream << "\n";
   return CodeGenC::Finish();
 }
@@ -697,6 +702,49 @@ MlsLastLoadTemplateArgs(const std::string &sym) {
 
 } // namespace
 
+Optional<Array<PrimExpr>> FindHcuWdraInitArgs(const Stmt &body) {
+  struct Finder : public StmtExprVisitor {
+    Optional<Array<PrimExpr>> args;
+
+    void VisitStmt_(const EvaluateNode *op) final {
+      if (args.defined()) {
+        return;
+      }
+      if (const auto *call = op->value.as<CallNode>()) {
+        if (call->op.same_as(tl::hcu_wdra_init())) {
+          args = call->args;
+          return;
+        }
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+  } finder;
+  finder(body);
+  return finder.args;
+}
+
+void PrintHcuWdraInit(std::ostream &os, const Array<PrimExpr> &args) {
+  os << "__builtin_hcu_wdra_init(";
+  for (size_t i = 0; i < args.size(); ++i) {
+    if (i > 0) {
+      os << ", ";
+    }
+    os << Downcast<IntImm>(args[i])->value;
+  }
+  os << ")";
+}
+
+void CodeGenTileLangHCU::PreFunctionBody(const PrimFunc &f) {
+  wdra_init_emitted_ = false;
+  if (auto args = FindHcuWdraInitArgs(f->body)) {
+    PrintIndent();
+    PrintHcuWdraInit(stream, args.value());
+    stream << ";\n";
+    wdra_init_emitted_ = true;
+  }
+  CodeGenC::PreFunctionBody(f);
+}
+
 void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
   const auto *call = op->value.as<CallNode>();
   if (call && call->op.same_as(tir::builtin::call_extern()) &&
@@ -709,8 +757,9 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
       const std::string async_load_mn_prefix = "tl::mls::async_load_mn<";
 
       if (sym.find(resource_init_prefix) == 0) {
-        ICHECK_EQ(call->args.size(), 6U) << "MLS resource_init expects symbol, "
-                                            "name, src, stride, mn_len, k_len";
+        ICHECK(call->args.size() == 6U || call->args.size() == 7U)
+            << "MLS resource_init expects symbol, name, src, stride, mn_len, "
+               "k_len[, warp_id_offset]";
         enable_gemm_mls_ = true;
         const auto *name = call->args[1].as<StringImmNode>();
         ICHECK(name) << "MLS resource_init expects a string resource name";
@@ -718,13 +767,15 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         const std::string base_template =
             sym.substr(resource_init_prefix.size(),
                        sym.size() - resource_init_prefix.size() - 1);
+        const std::string warp_id_offset =
+            call->args.size() == 7U ? PrintExpr(call->args[6]) : "0";
         PrintIndent();
         stream << "using " << obj_name << "_t = " << base_template << ";\n";
         PrintIndent();
         stream << obj_name << "_t " << obj_name << "("
                << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3])
                << ", " << PrintExpr(call->args[4]) << ", "
-               << PrintExpr(call->args[5]) << ");\n";
+               << PrintExpr(call->args[5]) << ", " << warp_id_offset << ");\n";
         return;
       }
 
@@ -800,9 +851,9 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
     }
   }
   if (call && IsMlsLoadTileCallExtern(call)) {
-    ICHECK_EQ(call->args.size(), 8U)
+    ICHECK(call->args.size() == 8U || call->args.size() == 9U)
         << "mls_load_tile extern expects symbol, src, stride, mn_len, k_len, "
-           "mn_base, k_base, dst";
+           "mn_base, k_base, dst[, warp_id_offset]";
     enable_gemm_mls_ = true;
     const auto *sym_node = call->args[0].as<StringImmNode>();
     const std::string sym = sym_node->value;
@@ -817,6 +868,8 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
     const std::string mn_base = PrintExpr(call->args[5]);
     const std::string k_base = PrintExpr(call->args[6]);
     const std::string dst_ptr = PrintExpr(call->args[7]);
+    const std::string warp_id_offset =
+        call->args.size() == 9U ? PrintExpr(call->args[8]) : "0";
 
     const std::string obj_name =
         "_tl_mls_" + std::to_string(mls_resource_object_counter_++);
@@ -824,7 +877,8 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
     stream << "using " << obj_name << "_t = " << base_template << ";\n";
     PrintIndent();
     stream << obj_name << "_t " << obj_name << "(" << src_ptr << ", " << stride
-           << ", " << mn_len << ", " << k_len << ");\n";
+           << ", " << mn_len << ", " << k_len << ", " << warp_id_offset
+           << ");\n";
     PrintIndent();
     stream << obj_name << ".set_window_origin(tl::make_array<tl::index_t>("
            << mn_base << ", 0));\n";
@@ -1724,6 +1778,43 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     print_extern_call_stmt("tl::mbarrier_expect_tx");
   } else if (op->op.same_as(tl::mbarrier_wait_parity())) {
     print_extern_call_stmt("tl::mbarrier_wait");
+  } else if (op->op.same_as(tl::abarrier_init())) {
+    print_extern_call_stmt("tl::abarrier_init");
+  } else if (op->op.same_as(tl::abarrier_inv())) {
+    print_extern_call_stmt("tl::abarrier_inv");
+  } else if (op->op.same_as(tl::abarrier_arrive())) {
+    std::string abar_id = this->PrintExpr(op->args[0]);
+    if (const auto *imm = op->args[1].as<IntImmNode>()) {
+      if (imm->value == 1) {
+        os << "tl::abarrier_arrive(" << abar_id << ")";
+      } else {
+        os << "tl::abarrier_arrive_cnt(" << abar_id << ", " << imm->value
+           << ")";
+      }
+    } else {
+      os << "tl::abarrier_arrive_cnt(" << abar_id << ", "
+         << this->PrintExpr(op->args[1]) << ")";
+    }
+  } else if (op->op.same_as(tl::abarrier_try_wait())) {
+    os << "tl::abarrier_try_wait(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]) << ")";
+  } else if (op->op.same_as(tl::abarrier_wait())) {
+    print_extern_call_stmt("tl::abarrier_wait");
+  } else if (op->op.same_as(tl::abarrier_test_wait())) {
+    os << "tl::abarrier_test_wait(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]) << ")";
+  } else if (op->op.same_as(tl::abarrier_seq())) {
+    print_extern_call_stmt("tl::abarrier_seq");
+  } else if (op->op.same_as(tl::abarrier_expect_tx())) {
+    print_extern_call_stmt("tl::abarrier_expect_tx");
+  } else if (op->op.same_as(tl::abarrier_complete_tx())) {
+    print_extern_call_stmt("tl::abarrier_complete_tx");
+  } else if (op->op.same_as(tl::ebarrier_sync())) {
+    print_extern_call_stmt("tl::ebarrier_sync");
+  } else if (op->op.same_as(tl::ebarrier_sync_cnt())) {
+    print_extern_call_stmt("tl::ebarrier_sync_cnt");
+  } else if (op->op.same_as(tl::ebarrier_arrive())) {
+    print_extern_call_stmt("tl::ebarrier_arrive");
   } else if (op->op.same_as(tl::ptx_stmatrix())) {
     int trans = Downcast<IntImm>(op->args[0])->value;
     int num = Downcast<IntImm>(op->args[1])->value;
@@ -1818,6 +1909,8 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       os << PrintExpr(op->args[0]);
     }
     os << ")";
+  } else if (op->op.same_as(tl::get_wave_id())) {
+    os << "__builtin_hcu_get_wave_id()";
   } else if (op->op.same_as(tl::ieee_fmaf())) {
     ICHECK_EQ(op->args.size(), 4U)
         << "tl.ieee_fmaf expects <x, y, z, rounding_mode>.";
@@ -2216,6 +2309,19 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       os << ", " << PrintExpr(op->args[2]);
     }
     os << ")";
+  } else if (op->op.same_as(tl::set_max_nreg())) {
+    this->PrintIndent();
+    int nreg = Downcast<IntImm>(op->args[0])->value;
+    this->stream << "__builtin_hcu_s_set_vgpr_size(" << nreg << ");\n";
+    return;
+  } else if (op->op.same_as(tl::hcu_wdra_init())) {
+    if (wdra_init_emitted_) {
+      return;
+    }
+    this->PrintIndent();
+    PrintHcuWdraInit(this->stream, op->args);
+    this->stream << ";\n";
+    return;
   } else if (op->op.same_as(tl::no_set_max_nreg())) {
     // HCU doesn't need explicit register management like CUDA
     // This is a no-op for HIP
@@ -2679,6 +2785,7 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   ReserveKeywordsAsUnique();
   buffer_ops_disable_param_names_.clear();
   mls_resource_object_counter_ = 0;
+  wdra_init_emitted_ = false;
 
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol.has_value())
@@ -2733,8 +2840,8 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
     stream << ' ' << vid;
   }
   stream << ") {\n";
-  this->PreFunctionBody(f);
   int func_scope = this->BeginScope();
+  this->PreFunctionBody(f);
   this->PrintStmt(f->body);
   this->EndScope(func_scope);
   this->PrintIndent();

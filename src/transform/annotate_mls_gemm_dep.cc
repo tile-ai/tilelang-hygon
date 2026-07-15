@@ -106,7 +106,7 @@ private:
       return true;
     }
     bool trans = true;
-    ComputeSharedDstMlsTrans(dst, collector_, &trans);
+    ComputeSharedDstMlsTrans(dst, collector_, target_, &trans);
     shared_mls_trans_[dst] = trans;
     *out_trans = trans;
     return true;

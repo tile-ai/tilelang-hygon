@@ -9,6 +9,7 @@
 #include <optional>
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/target/target.h>
 
 #include "propagation_tir_collector.h"
 #include "propagation_util.h"
@@ -77,7 +78,7 @@ MlsGemmDepMeta BuildMlsGemmDepMeta(const GemmWithInput &gwi,
 
 bool ComputeSharedDstMlsTrans(const Buffer &dst,
                               const PropagationTirCollector *collector,
-                              bool *out_trans);
+                              Target target, bool *out_trans);
 
 Optional<MlsGemmDepMeta>
 GetMlsGemmDepFromAnnotations(const Map<String, ObjectRef> &annotations);

@@ -90,6 +90,8 @@ static constexpr const char *kMinBlocksPerSM = "tl.min_blocks_per_sm";
 // giving the underlying compiler accurate variable lifetime information for
 // register allocation.
 static constexpr const char *kLexicalAllocScope = "lexical_alloc_scope";
+static constexpr const char *kHcuWdra = "tl.hcu_wdra";
+static constexpr const char *kHcuWdraWavesPerTg = "tl.hcu_wdra_waves_per_tg";
 } // namespace attr
 
 inline Optional<PrimExpr>
@@ -212,6 +214,15 @@ static constexpr const char *kDisableOutOfBoundWarning =
  */
 static constexpr const char *kEnableDumpIR = "tl.enable_dump_ir";
 static constexpr const char *kDumpIRDir = "tl.dump_ir_path";
+
+/*!
+ * \brief Enable HCU WDRA lowering for gfx946 warp-specialized kernels.
+ *
+ * Required when the kernel uses tl.set_max_nreg. Default: false.
+ *
+ * kEnableHcuWdra = "tl.enable_hcu_wdra"
+ */
+static constexpr const char *kEnableHcuWdra = "tl.enable_hcu_wdra";
 
 /*!
  * \brief Get the type of the CUDA tensor map
@@ -588,6 +599,23 @@ TVM_DLL const Op &get_warp_idx_sync();
  *
  */
 TVM_DLL const Op &get_warp_idx();
+
+/*!
+ * \brief Return the hardware wave id on HCU WDRA kernels.
+ *
+ * get_wave_id()
+ */
+TVM_DLL const Op &get_wave_id();
+
+/*!
+ * \brief Initialize HCU WDRA per-branch VGPR allocation table.
+ *
+ * hcu_wdra_init(nreg_branch0, nreg_branch1, nreg_branch2, nreg_branch3)
+ *
+ * Each branch covers 4 consecutive waves. Unused branches are padded with 0.
+ * Injected by LowerAndValidateHcuWdra; not intended for direct Python use.
+ */
+TVM_DLL const Op &hcu_wdra_init();
 
 /*!
  * \brief Return the canonical warp group index for converged threads.
@@ -1224,6 +1252,24 @@ TVM_DLL const Op &stg128();
  *    T.stg256(y, i, value)
  */
 TVM_DLL const Op &stg256();
+
+/*!
+ * \brief Hygon gfx946 ABarrier / EBarrier intrinsics (hardware slot id).
+ *
+ * See tl_templates/hcu/barrier.h for device wrappers.
+ */
+TVM_DLL const Op &abarrier_init();
+TVM_DLL const Op &abarrier_inv();
+TVM_DLL const Op &abarrier_arrive();
+TVM_DLL const Op &abarrier_try_wait();
+TVM_DLL const Op &abarrier_wait();
+TVM_DLL const Op &abarrier_test_wait();
+TVM_DLL const Op &abarrier_seq();
+TVM_DLL const Op &abarrier_expect_tx();
+TVM_DLL const Op &abarrier_complete_tx();
+TVM_DLL const Op &ebarrier_sync();
+TVM_DLL const Op &ebarrier_sync_cnt();
+TVM_DLL const Op &ebarrier_arrive();
 
 } // namespace tl
 } // namespace tvm

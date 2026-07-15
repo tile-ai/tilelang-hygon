@@ -143,6 +143,9 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
         ]
         if _pass_config_truthy(pass_configs, PassConfigKey.TL_ENABLE_FAST_MATH):
             flags.append("-mllvm=-enable-hcu-approx-func-fp-math=true")
+        if _pass_config_truthy(pass_configs, PassConfigKey.TL_ENABLE_HCU_WDRA):
+            flags.append("-mllvm=-vgpr-greedy-alloc-mode=local-wave")
+            # flags.append("-mllvm=-run-on-model=true") # just for cmodel testing
         if arch in ["gfx938", "gfx92a", "gfx946"]:
             flags.append("-mllvm=-hcu-update-wait-by-reverse-search=true")
             flags.append("-mllvm=-hcu-pre-emit-load-store-opt=false")

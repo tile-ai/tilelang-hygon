@@ -5,6 +5,7 @@
 
 #include "mls.h"
 #include "../target/utils.h"
+#include "../transform/common/pipeline_utils.h"
 #include "builtin.h"
 #include "mls_gemm_dep.h"
 #include "operator.h"
@@ -142,6 +143,22 @@ std::pair<int64_t, int64_t> MlsBlockDims(const Buffer &buf, bool mls_trans) {
 
 } // namespace
 
+int MlsScopedWarpIdOffset(const Range &thread_bounds, Target target) {
+  if (!is_const_int(thread_bounds->min)) {
+    return 0;
+  }
+  int min = *as_const_int(thread_bounds->min);
+  if (min == 0) {
+    return 0;
+  }
+  int warp_size = TargetGetWarpSize(target);
+  ICHECK(min % warp_size == 0)
+      << "MLS scoped lowering requires thread_bounds.min to be warp-aligned, "
+         "got min="
+      << min << " warp_size=" << warp_size;
+  return min / warp_size;
+}
+
 /*
  * MLS tile size rules (MN interleave=1, b16):
  * num_warps = block_size / TargetGetWarpSize(target); warp_mn * warp_k =
@@ -216,6 +233,7 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   const bool mls_trans = mls_trans_;
   auto [block_mn, block_k] = MlsBlockDims(dst, mls_trans);
   int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
+  int warp_id_offset = MlsScopedWarpIdOffset(T.thread_bounds, T.target);
   int tile_mn, tile_k, warp_m, warp_k;
   ComputeMlsWarpPartition(mls_trans, static_cast<int>(block_mn),
                           static_cast<int>(block_k), block_size, T.target,
@@ -318,6 +336,7 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   call_args.push_back(block_mn_base);
   call_args.push_back(block_k_base);
   call_args.push_back(dst_ptr);
+  call_args.push_back(IntImm(DataType::Int(32), warp_id_offset));
 
   return Evaluate(Call(DataType::Handle(), builtin::call_extern(), call_args));
 }

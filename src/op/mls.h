@@ -20,6 +20,9 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
                              int &warp_mn, int &warp_k, int &mls_tile_mn,
                              int &mls_tile_k);
 
+/// Logical warp index base for scoped MLS: thread_bounds.min / warp_size.
+int MlsScopedWarpIdOffset(const Range &thread_bounds, Target target);
+
 class MatrixLoadNode : public TileOperatorNode {
 public:
   Buffer src, dst;
