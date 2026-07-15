@@ -170,6 +170,10 @@ class PassConfigKey(str, Enum):
     optimization in cases where manual synchronization is preferred or when
     synchronization is not needed. Default: False"""
 
+    TL_ENABLE_HCU_WDRA = "tl.enable_hcu_wdra"
+    """Enable HCU WDRA lowering/validation and WDRA vgpr-greedy-alloc compile
+    flags. Required when the kernel uses tl.set_max_nreg. Default: False"""
+
     TL_FORCE_LET_INLINE = "tl.force_let_inline"
     """Force TileLang to inline let bindings during simplification. Default: False"""
 

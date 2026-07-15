@@ -159,9 +159,10 @@ template <typename BlockSize, typename MlsTileA, ::tl::index_t WarpM,
           ::tl::index_t WarpK, typename DataType, ::tl::index_t Alt, bool Trans,
           ::tl::hcu_target_enum HcuArch>
 TL_DEVICE void ds_read_format_tensor_a(TL_LDS_ADDR DataType *smem_ptr,
-                                       DataType *target) {
+                                       DataType *target,
+                                       ::tl::index_t warp_id_offset = 0) {
   static_assert(WarpK == 1, "WarpK must be 1");
-  const ::tl::index_t warp_id = ::tl::get_warp_id();
+  const ::tl::index_t warp_id = ::tl::get_warp_id() - warp_id_offset;
   const ::tl::index_t warp_m_idx = warp_id % WarpM;
   const ::tl::index_t warp_k_idx = 0;
   ds_read_format_tensor<BlockSize, MlsTileA, WarpM, WarpK, DataType, Alt, Trans,
@@ -179,7 +180,8 @@ template <typename BlockSize, typename MlsTileSize, ::tl::index_t WarpMN,
           ::tl::index_t WarpK, typename DataType, ::tl::index_t Alt, bool Trans,
           ::tl::hcu_target_enum HcuArch>
 TL_DEVICE void ds_read_format_tensor_common(TL_LDS_ADDR DataType *smem_ptr,
-                                            DataType *target) {
+                                            DataType *target,
+                                            ::tl::index_t warp_id_offset = 0) {
   static constexpr ::tl::index_t BlockSizeMN = BlockSize::at(::tl::number<0>{});
   static constexpr ::tl::index_t Bits = sizeof(DataType) * 8;
 
@@ -192,7 +194,7 @@ TL_DEVICE void ds_read_format_tensor_common(TL_LDS_ADDR DataType *smem_ptr,
   static constexpr ::tl::index_t WarpMN_no_recompute =
       std::min(WarpMN, BlockSizeMN / DsFormatInst::kMN);
 
-  const ::tl::index_t warp_id = ::tl::get_warp_id();
+  const ::tl::index_t warp_id = ::tl::get_warp_id() - warp_id_offset;
   ::tl::index_t warp_mn_idx = warp_id % WarpMN_no_recompute;
   ::tl::index_t warp_k_idx = warp_id / WarpMN_no_recompute;
   if constexpr (WarpMN_no_recompute != WarpMN) {
@@ -220,10 +222,11 @@ template <typename BlockSize, typename MlsTileB, ::tl::index_t TotalWarp,
           ::tl::index_t WarpN, ::tl::index_t WarpK, typename DataType,
           ::tl::index_t Alt, bool Trans, ::tl::hcu_target_enum HcuArch>
 TL_DEVICE void ds_read_format_tensor_b(TL_LDS_ADDR DataType *smem_ptr,
-                                       DataType *target) {
+                                       DataType *target,
+                                       ::tl::index_t warp_id_offset = 0) {
   static_assert(WarpK == 1, "WarpK must be 1");
   static constexpr ::tl::index_t WarpM = TotalWarp / (WarpN * WarpK);
-  const ::tl::index_t warp_id = ::tl::get_warp_id();
+  const ::tl::index_t warp_id = ::tl::get_warp_id() - warp_id_offset;
   const ::tl::index_t warp_k_idx = 0;
 
   ::tl::index_t warp_n_idx = warp_id / WarpM;

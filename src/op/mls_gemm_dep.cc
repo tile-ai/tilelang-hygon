@@ -4,6 +4,7 @@
 
 #include "mls_gemm_dep.h"
 
+#include "../target/utils.h"
 #include "ds_read_format.h"
 #include "gemm.h"
 #include "operator.h"
@@ -54,11 +55,24 @@ static std::optional<bool> MlsTransFromGemmAndBuffer(const GemmNode *gemm,
   return std::nullopt;
 }
 
+namespace {
+
+bool TargetRequiresSharedMlsTransConsistency(Target target) {
+  if (!TargetIsHCU(target)) {
+    return false;
+  }
+  return GetHcuArchString(target) == "gfx938";
+}
+
+} // namespace
+
 bool ComputeSharedDstMlsTrans(const Buffer &dst,
                               const PropagationTirCollector *collector,
-                              bool *out_trans) {
+                              Target target, bool *out_trans) {
   ICHECK(collector != nullptr);
   ICHECK(out_trans != nullptr);
+  const bool require_consistent =
+      TargetRequiresSharedMlsTransConsistency(target);
   bool found = false;
   bool mls_trans = true;
   for (const ReaderCallRecord &reader : collector->GetReaderCalls(dst)) {
@@ -78,7 +92,7 @@ bool ComputeSharedDstMlsTrans(const Buffer &dst,
       if (!found) {
         mls_trans = *cur;
         found = true;
-      } else if (*cur != mls_trans) {
+      } else if (*cur != mls_trans && require_consistent) {
         LOG(FATAL)
             << "MatrixLoad dst Gemm consumers must have consistent mls_trans";
       }
@@ -97,7 +111,7 @@ bool ComputeSharedDstMlsTrans(const Buffer &dst,
       if (!found) {
         mls_trans = *cur;
         found = true;
-      } else if (*cur != mls_trans) {
+      } else if (*cur != mls_trans && require_consistent) {
         LOG(FATAL)
             << "MatrixLoad dst Gemm consumers must have consistent mls_trans";
       }

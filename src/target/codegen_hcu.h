@@ -26,6 +26,7 @@ public:
   // override behavior
   void PrintFuncPrefix(std::ostream &os) final;
   void PrintExtraAttrs(const PrimFunc &f, std::ostream &os) final;
+  void PreFunctionBody(const PrimFunc &f) final;
   void VisitStmt_(const ForNode *op) final;
   void PrintStorageSync(const CallNode *op) final;
   void PrintStorageScope(const std::string &scope,
@@ -186,6 +187,7 @@ private:
   std::unordered_map<const VarNode *, PrimExpr>
       let_initializer_expr_for_predicate_;
   int mls_resource_object_counter_{0};
+  bool wdra_init_emitted_{false};
 };
 
 } // namespace codegen

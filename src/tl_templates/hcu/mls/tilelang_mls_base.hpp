@@ -10,8 +10,8 @@
  * mls_stride + mn
  *
  * Template params: BlockSize (sequence<MN,K>), MlsTileSize (sequence<MN,K>),
- * WarpMN, WarpK, DataType, Alt, Trans, HcuArch. Uses ::tl::get_warp_id()
- * internally (standard block layout).
+ * WarpMN, WarpK, DataType, Alt, Trans, HcuArch. Uses scoped warp id
+ * (get_warp_id() - warp_id_offset) for partition inside thread branches.
  */
 
 #include <tl_templates/hcu/core.hpp>
@@ -67,9 +67,10 @@ struct tilelang_mls_base {
 
   TL_DEVICE tilelang_mls_base(DataType *p_data, ::tl::index_t mls_stride,
                               ::tl::index_t mn_length_raw,
-                              ::tl::index_t k_length_raw)
+                              ::tl::index_t k_length_raw,
+                              ::tl::index_t warp_id_offset = 0)
       : p_data_(p_data), mls_stride_(mls_stride), mn_length_raw_(mn_length_raw),
-        k_length_raw_(k_length_raw),
+        k_length_raw_(k_length_raw), warp_id_offset_(warp_id_offset),
         last_block_remain_k(k_length_raw % BlockSizeK) {
     init();
   }
@@ -84,7 +85,7 @@ struct tilelang_mls_base {
             ::tl::make_tuple(::tl::sequence<0>{}));
 
     return warp_cluster_to_id_adaptor.calculate_bottom_index(
-        ::tl::make_multi_index(::tl::get_warp_id()));
+        ::tl::make_multi_index(::tl::get_warp_id() - warp_id_offset_));
   }
 
   TL_DEVICE void init() {
@@ -415,6 +416,7 @@ struct tilelang_mls_base {
   ::tl::index_t k_length_raw_;
   ::tl::index_t mls_k_origin_{0};
   ::tl::index_t last_block_remain_k;
+  ::tl::index_t warp_id_offset_{0};
 
   ::tl::array<::tl::index_t, NumWarpAccess> mls_lds_offset_;
 };
@@ -436,10 +438,10 @@ TL_DEVICE void
 mls_load_tile(DataType *p_data, ::tl::index_t mls_stride,
               ::tl::index_t mn_length_raw, ::tl::index_t k_length_raw,
               ::tl::index_t block_mn_base, ::tl::index_t block_k_base,
-              TL_LDS_ADDR DataType *smem) {
+              TL_LDS_ADDR DataType *smem, ::tl::index_t warp_id_offset = 0) {
   using MlsBase = tilelang_mls_base<BlockSize, MlsTileSize, WarpMN, WarpK,
                                     DataType, Alt, Trans, HcuArch>;
-  MlsBase mls(p_data, mls_stride, mn_length_raw, k_length_raw);
+  MlsBase mls(p_data, mls_stride, mn_length_raw, k_length_raw, warp_id_offset);
   // mls.set_window_origin(::tl::make_array<::tl::index_t>(block_mn_base,
   // ::tl::number<0>{})); mls.update_base(block_k_base);
   mls.set_window_origin(

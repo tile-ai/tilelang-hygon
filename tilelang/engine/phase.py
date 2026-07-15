@@ -293,6 +293,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # handoffs, and is a no-op on non-SM100 targets or functions without TMEM.
     mod = tilelang.transform.InjectTcgen05Fence()(mod)
     mod = tilelang.transform.MergeIfStmt()(mod)
+    mod = tilelang.transform.LowerAndValidateHcuWdra()(mod)
     # NOTE: LowerPTXAsyncCopy is applied earlier (before PipelinePlanning).
     if allow_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.AnnotateWarpGroupRegAlloc()(mod)

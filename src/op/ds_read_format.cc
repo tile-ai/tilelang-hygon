@@ -85,7 +85,7 @@ LayoutMap InferLayoutWithGemmDep(const DsReadFormatNode *self,
   LayoutMap result;
   GemmWarpPolicy policy(meta->gemm_policy);
   GemmInst gemm_inst = GemmInst::kHCUMMAC;
-  int block_size = *as_const_int(T.thread_bounds->extent);
+  int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
   int element_byte_size = self->src->dtype.bits() / 8;
   const bool a_mls_trans = !meta->gemm_trans_a;
   const bool b_mls_trans = meta->gemm_trans_b;
@@ -177,7 +177,7 @@ LayoutMap DsReadFormatNode::InferLayout(const LayoutInferArgs &T,
     const bool trans = true;
     int64_t block_mn = *as_const_int(dst->shape[0]);
     int64_t block_k = *as_const_int(dst->shape[1]);
-    int block_size = *as_const_int(T.thread_bounds->extent);
+    int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
     int w_mn, w_k, t_mn, t_k;
     ComputeMlsWarpPartition(trans, static_cast<int>(block_mn),
                             static_cast<int>(block_k), block_size, T.target,
@@ -222,6 +222,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   }
 
   int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
+  int warp_id_offset = MlsScopedWarpIdOffset(T.thread_bounds, T.target);
   bool ds_trans = true;
   int64_t block_mn = *as_const_int(dst->shape[0]);
   int64_t block_k = *as_const_int(dst->shape[1]);
@@ -360,6 +361,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   call_args.push_back(StringImm(ss.str()));
   call_args.push_back(src_ptr);
   call_args.push_back(dst_ptr);
+  call_args.push_back(IntImm(DataType::Int(32), warp_id_offset));
 
   return Evaluate(Call(DataType::Handle(), builtin::call_extern(), call_args));
 }

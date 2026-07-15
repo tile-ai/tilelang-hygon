@@ -94,6 +94,7 @@ class HCUMatrixCoreIntrinEmitter:
         block_k_warps: int = 1,
         target: Target | None = None,
         thread_var: Var | None = None,
+        thread_bounds_min: int = 0,
         min_n_per_warp: int | None = None,
         use_tf32: bool = False,
     ):
@@ -107,6 +108,7 @@ class HCUMatrixCoreIntrinEmitter:
         self.chunk = chunk
         self.block_k_warps = int(block_k_warps)
         self.thread_var = thread_var
+        self.thread_bounds_min = int(thread_bounds_min)
         self.use_tf32 = bool(use_tf32)
         if self.use_tf32:
             if a_dtype != "float32" or b_dtype != "float32":
@@ -289,6 +291,18 @@ class HCUMatrixCoreIntrinEmitter:
             assert current_frame is not None, "Must be called in a T.Kernel frame"
             return current_frame.get_thread_binding()
         return self.thread_var
+
+    def scoped_warp_id_offset(self) -> int:
+        if self.thread_bounds_min <= 0:
+            return 0
+        if self.thread_bounds_min % self.WARP_SIZE != 0:
+            raise ValueError(f"HCU gemm scoped lowering requires thread_bounds.min to be warp-aligned, got min={self.thread_bounds_min}")
+        return self.thread_bounds_min // self.WARP_SIZE
+
+    def scoped_thread_id(self, thread_id: PrimExpr) -> PrimExpr:
+        if self.thread_bounds_min > 0:
+            return thread_id - self.thread_bounds_min
+        return thread_id
 
     def inner_k_per_warp(self) -> int:
         warp_k_tile = self.chunk // self.block_k_warps
@@ -474,8 +488,8 @@ class HCUMatrixCoreIntrinEmitter:
         if is_m_first is None:
             is_m_first = self.is_m_first
 
-        lane_id = thread_id % WARP_SIZE
-        warp_id = thread_id // WARP_SIZE
+        lane_id = self.scoped_thread_id(thread_id) % WARP_SIZE
+        warp_id = self.scoped_thread_id(thread_id) // WARP_SIZE
 
         if self.block_k_warps > 1:
             warp_m = warp_id % block_row_warps
@@ -495,7 +509,7 @@ class HCUMatrixCoreIntrinEmitter:
         """K-tile base offset for the current warp when ``block_k_warps > 1``."""
         if self.block_k_warps <= 1:
             return 0
-        warp_id = thread_id // self.WARP_SIZE
+        warp_id = self.scoped_thread_id(thread_id) // self.WARP_SIZE
         warp_k_idx = warp_id // (self.block_row_warps * self.block_col_warps)
         warp_k_tile = self.chunk // self.block_k_warps
         return warp_k_idx * warp_k_tile
@@ -606,11 +620,12 @@ class HCUMatrixCoreIntrinEmitter:
         )
         src_ptr = retrieve_ptr(A_mls_src, "r")
         dst_ptr = retrieve_ptr(A_local_buf, "rw")
+        warp_id_offset = self.scoped_warp_id_offset()
         self._a_full_k = True
 
         @T.macro
         def _warp_ldmatrix_mls_a(A_local_buf, A_mls_src):
-            T.evaluate(tir.call_extern("handle", template, src_ptr, dst_ptr))
+            T.evaluate(tir.call_extern("handle", template, src_ptr, dst_ptr, warp_id_offset))
 
         return _warp_ldmatrix_mls_a(A_local_buf, A_mls_src)
 
@@ -637,11 +652,12 @@ class HCUMatrixCoreIntrinEmitter:
         )
         src_ptr = retrieve_ptr(B_mls_src, "r")
         dst_ptr = retrieve_ptr(B_local_buf, "rw")
+        warp_id_offset = self.scoped_warp_id_offset()
         self._b_full_k = True
 
         @T.macro
         def _warp_ldmatrix_mls_b(B_local_buf, B_mls_src):
-            T.evaluate(tir.call_extern("handle", template, src_ptr, dst_ptr))
+            T.evaluate(tir.call_extern("handle", template, src_ptr, dst_ptr, warp_id_offset))
 
         return _warp_ldmatrix_mls_b(B_local_buf, B_mls_src)
 
