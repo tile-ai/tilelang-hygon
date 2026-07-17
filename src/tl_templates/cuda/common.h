@@ -6,10 +6,41 @@
 #include <cuda_runtime.h>
 #endif
 
-#include "atomic.h"
-#include <cute/arch/util.hpp>
-#include <cutlass/fast_math.h>
-#include <cutlass/numeric_types.h>
+// TVM's `PrintMMAAssembly` and several `cp.async.*` codegen paths emit
+// GCC-style `__asm__ __volatile__(...)` (see
+// 3rdparty/tvm/src/target/source/ptx.cc and codegen_cuda.cc). NVCC's EDG
+// frontend on Windows and MSVC do not recognize those keywords, so map them
+// to the portable CUDA spellings on non-GCC/Clang toolchains. TileLang's own
+// template headers already use `asm volatile`, so this only affects
+// generated kernel bodies.
+#if !defined(__GNUC__) && !defined(__clang__)
+#define __asm__ asm
+#define __volatile__ volatile
+#endif
+
+#if defined(__CUDACC_RTC__)
+#include <vector_types.h>
+// Older NVRTC builtin vector headers omit these aligned double4 aliases.
+// CUDA 13 defines them already, so keep this compatibility patch pre-CUDA 13.
+#if defined(__CUDACC_RTC_BUILTIN_VECTOR_TYPES__) &&                            \
+    (!defined(__CUDACC_VER_MAJOR__) || __CUDACC_VER_MAJOR__ < 13)
+struct __device_builtin__ __builtin_align__(16) double4_16a {
+  double x, y, z, w;
+};
+
+struct __device_builtin__ __builtin_align__(32) double4_32a {
+  double x, y, z, w;
+};
+#endif
+#ifndef __NV_SILENCE_DEPRECATION_BEGIN
+#define __NV_SILENCE_DEPRECATION_BEGIN
+#endif
+#ifndef __NV_SILENCE_DEPRECATION_END
+#define __NV_SILENCE_DEPRECATION_END
+#endif
+#endif
+
+#include <cute/numeric/numeric_types.hpp>
 #include <math_constants.h>
 
 #include <cutlass/bfloat16.h>
@@ -17,19 +48,8 @@
 
 using cutlass::bfloat16_t;
 using cutlass::half_t;
-using cutlass::tfloat32_t;
-
-using cute::cast_smem_ptr_to_uint;
 
 using int4_t = int4;
-
-#define hexp cutlass::fast_exp
-#define hlog cutlass::fast_log
-#define hsqrt cutlass::fast_sqrt
-#define hsin cutlass::fast_sin
-#define hcos cutlass::fast_cos
-#define htanh cutlass::fast_tanh
-#define hpow powf
 
 #define uint unsigned int
 #define uchar unsigned char
@@ -93,6 +113,20 @@ TL_PATCH TL_DEVICE half_t hrsqrt(const half_t x) {
   return half_t(hrsqrt(x.to_half()));
 }
 
+// hrsqrt function for bfloat16_t
+TL_PATCH TL_DEVICE bfloat16_t hrsqrt(const bfloat16_t x) {
+  return bfloat16_t(hrsqrt(x.to_nv_bfloat16()));
+}
+
+// TVM lowers T.exp(bfloat16) to the CUDA half-style `hexp` name. TileLang uses
+// cutlass::bfloat16_t for scalar bf16, while CUDA only overloads hexp for
+// __nv_bfloat16. Keep this narrow bridge in common.h so plain T.exp works
+// without pulling tl_templates/cuda/math.h and cutlass/fast_math.h into every
+// kernel.
+TL_PATCH TL_DEVICE bfloat16_t hexp(const bfloat16_t x) {
+  return bfloat16_t(hexp(x.to_nv_bfloat16()));
+}
+
 // Pack two half values.
 TL_DEVICE unsigned __pack_half2(const half x, const half y) {
   unsigned v0 = *((unsigned short *)&x);
@@ -121,10 +155,24 @@ TL_DEVICE unsigned __pack_nv_bfloat162(const bfloat16_t x, const bfloat16_t y) {
   return (v1 << 16) | v0;
 }
 
-// Pack four char values.
+namespace tl {
+TL_DEVICE float fast_rcp(float x) {
+  float ret;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(ret) : "f"(x));
+  return ret;
+}
+} // namespace tl
+
+// Pack four char values. Build the 32-bit pattern from unsigned bytes: a
+// negative signed char would otherwise sign-extend and flood the other lanes
+// through the OR.
 TL_DEVICE int make_int(signed char x0, signed char x1, signed char x2,
                        signed char x3) {
-  return (x3 << 24) | (x2 << 16) | (x1 << 8) | x0;
+  const unsigned int b0 = static_cast<unsigned char>(x0);
+  const unsigned int b1 = static_cast<unsigned char>(x1);
+  const unsigned int b2 = static_cast<unsigned char>(x2);
+  const unsigned int b3 = static_cast<unsigned char>(x3);
+  return static_cast<int>((b3 << 24) | (b2 << 16) | (b1 << 8) | b0);
 }
 
 // Pack eight char values.
@@ -166,6 +214,13 @@ TL_DEVICE int4_t make_int4(short x0, short x1, short y0, short y1, short z0,
 TL_DEVICE unsigned int make_uint(unsigned char x0, unsigned char x1,
                                  unsigned char x2, unsigned char x3) {
   return (x3 << 24) | (x2 << 16) | (x1 << 8) | x0;
+}
+
+template <typename T> TL_DEVICE unsigned int pack_b8x4(T x0, T x1, T x2, T x3) {
+  return make_uint(*reinterpret_cast<unsigned char *>(&x0),
+                   *reinterpret_cast<unsigned char *>(&x1),
+                   *reinterpret_cast<unsigned char *>(&x2),
+                   *reinterpret_cast<unsigned char *>(&x3));
 }
 
 // Pack eight char values.
@@ -273,12 +328,7 @@ TL_DEVICE uint32_t smem_ptr_to_uint(void const *const ptr) {
  *       pointers in other address spaces.
  */
 TL_DEVICE unsigned int cast_smem_ptr_to_int(const void *const smem_ptr) {
-  unsigned int smem_int;
-  asm volatile("{ .reg .u64 smem_int; cvta.to.shared.u64 smem_int, %1; "
-               "cvt.u32.u64 %0, smem_int; }"
-               : "=r"(smem_int)
-               : "l"(smem_ptr));
-  return smem_int;
+  return smem_ptr_to_uint(smem_ptr);
 }
 
 // DP4A
@@ -340,7 +390,10 @@ enum class DataType : int {
   kBit8 = 19,
   kBit16 = 20,
   kBit32 = 21,
-  kBit64 = 22
+  kBit64 = 22,
+  kFloat6_e2m3fn = 23,
+  kFloat6_e3m2fn = 24,
+  kFloat4_e2m1fn = 25
 };
 
 union GmmaDescriptor {
@@ -398,8 +451,8 @@ union GmmaDescriptor {
   template <typename T>
   CUTE_HOST_DEVICE constexpr GmmaDescriptor operator+(const T &offset) const {
     GmmaDescriptor ret;
-    ret.reg32_[0] = reg32_[0] + uint32_t(offset);
-    ret.reg32_[1] = reg32_[1];
+    ret.desc_ = desc_;
+    ret.reg32_[0] += uint32_t(offset);
     return ret;
   }
 };
@@ -461,9 +514,9 @@ union Tcgen05SMemDescriptor {
   CUTE_HOST_DEVICE constexpr Tcgen05SMemDescriptor
   operator+(const T &offset) const {
     Tcgen05SMemDescriptor ret;
+    ret.desc_ = desc_;
     // Address addition is in units of 16 bytes (4 LSB not encoded)
-    ret.reg32_[0] = reg32_[0] + (uint32_t(offset) >> 4);
-    ret.reg32_[1] = reg32_[1];
+    ret.reg32_[0] += uint32_t(offset) >> 4;
     return ret;
   }
 };
@@ -567,17 +620,24 @@ template <int y = 1, typename T> TL_DEVICE T pow_of_int(T x) {
 
 // Thread partial barrier synchronization
 // https://docs.nvidia.com/cuda/parallel-thread-execution/#memory-consistency-model
-template <int barrier_id = 0, int thread_count = 0>
-TL_DEVICE void __sync_thread_partial() {
+TL_DEVICE void __sync_thread_partial(int barrier_id = 0, int thread_count = 0) {
   asm volatile("bar.sync %0, %1;" : : "r"(barrier_id), "r"(thread_count));
+}
+
+// CTA named barrier one-sided arrive (bar.arrive).
+// Signals arrival at the named barrier without waiting for other participants.
+// Useful in warp-specialized pipelines where one warp group signals readiness
+// without blocking, while the other waits with bar.sync /
+// __sync_thread_partial.
+TL_DEVICE void __named_barrier_arrive(int barrier_id, int thread_count) {
+  asm volatile("bar.arrive %0, %1;" : : "r"(barrier_id), "r"(thread_count));
 }
 
 template <int layout_type = 0, int leading_byte_offset = 0,
           int stride_byte_offset = 0, typename T>
 TL_DEVICE void initialize_wgmma_descriptor(GmmaDescriptor &descriptor,
                                            T *start_address) {
-  descriptor.bitfield.start_address_ =
-      cute::cast_smem_ptr_to_uint(start_address) >> 4;
+  descriptor.bitfield.start_address_ = smem_ptr_to_uint(start_address) >> 4;
   descriptor.bitfield.layout_type_ = layout_type;
   descriptor.bitfield.base_offset_ = 0;
   descriptor.bitfield.leading_byte_offset_ = leading_byte_offset;
@@ -592,7 +652,7 @@ initialize_tcgen05_descriptor(Tcgen05SMemDescriptor &descriptor,
                               bool leading_is_absolute, int swizzle_mode) {
 
   descriptor.bitfield.start_address_ =
-      static_cast<uint16_t>(cast_smem_ptr_to_uint(start_address) >> 4);
+      static_cast<uint16_t>(smem_ptr_to_uint(start_address) >> 4);
   descriptor.bitfield.leading_byte_offset_ = leading_byte_offset;
   descriptor.bitfield.stride_byte_offset_ = stride_byte_offset;
   descriptor.bitfield.version_ = 1;
@@ -607,6 +667,12 @@ TL_DEVICE void increase_descriptor_offset(GmmaDescriptor &descriptor,
   descriptor.reg32_[0] += (offset >> 4);
 }
 
+template <typename T>
+TL_DEVICE void increase_descriptor_offset(Tcgen05SMemDescriptor &descriptor,
+                                          T offset) {
+  descriptor.reg32_[0] += (offset >> 4);
+}
+
 // and add the desired implicit conversion from bfloat16_t.
 struct float_e4m3_t : public cute::float_e4m3_t {
   using cute::float_e4m3_t::float_e4m3_t;
@@ -615,7 +681,10 @@ struct float_e4m3_t : public cute::float_e4m3_t {
 
   CUTLASS_HOST_DEVICE
   explicit float_e4m3_t(__nv_bfloat16 x)
-      : float_e4m3_t(static_cast<float>(x)) {}
+      : cute::float_e4m3_t(
+            cute::float_e4m3_t::bitcast(__nv_cvt_bfloat16raw_to_fp8(
+                *reinterpret_cast<__nv_bfloat16_raw *>(&x), __NV_SATFINITE,
+                __NV_E4M3))) {}
 
   CUTLASS_HOST_DEVICE
   float_e4m3_t(cutlass::float_e4m3_t x)
@@ -629,11 +698,27 @@ struct float_e5m2_t : public cute::float_e5m2_t {
 
   CUTLASS_HOST_DEVICE
   explicit float_e5m2_t(__nv_bfloat16 x)
-      : float_e5m2_t(static_cast<float>(x)) {}
+      : cute::float_e5m2_t(
+            cute::float_e5m2_t::bitcast(__nv_cvt_bfloat16raw_to_fp8(
+                *reinterpret_cast<__nv_bfloat16_raw *>(&x), __NV_SATFINITE,
+                __NV_E5M2))) {}
 
   CUTLASS_HOST_DEVICE
   float_e5m2_t(cutlass::float_e5m2_t x)
       : cute::float_e5m2_t(*reinterpret_cast<cute::float_e5m2_t *>(&x)) {}
+};
+
+struct tfloat32_t : public cute::tfloat32_t {
+  using cute::tfloat32_t::tfloat32_t;
+  CUTLASS_HOST_DEVICE
+  tfloat32_t() = default;
+
+  CUTLASS_HOST_DEVICE
+  explicit tfloat32_t(__nv_bfloat16 x) : tfloat32_t(static_cast<float>(x)) {}
+
+  CUTLASS_HOST_DEVICE
+  tfloat32_t(cutlass::tfloat32_t x)
+      : cute::tfloat32_t(*reinterpret_cast<cute::tfloat32_t *>(&x)) {}
 };
 
 template <typename T> struct to_cute_type {
@@ -644,6 +729,9 @@ template <> struct to_cute_type<tl::float_e4m3_t> {
 };
 template <> struct to_cute_type<tl::float_e5m2_t> {
   using type = cute::float_e5m2_t;
+};
+template <> struct to_cute_type<tl::tfloat32_t> {
+  using type = cute::tfloat32_t;
 };
 
 // =========================================================================
@@ -674,6 +762,28 @@ template <typename T> TL_DEVICE uint1 to_uint1(T v) {
   uint1 r;
   memcpy(&r, &v, sizeof(uint1));
   return r;
+}
+
+// Pack two half_t into a uint1.
+TL_DEVICE uint1 pack_half2(half_t a, half_t b) {
+  unsigned packed =
+      __pack_half2(static_cast<__half>(a), static_cast<__half>(b));
+  return uint1{packed};
+}
+
+template <uint64_t bytes, uint64_t init_val>
+TL_DEVICE void st_bulk_shared(void *smem_ptr) {
+  static_assert(init_val == 0,
+                "tl::st_bulk_shared only supports init_val == 0");
+#if (__CUDACC_VER_MAJOR__ > 12) ||                                             \
+    (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 8)
+  asm volatile("st.bulk.weak.shared::cta [%0], %1, 0;" ::"l"(
+                   __cvta_generic_to_shared(smem_ptr)),
+               "l"(bytes)
+               : "memory");
+#else
+  static_assert(false, "tl::st_bulk_shared requires CUDA >= 12.8");
+#endif
 }
 
 // --- add2 ----------------------------------------------------------------
@@ -775,7 +885,11 @@ TL_DEVICE __nv_bfloat162 fma2(__nv_bfloat162 a, __nv_bfloat162 b,
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
   return __hfma2(a, b, c);
 #else
-  return __nv_bfloat162{__hfma(a.x, b.x, c.x), __hfma(a.y, b.y, c.y)};
+  float a_x = __bfloat162float(a.x), a_y = __bfloat162float(a.y);
+  float b_x = __bfloat162float(b.x), b_y = __bfloat162float(b.y);
+  float c_x = __bfloat162float(c.x), c_y = __bfloat162float(c.y);
+  return __nv_bfloat162{__float2bfloat16(a_x * b_x + c_x),
+                        __float2bfloat16(a_y * b_y + c_y)};
 #endif
 }
 
@@ -786,6 +900,14 @@ TL_DEVICE __half2 fma2(__half2 a, __half2 b, __half2 c) {
   return __half2{__hfma(a.x, b.x, c.x), __hfma(a.y, b.y, c.y)};
 #endif
 }
+
+template <typename T> TL_DEVICE T fast_max(T a, T b) { return a < b ? b : a; }
+
+template <> TL_DEVICE float fast_max(float a, float b) { return fmaxf(a, b); }
+
+template <typename T> TL_DEVICE T fast_min(T a, T b) { return b < a ? b : a; }
+
+template <> TL_DEVICE float fast_min(float a, float b) { return fminf(a, b); }
 
 // --- max2 ----------------------------------------------------------------
 
@@ -831,6 +953,42 @@ TL_DEVICE __half2 min2(__half2 a, __half2 b) {
 #endif
 }
 
+// --- max2_nan ------------------------------------------------------------
+
+TL_DEVICE __nv_bfloat162 max2_nan(__nv_bfloat162 a, __nv_bfloat162 b) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  return __hmax2_nan(a, b);
+#else
+  return __nv_bfloat162{__hmax_nan(a.x, b.x), __hmax_nan(a.y, b.y)};
+#endif
+}
+
+TL_DEVICE __half2 max2_nan(__half2 a, __half2 b) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 530)
+  return __hmax2_nan(a, b);
+#else
+  return __half2{__hmax_nan(a.x, b.x), __hmax_nan(a.y, b.y)};
+#endif
+}
+
+// --- min2_nan ------------------------------------------------------------
+
+TL_DEVICE __nv_bfloat162 min2_nan(__nv_bfloat162 a, __nv_bfloat162 b) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  return __hmin2_nan(a, b);
+#else
+  return __nv_bfloat162{__hmin_nan(a.x, b.x), __hmin_nan(a.y, b.y)};
+#endif
+}
+
+TL_DEVICE __half2 min2_nan(__half2 a, __half2 b) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 530)
+  return __hmin2_nan(a, b);
+#else
+  return __half2{__hmin_nan(a.x, b.x), __hmin_nan(a.y, b.y)};
+#endif
+}
+
 // --- abs2 ----------------------------------------------------------------
 
 TL_DEVICE float2 abs2(float2 a) { return make_float2(fabsf(a.x), fabsf(a.y)); }
@@ -853,10 +1011,7 @@ TL_DEVICE __half2 abs2(__half2 a) {
 
 } // namespace tl
 
-namespace cutlass {
-TL_DEVICE
-bfloat16_t fast_exp(bfloat16_t x) { return ::hexp(x); }
-} // namespace cutlass
+using tl::tfloat32_t;
 
 //
 // Optimized type-punned warp shuffle helpers for 16-bit types
@@ -957,6 +1112,28 @@ TL_DEVICE bfloat16_t shfl_sync(unsigned mask, bfloat16_t val, int srcLane) {
   uint32_t ret32 = __shfl_sync(mask, raw32, srcLane);
   uint16_t ret16 = static_cast<uint16_t>(ret32);
   return reinterpret_cast<bfloat16_t &>(ret16);
+}
+
+// Specializations for uint1 (packed bfloat16x2 / float16x2).
+// uint1 is a 32-bit struct { unsigned x; } used to represent packed pairs.
+// __shfl_xor_sync operates on native 32-bit types, so we pass the raw unsigned.
+
+template <>
+TL_DEVICE uint1 shfl_xor_sync(unsigned mask, uint1 val, int laneMask) {
+  return uint1{__shfl_xor_sync(mask, val.x, laneMask)};
+}
+
+template <>
+TL_DEVICE uint1 shfl_down_sync(unsigned mask, uint1 val, int delta) {
+  return uint1{__shfl_down_sync(mask, val.x, delta)};
+}
+
+template <> TL_DEVICE uint1 shfl_up_sync(unsigned mask, uint1 val, int delta) {
+  return uint1{__shfl_up_sync(mask, val.x, delta)};
+}
+
+template <> TL_DEVICE uint1 shfl_sync(unsigned mask, uint1 val, int srcLane) {
+  return uint1{__shfl_sync(mask, val.x, srcLane)};
 }
 
 } // namespace tl

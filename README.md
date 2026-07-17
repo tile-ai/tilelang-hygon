@@ -16,11 +16,16 @@ tilelang-hygon supports almost all upstream TileLang syntax.
 
 ## Latest News
 
-- **v0.1.9-release** — Based on TileLang 0.1.9 for Hygon DCU. Use `build.sh` for source builds.
+- **v0.1.12-release** — Based on TileLang v0.1.12 for Hygon DCU. Use `build.sh` for source builds.
+- **v0.1.9-release** — Based on TileLang v0.1.9 for Hygon DCU. Use `build.sh` for source builds.
 
 ## Tested Devices
 
-tilelang-hygon has been tested on **Hygon DCU-2G** and **DCU-3G** under the Hygon DTK environment.
+tilelang-hygon has been tested on **Hygon DCU-2G** and **DCU-3G**.
+
+**Toolchain**: requires **Hygon DTK**. Source the DTK environment before `build.sh` or compiling kernels.
+
+**Target**: leave unset / `auto`, or set `target="hcu"` explicitly (e.g. `@tilelang.jit(target="hcu")`).
 
 ## Build from Source
 
@@ -56,7 +61,8 @@ Below is the upstream GEMM example with layout annotation, pipelining, and optio
 import tilelang
 import tilelang.language as T
 
-@tilelang.jit(target="auto")
+# Default / auto selects HCU on Hygon DCU; or pass target="hcu" explicitly.
+@tilelang.jit
 def matmul_relu(
     A, B,
     block_M: int = 64,

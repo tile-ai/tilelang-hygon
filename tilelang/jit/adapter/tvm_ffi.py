@@ -8,16 +8,18 @@ On non-CUDA builds, the stream/device fall back to 0/CPU semantics.
 
 from __future__ import annotations
 
-from typing import Callable, Any
+from typing import Any
+from collections.abc import Callable
 import sys
+import threading
 
 import torch
 from tilelang import tvm
-from tvm import runtime, tir
+from tvm import runtime, tirx
 from tvm.target import Target
 from tvm.relax import TensorType
-from tilelang.utils.target import determine_target
-from tilelang.jit.adapter.base import BaseKernelAdapter
+from tilelang.backend.target import determine_target
+from tilelang.jit.adapter.base import BaseKernelAdapter, CachedTextSource
 from tilelang.utils.language import retrieve_func_from_module
 from tilelang.engine.param import KernelParam
 from tilelang.language.dtypes import dtype
@@ -65,6 +67,10 @@ if sys.platform == "darwin":
     from torch.utils import cpp_extension
 
     COMPILE_ARGS["options"] = ["-x", "objective-c++", "-g", "-std=gnu++17"] + ["-I" + i for i in cpp_extension.include_paths()]
+elif sys.platform == "win32":
+    from tilelang.contrib.msvc import create_shared as _msvc_create_shared
+
+    COMPILE_ARGS["fcompile"] = _msvc_create_shared
 
 
 class TVMFFIKernelAdapter(BaseKernelAdapter):
@@ -96,7 +102,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
     # rt_mod
     rt_mod: tvm.runtime.Module | None = None
     # Maps symbolic variables to their corresponding buffer and shape indices
-    dynamic_symbolic_map: dict[tir.Var, tuple[int, int, int]] | None = None
+    dynamic_symbolic_map: dict[tirx.Var, tuple[int, int, int]] | None = None
 
     # Stream/device functors are inherited from BaseKernelAdapter
     def __init__(
@@ -104,7 +110,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         params: list[KernelParam],
         result_idx: list[int],
         target: str | Target,
-        func_or_mod: tir.PrimFunc | tvm.IRModule,
+        func_or_mod: tirx.PrimFunc | tvm.IRModule,
         host_mod: tvm.IRModule | None = None,
         device_mod: tvm.IRModule | None = None,
         rt_mod: tvm.runtime.Module | None = None,
@@ -128,12 +134,12 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         self.host_kernel_source = host_kernel_source
         self.device_kernel_source = device_kernel_source
 
-        if isinstance(func_or_mod, tir.PrimFunc):
+        if isinstance(func_or_mod, tirx.PrimFunc):
             self.ir_module = tvm.IRModule({func_or_mod.attrs["global_symbol"]: func_or_mod})
         else:
             self.ir_module = func_or_mod
 
-        self.target = Target.canon_target(determine_target(target))
+        self.target = Target(determine_target(target))
 
         self.host_mod = host_mod
         self.device_mod = device_mod
@@ -143,10 +149,27 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         self.compile_flags = compile_flags
         self.dynamic_symbolic_map = self._process_dynamic_symbolic()
         self.kernel_global_source = self.device_kernel_source
+        self.executable = None
+        self._executables_by_device: dict[int | str, tvm.runtime.Executable] = {}
+        self._executable_lock = threading.Lock()
 
         self._post_init()
 
-    def _process_dynamic_symbolic(self) -> dict[tir.Var, tuple[int, int, int, int]]:
+    def _make_executable(self) -> tvm.runtime.Executable:
+        if self.rt_mod is None:
+            raise RuntimeError("Cannot create TVM FFI executable without a runtime module.")
+        executable = runtime.Executable(self.rt_mod)
+        if COMPILE_ARGS:
+            # Precompile jit module with extra arguments.
+            executable.jit(**COMPILE_ARGS)
+        return executable
+
+    def get_exportable_executable(self) -> tvm.runtime.Executable:
+        if self.executable is not None:
+            return self.executable
+        return self._make_executable()
+
+    def _process_dynamic_symbolic(self) -> dict[tirx.Var, tuple[int, int, int, int]]:
         """Extract information about dynamic shapes from the TIR function.
 
         Maps symbolic variables to their corresponding (id, buffer_index, dimension, stride_scale)
@@ -160,13 +183,13 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         buffer_map = func.buffer_map
         dynamic_symbolic_map = {}
         for i, param in enumerate(params):
-            if isinstance(param, tir.Var) and (param not in dynamic_symbolic_map):
+            if isinstance(param, tirx.Var) and (param not in dynamic_symbolic_map):
                 dynamic_symbolic_map[param] = (2, i, -1, 1)
         for i, param in enumerate(params):
             if param in buffer_map:
                 buffer = buffer_map[param]
                 for j, shape in enumerate(buffer.shape):
-                    if isinstance(shape, tir.Var) and (shape not in dynamic_symbolic_map) and (shape not in params):
+                    if isinstance(shape, tirx.Var) and (shape not in dynamic_symbolic_map) and (shape not in params):
                         dynamic_symbolic_map[shape] = (0, i, j, 1)
         for i, param in enumerate(params):
             if param in buffer_map:
@@ -174,7 +197,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 element_bits = buffer.dtype.bits * buffer.dtype.lanes
                 stride_scale = 8 // element_bits if element_bits < 8 else 1
                 for j, stride in enumerate(buffer.strides):
-                    if isinstance(stride, tir.Var) and (stride not in dynamic_symbolic_map) and (stride not in params):
+                    if isinstance(stride, tirx.Var) and (stride not in dynamic_symbolic_map) and (stride not in params):
                         dynamic_symbolic_map[stride] = (1, i, j, stride_scale)
         return dynamic_symbolic_map
 
@@ -194,10 +217,10 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         for param in self.params:
             native_shape = []
             for dim in param.shape:
-                if isinstance(dim, tir.IntImm):
+                if isinstance(dim, tirx.IntImm):
                     native_shape.append(int(dim))
-                elif isinstance(dim, tir.Var):
-                    native_shape.append(dim)  # Keep tir.Var for dynamic dimensions
+                elif isinstance(dim, tirx.Var):
+                    native_shape.append(dim)  # Keep tirx.Var for dynamic dimensions
                 else:
                     native_shape.append(dim)
             tl_dtype = param.dtype
@@ -207,14 +230,26 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 native_shape[-1] = native_shape[-1] * tl_dtype.bits * tl_dtype.lanes // (stroage_dtype.bits * stroage_dtype.lanes)
             param_shapes.append(native_shape)
 
-        if self.executable is None:
-            self.executable = runtime.Executable(self.rt_mod)
-            if COMPILE_ARGS:
-                # Precompile jit module with extra arguments
-                self.executable.jit(**COMPILE_ARGS)
-
         dynamic_symbolic_map = self._process_dynamic_symbolic()
-        executable = self.executable
+
+        def get_executable():
+            if self.executable is not None:
+                return self.executable
+
+            device_key: int | str = "cpu"
+            if torch.cuda.is_available():
+                device_key = torch.cuda.current_device()
+
+            executable = self._executables_by_device.get(device_key)
+            if executable is not None:
+                return executable
+
+            with self._executable_lock:
+                executable = self._executables_by_device.get(device_key)
+                if executable is None:
+                    executable = self._make_executable()
+                    self._executables_by_device[device_key] = executable
+                return executable
 
         # Prepare helpers for friendly dtype error messages
         prim_func = self.prim_func
@@ -240,7 +275,10 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
             # Resolve the device used for outputs. Prefer the first tensor input's device
             # if available, otherwise use PyTorch's current device.
-            out_device: torch.device | None = None
+            out_device: torch.device | None = next(
+                (input.device for input in inputs if isinstance(input, torch.Tensor)),
+                None,
+            )
 
             # Stitch the full positional argument list expected by the TVM executable
             ins_idx: int = 0
@@ -255,7 +293,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                     shape = []
                     # Now working with native Python list, no FFI calls needed
                     for s in param_shapes[i]:
-                        if isinstance(s, tir.Var):
+                        if isinstance(s, tirx.Var):
                             for key in dynamic_symbolic_map:
                                 if str(s) == str(key):
                                     ref_id, ref_tensor_idx, ref_shape_idx, stride_scale = dynamic_symbolic_map[key]
@@ -288,6 +326,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                     ins_idx += 1
                 tensor_list.append(tensor)
 
+            executable = get_executable()
             executable(*tensor_list)
 
             def _result_tensor(idx: int) -> torch.Tensor:
@@ -309,9 +348,9 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         params: list[TensorType],
         result_idx: list[int],
         target: str,
-        func_or_mod: tir.PrimFunc | tvm.IRModule,
-        host_kernel_source: str,
-        device_kernel_source: str,
+        func_or_mod: tirx.PrimFunc | tvm.IRModule,
+        host_kernel_source: CachedTextSource,
+        device_kernel_source: CachedTextSource,
         kernel_lib_path: str,
         verbose: bool = False,
         pass_configs: dict[str, Any] | None = None,
@@ -320,46 +359,66 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         adapter = cls.__new__(cls)
         adapter.params = params
         adapter.result_idx = adapter._legalize_result_idx(result_idx)
-        adapter.host_kernel_source = host_kernel_source
-        adapter.device_kernel_source = device_kernel_source
-        adapter.wrapped_source = device_kernel_source + "\n\n" + host_kernel_source
+        host_kernel_source = adapter._set_cached_text_source("host_kernel_source", "_host_kernel_source_path", host_kernel_source)
+        device_kernel_source = adapter._set_cached_text_source("device_kernel_source", "_device_kernel_source_path", device_kernel_source)
+        adapter.wrapped_source = (
+            device_kernel_source.text + "\n\n" + host_kernel_source.text
+            if device_kernel_source.text is not None and host_kernel_source.text is not None
+            else None
+        )
         adapter.pass_configs = pass_configs
 
-        if isinstance(func_or_mod, tir.PrimFunc):
+        if isinstance(func_or_mod, tirx.PrimFunc):
             adapter.ir_module = tvm.IRModule({func_or_mod.attrs["global_symbol"]: func_or_mod})
         else:
             adapter.ir_module = func_or_mod
 
         target = determine_target(target, return_object=True)
-        adapter.target = Target.canon_target(determine_target(target))
+        adapter.target = Target(determine_target(target))
 
         adapter.verbose = verbose
         adapter.libpath = kernel_lib_path
-        adapter.kernel_global_source = device_kernel_source
+        adapter.kernel_global_source = device_kernel_source.text
+        adapter.rt_mod = None
         adapter.executable = runtime.load_module(kernel_lib_path)
+        adapter._executables_by_device = {}
+        adapter._executable_lock = threading.Lock()
         adapter._post_init()
         return adapter
 
-    def get_host_source(self):
+    def get_host_source(self) -> str | None:
         """Returns the source code of the host module."""
-        if self.host_kernel_source is not None:
-            return self.host_kernel_source
-        return self.rt_mod.inspect_source()
+        source = self._load_cached_text_source("host_kernel_source", "_host_kernel_source_path")
+        if source is not None:
+            return source
+        rt_mod = getattr(self, "rt_mod", None)
+        if rt_mod is None:
+            return None
+        return rt_mod.inspect_source()
 
-    def get_device_source(self):
+    def get_device_source(self) -> str | None:
         """Returns the source code of the device module."""
-        if self.device_kernel_source is not None:
-            return self.device_kernel_source
-        return self.rt_mod.imports[0].inspect_source()
+        source = self._load_cached_text_source("device_kernel_source", "_device_kernel_source_path")
+        if source is not None:
+            self.kernel_global_source = source
+            return source
+        rt_mod = getattr(self, "rt_mod", None)
+        if rt_mod is None:
+            return None
+        return rt_mod.imports[0].inspect_source()
 
     def get_kernel_source(self, kernel_only: bool = False):
         """Returns the source code of the compiled kernel."""
+        device_source = self.get_device_source() or ""
         if kernel_only:
-            return self.get_device_source()
-        else:
-            return self.get_device_source() + "\n\n" + self.get_host_source()
+            return device_source
+
+        host_source = self.get_host_source() or ""
+        if device_source and host_source:
+            return device_source + "\n\n" + host_source
+        return device_source or host_source
 
     @property
-    def prim_func(self) -> tir.PrimFunc:
+    def prim_func(self) -> tirx.PrimFunc:
         """Returns the primary TIR function from the IR module."""
         return retrieve_func_from_module(self.ir_module)

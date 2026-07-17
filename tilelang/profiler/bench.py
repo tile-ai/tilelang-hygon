@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Callable, Literal
+from typing import Literal
+from collections.abc import Callable
 
 import torch
 
@@ -58,7 +59,7 @@ class suppress_stdout_stderr:
 
 IS_CUDA = torch.cuda.is_available()
 device = "cuda:0" if IS_CUDA else "mps:0"
-Event = torch.cuda.Event if IS_CUDA else torch.mps.Event
+_CACHE_FLUSH_ID = "tilelang::cache_flush"
 
 
 def do_bench(
@@ -71,6 +72,8 @@ def do_bench(
     fast_flush: bool = True,
     backend: Literal["event", "cupti", "cudagraph"] = "event",
     return_mode: Literal["min", "max", "mean", "median"] = "mean",
+    device: int | torch.device | None = None,
+    cache_size: int = 256,
 ) -> float | list[float]:
     """Benchmark the runtime of a PyTorch function with L2 cache management.
 
@@ -90,21 +93,99 @@ def do_bench(
         fast_flush: Use faster L2 cache flush with int32 vs int8 (default: True)
         backend: Profiler backend - "event" (CUDA events), "cupti", or "cudagraph" (default: "event")
         return_mode: Result aggregation method - "mean", "median", "min", or "max"
+        device: Optional CUDA device to benchmark on. When provided, CUDA
+            events, streams, cache buffers, and synchronizations are scoped to
+            that device.
+        cache_size: L2 cache flush buffer size in MB (default: 256)
 
     Returns:
         Runtime in milliseconds (float) or list of quantile values if quantiles specified
     """
     assert return_mode in ["min", "max", "mean", "median"], f"Invalid return_mode: {return_mode}"
 
+    device_idx = _normalize_cuda_device(device)
+    if device_idx is not None:
+        with torch.cuda.device(device_idx):
+            return _do_bench_impl(
+                fn,
+                warmup=warmup,
+                rep=rep,
+                _n_warmup=_n_warmup,
+                _n_repeat=_n_repeat,
+                quantiles=quantiles,
+                fast_flush=fast_flush,
+                backend=backend,
+                return_mode=return_mode,
+                device_idx=device_idx,
+                cache_size=cache_size,
+            )
+
+    return _do_bench_impl(
+        fn,
+        warmup=warmup,
+        rep=rep,
+        _n_warmup=_n_warmup,
+        _n_repeat=_n_repeat,
+        quantiles=quantiles,
+        fast_flush=fast_flush,
+        backend=backend,
+        return_mode=return_mode,
+        device_idx=None,
+        cache_size=cache_size,
+    )
+
+
+def _normalize_cuda_device(benchmark_device: int | torch.device | None) -> int | None:
+    """Return a concrete CUDA device index, preserving implicit mode for None."""
+    if benchmark_device is None:
+        return None
+    if isinstance(benchmark_device, int):
+        return benchmark_device
+
+    torch_device = torch.device(benchmark_device)
+    if torch_device.type != "cuda":
+        raise ValueError(f"do_bench device must be a CUDA device, got {torch_device}")
+    if torch_device.index is None:
+        return torch.cuda.current_device()
+    return torch_device.index
+
+
+def _cuda_synchronize(device_idx: int | None = None) -> None:
+    if device_idx is None:
+        torch.cuda.synchronize()
+    else:
+        torch.cuda.synchronize(device_idx)
+
+
+def _cache_device(device_idx: int | None) -> str | torch.device:
+    if device_idx is None:
+        return device
+    return torch.device("cuda", device_idx)
+
+
+def _do_bench_impl(
+    fn: Callable,
+    warmup: float,
+    rep: float,
+    _n_warmup: int,
+    _n_repeat: int,
+    quantiles: list[float] | None,
+    fast_flush: bool,
+    backend: Literal["event", "cupti", "cudagraph"],
+    return_mode: Literal["min", "max", "mean", "median"],
+    device_idx: int | None,
+    cache_size: int,
+) -> float | list[float]:
     # Initial function call and synchronization
     fn()
-    torch.cuda.synchronize()
+    _cuda_synchronize(device_idx)
 
-    # Create L2 cache flush buffer (256 MB)
+    # Create L2 cache flush buffer (`cache_size` MB)
     # Fast flush uses int32 (4 bytes), regular uses int8 (1 byte)
-    cache_size = int(256e6 // 4) if fast_flush else int(256e6)
+    cache_bytes = cache_size * 1024 * 1024
+    cache_numel = cache_bytes // 4 if fast_flush else cache_bytes
     cache_dtype = torch.int if fast_flush else torch.int8
-    cache = torch.empty(cache_size, dtype=cache_dtype, device="cuda")
+    cache = torch.empty(cache_numel, dtype=cache_dtype, device=_cache_device(device_idx))
 
     # Estimate kernel runtime with 5 iterations
     start_event = torch.cuda.Event(enable_timing=True)
@@ -128,11 +209,11 @@ def do_bench(
 
     # Benchmarking phase
     if backend == "event":
-        return _bench_with_cuda_events(fn, cache, n_repeat, quantiles, return_mode)
+        return _bench_with_cuda_events(fn, cache, n_repeat, quantiles, return_mode, device_idx)
     elif backend == "cupti":
         return _bench_with_cupti(fn, cache, n_repeat)
     elif backend == "cudagraph":
-        return _bench_with_cudagraph(fn, cache, n_repeat, quantiles, return_mode)
+        return _bench_with_cudagraph(fn, cache, n_repeat, quantiles, return_mode, device_idx)
     else:
         raise ValueError(f"Unknown profiler backend: {backend}")
 
@@ -226,6 +307,7 @@ def _bench_with_cuda_events(
     n_repeat: int,
     quantiles: list[float] | None,
     return_mode: str,
+    device_idx: int | None,
 ) -> float | list[float]:
     """Benchmark using CUDA events for timing."""
     # Create timing events
@@ -240,7 +322,7 @@ def _bench_with_cuda_events(
         end_events[i].record()
 
     # Synchronize and collect timings
-    torch.cuda.synchronize()
+    _cuda_synchronize(device_idx)
     times = torch.tensor(
         [s.elapsed_time(e) for s, e in zip(start_events, end_events)],
         dtype=torch.float,
@@ -264,25 +346,36 @@ def _bench_with_cupti(
     with suppress_stdout_stderr():
         schedule = torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
         profiler = torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CUDA],
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
             schedule=schedule,
         )
 
         with profiler:
             for _ in range(2):
                 for _ in range(n_repeat):
-                    cache.zero_()
+                    with torch.profiler.record_function(_CACHE_FLUSH_ID):
+                        cache.zero_()
                     fn()
                 profiler.step()
 
-    # Calculate average kernel time, excluding cache-clearing overhead
+    # `cache.zero_()` and user code such as `torch.zeros` can share the same
+    # generated kernel name, so exclude only the annotated cache flush range.
+    def is_cuda_event(event):
+        return getattr(getattr(event, "device_type", None), "name", "") == "CUDA"
+
     total_cuda_time = 0.0
     excluded_time = 0.0
-    excluded_kernels = "at::native::vectorized_elementwise"
 
-    for event in profiler.key_averages():
-        total_cuda_time += event.self_device_time_total
-        if excluded_kernels in event.key:
+    for event in profiler.events():
+        if not is_cuda_event(event):
+            continue
+
+        if not event.is_user_annotation:
+            total_cuda_time += event.self_device_time_total
+        elif event.key == _CACHE_FLUSH_ID:
             excluded_time += event.self_device_time_total
 
     kernel_time_us = (total_cuda_time - excluded_time) / n_repeat
@@ -295,6 +388,7 @@ def _bench_with_cudagraph(
     n_repeat: int,
     quantiles: list[float] | None,
     return_mode: str,
+    device_idx: int | None,
 ) -> float | list[float]:
     """Benchmark using CUDA graph for minimal launch overhead.
 
@@ -306,14 +400,15 @@ def _bench_with_cudagraph(
     since CUDA graphs require fixed execution patterns.
     """
     n_retries = 10
-    with torch.cuda.stream(torch.cuda.Stream()):
+    stream = torch.cuda.Stream(device=device_idx) if device_idx is not None else torch.cuda.Stream()
+    with torch.cuda.stream(stream):
         # Construct a CUDA graph with `n_repeat` unrolled function calls to minimize host overhead.
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             for _ in range(n_repeat):
                 fn()
 
-        torch.cuda.synchronize()
+        _cuda_synchronize(device_idx)
 
         # Measure time by replaying the graph multiple times.
         # Clear cache before each replay for consistent measurements.
@@ -325,7 +420,7 @@ def _bench_with_cudagraph(
             g.replay()
             end_events[i].record()
 
-        torch.cuda.synchronize()
+        _cuda_synchronize(device_idx)
         times = torch.tensor(
             [s.elapsed_time(e) / n_repeat for s, e in zip(start_events, end_events)],
             dtype=torch.float,

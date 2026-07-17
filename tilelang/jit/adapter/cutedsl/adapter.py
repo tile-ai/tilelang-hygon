@@ -1,10 +1,11 @@
 from __future__ import annotations
 import logging
 import weakref
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 import torch
-from tvm import tir
+from tvm import tirx
 from tvm.target import Target
 
 from tilelang import tvm as tvm
@@ -13,21 +14,23 @@ from tilelang.jit.adapter.wrapper import TLPyWrapper
 from tilelang.jit.adapter.cutedsl.checks import check_cutedsl_available
 from tilelang.jit.adapter.cutedsl.libgen import CuTeDSLLibraryGenerator
 from tilelang.utils.language import retrieve_func_from_module
-from tilelang.utils.target import determine_target
-from tilelang.jit.adapter.base import BaseKernelAdapter
+from tilelang.backend.target import determine_target
+from tilelang.jit.adapter.base import BaseKernelAdapter, CachedTextSource
 
 logger = logging.getLogger(__name__)
 
 
 class CuTeDSLKernelAdapter(BaseKernelAdapter):
+    """Runtime adapter for generated CuTeDSL Python modules."""
+
     pymodule = None
 
     def __init__(
         self,
         params: list[KernelParam],
         result_idx: list[int],
-        target: str | Target,
-        func_or_mod: tir.PrimFunc | tvm.IRModule,
+        target: str | dict[str, object] | Target,
+        func_or_mod: tirx.PrimFunc | tvm.IRModule,
         host_mod: tvm.IRModule | None = None,
         device_mod: tvm.IRModule | None = None,
         host_kernel_source: str | None = None,
@@ -36,14 +39,17 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
         pass_configs: dict[str, Any] | None = None,
         compile_flags: list[str] | None = None,
     ):
+        """Build a CuTeDSL adapter from freshly lowered TileLang artifacts."""
         check_cutedsl_available()
 
         self.params = params
         self.result_idx = self._legalize_result_idx(result_idx)
         self.host_kernel_source = host_kernel_source
         self.device_kernel_source = device_kernel_source
+        self.kernel_global_source = device_kernel_source
+        self.generated_module_source: str | None = None
 
-        if isinstance(func_or_mod, tir.PrimFunc):
+        if isinstance(func_or_mod, tirx.PrimFunc):
             gsym = func_or_mod.attrs.get("global_symbol")
             if gsym is None:
                 raise ValueError("PrimFunc is missing required attr 'global_symbol'")
@@ -57,10 +63,10 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
         for param in params:
             native_shape = []
             for dim in param.shape:
-                if isinstance(dim, tir.IntImm):
+                if isinstance(dim, tirx.IntImm):
                     native_shape.append(int(dim))
-                elif isinstance(dim, tir.Var):
-                    # Keep tir.Var for dynamic dimensions
+                elif isinstance(dim, tirx.Var):
+                    # Keep tirx.Var for dynamic dimensions
                     native_shape.append(dim)
                 else:
                     native_shape.append(dim)
@@ -68,7 +74,7 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
 
         self.dynamic_symbolic_map, self.dynamic_symbolic_order = self._process_dynamic_symbolic()
 
-        self.target = Target.canon_target(determine_target(target))
+        self.target = Target(determine_target(target))
         self.verbose = verbose
         self.wrapper = TLPyWrapper(self.target)
         self.wrapper.assign_optimized_module(self.ir_module)
@@ -77,6 +83,7 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
         self.wrapper.assign_device_module(device_mod)
         wrapper_result = self.wrapper.wrap(device_kernel_source)
         self.host_func = wrapper_result["host_func"]
+        self.host_kernel_source = self.host_func
         self.function_names = wrapper_result["function_names"]
         self.launcher_cpp_code = wrapper_result.get("launcher_cpp_code", None)
         self.launcher_lib_name = wrapper_result.get("launcher_lib_name", None)
@@ -91,8 +98,9 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
         self.lib_generator.load_lib()
         self.libpath = self.lib_generator.libpath
         with open(self.libpath) as f:
-            self.device_kernel_source = f.read()
-        self.kernel_global_source = self.device_kernel_source
+            self.generated_module_source = f.read()
+        if self.kernel_global_source is None:
+            self.kernel_global_source = self.device_kernel_source
         self.pymodule = self.lib_generator.pymodule
 
         self._post_init()
@@ -102,22 +110,25 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
         cls,
         params: list[KernelParam],
         result_idx: list[int],
-        target: str,
-        func_or_mod: tir.PrimFunc | tvm.IRModule,
-        host_kernel_source: str,
-        device_kernel_source: str,
+        target: str | dict[str, object] | Target,
+        func_or_mod: tirx.PrimFunc | tvm.IRModule,
+        host_kernel_source: CachedTextSource,
+        device_kernel_source: CachedTextSource,
         kernel_lib_path: str,
         verbose: bool = False,
         pass_configs: dict[str, Any] | None = None,
         compile_flags: list[str] | None = None,
     ):
+        """Rebuild a CuTeDSL adapter from persisted cache artifacts."""
         adapter = cls.__new__(cls)
         adapter.params = params
         adapter.result_idx = adapter._legalize_result_idx(result_idx)
-        adapter.host_kernel_source = host_kernel_source
-        adapter.device_kernel_source = device_kernel_source
+        host_kernel_source = adapter._set_cached_text_source("host_kernel_source", "_host_kernel_source_path", host_kernel_source)
+        device_kernel_source = adapter._set_cached_text_source("device_kernel_source", "_device_kernel_source_path", device_kernel_source)
+        adapter.host_func = host_kernel_source.text
+        adapter.generated_module_source = None
 
-        if isinstance(func_or_mod, tir.PrimFunc):
+        if isinstance(func_or_mod, tirx.PrimFunc):
             gsym = func_or_mod.attrs.get("global_symbol")
             if gsym is None:
                 raise ValueError("PrimFunc is missing required attr 'global_symbol'")
@@ -131,10 +142,10 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
         for param in params:
             native_shape = []
             for dim in param.shape:
-                if isinstance(dim, tir.IntImm):
+                if isinstance(dim, tirx.IntImm):
                     native_shape.append(int(dim))
-                elif isinstance(dim, tir.Var):
-                    # Keep tir.Var for dynamic dimensions
+                elif isinstance(dim, tirx.Var):
+                    # Keep tirx.Var for dynamic dimensions
                     native_shape.append(dim)
                 else:
                     native_shape.append(dim)
@@ -142,19 +153,26 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
 
         adapter.dynamic_symbolic_map, adapter.dynamic_symbolic_order = adapter._process_dynamic_symbolic()
 
-        adapter.target = Target.canon_target(determine_target(target))
+        from tilelang.cuda.target import normalize_cutedsl_target
+
+        adapter.target = normalize_cutedsl_target(target) or Target(determine_target(target))
         adapter.verbose = verbose
         adapter.lib_generator = CuTeDSLLibraryGenerator(adapter.target, adapter.verbose)
         adapter.lib_generator.assign_compile_flags(compile_flags)
         adapter.lib_generator.load_lib(lib_path=kernel_lib_path)
         adapter.libpath = kernel_lib_path
-        adapter.kernel_global_source = device_kernel_source
+        adapter.kernel_global_source = device_kernel_source.text
+        try:
+            with open(kernel_lib_path) as f:
+                adapter.generated_module_source = f.read()
+        except OSError:
+            adapter.generated_module_source = None
         adapter.pymodule = adapter.lib_generator.pymodule
 
         adapter._post_init()
         return adapter
 
-    def _process_dynamic_symbolic(self) -> tuple[dict[tir.Var, tuple[int, int, int]], list[tir.Var]]:
+    def _process_dynamic_symbolic(self) -> tuple[dict[tirx.Var, tuple[int, int, int]], list[tirx.Var]]:
         """Extract information about dynamic symbols from the TIR function.
 
         We follow the same ordering semantics as `TLCUDASourceWrapper.get_dynamic_symbolic_set()`:
@@ -171,14 +189,19 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
         func = self.prim_func
         params = func.params
         buffer_map = func.buffer_map
-        dynamic_symbolic_map: dict[tir.Var, tuple[int, int, int]] = {}
-        dynamic_symbolic_order: list[tir.Var] = []
-        # Secondary index by variable name for fallback lookup when tir.Var
+        dynamic_symbolic_map: dict[tirx.Var, tuple[int, int, int]] = {}
+        dynamic_symbolic_order: list[tirx.Var] = []
+        self._dynamic_symbolic_candidates_map: dict[tirx.Var, list[tuple[int, int, int]]] = {}
+        self._dynamic_symbolic_name_candidates_map: dict[str, list[tuple[int, int, int]]] = {}
+        # Secondary index by variable name for fallback lookup when tirx.Var
         # object identity differs (e.g. params created from a different
         # PrimFunc instance than the one stored in ir_module).
         self._dynamic_symbolic_name_map: dict[str, tuple[int, int, int]] = {}
 
-        def unique_push_back(v: tir.Var, entry: tuple[int, int, int]):
+        def unique_push_back(v: tirx.Var, entry: tuple[int, int, int]):
+            """Append one symbolic variable unless it has already been seen."""
+            self._dynamic_symbolic_candidates_map.setdefault(v, []).append(entry)
+            self._dynamic_symbolic_name_candidates_map.setdefault(v.name, []).append(entry)
             if v in dynamic_symbolic_map:
                 return
             dynamic_symbolic_map[v] = entry
@@ -191,7 +214,7 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
                 continue
             buffer = buffer_map[param]
             for j, shape in enumerate(buffer.shape):
-                if isinstance(shape, tir.Var):
+                if isinstance(shape, tirx.Var):
                     unique_push_back(shape, (0, i, j))
 
         # 2) Strides
@@ -202,13 +225,13 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
             if buffer.strides is None:
                 continue
             for j, stride in enumerate(buffer.strides):
-                if isinstance(stride, tir.Var):
+                if isinstance(stride, tirx.Var):
                     unique_push_back(stride, (1, i, j))
 
         return dynamic_symbolic_map, dynamic_symbolic_order
 
-    def _lookup_dynamic_symbolic(self, v: tir.Var) -> tuple[int, int, int]:
-        """Look up a tir.Var in the dynamic symbolic map.
+    def _lookup_dynamic_symbolic(self, v: tirx.Var) -> tuple[int, int, int]:
+        """Look up a tirx.Var in the dynamic symbolic map.
 
         Falls back to name-based lookup when object identity doesn't match
         (can happen when param_shapes and prim_func come from different
@@ -220,15 +243,86 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
             return self._dynamic_symbolic_name_map[v.name]
         raise KeyError(f"Dynamic symbolic variable '{v.name}' not found in symbolic map")
 
+    def _lookup_dynamic_symbolic_candidates(self, v: tirx.Var) -> list[tuple[int, int, int]]:
+        """Return all shape/stride sources for a dynamic symbolic variable."""
+        if v in self._dynamic_symbolic_candidates_map:
+            return self._dynamic_symbolic_candidates_map[v]
+        if v.name in self._dynamic_symbolic_name_candidates_map:
+            return self._dynamic_symbolic_name_candidates_map[v.name]
+        raise KeyError(f"Dynamic symbolic variable '{v.name}' not found in symbolic map")
+
+    def _resolve_dynamic_symbolic_value(
+        self,
+        v: tirx.Var,
+        param_values: list[Any],
+        *,
+        require_live_shape: bool = True,
+    ) -> int:
+        """Resolve a dynamic shape/stride variable from the first live tensor source."""
+        candidates = self._lookup_dynamic_symbolic_candidates(v)
+        non_tensor_values: list[tuple[int, Any]] = []
+        has_shape_candidate = False
+        has_stride_candidate = False
+        for ref_id, buffer_idx, dim_idx in candidates:
+            if ref_id == 0:
+                has_shape_candidate = True
+            elif ref_id == 1:
+                has_stride_candidate = True
+            else:
+                raise ValueError(f"Unknown dynamic symbol ref id: {ref_id}")
+
+            ref_val = param_values[buffer_idx]
+            if not isinstance(ref_val, torch.Tensor):
+                non_tensor_values.append((buffer_idx, ref_val))
+                continue
+            if ref_id == 0:
+                return ref_val.shape[dim_idx]
+            if ref_id == 1:
+                return ref_val.stride()[dim_idx]
+
+        # Optional tensors can be absent from a lowered kernel variant while
+        # their dynamic shape/stride remains in the host wrapper ABI. Output
+        # allocation still calls this helper in the default strict mode, so a
+        # live tensor remains required for any shape symbol that materializes a
+        # result tensor.
+        if has_stride_candidate and not has_shape_candidate:
+            return 0
+        if has_shape_candidate and not require_live_shape:
+            return 0
+
+        details = ", ".join(f"param {buffer_idx}: {type(ref_val).__name__}" for buffer_idx, ref_val in non_tensor_values)
+        raise TypeError(f"Dynamic symbolic var {v} has no live tensor source among candidates ({details})")
+
+    def get_host_source(self) -> str | None:
+        """Get the cached host-side source code."""
+        source = self._load_cached_text_source("host_kernel_source", "_host_kernel_source_path")
+        if source is not None:
+            return source
+        return getattr(self, "host_func", None)
+
+    def get_generated_module_source(self) -> str | None:
+        """Get the importable generated CuTeDSL Python module source."""
+        return self.generated_module_source
+
     def get_kernel_source(self, kernel_only: bool = True) -> str | None:
-        """Get the CUDA kernel source code.
+        """Get the CuTeDSL device source, optionally with host wrapper source.
 
         Returns
         -------
         str | None
             The kernel source code, or None if not available
         """
-        return self.device_kernel_source
+        source = self._load_cached_text_source("device_kernel_source", "_device_kernel_source_path")
+        if source is not None:
+            self.kernel_global_source = source
+        device_source = source or self.kernel_global_source or self.device_kernel_source
+        if kernel_only:
+            return device_source
+
+        sources = [source for source in (device_source, self.get_host_source()) if source]
+        if sources:
+            return "\n\n".join(sources)
+        return self.generated_module_source
 
     def _forward_from_prebuild_lib(self, *args, stream: int | None = None, device_id: int = 0):
         """Low-level function to call the compiled CUDA kernel.
@@ -328,18 +422,8 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
                 shape = []
                 # Now working with native Python list, no FFI calls needed
                 for s in self.param_shapes[i]:
-                    if isinstance(s, tir.Var):
-                        ref_id, ref_param_idx, ref_dim_idx = self._lookup_dynamic_symbolic(s)
-                        ref_val = param_values[ref_param_idx]
-                        if not isinstance(ref_val, torch.Tensor):
-                            raise TypeError(f"Dynamic shape/stride var {s} refers to a non-tensor param at index {ref_param_idx}")
-                        if ref_id == 0:
-                            shape.append(ref_val.shape[ref_dim_idx])
-                        elif ref_id == 1:
-                            # Stride vars are not expected in output shapes, but handle defensively.
-                            shape.append(ref_val.stride()[ref_dim_idx])
-                        else:
-                            raise ValueError(f"Unknown dynamic symbol ref id: {ref_id}")
+                    if isinstance(s, tirx.Var):
+                        shape.append(self._resolve_dynamic_symbolic_value(s, param_values))
                     else:  # Already converted to Python int during initialization
                         shape.append(s)
                 tensor = torch.empty(*shape, dtype=dtype, device=first_tensor.device)
@@ -350,16 +434,7 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
 
         # dynamic symbolics
         for sym in self.dynamic_symbolic_order:
-            ref_id, buffer_idx, dim_idx = self.dynamic_symbolic_map[sym]
-            ref_val = param_values[buffer_idx]
-            if not isinstance(ref_val, torch.Tensor):
-                raise TypeError(f"Dynamic symbolic var {sym} refers to a non-tensor param at index {buffer_idx}")
-            if ref_id == 0:
-                args.append(ref_val.shape[dim_idx])
-            elif ref_id == 1:
-                args.append(ref_val.stride()[dim_idx])
-            else:
-                raise ValueError(f"Unknown dynamic symbol ref id: {ref_id}")
+            args.append(self._resolve_dynamic_symbolic_value(sym, param_values, require_live_shape=False))
 
         # if stream is not None, we need to pass the stream to the library
         if stream is None:
@@ -424,6 +499,6 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
         self._cleanup_module(self.pymodule)
 
     @property
-    def prim_func(self) -> tir.PrimFunc:
+    def prim_func(self) -> tirx.PrimFunc:
         """Returns the primary TIR function from the IR module."""
         return retrieve_func_from_module(self.ir_module)

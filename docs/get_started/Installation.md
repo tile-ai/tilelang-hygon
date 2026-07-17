@@ -5,7 +5,7 @@
 **Prerequisites for installation via wheel or PyPI:**
 
 - **glibc**: 2.28 (Ubuntu 20.04 or later)
-- **Python Version**: >= 3.9
+- **Python Version**: >= 3.10
 - **CUDA Version**: >= 10.0 (host installation), or pip-provided CUDA toolchain (>= 13.0)
 
 The easiest way to install tilelang is directly from PyPI using pip. To install the latest version, run the following command in your terminal:
@@ -36,11 +36,11 @@ python -c "import tilelang; print(tilelang.__version__)"
 
 **Prerequisites for building from source:**
 
-- **Operating System**: Linux
-- **Python Version**: >= 3.9
+- **Operating System**: Linux or Windows
+- **Python Version**: >= 3.10
 - **CUDA Version**: >= 10.0 (host installation), or pip-provided CUDA toolchain (>= 13.0)
 
-If you prefer Docker, please skip to the [Install Using Docker](#install-using-docker) section. This section focuses on building from source on a native Linux environment.
+If you prefer Docker, please skip to the [Install Using Docker](#install-using-docker) section. The commands below use Ubuntu/Debian as the Linux example; Windows-specific notes are called out where they differ.
 
 First, install the OS-level prerequisites on Ubuntu/Debian-based systems using the following commands:
 
@@ -48,6 +48,8 @@ First, install the OS-level prerequisites on Ubuntu/Debian-based systems using t
 apt-get update
 apt-get install -y python3 python3-dev python3-setuptools gcc zlib1g-dev build-essential cmake libedit-dev
 ```
+
+On Windows, install Python 3, CMake, and Visual Studio Build Tools with the MSVC C++ toolchain. Run the `pip install` commands below from a Visual Studio Developer Command Prompt (or `call VsDevCmd.bat` first) so that `cl.exe` is on `PATH` and CMake can detect the compiler.
 
 Then, clone the tilelang repository and install it using pip. The `-v` flag enables verbose output during the build process.
 
@@ -122,6 +124,7 @@ Some useful CMake options you can toggle while configuring:
 - `-DUSE_CUDA=ON|OFF` builds against NVIDIA CUDA (default ON when CUDA headers are found).
 - `-DUSE_ROCM=ON` selects ROCm support when building on AMD GPUs.
 - `-DNO_VERSION_LABEL=ON` disables the backend/git suffix in `tilelang.__version__`.
+- `-DUSE_LLVM=ON` enables the LLVM backend for CPU codegen.
 
 (using-existing-tvm)=
 
@@ -268,7 +271,7 @@ pip install -e . -v --no-build-isolation --no-deps
 
 # Manually install required runtime deps when using --no-deps.
 # Note: skip torch-c-dlpack-ext on ROCm (its wheel expects CUDA libs).
-pip install "apache-tvm-ffi>=0.1.6" "z3-solver>=4.13.0"
+pip install "apache-tvm-ffi>=0.1.10,<=0.1.11" "z3-solver>=4.13.0"
 # If you already installed torch-c-dlpack-ext and hit `libtorch_cuda.so` errors:
 # pip uninstall -y torch-c-dlpack-ext
 
@@ -302,6 +305,8 @@ pip install tilelang -f https://tile-ai.github.io/whl/nightly
 `USE_ROCM`: If to enable ROCm support, default: `OFF`. If your ROCm SDK does not located in `/opt/rocm`, set `USE_ROCM=<rocm_sdk>` to enable build ROCm against custom sdk path.
 
 `USE_METAL`: If to enable Metal support, default: `ON` on Darwin.
+
+`USE_LLVM`: If to enable LLVM support for CPU codegen, default: `OFF`. Set `USE_LLVM=1` for auto-detection, or pass `-DUSE_LLVM=/path/to/llvm-config` through `CMAKE_ARGS` when you need a specific LLVM installation. LLVM 15 or newer is required.
 
 `TVM_ROOT`: TVM source root to use.
 

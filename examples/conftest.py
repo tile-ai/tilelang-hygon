@@ -4,6 +4,17 @@ import pytest
 
 os.environ["PYTHONHASHSEED"] = "0"
 
+
+def _configure_torch_extensions_dir():
+    cache_dir = os.environ.get("TILELANG_CACHE_DIR", os.path.expanduser("~/.tilelang/cache"))
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    path = os.path.join(cache_dir, "torch_extension", f"{worker}-{os.getpid()}")
+    os.makedirs(path, exist_ok=True)
+    os.environ["TORCH_EXTENSIONS_DIR"] = path
+
+
+_configure_torch_extensions_dir()
+
 random.seed(0)
 
 try:
@@ -28,11 +39,10 @@ else:
 # Known failures when running with TILELANG_TARGET=cutedsl.
 # These are marked as xfail(strict=False) so unexpected passes are reported.
 CUTEDSL_KNOWN_FAILURES = {
-    # Unimplemented sparse ops: tl.tl_gemm_sp
-    "sparse_tensorcore/test_example_sparse_tensorcore.py::test_tilelang_example_sparse_tensorcore",
-    "gemm_sp/test_example_gemm_sp.py::test_example_gemm_sp",
     # Flaky — passes when run in isolation, fails under parallel execution
     "minference/test_vs_sparse_attn.py::test_vs_sparse_attn",
+    # CuTeDSL does not yet lower DeepSeek V4 FP4 act quant conversions.
+    "deepseek_v4/test_tilelang_example_deepseek_v4.py::test_example_act_quant",
 }
 
 # HCU gfx validated for examples that rely on FP8/MMAC lowering.
@@ -54,7 +64,8 @@ def _match_any(nodeid, patterns):
 def _unsupported_hcu_fp8_mmac_target():
     try:
         from tilelang import tvm
-        from tilelang.utils.target import determine_target, target_is_hcu
+        from tilelang.backend.target import determine_target
+        from tilelang.hcu.target import target_is_hcu
 
         target = tvm.target.Target(determine_target("auto"))
         mcpu = target.attrs.get("mcpu") if target_is_hcu(target) else None

@@ -17,19 +17,6 @@ from tilelang.carver.roller.rasterization import NoRasterization
 from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
 
 
-# from aiter.ops.triton.gemm_unquantized import gemm_unquantized
-
-
-def triton_gemm(A, B):
-    """
-    Compute the matrix product of A and the transpose of B.
-
-    A and B are expected to be 2-D tensors where A has shape (M, K) and B has shape (N, K).
-    The result is a tensor with shape (M, N) equal to A @ B.T, using the inputs' dtypes.
-    """
-    return A @ B.T
-
-
 def ref_program(A, B):
     """
     Compute the matrix product of A and the transpose of B.

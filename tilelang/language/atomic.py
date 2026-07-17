@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import tilelang.language as T
 from tvm import ir
-from tvm.tir import PrimExpr, Buffer, op
+from tvm.tirx import PrimExpr, Buffer, op
 from tilelang.utils.language import to_buffer_region, legalize_pairwise_extents
 from tilelang.language.utils import get_extent
 
@@ -454,4 +454,18 @@ def atomic_store(dst: Buffer, src: PrimExpr, memory_order: str = "seq_cst") -> P
         T.access_ptr(dst, "w"),
         src,
         _MEMORY_ORDER_ID_MAP[memory_order],
+    )
+
+
+def atomic_or(dst: Buffer, value: PrimExpr, memory_order: str | None = None) -> PrimExpr:
+    """Atomically bitwise-or an integer scalar address."""
+    if get_extent(dst) is not None or get_extent(value) is not None:
+        raise NotImplementedError("atomic_or currently supports scalar addresses only")
+    memory_order_id = _MEMORY_ORDER_ID_MAP[memory_order] if memory_order else 0
+    return T.call_intrin(
+        "handle",
+        op.Op.get("tl.atomic_or_elem_op"),
+        T.access_ptr(dst, "rw"),
+        value,
+        memory_order_id,
     )

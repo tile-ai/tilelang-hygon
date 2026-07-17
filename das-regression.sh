@@ -156,7 +156,6 @@ TILELANG_EXAMPLES_NODEIDS=(
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/minference/test_vs_sparse_attn.py")"
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/norm/test_rms_norm.py")"
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/seer_attention/test_block_sparse_attn_tilelang.py")"
-  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/sparse_tensorcore/test_example_sparse_tensorcore.py")"
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/topk/test_topk_tilelang.py")"
   # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/warp_specialize/test_example_warp_specialize.py")"
 )

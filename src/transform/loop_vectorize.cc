@@ -26,23 +26,27 @@
 #include "../config.h"
 #include "../op/builtin.h"
 #include "../op/utils.h"
-#include "../target/utils.h"
 #include "arith/int_operator.h"
 #include "arith/ir_visitor_with_analyzer.h"
+#include "backend/common/target_utils.h"
 #include "common/loop_vectorization_utils.h"
-#include "tvm/tir/analysis.h"
-#include "tvm/tir/var.h"
+#include "support/check.h"
 #include <iostream>
 #include <optional>
 #include <tvm/arith/iter_affine_map.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/stmt_functor.h>
+#include <tvm/ir/cast.h>
+#include <tvm/runtime/logging.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/var.h>
 #include <vector>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using namespace ffi;
 
 /*!
  * \brief Check if buffer strides represent a contiguous (row-major) layout.
@@ -153,10 +157,20 @@ private:
  * local buffer optimization.
  */
 bool ForBodyContainsSeqStmt(const For &loop) {
+  // Ignore flat Bind nodes (SSA value defs): a single store wrapped in leading
+  // Binds is not multi-stmt. Keeps this in sync with DecoupleTypeCast.
   bool has_seq_stmt = false;
   PostOrderVisit(loop->body, [&](const ObjectRef &obj) {
-    if (obj.as<SeqStmtNode>()) {
-      has_seq_stmt = true;
+    if (auto seq = obj.as<SeqStmtNode>()) {
+      int num_real_stmts = 0;
+      for (const Stmt &s : seq->seq) {
+        if (!s.as<BindNode>()) {
+          ++num_real_stmts;
+        }
+      }
+      if (num_real_stmts >= 2) {
+        has_seq_stmt = true;
+      }
     }
   });
   return has_seq_stmt;
@@ -165,8 +179,10 @@ bool ForBodyContainsSeqStmt(const For &loop) {
 class VectorizePlanner : public arith::IRMutatorWithAnalyzer {
 public:
   explicit VectorizePlanner(arith::Analyzer *analyzer,
-                            const LayoutMap &layout_map = {})
-      : arith::IRMutatorWithAnalyzer(analyzer), layout_map_(layout_map) {}
+                            const LayoutMap &layout_map = {},
+                            const Map<Var, ReducerInfo> &reducer_info_map = {})
+      : arith::IRMutatorWithAnalyzer(analyzer), layout_map_(layout_map),
+        reducer_info_map_(reducer_info_map) {}
 
   int Plan(const For &node) {
     bool disable_vectorize_256 = tl_config::Vectorize256Disabled();
@@ -376,7 +392,7 @@ private:
       // tiling size is always static.
       if (!extent_ptr) {
         loop_extent_vector_size_ = 1;
-        return ffi::GetRef<Stmt>(node);
+        return GetRef<Stmt>(node);
       }
       loop_extent_vector_size_ =
           arith::ZeroAwareGCD(initial_vector_size_, *extent_ptr);
@@ -552,7 +568,7 @@ private:
       if (!inner_for_)
         return true;
       bool all_invariant = true;
-      PostOrderVisit(ffi::GetRef<PrimExpr>(node), [&](const ObjectRef &obj) {
+      PostOrderVisit(GetRef<PrimExpr>(node), [&](const ObjectRef &obj) {
         if (!all_invariant)
           return;
         if (auto *load = obj.as<BufferLoadNode>()) {
@@ -610,7 +626,18 @@ private:
   }
 
   void CheckConditionVectorized(const PrimExpr &cond) {
-    // TODO: perform some checks here
+    if (!inner_for_) {
+      return;
+    }
+    PrimExpr condition = analyzer_->Simplify(cond);
+    int condition_vector_size = loop_extent_vector_size_;
+    while (condition_vector_size > 1 &&
+           !IsExprInvariantInVectorBoundary(condition, inner_for_->loop_var,
+                                            condition_vector_size, analyzer_)) {
+      condition_vector_size /= 2;
+    }
+    buffer_vector_infos_.push_back(
+        {Buffer(), condition_vector_size, false, {}});
   }
 
   void HandleTvmAccessPtr(const CallNode *node) {
@@ -622,7 +649,7 @@ private:
         << "tvm_access_ptr requires at least 3 args";
 
     // args[0] is TypeAnnotation(dtype[/lanes]); dtype() encodes the element
-    // type. See tvm::tir::Buffer::access_ptr implementation.
+    // type. See tvm::tirx::Buffer::access_ptr implementation.
     DataType dtype = node->args[0].dtype();
     Var data_var;
     if (auto data_var_node = node->args[1].as<VarNode>()) {
@@ -725,6 +752,16 @@ private:
     return transformed_indices;
   }
 
+  bool IsAllRepReducerBuffer(const Buffer &buffer) const {
+    if (!buffer.defined()) {
+      return false;
+    }
+    if (auto info = reducer_info_map_.Get(buffer->data)) {
+      return info.value()->rep == ReducerRepType::ALL;
+    }
+    return false;
+  }
+
   PrimExpr VisitExpr_(const CastNode *node) final {
     // Consider both source and target types to ensure all intermediate
     // vector types can be represented. For example, casting int32 to
@@ -738,6 +775,22 @@ private:
       max_lanes = std::min(target_lanes, source_lanes);
     }
     int cast_vector_size = arith::ZeroAwareGCD(max_lanes, initial_vector_size_);
+    // For casts that carry a "rbits" annotation (stochastic rounding), the
+    // rbits operand must be invariant within the vectorized boundary so the
+    // same value can be shared across the lanes of each PTX cvt.rs.*
+    // instruction. Halve the vector size until invariance holds, mirroring
+    // the call-node fallback above.
+    if (inner_for_) {
+      auto it = node->annotations.find("rbits");
+      if (it != node->annotations.end()) {
+        PrimExpr rbits = Downcast<PrimExpr>((*it).second);
+        while (cast_vector_size > 1 &&
+               !IsExprInvariantInVectorBoundary(rbits, inner_for_->loop_var,
+                                                cast_vector_size, analyzer_)) {
+          cast_vector_size /= 2;
+        }
+      }
+    }
     // Record cast constraint (use empty buffer to indicate cast)
     // Mark is_cast=true so Plan() can distinguish cast from other call nodes
     buffer_vector_infos_.push_back(
@@ -790,10 +843,15 @@ private:
     // 3. If element offset is independent with loop_var, ignore it.
     bool is_independent =
         CanProveIndependent(elem_offset, inner_for_->loop_var, analyzer_);
-    // For BufferStore, if indices is invariant or independent with loop_var,
-    // we should not vectorize it (broadcasting store is not supported).
+    // For ordinary BufferStore, if indices are invariant or independent with
+    // loop_var, vectorization would turn scalar lane stores into a broadcast
+    // store. Keep those scalar. All-rep reducer buffers are different: their
+    // loop-invariant stores are reduction accumulator updates, so they should
+    // not force the whole loop's vector size down to 1.
     if (is_store && (is_invariant || is_independent)) {
-      return 1;
+      if (!IsAllRepReducerBuffer(buffer)) {
+        return 1;
+      }
     }
     if (is_independent) {
       return buffer_vec_size; // only limited constraint from this buffer
@@ -815,27 +873,24 @@ private:
         {buffer, buffer_vec_size, is_store, indices});
   }
 
-  // NOTE(wt): The base class IRMutatorWithAnalyzer::VisitStmt_(LetStmtNode*)
+  // NOTE(wt): The base class IRMutatorWithAnalyzer::VisitStmt_(BindNode*)
   // binds let variables, but this causes issues when the same variable name
   // appears multiple times with different values (e.g., in pipelined loops
   // where the body is duplicated). For this case, we allow the analyzer to
   // override the binding. Check the impl of
-  // IRMutatorWithAnalyzer::VisitStmt_(LetStmtNode*) in:
+  // IRMutatorWithAnalyzer::VisitStmt_(BindNode*) in:
   // tvm/src/arith/ir_mutator_with_analyzer.cc
-  Stmt VisitStmt_(const LetStmtNode *op) final {
+  Stmt VisitStmt_(const BindNode *op) final {
     PrimExpr value = this->VisitExpr(op->value);
     if (SideEffect(value) <= CallEffectKind::kPure) {
       // Allow override to handle duplicated loop bodies in pipelined loops
       analyzer_->Bind(op->var, value, /*allow_override=*/true);
     }
-    // Continue visiting the body to collect vectorization info
-    Stmt body = this->VisitStmt(op->body);
-    if (value.same_as(op->value) && body.same_as(op->body)) {
-      return ffi::GetRef<Stmt>(op);
+    if (value.same_as(op->value)) {
+      return GetRef<Stmt>(op);
     } else {
       auto n = this->CopyOnWrite(op);
       n->value = std::move(value);
-      n->body = std::move(body);
       return Stmt(n);
     }
   }
@@ -849,6 +904,7 @@ private:
   int vector_size_ = 128;
   std::vector<BufferVectorInfo> buffer_vector_infos_;
   LayoutMap layout_map_;
+  Map<Var, ReducerInfo> reducer_info_map_;
 };
 
 class VectorizeRewriter : public StmtExprMutator {
@@ -906,22 +962,23 @@ private:
   const int vector_size_;
 };
 
-int GetVectorizeSize(const For &loop, const LayoutMap &layout_map) {
+int GetVectorizeSize(const For &loop, const LayoutMap &layout_map,
+                     const Map<Var, ReducerInfo> &reducer_info_map) {
   arith::Analyzer analyzer;
-  return VectorizePlanner(&analyzer, layout_map).Plan(loop);
+  return VectorizePlanner(&analyzer, layout_map, reducer_info_map).Plan(loop);
 }
 
 int GetVectorizeSize(const For &loop, arith::Analyzer *analyzer,
-                     const LayoutMap &layout_map) {
-  return VectorizePlanner(analyzer, layout_map).Plan(loop);
+                     const LayoutMap &layout_map,
+                     const Map<Var, ReducerInfo> &reducer_info_map) {
+  return VectorizePlanner(analyzer, layout_map, reducer_info_map).Plan(loop);
 }
 
 bool CanProveIndependent(const PrimExpr &expr, Var var,
                          arith::Analyzer *analyzer) {
   // 1. if var doesn't exist, it is independent
-  bool used_var = UsesVar(expr, [&](const VarNode *v) {
-    return tvm::ffi::GetRef<Var>(v).same_as(var);
-  });
+  bool used_var = UsesVar(
+      expr, [&](const VarNode *v) { return GetRef<Var>(v).same_as(var); });
   if (!used_var) {
     return true;
   }

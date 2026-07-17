@@ -8,18 +8,23 @@
 #define TVM_TL_OP_GEMM_H_
 
 #include "operator.h"
+#include "support/check.h"
+
+#include <utility>
 
 namespace tvm {
 
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using namespace ffi;
 
 enum class GemmWarpPolicyType : uint8_t {
   kSquare = 0,
   kFullRow = 1,
   kFullCol = 2,
-  kFullColK = 3,
+  kFullColK =
+      3, // HCU: partition warps along K (Python GemmWarpPolicy.FullColK)
   kFree = 4,
 };
 
@@ -32,42 +37,10 @@ inline const char *GemmWarpPolicyTypeToString(GemmWarpPolicyType type) {
     return "FullRow";
   case GemmWarpPolicyType::kFullCol:
     return "FullCol";
+  case GemmWarpPolicyType::kFullColK:
+    return "FullColK";
   case GemmWarpPolicyType::kFree:
     return "Free";
-  default:
-    return "Unknown";
-  }
-}
-
-// Target GEMM instruction
-enum class GemmInst : uint8_t {
-  kMMA,
-  kWGMMA,
-  kTCGEN5MMA,
-  kMFMA,
-  kScalar,
-  kWMMA,
-  kHCUMMAC, ///< AMD HCU matrix core (distinct from CDNA MFMA; Python
-            ///< GemmHCUMMAC)
-};
-
-/// Convert GemmInst enum to string for debugging
-inline const char *GemmInstToString(GemmInst inst) {
-  switch (inst) {
-  case GemmInst::kMMA:
-    return "MMA";
-  case GemmInst::kWGMMA:
-    return "WGMMA";
-  case GemmInst::kTCGEN5MMA:
-    return "TCGEN5MMA";
-  case GemmInst::kMFMA:
-    return "MFMA";
-  case GemmInst::kScalar:
-    return "Scalar";
-  case GemmInst::kWMMA:
-    return "WMMA";
-  case GemmInst::kHCUMMAC:
-    return "HCUMMAC";
   default:
     return "Unknown";
   }
@@ -83,7 +56,7 @@ public:
   TVM_FFI_DECLARE_OBJECT_INFO("tl.GemmWarpPolicy", GemmWarpPolicyNode, Object);
 
   static void RegisterReflection() {
-    namespace refl = tvm::ffi::reflection;
+    namespace refl = reflection;
     refl::ObjectDef<GemmWarpPolicyNode>()
         .def_ro("policy_type", &GemmWarpPolicyNode::policy_type)
         .def_ro("m_warp", &GemmWarpPolicyNode::m_warp)
@@ -91,30 +64,23 @@ public:
         .def_ro("k_warp", &GemmWarpPolicyNode::k_warp);
   }
 
-  std::pair<int, int> computeWarpPartition(int M, int N, int block_size,
+  std::pair<int, int> ComputeWarpPartition(int M, int N, int block_size,
                                            Target target,
-                                           GemmInst gemm_inst) const;
+                                           String gemm_inst) const;
 
-  std::tuple<int, int, int>
-  computeWarpPartitionHCU(int M, int N, int K, int k_pack,
-                          int element_byte_size, int block_size, Target target,
-                          GemmInst gemm_inst, bool A_from_mls = false,
-                          bool B_from_mls = false, bool A_mls_trans = true,
-                          bool B_mls_trans = true) const;
-
-  bool isSquare() const {
+  bool IsSquare() const {
     return policy_type == int(GemmWarpPolicyType::kSquare);
   }
-  bool isFullRow() const {
+  bool IsFullRow() const {
     return policy_type == int(GemmWarpPolicyType::kFullRow);
   }
-  bool isFullCol() const {
+  bool IsFullCol() const {
     return policy_type == int(GemmWarpPolicyType::kFullCol);
   }
-  bool isFullColK() const {
+  bool IsFullColK() const {
     return policy_type == int(GemmWarpPolicyType::kFullColK);
   }
-  bool isFree() const { return policy_type == int(GemmWarpPolicyType::kFree); }
+  bool IsFree() const { return policy_type == int(GemmWarpPolicyType::kFree); }
 };
 
 class GemmWarpPolicy : public ObjectRef {
@@ -123,22 +89,21 @@ public:
                                              GemmWarpPolicyNode);
 
   explicit GemmWarpPolicy(GemmWarpPolicyType policy_type) {
-    auto node = tvm::ffi::make_object<GemmWarpPolicyNode>();
+    auto node = make_object<GemmWarpPolicyNode>();
     node->policy_type = (int)policy_type;
     data_ = std::move(node);
   }
 
   explicit GemmWarpPolicy(int policy_type) {
-    auto node = tvm::ffi::make_object<GemmWarpPolicyNode>();
+    auto node = make_object<GemmWarpPolicyNode>();
     node->policy_type = policy_type;
     data_ = std::move(node);
   }
 
-  explicit GemmWarpPolicy(int m_warp, int n_warp, int k_warp = 1) {
-    auto node = tvm::ffi::make_object<GemmWarpPolicyNode>();
+  explicit GemmWarpPolicy(int m_warp, int n_warp) {
+    auto node = make_object<GemmWarpPolicyNode>();
     node->m_warp = m_warp;
     node->n_warp = n_warp;
-    node->k_warp = k_warp;
     node->policy_type = (int)GemmWarpPolicyType::kFree;
     data_ = std::move(node);
   }
@@ -146,18 +111,16 @@ public:
 
 class GemmNode : public TileOperatorNode {
 public:
-  bool checkWgmma() const;
-  bool allowTcgen5Mma(Target target) const;
-  bool allowWgmma(int block_size, Target target) const;
-  tir::Buffer a_, b_, c_;
+  tirx::Buffer a_, b_, c_;
   // BufferRegion for A, B and C
   BufferRegion aRegion_, bRegion_, cRegion_;
   bool transA_, transB_;
   int m_, n_, k_;
   int strideA_, strideB_;
-  int offsetA_, offsetB_;
+  // Offsets may be symbolic (e.g. a sliced operand B[:, j*64:...] in a loop).
+  PrimExpr offsetA_, offsetB_;
   PrimExpr clearAccum_ = const_false();
-  tir::BufferLoad mbar_; // mbar is optional, only used for TCGEN5MMA
+  tirx::BufferLoad mbar_; // mbar is optional, only used for TCGEN5MMA
   Array<PrimExpr> cCoords_;
   // k_pack please ref to bitblas/tl/mfma_macro_generator.py::k_pack
   // only will be enabled under cdna mfma instructions
@@ -167,11 +130,13 @@ public:
   bool isTcgen05_ = false;
   mutable GemmWarpPolicy policy_;
   Map<String, ObjectRef> annotations_;
+  BufferRegion sfaRegion_, sfbRegion_;
+  PrimExpr sfKStart_;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Gemm", GemmNode, TileOperatorNode);
 
   static void RegisterReflection() {
-    namespace refl = tvm::ffi::reflection;
+    namespace refl = reflection;
     refl::ObjectDef<GemmNode>()
         .def_ro("a", &GemmNode::a_)
         .def_ro("b", &GemmNode::b_)
@@ -196,21 +161,43 @@ public:
         .def_ro("isWgmma", &GemmNode::isWgmma_)
         .def_ro("isTcgen05", &GemmNode::isTcgen05_)
         .def_ro("policy", &GemmNode::policy_)
-        .def_ro("annotations", &GemmNode::annotations_);
+        .def_ro("annotations", &GemmNode::annotations_)
+        .def_ro("sfaRegion", &GemmNode::sfaRegion_)
+        .def_ro("sfbRegion", &GemmNode::sfbRegion_)
+        .def_ro("sfKStart", &GemmNode::sfKStart_);
   }
 
-  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
-  LayoutMap InferLayout(const LayoutInferArgs &T,
+  Stmt Lower(const LowerArgs &lower_args,
+             arith::Analyzer *analyzer) const override;
+  LayoutMap InferLayout(const LayoutInferArgs &layout_args,
                         InferLevel level) const override;
   AccessRegions GetAccessRegions() const override;
 
-  TileOperator Clone() const override;
+  TileOperator Clone() const;
 
-  GemmInst getGemmInst(int block_size, Target target) const;
+  // Target-specific GEMM instruction key.
+  String GetGemmInstructionKey(int block_size, Target target) const;
 
 private:
   mutable bool completed_ = false;
 };
+
+using GemmTargetPredicate = bool (*)(Target target);
+
+struct GemmImpl {
+  const char *name;
+  GemmTargetPredicate match_target;
+
+  String (*select_inst)(const GemmNode &op, int block_size, Target target);
+
+  std::pair<int, int> (*compute_warp_partition)(
+      const GemmWarpPolicyNode &policy, int M, int N, int block_size,
+      Target target, String gemm_inst);
+
+  bool (*reuse_existing_shared_layout)(String gemm_inst);
+};
+
+void RegisterGemmImpl(GemmImpl impl);
 
 class Gemm : public TileOperator {
 public:

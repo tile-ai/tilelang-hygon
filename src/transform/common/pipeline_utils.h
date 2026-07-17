@@ -5,34 +5,27 @@
  * Provides:
  *  - Pipeline annotation attribute keys
  *  - GetPipelineNumStages()  — extract num_stages from loop annotations
+ *  - IsPipelineDeclarationStmt() — identify non-stage buffer declarations
  *  - ComputeThreadBounds()  — derive thread bounds from an analyzer + IterVar
  */
 #ifndef TVM_TL_TRANSFORM_COMMON_PIPELINE_UTILS_H_
 #define TVM_TL_TRANSFORM_COMMON_PIPELINE_UTILS_H_
 
-#include <tvm/tir/stmt.h>
+#include "support/check.h"
+#include <tvm/arith/analyzer.h>
+#include <tvm/ir/cast.h>
+#include <tvm/s_tir/stmt.h>
+#include <tvm/tirx/stmt.h>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 // ---------------------------------------------------------------------------
 // Pipeline annotation attribute keys
 // ---------------------------------------------------------------------------
 
-/*! Marks the enclosing scope with the pipeline stage count. */
-static constexpr const char *kPipelineContextNumStages =
-    "tl.pipeline_context_num_stages";
-/*! Multi-version buffer: stage count for buffer expansion. */
-static constexpr const char *kPipelineMVBContextNumStages =
-    "tl.pipeline_mvb_num_stages";
-/*! Multi-version buffer: per-statement stage index expression. */
-static constexpr const char *kPipelineMVBStageExpr =
-    "tl.pipeline_mvb_stage_expr";
-/*! Multi-version buffer: per-statement parity expression. */
-static constexpr const char *kPipelineMVBParityExpr =
-    "tl.pipeline_mvb_parity_expr";
 /*! Per-statement TMA copy flag (1 = TMA eligible, 0 = not). */
 static constexpr const char *kPipelineTmaCopies =
     "software_pipeline_tma_copies";
@@ -42,6 +35,40 @@ static constexpr const char *kPipelineAsyncProducers =
 /*! Per-statement async producer group id (-1 = not an async producer). */
 static constexpr const char *kPipelineAsyncProducerGroups =
     "software_pipeline_async_producer_groups";
+/*! Per-original-statement replayable scalar Bind flag (1 = replayable). */
+static constexpr const char *kPipelineReplayableScalarBinds =
+    "software_pipeline_replayable_scalar_binds";
+
+/*! \brief Whether a flat TIRX statement declares pipeline-local buffer storage.
+ *
+ * Flat TIRX represents buffer allocations/declarations as standalone
+ * statements. They must stay in the loop body so later rewrites can preserve
+ * storage, but they are declarations rather than executable pipeline stages.
+ */
+inline bool IsPipelineDeclarationStmt(const Stmt &stmt) {
+  return stmt.as<AllocBufferNode>() != nullptr ||
+         stmt.as<DeclBufferNode>() != nullptr;
+}
+
+/*! \brief Return the top-level statement stream for a pipeline loop body.
+ *
+ * IfStmtBinding may preserve an if-body that starts with Bind as a single
+ * IfThenElse, so a valid pipeline body is not necessarily a SeqStmt. Keep the
+ * downstream planning code Array-based and only reconstruct SeqStmt when there
+ * are multiple children.
+ */
+inline ffi::Array<Stmt> NormalizePipelineBody(const Stmt &body) {
+  if (const auto *seq = body.as<SeqStmtNode>()) {
+    return seq->seq;
+  }
+  return ffi::Array<Stmt>{body};
+}
+
+/*! \brief Build a valid TIRX statement from a pipeline statement stream. */
+inline Stmt MakePipelineBody(const ffi::Array<Stmt> &stmts) {
+  ICHECK(!stmts.empty());
+  return stmts.size() == 1 ? stmts[0] : SeqStmt(stmts);
+}
 
 // ---------------------------------------------------------------------------
 // GetPipelineNumStages
@@ -53,11 +80,11 @@ static constexpr const char *kPipelineAsyncProducerGroups =
  * Checks (in order):
  *   1. "num_stages" — user-provided stage count
  *   2. "tl_pipelined_num_stages" — set by InjectSoftwarePipeline
- *   3. tir::attr::software_pipeline_stage — max(stage) + 1
+ *   3. s_tir::attr::software_pipeline_stage — max(stage) + 1
  *
  * \return The stage count, or nullopt if the loop is not pipelined.
  */
-inline Optional<Integer> GetPipelineNumStages(const ForNode *loop) {
+inline ffi::Optional<Integer> GetPipelineNumStages(const ForNode *loop) {
   if (auto num_stages = loop->annotations.Get("num_stages")) {
     if (const auto *imm = num_stages->as<IntImmNode>()) {
       return Integer(static_cast<int>(imm->value));
@@ -69,8 +96,8 @@ inline Optional<Integer> GetPipelineNumStages(const ForNode *loop) {
     }
   }
   if (auto stages_anno =
-          loop->annotations.Get(tir::attr::software_pipeline_stage)) {
-    auto stages = Downcast<Array<Integer>>(stages_anno.value());
+          loop->annotations.Get(s_tir::attr::software_pipeline_stage)) {
+    auto stages = Downcast<ffi::Array<Integer>>(stages_anno.value());
     int max_stage = -1;
     for (const auto &stage : stages) {
       max_stage = std::max(max_stage, static_cast<int>(stage->value));
@@ -79,7 +106,7 @@ inline Optional<Integer> GetPipelineNumStages(const ForNode *loop) {
       return Integer(max_stage + 1);
     }
   }
-  return Optional<Integer>();
+  return ffi::Optional<Integer>();
 }
 
 // ---------------------------------------------------------------------------

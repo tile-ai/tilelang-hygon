@@ -52,6 +52,9 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_DATA_RACE_CHECK = "tl.disable_data_race_check"
     """Disable data race check in TileLang. Default: False"""
 
+    TL_DISABLE_PRELOWER_SEMANTIC_CHECK = "tl.disable_prelower_semantic_check"
+    """Disable Python-side pre-lower semantic checks. Default: False"""
+
     TL_DISABLE_WARP_SPECIALIZED = "tl.disable_warp_specialized"
     """Disable warp specialization optimization. Default: False"""
 
@@ -64,9 +67,6 @@ class PassConfigKey(str, Enum):
     TL_PTXAS_REGISTER_USAGE_LEVEL = "tl.ptxas_register_usage_level"
     """The PTXAS register usage level in [0, 10], which controls the
     aggressiveness of optimizations that affect register usage. Default: None"""
-
-    TL_ENABLE_PTXAS_VERBOSE_OUTPUT = "tl.enable_ptxas_verbose_output"
-    """Enable ptxas verbose output. Default: False"""
 
     TL_DEVICE_COMPILE_FLAGS = "tl.device_compile_flags"
     """Additional device compiler flags passed to nvcc/NVRTC.
@@ -120,9 +120,14 @@ class PassConfigKey(str, Enum):
     Explicit `T.async_copy` still requires cp.async support and may error if
     it cannot be lowered.
 
-    Default: True on most targets. For HCU targets outside the whitelist in
-    ``src/target/utils.cc`` (``IsHCUEnableAutoAsyncCopyTarget``), ``@tilelang.jit``
-    injects False unless the user sets this key explicitly.
+    Default: True
+    """
+
+    TL_ENABLE_HCU_WDRA = "tl.enable_hcu_wdra"
+    """Enable HCU WDRA lowering/validation and WDRA vgpr-greedy-alloc compile
+    flags for gfx946 warp-specialized kernels using ``tl.set_max_nreg``.
+
+    Default: False
     """
 
     TL_ENABLE_LOWER_LDGSTG = "tl.enable_lower_ldgstg"
@@ -151,6 +156,12 @@ class PassConfigKey(str, Enum):
     TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE = "tl.enable_aggressive_shared_memory_merge"
     """Enable aggressive merge of shared memory allocations. Default: False"""
 
+    TL_DISABLE_SHARED_MEMORY_REUSE = "tl.disable_shared_memory_reuse"
+    """Disable shared memory reuse planning in MergeSharedMemoryAllocations.
+    When enabled, shared memory allocations are still merged into a single
+    allocation but each buffer gets its own dedicated region without lifetime-based
+    reuse. Default: False"""
+
     TL_DISABLE_SHUFFLE_ELECT = "tl.disable_shuffle_elect"
     """Disable shuffle election optimization. Default: False"""
 
@@ -163,16 +174,23 @@ class PassConfigKey(str, Enum):
     This is more aggressive and may increase code size. Default: False.
     """
 
+    TL_IF_STMT_BINDING_INLINE_REPLAYABLE_BINDS = "tl.if_stmt_binding_inline_replayable_binds"
+    """Inline replayable scalar Bind statements while distributing if conditions.
+
+    When True (default), IfStmtBinding may rewrite a guarded sequence such as
+    ``if cond: idx = ids[i]; copy(idx); gemm()`` into separately guarded
+    statements with ``idx`` substituted at each use, provided the Bind does not
+    read a buffer written inside the same guarded body. This exposes copy and
+    compute statements to pipeline planning while preserving non-replayable
+    Bind scopes.
+    """
+
     TL_DISABLE_THREAD_STORAGE_SYNC = "tl.disable_thread_storage_sync"
     """Disable thread storage synchronization pass. When enabled, disables the
     automatic insertion of thread synchronization barriers (e.g., __syncthreads())
     for shared memory access coordination. This can be useful for performance
     optimization in cases where manual synchronization is preferred or when
     synchronization is not needed. Default: False"""
-
-    TL_ENABLE_HCU_WDRA = "tl.enable_hcu_wdra"
-    """Enable HCU WDRA lowering/validation and WDRA vgpr-greedy-alloc compile
-    flags. Required when the kernel uses tl.set_max_nreg. Default: False"""
 
     TL_FORCE_LET_INLINE = "tl.force_let_inline"
     """Force TileLang to inline let bindings during simplification. Default: False"""
@@ -196,10 +214,8 @@ class PassConfigKey(str, Enum):
     such as `dst[i] = f(src[i])`, avoiding implicit aliasing:
 
     ```
-    read = T.allocate([1], T.int32, "local.var")
-    write = T.allocate([1], T.int32, "local.var")
-    read_buf = T.Buffer((1,), T.int32, data=read, scope="local.var")
-    write_buf = T.Buffer((1,), T.int32, data=write, scope="local.var")
+    read_buf = T.alloc_buffer((1,), T.int32, scope="local.var")
+    write_buf = T.alloc_buffer((1,), T.int32, scope="local.var")
     write_buf[0] = read_buf[0] * 2
     f(write_buf[0])
     ```
@@ -209,8 +225,7 @@ class PassConfigKey(str, Enum):
     like:
 
     ```
-    read = T.allocate([1], T.int32, "local.var")
-    read_buf = T.Buffer((1,), T.int32, data=read, scope="local.var")
+    read_buf = T.alloc_buffer((1,), T.int32, scope="local.var")
     read_buf[0] = read_buf[0] * 2
     f(read_buf[0])
     ```
@@ -234,36 +249,31 @@ class PassConfigKey(str, Enum):
     TIR_ENABLE_EQUIV_TERMS_IN_CSE = "tir.enable_equiv_terms_in_cse_tir"
     """Enable equivalent terms in TIR Common Subexpression Elimination. Default: True"""
 
-    TIR_DISABLE_CSE = "tir.disable_cse_tir"
+    TIR_DISABLE_CSE = "tirx.disable_cse_tir"
     """Disable TIR Common Subexpression Elimination. Default: False"""
 
-    TIR_SIMPLIFY = "tir.Simplify"
+    TIR_SIMPLIFY = "tirx.Simplify"
     """Enable/disable TIR simplification passes. Default: True"""
 
-    TIR_DISABLE_STORAGE_REWRITE = "tir.disable_storage_rewrite"
+    TIR_DISABLE_STORAGE_REWRITE = "tirx.disable_storage_rewrite"
     """Disable storage rewrite optimization. Default: False"""
 
-    TIR_DISABLE_VECTORIZE = "tir.disable_vectorize"
+    TIR_DISABLE_VECTORIZE = "tirx.disable_vectorize"
     """Disable vectorization optimization. Default: False"""
 
-    TIR_USE_ASYNC_COPY = "tir.use_async_copy"
-    """Enable asynchronous memory copy operations in pipeline planning.
+    TIR_USE_ASYNC_COPY = "tirx.use_async_copy"
+    """Enable asynchronous memory copy operations. Default: True"""
 
-    Default: True on most targets. For HCU targets outside the whitelist in
-    ``src/target/utils.cc`` (``IsHCUEnableAutoAsyncCopyTarget``), ``@tilelang.jit``
-    injects False together with ``tl.enable_async_copy`` unless set explicitly.
-    """
-
-    TIR_ENABLE_DEBUG = "tir.enable_debug"
+    TIR_ENABLE_DEBUG = "tirx.enable_debug"
     """Enable debug information in generated code. Default: False"""
 
-    TIR_MERGE_STATIC_SMEM = "tir.merge_static_smem"
+    TIR_MERGE_STATIC_SMEM = "tirx.merge_static_smem"
     """Merge static shared memory allocations. Default: True"""
 
-    TIR_ADD_LOWER_PASS = "tir.add_lower_pass"
+    TIR_ADD_LOWER_PASS = "tirx.add_lower_pass"
     """Additional lowering passes to be applied. Default: None"""
 
-    TIR_NOALIAS = "tir.noalias"
+    TIR_NOALIAS = "tirx.noalias"
     """Enable pointer non-aliasing assumptions. Default: True"""
 
     # Output debugging options
@@ -272,7 +282,7 @@ class PassConfigKey(str, Enum):
     """Output directory for generated CUDA kernels. Default: empty string"""
 
     TL_DISABLE_OUT_OF_BOUND_WARNING = "tl.disable_out_of_bound_warning"
-    """Disable out-of-bound access warnings in safe memory access legalization. Default: False"""
+    """Disable out-of-bound access warnings in safe memory access legalization. Default: True"""
 
     TL_ENABLE_DUMP_IR = "tl.enable_dump_ir"
     """Enable dumping IR during lowering between passes. Default: False"""
@@ -288,11 +298,7 @@ _DEPRECATED_PASS_CONFIG_MESSAGES = {
 }
 
 
-def _pass_config_explicitly_set(pass_configs: dict[str, Any], key: PassConfigKey) -> bool:
-    return key in pass_configs or key.value in pass_configs
-
-
-def normalize_pass_configs(pass_configs: dict[str, Any] | None) -> dict[str, Any]:
+def normalize_pass_configs(pass_configs: dict[str | PassConfigKey, Any] | None) -> dict[str, Any]:
     """Canonicalize known pass-config keys and emit compatibility warnings."""
     if pass_configs is None:
         return {}
@@ -301,41 +307,34 @@ def normalize_pass_configs(pass_configs: dict[str, Any] | None) -> dict[str, Any
     warned_keys: set[str] = set()
 
     for key, value in pass_configs.items():
-        normalized_key = key
-        if isinstance(key, str):
-            try:
-                normalized_key = PassConfigKey(key)
-            except ValueError:
-                normalized_key = key
+        normalized_key = key.value if isinstance(key, PassConfigKey) else key
 
         normalized[normalized_key] = value
 
-        warning_key = normalized_key.value if isinstance(normalized_key, PassConfigKey) else normalized_key
-        if warning_key in _DEPRECATED_PASS_CONFIG_MESSAGES and warning_key not in warned_keys:
-            warnings.warn(_DEPRECATED_PASS_CONFIG_MESSAGES[warning_key], DeprecationWarning, stacklevel=3)
-            warned_keys.add(warning_key)
+        if normalized_key in _DEPRECATED_PASS_CONFIG_MESSAGES and normalized_key not in warned_keys:
+            warnings.warn(_DEPRECATED_PASS_CONFIG_MESSAGES[normalized_key], DeprecationWarning, stacklevel=3)
+            warned_keys.add(normalized_key)
 
     return normalized
 
 
+def _pass_config_explicitly_set(pass_configs: dict[str, Any], key: PassConfigKey) -> bool:
+    return key in pass_configs or key.value in pass_configs
+
+
 def apply_target_default_pass_configs(
     target: Any,
-    pass_configs: dict[str, Any] | None,
+    pass_configs: dict[str | PassConfigKey, Any] | None,
 ) -> dict[str, Any]:
-    """Merge target-aware compiler defaults into pass configs.
-
-    Currently disables automatic async copy when
-    ``default_enable_auto_async_copy(target)`` is False. Explicit user settings
-    always win. Whitelist lives in ``src/target/utils.cc``.
-    """
-    from tilelang.utils.target import default_enable_auto_async_copy
+    """Merge target-aware compiler defaults into pass configs."""
+    from tilelang import _ffi_api
 
     normalized = normalize_pass_configs(pass_configs)
-    if default_enable_auto_async_copy(target):
+    if _ffi_api.DefaultEnableAutoAsyncCopy(target):
         return normalized
 
     merged = dict(normalized)
     for key in (PassConfigKey.TL_ENABLE_ASYNC_COPY, PassConfigKey.TIR_USE_ASYNC_COPY):
         if not _pass_config_explicitly_set(merged, key):
-            merged[key] = False
+            merged[key.value] = False
     return merged

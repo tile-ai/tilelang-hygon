@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import torch
 from tilelang import tvm as tvm
-from tvm.tir import Buffer, IntImm, Var, PrimExpr
+from tvm.tirx import Buffer, IntImm, Var, PrimExpr
 import tilelang.language as T
 
 
@@ -162,3 +162,5 @@ class CompiledArtifact:
     params: list[KernelParam]  # List of parameters (tensors/scalars) used by the kernel
     kernel_source: str  # Raw source code of the generated kernel
     rt_mod: tvm.runtime.Module | None = None  # Runtime module for execution, may be lazily initialized
+    target: tvm.target.Target | None = None  # Normalized device target used for lowering
+    target_host: tvm.target.Target | None = None  # Normalized host target used for host codegen/export

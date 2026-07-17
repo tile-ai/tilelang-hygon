@@ -1,5 +1,7 @@
 # Hygon mirror CI: format / static checks only (self-hosted container, no GPU/DTK).
-# Upstream full CI lives on tile-ai/tilelang (.github/workflows/ci.yml).
+# Lint steps/tooling baseline synced to upstream tile-ai/tilelang v0.1.12 Quick Lint
+# (see .github/workflows/ci.yml lint job). Keep HCU runner/image/branch gating here;
+# do not replace this file with the upstream CI workflow wholesale.
 #
 # Branch gating (GitHub → Settings → Secrets and variables → Actions → Variables):
 #   LINT_PUSH_BRANCHES      comma-separated push targets, e.g. main,v0.1.9-release,staging
@@ -57,7 +59,7 @@ jobs:
       image: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           # Lint excludes 3rdparty/; no submodule fetch needed.
@@ -70,9 +72,15 @@ jobs:
       - name: Check AST with Python 3.10
         run: python3 -m compileall -q -f tilelang
 
+      - name: C++ API Style Audit (warning only)
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 maint/scripts/audit_cpp_api_style.py --github-warnings --limit 20
+
       - name: Pre-commit Lint
         run: |
           if ! pre-commit run --all-files --color=always --show-diff-on-failure; then
-            echo "::error::Pre-commit checks failed. Run 'pre-commit run --all-files' locally."
+            echo "::error::Pre-commit checks failed. Please run 'pre-commit install' and 'pre-commit run --all-files' locally to see the issues."
             exit 1
           fi

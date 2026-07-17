@@ -1,5 +1,6 @@
 from tilelang import tvm as tvm
-from tilelang.utils.target import determine_target, get_hcu_arch_string, target_is_hcu
+from tilelang.backend.target import determine_target
+from tilelang.hcu.target import get_hcu_arch_string, target_is_hcu
 
 # HCU gfx validated for FP8 ``__builtin_hcu_mmac_*`` (extend when verified on new arch).
 _FP8_MMAC_SUPPORTED_HCU_ARCHES = frozenset({"gfx938", "gfx92a", "gfx946"})

@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import warnings
 
+import tvm_ffi
+from tvm.base import py_str
+from tvm.contrib import utils
+from tvm.contrib.rocm import find_rocm_path, get_rocm_arch
 from tvm.target import Target
 
 from tilelang.engine.callback import register_hip_postproc_callback
-from tilelang.env import get_hip_compiler
+from tilelang.env import TILELANG_TEMPLATE_PATH, get_hip_compiler
 from tilelang.transform.pass_config import PassConfigKey
 
 _GLOBAL_KERNEL_RE = re.compile(
@@ -153,3 +158,231 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
         return flags
     else:
         raise ValueError(f"Unsupported architecture: {arch}")
+
+
+def _debug_enabled():
+    return os.environ.get("TILELANG_HIPCC_DEBUG", "").lower() in ("1", "true", "yes", "on")
+
+
+def _debug_log(msg):
+    if _debug_enabled():
+        print(f"[TileLang][hcu][debug] {msg}")
+
+
+def _get_aillvm_tool(env_name, default_path):
+    tool_path = os.environ.get(env_name, default_path)
+    tool_path = os.path.abspath(os.path.expanduser(tool_path))
+    if not os.path.isfile(tool_path):
+        raise RuntimeError(f"{env_name} not found: {tool_path}")
+    return tool_path
+
+
+def _extract_device_bundle_asm(path, temp):
+    start_marker = "# __CLANG_OFFLOAD_BUNDLE____START__ hip-amdgcn-amd-amdhsa--"
+    end_marker = "# __CLANG_OFFLOAD_BUNDLE____END__ hip-amdgcn-amd-amdhsa--"
+
+    with open(path, encoding="utf-8") as in_file:
+        asm_text = in_file.read()
+
+    start_idx = asm_text.find(start_marker)
+    if start_idx == -1:
+        return path
+
+    body_start = asm_text.find("\n", start_idx)
+    if body_start == -1:
+        raise RuntimeError("Malformed asm bundle: START marker has no line break")
+    body_start += 1
+
+    end_idx = asm_text.find(end_marker, body_start)
+    if end_idx == -1:
+        raise RuntimeError("Malformed asm bundle: END marker not found for device bundle")
+
+    extracted = asm_text[body_start:end_idx]
+    extracted_path = temp.relpath("my_kernel_device_bundle.s")
+    with open(extracted_path, "w", encoding="utf-8") as out_file:
+        out_file.write(extracted)
+    return extracted_path
+
+
+def _extract_kernel_names_from_code(code):
+    pattern = re.compile(r'(?:extern\s+"C"\s+)?__global__\s+void(?:\s+__\w+__\s*\([^)]*\))*\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(')
+    return set(pattern.findall(code))
+
+
+def _parse_asm_map(raw):
+    mapping = {}
+    if not raw:
+        return mapping
+    for item in raw.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise RuntimeError("Invalid TILELANG_HIPCC_ASM_MAP item (missing '='): " + item)
+        kernel_name, asm_path = item.split("=", 1)
+        kernel_name = kernel_name.strip()
+        asm_path = asm_path.strip()
+        if not kernel_name or not asm_path:
+            raise RuntimeError("Invalid TILELANG_HIPCC_ASM_MAP item (empty key/value): " + item)
+        mapping[kernel_name] = asm_path
+    return mapping
+
+
+def _normalize_asm_input_path(asm_input, temp):
+    asm_input = os.path.abspath(os.path.expanduser(asm_input))
+    if not os.path.exists(asm_input):
+        raise RuntimeError("TILELANG_HIPCC_ASM_MAP points to missing file: " + asm_input)
+    if not os.path.isfile(asm_input):
+        raise RuntimeError("TILELANG_HIPCC_ASM_MAP points to non-file path: " + asm_input)
+    return _extract_device_bundle_asm(asm_input, temp)
+
+
+def _resolve_asm_input(code, temp, verbose=False):
+    asm_map = _parse_asm_map(os.environ.get("TILELANG_HIPCC_ASM_MAP"))
+    if asm_map:
+        kernel_names = _extract_kernel_names_from_code(code)
+        _debug_log(f"detected kernels: {sorted(kernel_names)}")
+        for kernel_name in sorted(kernel_names):
+            if kernel_name in asm_map:
+                _debug_log(f"asm_map hit: kernel={kernel_name} asm={asm_map[kernel_name]}")
+                if verbose:
+                    print(f"[TileLang][hcu] asm override hit kernel '{kernel_name}' -> {asm_map[kernel_name]}")
+                return _normalize_asm_input_path(asm_map[kernel_name], temp)
+        _debug_log("asm_map configured but no kernel matched; fallback to source compile")
+        if verbose:
+            print("[TileLang][hcu] asm map configured but no kernel matched, fallback to source compile")
+    return None
+
+
+def _compile_asm_with_aillvm(asm_input, arch, file_target, temp, verbose=False):
+    clangxx = _get_aillvm_tool("TILELANG_AILLVM_CLANGXX", "/opt/dtk/aillvm/bin/clang++")
+    lld = _get_aillvm_tool("TILELANG_AILLVM_LLD", "/opt/dtk/aillvm/bin/ld.lld")
+    temp_obj = temp.relpath("my_kernel_asm.o")
+
+    compile_cmd = [
+        clangxx,
+        "-x",
+        "assembler",
+        "-target",
+        "amdgcn-amd-amdhsa",
+        f"-mcpu={arch}",
+        "-c",
+        asm_input,
+        "-o",
+        temp_obj,
+    ]
+    link_cmd = [lld, "-shared", temp_obj, "-o", file_target]
+    _debug_log(f"asm compile cmd: {' '.join(compile_cmd)}")
+    _debug_log(f"asm link cmd: {' '.join(link_cmd)}")
+
+    compile_ret = subprocess.run(compile_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if verbose:
+        print(py_str(compile_ret.stdout))
+    if compile_ret.returncode != 0:
+        raise RuntimeError("Assembly compile error:\n" + py_str(compile_ret.stdout))
+
+    link_ret = subprocess.run(link_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if verbose:
+        print(py_str(link_ret.stdout))
+    if link_ret.returncode != 0:
+        raise RuntimeError("Assembly link error:\n" + py_str(link_ret.stdout))
+
+
+def compile_hcu(
+    code,
+    target_format="hsaco",
+    arch=None,
+    options=None,
+    path_target=None,
+    verbose=False,
+    pass_config=None,
+):
+    """Compile HIP device code for HCU with DTK/aicc tuning flags."""
+    if arch is None:
+        rocm_path = find_rocm_path()
+        arch = get_rocm_arch(rocm_path)
+
+    temp = utils.tempdir()
+    if target_format not in ["hsaco"]:
+        raise ValueError("target_format must be hsaco")
+    temp_code = temp.relpath("my_kernel.cc")
+    temp_target = temp.relpath(f"my_kernel.{target_format}")
+
+    with open(temp_code, "w") as out_file:
+        out_file.write(code)
+
+    asm_input = _resolve_asm_input(code, temp, verbose=verbose)
+
+    file_target = path_target if path_target else temp_target
+    if asm_input:
+        _debug_log("compilation mode: asm_map/aillvm")
+        _compile_asm_with_aillvm(asm_input, arch, file_target, temp, verbose=verbose)
+        with open(file_target, "rb") as f:
+            data = bytearray(f.read())
+        if not data:
+            raise RuntimeError("Compilation error: empty result is generated")
+        _debug_log(f"returning asm-built hsaco bytes={len(data)} target={file_target}")
+        return data
+
+    cmd = [get_hip_compiler()]
+    cmd += ["-O3", "-c"]
+    if isinstance(arch, str):
+        cmd += [f"--offload-arch={arch}"]
+    if target_format == "hsaco":
+        cmd += ["--genco"]
+    if options:
+        if isinstance(options, str):
+            cmd += [options]
+        elif isinstance(options, list):
+            cmd += options
+        else:
+            raise ValueError("options must be str or list of str")
+
+    cfg = pass_config or {}
+    cmd.extend(get_hcu_compile_flags(arch, cfg))
+
+    cmd += ["-o", file_target]
+    cmd += [temp_code]
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    out, _ = proc.communicate()
+    if verbose:
+        print(py_str(out))
+
+    if proc.returncode != 0:
+        msg = code
+        msg += "\nCompilation error:\n"
+        msg += py_str(out)
+        raise RuntimeError(msg)
+
+    with open(file_target, "rb") as f:
+        data = bytearray(f.read())
+        if not data:
+            raise RuntimeError("Compilation error: empty result is generated")
+        _debug_log(f"returning source-built hsaco bytes={len(data)} target={file_target}")
+        return data
+
+
+@tvm_ffi.register_global_func("tilelang_callback_hcu_compile", override=True)
+def tilelang_callback_hcu_compile(code, target, pass_config=None):
+    """HCU hsaco compile callback used by ``target.build.tilelang_hcu``."""
+    from tilelang.rocm.target import target_get_mcpu
+
+    cfg = pass_config or {}
+    arch = target_get_mcpu(target)
+    return compile_hcu(
+        code,
+        target_format="hsaco",
+        arch=arch,
+        options=[
+            "-std=c++17",
+            "-I" + TILELANG_TEMPLATE_PATH,
+        ],
+        pass_config=cfg,
+        verbose=False,
+    )
+
+
+@tvm_ffi.register_global_func("tilelang_callback_hcu_postproc", override=True)
+def tilelang_callback_hcu_postproc(code, target):
+    return hcu_recompute_from_source(code, target)

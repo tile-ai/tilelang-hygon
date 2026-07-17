@@ -4,7 +4,7 @@ import tilelang.testing
 from tilelang import tvm as tvm
 from tvm import DataType
 import tilelang.language as T
-from tilelang.intrinsics import get_swizzle_layout
+from tilelang.cuda.intrinsics import get_swizzle_layout
 from tilelang.transform import simplify_prim_func
 
 tilelang.testing.set_random_seed(0)
@@ -19,8 +19,7 @@ def make_swizzle_layout(shared_buf):
         return T.Layout(shape, lambda *args: args)
 
     def transform_func(i, j):
-        new_warp_i, new_warp_j = get_swizzle_layout(i, j, shape[-1], dtype)
-        return [new_warp_i, new_warp_j]
+        return list(get_swizzle_layout(i, j, shape[-1], dtype))
 
     return T.Layout(shape, transform_func)
 

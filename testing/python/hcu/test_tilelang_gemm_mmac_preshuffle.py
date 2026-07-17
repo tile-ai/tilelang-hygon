@@ -2,8 +2,8 @@ import torch
 import tilelang.testing
 from tilelang import tvm as tvm
 import tilelang.language as T
-from tilelang.intrinsics import make_mmac_swizzle_layout as make_swizzle_layout
-from tilelang.intrinsics.hcu_mmac_macro_generator import HCUMatrixCorePreshuffleIntrinEmitter as MatrixCorePreshuffleIntrinEmitter
+from tilelang.hcu.intrinsics import make_mmac_swizzle_layout as make_swizzle_layout
+from tilelang.hcu.intrinsics import HCUMatrixCorePreshuffleIntrinEmitter as MatrixCorePreshuffleIntrinEmitter
 from tilelang.transform import simplify_prim_func
 
 tilelang.testing.set_random_seed(0)

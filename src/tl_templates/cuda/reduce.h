@@ -34,7 +34,7 @@ struct SumOp {
 
 struct MaxOp {
   template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
-    return cutlass::fast_max(x, y);
+    return tl::fast_max(x, y);
   }
 
   TL_DEVICE bfloat16_t operator()(bfloat16_t const &x, bfloat16_t const &y) {
@@ -47,7 +47,7 @@ struct MaxOp {
 };
 struct MaxOpNan {
   template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
-    return cutlass::fast_max(x, y);
+    return tl::fast_max(x, y);
   }
 
   TL_DEVICE bfloat16_t operator()(bfloat16_t const &x, bfloat16_t const &y) {
@@ -61,7 +61,7 @@ struct MaxOpNan {
 
 struct MinOp {
   template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
-    return cutlass::fast_min(x, y);
+    return tl::fast_min(x, y);
   }
 
   TL_DEVICE cutlass::bfloat16_t operator()(bfloat16_t const &x,
@@ -76,7 +76,7 @@ struct MinOp {
 
 struct MinOpNan {
   template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
-    return cutlass::fast_min(x, y);
+    return tl::fast_min(x, y);
   }
 
   TL_DEVICE bfloat16_t operator()(bfloat16_t const &x, bfloat16_t const &y) {
@@ -85,6 +85,76 @@ struct MinOpNan {
 
   TL_DEVICE half_t operator()(half_t const &x, half_t const &y) {
     return half_t(__hmin_nan(x.to_half(), y.to_half()));
+  }
+};
+
+struct SumOp_bf16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return tl::to_uint1(tl::add2(tl::from_uint1<__nv_bfloat162>(x),
+                                 tl::from_uint1<__nv_bfloat162>(y)));
+  }
+};
+
+struct MaxOp_bf16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return tl::to_uint1(tl::max2(tl::from_uint1<__nv_bfloat162>(x),
+                                 tl::from_uint1<__nv_bfloat162>(y)));
+  }
+};
+
+struct MinOp_bf16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return tl::to_uint1(tl::min2(tl::from_uint1<__nv_bfloat162>(x),
+                                 tl::from_uint1<__nv_bfloat162>(y)));
+  }
+};
+
+struct SumOp_fp16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return tl::to_uint1(
+        tl::add2(tl::from_uint1<__half2>(x), tl::from_uint1<__half2>(y)));
+  }
+};
+
+struct MaxOp_fp16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return tl::to_uint1(
+        tl::max2(tl::from_uint1<__half2>(x), tl::from_uint1<__half2>(y)));
+  }
+};
+
+struct MinOp_fp16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return tl::to_uint1(
+        tl::min2(tl::from_uint1<__half2>(x), tl::from_uint1<__half2>(y)));
+  }
+};
+
+struct MaxOpNan_bf16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return tl::to_uint1(tl::max2_nan(tl::from_uint1<__nv_bfloat162>(x),
+                                     tl::from_uint1<__nv_bfloat162>(y)));
+  }
+};
+
+struct MinOpNan_bf16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return tl::to_uint1(tl::min2_nan(tl::from_uint1<__nv_bfloat162>(x),
+                                     tl::from_uint1<__nv_bfloat162>(y)));
+  }
+};
+
+struct MaxOpNan_fp16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return tl::to_uint1(
+        tl::max2_nan(tl::from_uint1<__half2>(x), tl::from_uint1<__half2>(y)));
+  }
+};
+
+struct MinOpNan_fp16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return tl::to_uint1(
+        tl::min2_nan(tl::from_uint1<__half2>(x), tl::from_uint1<__half2>(y)));
   }
 };
 
@@ -125,37 +195,60 @@ template <int all_threads> struct NamedBarrier {
 // threads.
 //
 // Template parameters:
-//   Reducer       - binary reduction functor (e.g. SumOp, MaxOp).
-//   threads       - number of threads that span the reduce dimension,
-//                   equal to extent * scale.
-//   scale         - stride of participating threads in the thread index space.
-//                   When the thread-to-data mapping is normalized as
-//                     threadIdx = source * scale + ...
-//                   `scale` is the stride between consecutive logical
-//                   participants in the reduce dimension.
-//                   The recursion terminates when threads == scale, meaning
-//                   each reduce group has been collapsed to a single thread.
-//                   Uses a recursive XOR-butterfly pattern: at each level,
-//                   offset >= 32 goes through shared memory + barrier,
-//                   offset < 32 uses warp shuffle (shfl_xor_sync).
-//   thread_offset - base thread index offset within the block.
-//   Barrier       - barrier policy type (SyncThreadsBarrier or
-//                   NamedBarrier<N>).
+//   Reducer         - binary reduction functor (e.g. SumOp, MaxOp).
+//   threads         - number of threads that span the reduce dimension,
+//                     equal to extent * scale.
+//   scale           - stride of participating threads in the thread index
+//                     space. When the thread-to-data mapping is normalized as
+//                       threadIdx = source * scale + ...
+//                     `scale` is the stride between consecutive logical
+//                     participants in the reduce dimension.
+//                     The recursion terminates when threads == scale, meaning
+//                     each reduce group has been collapsed to a single thread.
+//                     Uses a recursive XOR-butterfly pattern: at each level,
+//                     offset >= 32 goes through shared memory + barrier,
+//                     offset < 32 uses warp shuffle (shfl_xor_sync).
+//   thread_offset   - base thread index offset within the block.
+//   Barrier         - barrier policy type (SyncThreadsBarrier or
+//                     NamedBarrier<N>).
+//   batch_size      - number of independent values to reduce in parallel,
+//                     sharing synchronization barriers across all values.
+//                     Default 1 preserves the original scalar behaviour.
+//   workspace_stride - stride between per-channel slices in the shared-memory
+//                     workspace (typically total threads in the block).
+//                     Only used when batch_size > 1.
 template <class Reducer, int threads, int scale, int thread_offset = 0,
-          class Barrier = SyncThreadsBarrier>
+          class Barrier = SyncThreadsBarrier, int batch_size = 1,
+          int workspace_stride = 0>
 struct AllReduce {
   static_assert(threads % scale == 0);
+
+  // Scalar interface (backward-compatible).
   template <typename T> static TL_DEVICE T run(T x, T *red_buf = nullptr) {
     if constexpr (threads == scale) {
-      // Recursion base case: each reduce group has exactly one thread left.
       return x;
     } else {
-      return butterfly_reduce(x, red_buf);
+      return butterfly_reduce_scalar(x, red_buf);
+    }
+  }
+
+  // Batch interface (named run_batch to avoid overload-resolution ambiguity
+  // with the scalar run(T x, T*) when a pointer is passed as the first arg).
+  template <typename T>
+  static TL_DEVICE void run_batch(T *x, T *red_buf = nullptr) {
+    if constexpr (threads == scale) {
+      return;
+    } else {
+      butterfly_reduce_batch(x, red_buf);
     }
   }
 
 private:
-  template <typename T> static TL_DEVICE T butterfly_reduce(T x, T *red_buf) {
+  using Next = AllReduce<Reducer, threads / 2, scale, thread_offset, Barrier,
+                         batch_size, workspace_stride>;
+
+  template <typename T>
+  static TL_DEVICE T butterfly_reduce_scalar(T x, T *red_buf) {
     constexpr int offset = threads / 2;
     if constexpr (offset >= 32) {
       Barrier::template sync<1>();
@@ -168,155 +261,36 @@ private:
     if constexpr (offset == scale) {
       return x;
     } else {
-      return AllReduce<Reducer, offset, scale, thread_offset, Barrier>::run(
-          x, red_buf);
+      return Next::run(x, red_buf);
     }
   }
-};
 
-template <int threads, bool reverse = false> struct CumSum1D {
-  static_assert(threads == 1024 or threads == 512 or threads == 256 or
-                threads == 128 or threads == 64 or threads == 32);
-  template <typename T, int SEG = 32>
-  static TL_DEVICE void run(const T *__restrict__ src, T *__restrict__ dst,
-                            int N) {
-    if (N <= 0)
-      return;
-
-    constexpr unsigned MASK = 0xffffffff;
-    const int tid = threadIdx.x;
-    const int lane = tid % SEG;
-
-    if (tid >= SEG)
-      return;
-
-    T carry = (T)0;
-
-    if (reverse) {
-      const int num_segments = (N + SEG - 1) / SEG;
-      for (int seg = num_segments - 1; seg >= 0; --seg) {
-        const int idx = seg * SEG + lane;
-        T val = (idx < N) ? src[idx] : (T)0;
-
+  template <typename T>
+  static TL_DEVICE void butterfly_reduce_batch(T *x, T *red_buf) {
+    constexpr int offset = threads / 2;
+    if constexpr (offset >= 32) {
+      Barrier::template sync<1>();
 #pragma unroll
-        for (int off = 1; off < SEG; off <<= 1) {
-          T n = (T)tl::shfl_down_sync(MASK, val, off);
-          if (lane < SEG - off)
-            val += n;
-        }
-
-        val += carry;
-
-        if (idx < N)
-          dst[idx] = val;
-
-        T segSum = (T)__shfl_sync(MASK, val, 0);
-        if (lane == 0)
-          carry = segSum;
-        carry = (T)__shfl_sync(MASK, carry, 0);
+      for (int i = 0; i < batch_size; i++) {
+        red_buf[(threadIdx.x - thread_offset) + i * workspace_stride] = x[i];
+      }
+      Barrier::template sync<2>();
+#pragma unroll
+      for (int i = 0; i < batch_size; i++) {
+        x[i] =
+            Reducer()(x[i], red_buf[((threadIdx.x - thread_offset) ^ offset) +
+                                    i * workspace_stride]);
       }
     } else {
-      const int num_segments = (N + SEG - 1) / SEG;
-      for (int seg = 0; seg < num_segments; ++seg) {
-        const int idx = seg * SEG + lane;
-        T val = (idx < N) ? src[idx] : (T)0;
-
 #pragma unroll
-        for (int off = 1; off < SEG; off <<= 1) {
-          T n = (T)__shfl_up_sync(MASK, val, off);
-          if (lane >= off)
-            val += n;
-        }
-
-        val += carry;
-
-        if (idx < N)
-          dst[idx] = val;
-
-        T segSum = (T)__shfl_sync(MASK, val, SEG - 1);
-        if (lane == SEG - 1)
-          carry = segSum;
-        carry = (T)__shfl_sync(MASK, carry, SEG - 1);
+      for (int i = 0; i < batch_size; i++) {
+        x[i] = Reducer()(x[i], tl::shfl_xor_sync(uint32_t(-1), x[i], offset));
       }
     }
-  }
-};
-
-template <int threads, int Axis = 0, bool reverse = false> struct CumSum2D {
-  static_assert(threads == 1024 or threads == 512 or threads == 256 or
-                threads == 128 or threads == 64 or threads == 32);
-  template <typename T, int SEG = 32>
-  static TL_DEVICE void run(const T *__restrict__ src, T *__restrict__ dst,
-                            int H, int W) {
-
-    constexpr int TILE_H = threads / SEG;
-    constexpr unsigned MASK = 0xffffffff;
-    const int num_blocks = (H + TILE_H - 1) / TILE_H;
-    const int tid = threadIdx.x;
-    const int lane = tid % SEG;
-    const int row = tid / SEG;
-
-    for (int b = 0; b < num_blocks; ++b) {
-      const int gRow = b * TILE_H + row;
-      if (gRow >= H)
-        return;
-
-      T carry = (T)0;
-
-      if (reverse) {
-        // Start from the last segment for reverse mode
-        for (int seg = (W + SEG - 1) / SEG - 1; seg >= 0; --seg) {
-          const int col = seg * SEG + lane;
-
-          const int real_row = Axis == 1 ? gRow : col;
-          const int real_col = Axis == 1 ? col : gRow;
-
-          T val = (col < W) ? src[real_row * W + real_col] : (T)0;
-
-#pragma unroll
-          for (int off = 1; off < SEG; off <<= 1) {
-            T n = tl::shfl_down_sync(MASK, val, off);
-            if (lane < SEG - off)
-              val += n;
-          }
-
-          val += carry;
-
-          if (real_col < W)
-            dst[real_row * W + real_col] = val;
-
-          T segSum = tl::shfl_sync(MASK, val, 0);
-          if (lane == 0)
-            carry = segSum;
-          carry = tl::shfl_sync(MASK, carry, 0);
-        }
-      } else {
-        for (int seg = 0; seg * SEG < W; ++seg) {
-          const int col = seg * SEG + lane;
-
-          const int real_row = Axis == 1 ? gRow : col;
-          const int real_col = Axis == 1 ? col : gRow;
-
-          T val = (col < W) ? src[real_row * W + real_col] : (T)0;
-
-#pragma unroll
-          for (int off = 1; off < SEG; off <<= 1) {
-            T n = tl::shfl_up_sync(MASK, val, off);
-            if (lane >= off)
-              val += n;
-          }
-
-          val += carry;
-
-          if (real_col < W)
-            dst[real_row * W + real_col] = val;
-
-          T segSum = tl::shfl_sync(MASK, val, SEG - 1);
-          if (lane == SEG - 1)
-            carry = segSum;
-          carry = tl::shfl_sync(MASK, carry, SEG - 1);
-        }
-      }
+    if constexpr (offset == scale) {
+      return;
+    } else {
+      Next::run_batch(x, red_buf);
     }
   }
 };

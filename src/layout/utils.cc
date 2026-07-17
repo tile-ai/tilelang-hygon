@@ -5,20 +5,20 @@
  */
 
 #include "utils.h"
+#include "support/check.h"
 #include "tvm/arith/iter_affine_map.h"
-#include "tvm/ffi/container/map.h"
-#include "tvm/node/functor.h"
-#include "tvm/node/repr_printer.h"
-#include "tvm/node/structural_equal.h"
+#include <tvm/ffi/extra/structural_equal.h>
+#include <tvm/ffi/extra/structural_hash.h>
 
 #include <sstream>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using namespace ffi;
 using namespace arith;
 
 bool CanProveDivisible(const PrimExpr &lhs, const PrimExpr &rhs) {
@@ -111,12 +111,17 @@ Array<IterSplitExpr> get_unused_iters(const IterMark &mark,
     } else {
       used[j] = true;
       i++;
-      expected_lower_factor = splits[j]->lower_factor * splits[j]->extent;
+      expected_lower_factor =
+          analyzer->Simplify(splits[j]->lower_factor * splits[j]->extent);
     }
   }
-  bool match_full_iter =
-      analyzer->CanProveEqual(expected_lower_factor, mark->extent);
-  if (!match_full_iter) {
+  // Iter split normalization may over-approximate the original mark span.
+  // Treat over-coverage as fully covered instead of synthesizing a zero-extent
+  // leftover iterator, which later normalizes into division by zero.
+  bool covers_full_iter =
+      analyzer->CanProveEqual(expected_lower_factor, mark->extent) ||
+      analyzer->CanProve(expected_lower_factor > mark->extent);
+  if (!covers_full_iter) {
     results.emplace_back(
         mark, expected_lower_factor,
         analyzer->Simplify(FloorDiv(mark->extent, expected_lower_factor)), 1);
@@ -126,7 +131,7 @@ Array<IterSplitExpr> get_unused_iters(const IterMark &mark,
 
 struct IterExprPP {
   // std::vector<std::pair<std::string, PrimExpr>> marks;
-  ffi::Map<ffi::String, PrimExpr> marks;
+  Map<String, PrimExpr> marks;
   std::string data;
 
   IterExprPP(const PrimExpr &expr) { data = Visit(expr); }
@@ -202,26 +207,6 @@ struct IterExprPP {
   }
 };
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .clear_dispatch<IterMarkNode>()
-    .set_dispatch<IterMarkNode>([](const ObjectRef &obj, ReprPrinter *p) {
-      auto *node = static_cast<const IterMarkNode *>(obj.get());
-      IterExprPP pp(tvm::ffi::GetRef<IterMark>(node));
-      p->stream << pp;
-    })
-    .clear_dispatch<IterSumExprNode>()
-    .set_dispatch<IterSumExprNode>([](const ObjectRef &obj, ReprPrinter *p) {
-      auto *node = static_cast<const IterSumExprNode *>(obj.get());
-      IterExprPP pp(tvm::ffi::GetRef<IterSumExpr>(node));
-      p->stream << pp;
-    })
-    .clear_dispatch<IterSplitExprNode>()
-    .set_dispatch<IterSplitExprNode>([](const ObjectRef &obj, ReprPrinter *p) {
-      auto *node = static_cast<const IterSplitExprNode *>(obj.get());
-      IterExprPP pp(tvm::ffi::GetRef<IterSplitExpr>(node));
-      p->stream << pp;
-    });
-
 // Heuristic: detect per-iterator gaps ("unused" pieces) even when the iterator
 // appears in fused forms across multiple index expressions. We first normalize
 // every index into IterSumExpr, collect all splits per source Var, then
@@ -229,7 +214,7 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
 Array<IterSplitExpr> DivideUnusedIterators(const Array<PrimExpr> &exprs,
                                            const Array<IterVar> input_iters,
                                            Analyzer *analyzer) {
-  auto iter_sum = exprs.Map([&](const auto &e) {
+  auto iter_sum = exprs.Map([&](const PrimExpr &e) {
     return NormalizeToIterSum(e, ToVMap(input_iters), analyzer);
   });
   IterMarkSplitCollector collector;
@@ -305,7 +290,7 @@ public:
 
   IterMark Mutate(const IterMark &mark) {
     if (auto *op = mark->source.as<IterSumExprNode>()) {
-      return IterMark(Mutate(tvm::ffi::GetRef<IterSumExpr>(op)), mark->extent);
+      return IterMark(Mutate(GetRef<IterSumExpr>(op)), mark->extent);
     } else {
       return mark;
     }

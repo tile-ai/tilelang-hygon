@@ -7,7 +7,7 @@ from __future__ import annotations
 # tir script
 # TODO(lei): remove this import once the
 # upstream tir script is fully compatible
-from tvm.script.parser.tir import *
+from tvm.tirx.script.parser import *
 from . import overrides as _overrides  # noqa: F401
 
 # from .tir import prim_func, macro,  # noqa: F401
@@ -30,6 +30,7 @@ from .frame import has_let_value, get_let_value  # noqa: F401
 from .math_intrinsics import *  # noqa: F401
 from .kernel import (
     Kernel,  # noqa: F401
+    ClusterKernel,  # noqa: F401
     CUDASourceCodeKernel,  # noqa: F401
     KernelLaunchFrame,  # noqa: F401
     get_thread_binding,  # noqa: F401
@@ -43,6 +44,7 @@ from .allocate import (
     alloc_local,  # noqa: F401
     alloc_shared,  # noqa: F401
     alloc_fragment,  # noqa: F401
+    alloc_global,  # noqa: F401
     alloc_barrier,  # noqa: F401
     alloc_cluster_barrier,  # noqa: F401
     alloc_tmem,  # noqa: F401
@@ -52,35 +54,48 @@ from .allocate import (
     alloc_tcgen05_smem_desc,  # noqa: F401
     alloc_tcgen05_instr_desc,  # noqa: F401
     empty,  # noqa: F401
-    alloc_global,  # noqa: F401
 )
-from tvm.script.parser.tir import allocate as allocate  # noqa: F401
-from .copy_op import (
-    copy,  # noqa: F401
-    async_copy,  # noqa: F401
-    tma_copy,  # noqa: F401
-    transpose,  # noqa: F401
-    c2d_im2col,  # noqa: F401
-    matrix_load,  # noqa: F401
-    ds_read_format,  # noqa: F401
+from tvm.tirx.script.builder.ir import alloc_buffer as allocate  # noqa: F401
+from .copy_op import (  # noqa: F401
+    copy,
+    matrix_load,
+    ds_read_format,
+    async_copy,
+    tma_copy,
+    tma_gather4,
+    tma_gather4_bytes,
+    tma_scatter4,
+    transpose,
+    im2col,
+    c2d_im2col,
+    copy_cluster,
 )
 from tilelang.tileop.base import GemmWarpPolicy  # noqa: F401
-from .gemm_op import gemm, wgmma_gemm, tcgen05_gemm  # noqa: F401
-from .experimental.gemm_sp import gemm_sp, gemm_sp_v2  # noqa: F401
+from .gemm_op import (  # noqa: F401
+    gemm,
+    wgmma_gemm,
+    tcgen05_gemm,
+    tcgen05_gemm_blockscaled,
+    make_blockscaled_gemm_layout,
+)
+from .experimental.gemm_sp_op import (  # noqa: F401
+    gemm_sp,
+    wgmma_gemm_sp,
+    tcgen05_gemm_sp,
+)
 from .fill_op import fill, clear  # noqa: F401
 from .reduce_op import (
     reduce,  # noqa: F401
+    reduce_warp,  # noqa: F401
     reduce_max,  # noqa: F401
     reduce_min,  # noqa: F401
     reduce_sum,  # noqa: F401
+    reduce_sum_warp,  # noqa: F401
     reduce_abssum,  # noqa: F401
     reduce_absmax,  # noqa: F401
-    reduce_warp,  # noqa: F401
-    reduce_sum_warp,  # noqa: F401
     reduce_bitand,  # noqa: F401
     reduce_bitor,  # noqa: F401
     reduce_bitxor,  # noqa: F401
-    cumsum,  # noqa: F401
     finalize_reducer,  # noqa: F401
     warp_reduce_sum,  # noqa: F401
     warp_reduce_max,  # noqa: F401
@@ -88,6 +103,7 @@ from .reduce_op import (
     warp_reduce_bitand,  # noqa: F401
     warp_reduce_bitor,  # noqa: F401
 )
+from .scan_op import cumsum, cummax  # noqa: F401
 from .print_op import print, device_assert  # noqa: F401
 from .customize import (
     atomic_max,  # noqa: F401
@@ -100,19 +116,30 @@ from .customize import (
     reshape,  # noqa: F401
     view,  # noqa: F401
     atomic_load,  # noqa: F401
+    atomic_or,  # noqa: F401
     atomic_store,  # noqa: F401
     loop_break,  # noqa: F401
 )
 from .logical import any_of, all_of  # noqa: F401
 from .builtin import *  # noqa: F401
 from .builtin import __ldg as __ldg  # noqa: F401
+from .builtin import __ffs as __ffs  # noqa: F401
+from .builtin import __fns as __fns  # noqa: F401
+from .builtin import ds_read_tr16_b64 as ds_read_tr16_b64  # noqa: F401
+from .builtin import ds_read_tr8_b64 as ds_read_tr8_b64  # noqa: F401
 from .builtin import ldg32 as ldg32  # noqa: F401
 from .builtin import ldg64 as ldg64  # noqa: F401
 from .builtin import ldg128 as ldg128  # noqa: F401
+from .builtin import lds32 as lds32  # noqa: F401
+from .builtin import lds64 as lds64  # noqa: F401
+from .builtin import lds128 as lds128  # noqa: F401
 from .builtin import ldg256 as ldg256  # noqa: F401
 from .builtin import stg32 as stg32  # noqa: F401
 from .builtin import stg64 as stg64  # noqa: F401
 from .builtin import stg128 as stg128  # noqa: F401
+from .builtin import sts32 as sts32  # noqa: F401
+from .builtin import sts64 as sts64  # noqa: F401
+from .builtin import sts128 as sts128  # noqa: F401
 from .builtin import stg256 as stg256  # noqa: F401
 from .builtin import any_sync as any_sync  # noqa: F401
 from .builtin import all_sync as all_sync  # noqa: F401
@@ -132,8 +159,6 @@ from .annotations import (  # noqa: F401
     annotate_safe_value,
     annotate_l2_hit_ratio,
     annotate_direct_to_lds,
-    disable_buffer_ops,
-    annotate_padding,
     annotate_restrict_buffers,
     annotate_min_blocks_per_sm,
 )
@@ -163,7 +188,19 @@ from .cluster import (
     clc_get_first_ctaid_z,  # noqa: F401
 )
 
+from .meta import (
+    inline,  # noqa: F401
+    meta_class,  # noqa: F401
+)
+
+from .tile_schedule import (
+    BaseTileScheduler,  # noqa: F401
+    PersistentTileScheduler,  # noqa: F401
+)
+
 
 def import_source(source: str | None = None):
     # source is the source code to be imported
-    return block_attr({"pragma_import_c": source}) if source is not None else None
+    from tvm.tirx.script.builder.ir import sblock_attr
+
+    return sblock_attr({"pragma_import_c": source}) if source is not None else None

@@ -6,24 +6,25 @@
 #ifndef TVM_TL_OP_UTILS_H_
 #define TVM_TL_OP_UTILS_H_
 
-#include "../target/stubs/cuda.h"
 #include "./operator.h"
+#include "cuda/stubs/cuda.h"
 #include "region.h"
+#include "support/check.h"
 #include "tvm/runtime/base.h"
-#include <tvm/tir/buffer.h>
-#include <tvm/tir/op.h>
+#include <tvm/tirx/buffer.h>
+#include <tvm/tirx/op.h>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 // Maps TVM DataType to CUDA's CUtensorMapDataType enum value.
 TVM_DLL int to_CUtensorMapDataType(DataType dtype);
 
 // Reverses an array (used for row-major/column-major layout conversion).
-template <typename T> Array<T> ReverseArray(Array<T> array) {
-  return Array<T>{array.rbegin(), array.rend()};
+template <typename T> ffi::Array<T> ReverseArray(ffi::Array<T> array) {
+  return ffi::Array<T>{array.rbegin(), array.rend()};
 }
 
 // Check if an PrimExpr is a buffer-like (BufferRegion/BufferLoad/tl.region)
@@ -53,7 +54,6 @@ TVM_DLL PrimExpr MakeAccessPtrFromRegion(const BufferRegion &region,
 TVM_DLL PrimExpr MakeAccessPtrFromBufferLoad(const BufferLoad &load,
                                              int rw_mask);
 
-// Check if a buffer is a fragment buffer (scope == "local.fragment")
 inline bool IsFragmentBuffer(const Buffer &buffer) {
   return buffer.defined() && buffer.scope() == "local.fragment";
 }
@@ -74,7 +74,7 @@ inline Layout ExpandLayoutToMatchBuffer(const Layout &layout,
     return layout;
   }
 
-  Array<PrimExpr> leading_shape;
+  ffi::Array<PrimExpr> leading_shape;
   leading_shape.reserve(buffer_ndim - layout_ndim);
   for (size_t i = 0; i < buffer_ndim - layout_ndim; ++i) {
     leading_shape.push_back(buffer->shape[i]);
@@ -112,6 +112,52 @@ inline bool IsLocalBuffer(const Buffer &buffer, bool allow_var = false) {
 
 inline bool IsLocalVarBuffer(const Buffer &buffer) {
   return buffer.defined() && buffer.scope() == "local.var";
+}
+
+// True when global packed FP4 is copied into f8f6f4/mxf8f6f4 unpacked FP4 SMEM.
+inline bool IsFP4PackedToUnpackedStorageCopy(DataType global_dtype,
+                                             DataType shared_dtype) {
+  return global_dtype.is_float4_e2m1fn() &&
+         shared_dtype.is_float4_e2m1_unpacked();
+}
+
+inline bool IsValidTMALoadDtypePair(DataType global_dtype,
+                                    DataType shared_dtype) {
+  if (global_dtype.is_float4_e2m1_unpacked() ||
+      shared_dtype.is_float4_e2m1_unpacked()) {
+    return IsFP4PackedToUnpackedStorageCopy(global_dtype, shared_dtype);
+  }
+  if (global_dtype == shared_dtype) {
+    return true;
+  }
+  return false;
+}
+
+inline bool IsValidTMAStoreDtypePair(DataType global_dtype,
+                                     DataType shared_dtype) {
+  return global_dtype == shared_dtype &&
+         !shared_dtype.is_float4_e2m1_unpacked();
+}
+
+inline bool IsValidTMADtypePair(bool is_load, DataType global_dtype,
+                                DataType shared_dtype) {
+  if (is_load) {
+    return IsValidTMALoadDtypePair(global_dtype, shared_dtype);
+  }
+  return IsValidTMAStoreDtypePair(global_dtype, shared_dtype);
+}
+
+// Valid dtype pairs for TMA global->shared copies.
+inline bool IsValidTMACopyDtypePair(DataType global_dtype,
+                                    DataType shared_dtype) {
+  return IsValidTMALoadDtypePair(global_dtype, shared_dtype);
+}
+
+// True only for the supported TMA load transition from packed global FP4 to
+// unpacked shared FP4. The reverse store direction is not a valid TMA path.
+inline bool IsFP4UnpackLoad(const Buffer &src, const Buffer &dst) {
+  return IsGlobalBuffer(src) && IsSharedBuffer(dst) &&
+         IsFP4PackedToUnpackedStorageCopy(src->dtype, dst->dtype);
 }
 
 } // namespace tl

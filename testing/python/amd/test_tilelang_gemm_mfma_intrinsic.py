@@ -3,12 +3,13 @@ import torch
 import tilelang.testing
 from tilelang import tvm as tvm
 import tilelang.language as T
-from tilelang.intrinsics import make_mfma_swizzle_layout as make_swizzle_layout
-from tilelang.intrinsics.mfma_macro_generator import (
+from tilelang.rocm.intrinsics import make_mfma_swizzle_layout as make_swizzle_layout
+from tilelang.rocm.intrinsics.mfma_macro_generator import (
     MatrixCoreIntrinEmitter,
 )
 from tilelang.transform import simplify_prim_func
-from tilelang.utils import determine_fp8_type, determine_target
+from tilelang.backend.target import determine_target
+from tilelang.language.fp8 import determine_fp8_type
 
 tilelang.testing.set_random_seed(0)
 
@@ -227,7 +228,7 @@ def assert_tl_matmul_correctness(M, N, K, in_dtype, out_dtype, accum_dtype=T.flo
         (128, 256, 256, determine_fp8_type(), T.float32, T.float32, False, False, 2),
     ],
 )
-@tilelang.testing.requires_rocm
+@tilelang.testing.requires_cdna
 def test_assert_tl_matmul(M, N, K, in_dtype, out_dtype, accum_dtype, a_transposed, b_transposed, k_pack):
     assert_tl_matmul_correctness(
         M,

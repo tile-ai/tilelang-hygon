@@ -3,47 +3,45 @@ This module provides macros and utilities for debugging TileLang (tl) programs.
 It includes functionality to print variables, print values in buffers, conditionally execute debug prints and assert.
 """
 
-from tilelang.language.eager.builder import Builder
-from tvm import tir
+from tvm import tirx
 from typing import Any
-import tilelang.language as T
 from tilelang.language.kernel import get_thread_bindings
 from tilelang.language import copy, macro, serial, alloc_shared
 from tilelang.language.utils import index_to_coordinates
 
 
 @macro
-def print_var(var: tir.PrimExpr, msg: str = "") -> None:
+def print_var(var: tirx.PrimExpr, msg: str = "") -> None:
     """
     Prints the value of a TIR primitive expression (PrimExpr) for debugging purposes.
 
     Parameters:
-        var (tir.PrimExpr): The variable or expression to be printed.
+        var (tirx.PrimExpr): The variable or expression to be printed.
 
     Returns:
-        tir.PrimExpr: The TIR expression for the debug print operation.
+        tirx.PrimExpr: The TIR expression for the debug print operation.
     """
-    tir.call_extern("handle", "debug_print_var", msg, var)
+    tirx.call_extern("handle", "debug_print_var", msg, var)
 
 
 @macro
-def print_var_with_condition(condition: tir.PrimExpr, var: tir.PrimExpr, msg: str = "") -> None:
+def print_var_with_condition(condition: tirx.PrimExpr, var: tirx.PrimExpr, msg: str = "") -> None:
     """
     Conditionally prints a TIR primitive expression (PrimExpr) if a given condition is True.
 
     Parameters:
-        condition (tir.PrimExpr): A TIR expression representing the condition to check.
-        var (tir.PrimExpr): The variable or expression to be printed.
+        condition (tirx.PrimExpr): A TIR expression representing the condition to check.
+        var (tirx.PrimExpr): The variable or expression to be printed.
 
     Returns:
-        tir.PrimExpr: The TIR expression for the debug print operation, if the condition is True.
+        tirx.PrimExpr: The TIR expression for the debug print operation, if the condition is True.
     """
     if condition:
-        tir.call_extern("handle", "debug_print_var", msg, var)
+        tirx.call_extern("handle", "debug_print_var", msg, var)
 
 
 @macro
-def print_global_buffer_with_condition(condition: tir.PrimExpr, buffer: tir.Buffer, elems: int, msg: str = "") -> tir.PrimExpr:
+def print_global_buffer_with_condition(condition: tirx.PrimExpr, buffer: tirx.Buffer, elems: int, msg: str = "") -> tirx.PrimExpr:
     """
     Conditionally prints the values of a flattened TIR buffer if the condition is True.
     """
@@ -51,41 +49,41 @@ def print_global_buffer_with_condition(condition: tir.PrimExpr, buffer: tir.Buff
         # Iterate through the buffer elements and print each one.
         for i in serial(elems):
             coords = index_to_coordinates(i, buffer.shape)
-            tir.call_extern("handle", "debug_print_buffer_value", msg, buffer.name, i, buffer[coords])
+            tirx.call_extern("handle", "debug_print_buffer_value", msg, buffer.name, i, buffer[coords])
 
 
 @macro
-def print_shared_buffer_with_condition(condition: tir.PrimExpr, buffer: tir.Buffer, elems: int, msg: str = "") -> None:
+def print_shared_buffer_with_condition(condition: tirx.PrimExpr, buffer: tirx.Buffer, elems: int, msg: str = "") -> None:
     """
     Conditionally prints the values of a flattened TIR buffer if the condition is True.
 
     Parameters:
-        condition (tir.PrimExpr): A TIR expression representing the condition to check.
-        buffer (tir.Buffer): The buffer whose values need to be printed.
+        condition (tirx.PrimExpr): A TIR expression representing the condition to check.
+        buffer (tirx.Buffer): The buffer whose values need to be printed.
         elems (int): The number of elements in the buffer to print.
 
     Returns:
-        tir.PrimExpr: The TIR expression for the debug print operation.
+        tirx.PrimExpr: The TIR expression for the debug print operation.
     """
     if condition:
         # Iterate through the buffer elements and print each one.
         for i in serial(elems):
             coords = index_to_coordinates(i, buffer.shape)
-            tir.call_extern("handle", "debug_print_buffer_value", msg, buffer.name, i, buffer[coords])
+            tirx.call_extern("handle", "debug_print_buffer_value", msg, buffer.name, i, buffer[coords])
 
 
 @macro
-def print_fragment_buffer_with_condition(condition: tir.PrimExpr, buffer: tir.Buffer, elems: int, msg: str = "") -> None:
+def print_fragment_buffer_with_condition(condition: tirx.PrimExpr, buffer: tirx.Buffer, elems: int, msg: str = "") -> None:
     """
     Conditionally prints the values of a flattened TIR buffer if the condition is True.
 
     Parameters:
-        condition (tir.PrimExpr): A TIR expression representing the condition to check.
-        buffer (tir.Buffer): The buffer whose values need to be printed.
+        condition (tirx.PrimExpr): A TIR expression representing the condition to check.
+        buffer (tirx.Buffer): The buffer whose values need to be printed.
         elems (int): The number of elements in the buffer to print.
 
     Returns:
-        tir.PrimExpr: The TIR expression for the debug print operation.
+        tirx.PrimExpr: The TIR expression for the debug print operation.
     """
     smem = alloc_shared(buffer.shape, buffer.dtype, "shared")
     copy(buffer, smem)
@@ -93,7 +91,7 @@ def print_fragment_buffer_with_condition(condition: tir.PrimExpr, buffer: tir.Bu
         # Iterate through the buffer elements and print each one.
         for i in serial(elems):
             coords = index_to_coordinates(i, buffer.shape)
-            tir.call_extern("handle", "debug_print_buffer_value", msg, buffer.name, i, smem[coords])
+            tirx.call_extern("handle", "debug_print_buffer_value", msg, buffer.name, i, smem[coords])
 
 
 @macro
@@ -103,56 +101,30 @@ def print_msg(msg: str) -> None:
     """
     assert isinstance(msg, str), "msg must be a string"
     assert msg != "", "msg must not be empty"
-    tir.call_extern("handle", "debug_print_msg", msg)
+    tirx.call_extern("handle", "debug_print_msg", msg)
 
 
 @macro
-def print_local_buffer_with_condition(condition: tir.PrimExpr, buffer: tir.Buffer, elems: int, msg: str = "") -> None:
+def print_local_buffer_with_condition(condition: tirx.PrimExpr, buffer: tirx.Buffer, elems: int, msg: str = "") -> None:
     """
     Conditionally prints the values of a flattened TIR buffer if the condition is True.
 
     Parameters:
-        condition (tir.PrimExpr): A TIR expression representing the condition to check.
-        buffer (tir.Buffer): The buffer whose values need to be printed.
+        condition (tirx.PrimExpr): A TIR expression representing the condition to check.
+        buffer (tirx.Buffer): The buffer whose values need to be printed.
         elems (int): The number of elements in the buffer to print.
     """
     if condition:
         # Iterate through the buffer elements and print each one.
         for i in serial(elems):
             coords = index_to_coordinates(i, buffer.shape)
-            tir.call_extern("handle", "debug_print_buffer_value", msg, buffer.name, i, buffer[coords])
+            tirx.call_extern("handle", "debug_print_buffer_value", msg, buffer.name, i, buffer[coords])
 
 
-from tilelang.utils.target import check_cuda_availability
-import warnings
+def device_assert(condition: tirx.PrimExpr, msg: str = "", no_stack_info=False):
+    from tilelang.cuda.debug import device_assert as cuda_device_assert
 
-_IS_CUDA_AVAILABLE = check_cuda_availability()
-
-
-def get_stack_str(msg, stacklevel=1):
-    stack = Builder.current().get_fileline_stack(stacklevel)
-    msg = msg + "\n"
-    for fileline, lineno, macro_name in stack:
-        msg += f"  at {fileline}:{lineno} in {macro_name}\n"
-    return msg
-
-
-@macro
-def device_assert(condition: tir.PrimExpr, msg: str = "", no_stack_info=False):
-    """
-    Device-side assert emulation.
-    Emits a device-side assert call on CUDA targets when CUDA is available.
-    The assert is always enabled and cannot be disabled at runtime.
-    """
-    if _IS_CUDA_AVAILABLE:
-        if no_stack_info:
-            if msg == "":
-                T.call_intrin("void", tir.op.Op.get("tl.device_assert"), condition)
-            else:
-                warnings.warn("Non-empty msg may slightly slow down the kernel", stacklevel=2)
-                T.call_intrin("void", tir.op.Op.get("tl.device_assert_with_msg"), condition, msg)
-        else:
-            T.call_intrin("void", tir.op.Op.get("tl.device_assert_with_msg"), condition, get_stack_str(msg, stacklevel=2))
+    return cuda_device_assert(condition, msg, no_stack_info)
 
 
 # NOTE(chaofan): T.print is implemented as a macro, so no return
@@ -164,7 +136,7 @@ def print(obj: Any = None, msg: str = "", warp_group_id: int = 0, warp_id: int =
     - If the input is a TIR primitive expression, it prints its value directly.
 
     Parameters:
-        obj (Any): The object to print. It can be either a tir.Buffer, tir.PrimExpr, or None (for msg-only print).
+        obj (Any): The object to print. It can be either a tirx.Buffer, tirx.PrimExpr, or None (for msg-only print).
         msg (str): An optional message to include in the print statement.
         warp_group_id (int): The warp group id to print.
         warp_id (int): The warp id to print.
@@ -173,7 +145,7 @@ def print(obj: Any = None, msg: str = "", warp_group_id: int = 0, warp_id: int =
     Raises:
         ValueError: If the input object type is unsupported.
     """
-    if isinstance(obj, tir.Buffer):
+    if isinstance(obj, tirx.Buffer):
         # Buffers must be printed in just one thread to avoid duplicate outputs.
         # Retrieve the thread bindings for thread x, y, and z.
         tx, ty, tz = get_thread_bindings()
@@ -224,7 +196,7 @@ def print(obj: Any = None, msg: str = "", warp_group_id: int = 0, warp_id: int =
         else:
             raise ValueError(f"Unsupported buffer scope: {buffer.scope()}")
 
-    elif isinstance(obj, tir.PrimExpr):
+    elif isinstance(obj, tirx.PrimExpr):
         if not msg:
             msg = f"expr<{obj}>"
         # Directly print primitive expressions.
@@ -235,4 +207,4 @@ def print(obj: Any = None, msg: str = "", warp_group_id: int = 0, warp_id: int =
 
     else:
         # Unsupported object type.
-        raise ValueError(f"Unexpected type: {type(obj)}. Supported types are tir.Buffer, tir.PrimExpr, and None.")
+        raise ValueError(f"Unexpected type: {type(obj)}. Supported types are tirx.Buffer, tirx.PrimExpr, and None.")

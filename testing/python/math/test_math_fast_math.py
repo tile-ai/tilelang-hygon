@@ -50,7 +50,16 @@ def check_non_fastmath_usage(source, mathop_name):
     check_fastmath_usage(source, mathop_name, expect_fastmath=False)
 
 
-def run_single_arg_mathop_test(mathop_name, mathop_func, M=32, N=32, block_M=32, block_N=32, dtype=T.float32):
+def run_single_arg_mathop_test(
+    mathop_name,
+    mathop_func,
+    M=32,
+    N=32,
+    block_M=32,
+    block_N=32,
+    dtype=T.float32,
+    cuda_mathop_name=None,
+):
     """
     Test single-argument mathops.
     T.exp should generate expf (non-fastmath), T.__exp should generate __expf (fastmath)
@@ -74,14 +83,14 @@ def run_single_arg_mathop_test(mathop_name, mathop_func, M=32, N=32, block_M=32,
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
         },
     )
-
     source_no_fastmath = kernel_no_fastmath.get_kernel_source()
 
     print(f"\n=== Testing {mathop_name} ===")
     print("FAST_MATH=False:")
 
     # Our tl.* intrinsics actually generate fastmath versions (e.g., __expf)
-    check_fastmath_usage(source_no_fastmath, mathop_name, expect_fastmath=False)
+    cuda_mathop_name = cuda_mathop_name or mathop_name
+    check_fastmath_usage(source_no_fastmath, cuda_mathop_name, expect_fastmath=False)
 
     print(f"✓ {mathop_name} compilation and execution test passed")
 
@@ -243,6 +252,26 @@ def run_fastmath_mathop_test(mathop_name, mathop_func, M=32, N=32, block_M=32, b
     print(f"✓ {mathop_name} numerical test passed")
 
 
+@tilelang.testing.requires_cuda
+def test_fast_rcp_codegen_uses_approx_rcp():
+    @T.prim_func
+    def main(
+        A: T.Tensor((32,), T.float32),
+        B: T.Tensor((32,), T.float32),
+    ):
+        with T.Kernel(1, threads=32):
+            tx = T.get_thread_binding()
+            B[tx] = T.fast_rcp(A[tx])
+
+    kernel = tilelang.compile(main, out_idx=[1], target="cuda")
+    source = kernel.get_kernel_source()
+    assert "tl::fast_rcp" in source
+
+    a = torch.rand((32,), device="cuda", dtype=torch.float32) + 0.25
+    b = kernel(a)
+    torch.testing.assert_close(b, 1.0 / a, rtol=2e-3, atol=2e-3)
+
+
 FASTMATH_MATHOPS = [
     ("__exp", T.__exp),
     ("__exp10", T.__exp10),
@@ -279,7 +308,6 @@ SINGLE_ARG_MATHOPS = [
     ("floor", T.floor),
     ("ceil", T.ceil),
     ("trunc", T.trunc),
-    ("round", T.round),
     ("nearbyint", T.nearbyint),
 ]
 
@@ -293,6 +321,24 @@ def test_mathops_generate_no_fastmath(name, func):
     # This appears to be the intended behavior
     run_single_arg_mathop_test(name, func, dtype=T.float32)
     print(f"✓ {name} test passed")
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize(
+    ("rounding_mode", "func", "cuda_mathop_name"),
+    [
+        ("ties-to-even", lambda x: T.round(x), "nearbyint"),
+        ("ties-away-from-zero", lambda x: T.round(x, "ties-away-from-zero"), "round"),
+    ],
+    ids=["ties-to-even", "ties-away-from-zero"],
+)
+def test_round_modes(rounding_mode, func, cuda_mathop_name):
+    run_single_arg_mathop_test(
+        f"round[{rounding_mode}]",
+        func,
+        dtype=T.float32,
+        cuda_mathop_name=cuda_mathop_name,
+    )
 
 
 @tilelang.testing.requires_cuda

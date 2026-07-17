@@ -5,7 +5,7 @@ Benchmark script for all GEMM implementations.
 import argparse
 import torch
 import tilelang as tl
-from perf.gemm.utils import ref_program, get_heuristic_config, get_default_kernel_version, triton_gemm
+from perf.gemm.utils import ref_program, get_heuristic_config, get_default_kernel_version
 from perf.gemm.vanilla_gemm import (
     get_best_vanilla_config,
     gemm_vanilla_v1,
@@ -23,7 +23,7 @@ from perf.gemm.splitk_gemm import gemm_splitk
 from perf.gemm.streamk_gemm import gemm_streamk
 from perf.utils.device import get_free_devices
 
-import triton.testing as triton_testing
+from tilelang.profiler import do_bench_cudagraph
 
 
 def normalize_dtype(dtype_str: str) -> str:
@@ -142,23 +142,17 @@ def main(
     def ref_run():
         ref_program(*inputs)
 
-    def triton_run():
-        triton_gemm(*inputs)
-
     # tilelang_latency = profiler.do_bench()
     # ref_latency = profiler.do_bench(ref_program)
 
-    tilelang_latency = triton_testing.do_bench_cudagraph(tilelang_run)
-    ref_latency = triton_testing.do_bench_cudagraph(ref_run)
-    # triton_latency = triton_testing.do_bench_cudagraph(triton_run)
+    tilelang_latency = do_bench_cudagraph(tilelang_run)
+    ref_latency = do_bench_cudagraph(ref_run)
 
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
     print("\n=== Benchmark Results ===")
     print(f"TileLang latency: {tilelang_latency:.6f} ms")
-    # print(f"Triton latency: {triton_latency:.6f} ms")
     print(f"Ref latency: {ref_latency:.6f} ms")
     print(f"TileLang TFlops: {2 * M * N * K / tilelang_latency * 1e-9:.4f}")
-    # print(f"Triton TFlops: {2 * M * N * K / triton_latency * 1e-9:.4f}")
     print(f"Ref TFlops: {2 * M * N * K / ref_latency * 1e-9:.4f}")
     print(f"Speedup: {ref_latency / tilelang_latency:.4f}x")
 

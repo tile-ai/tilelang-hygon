@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Literal
 
 import torch
-import tvm
-from tilelang.utils import determine_fp8_type
-from tilelang.utils.target import determine_target, target_get_warp_size, target_is_hcu
+from tilelang import tvm as tvm
+from tilelang.language.fp8 import determine_fp8_type
+from tilelang.backend.target import determine_target
+from tilelang.hcu.target import target_get_warp_size, target_is_hcu
 
 
 def _on_hcu() -> bool:
@@ -196,7 +197,7 @@ def shared_swizzle_layout(shared_buf, major_pack: int = 1):
 
 def mmac_intrinsic_swizzle_layout(shared_buf, vec_size: int = 8):
     """Swizzle for manual HCU matrix-core intrinsic emitters."""
-    from tilelang.intrinsics import make_mmac_swizzle_layout
+    from tilelang.hcu.intrinsics import make_mmac_swizzle_layout
 
     return make_mmac_swizzle_layout(shared_buf, vecSize=vec_size)
 

@@ -3,8 +3,8 @@ import torch
 import tilelang.testing
 from tilelang import tvm as tvm
 import tilelang.language as T
-from tilelang.intrinsics import make_mmac_swizzle_layout as make_swizzle_layout
-from tilelang.intrinsics.hcu_mmac_macro_generator import HCUMatrixCoreIntrinEmitter as MatrixCoreIntrinEmitter
+from tilelang.hcu.intrinsics import make_mmac_swizzle_layout as make_swizzle_layout
+from tilelang.hcu.intrinsics import HCUMatrixCoreIntrinEmitter as MatrixCoreIntrinEmitter
 from tilelang.transform import simplify_prim_func
 from hcu_test_utils import target_supports_fp8_mmac
 

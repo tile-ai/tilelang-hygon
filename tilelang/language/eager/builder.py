@@ -2,31 +2,28 @@ from __future__ import annotations
 from contextlib import contextmanager, AbstractContextManager
 from dataclasses import dataclass
 import inspect
-import sys
 
 from tilelang.language.kernel import KernelLaunchFrame
 from tvm_ffi.container import Map
 from tvm.ir.base import Span
 from tvm.ir.expr import Range
-from tvm.tir.stmt import BufferRegion
-from tvm.tir.stmt_functor import substitute
+from tvm.tirx.stmt import BufferRegion
+from tvm.tirx.stmt_functor import substitute
 from .ast import BaseBuilder, IRGenerator, eval_op, has_internal_prim_func, mutate
 from .utils import construct_strides
+from tilelang.language.frame import clear_let_values, register_let_value
 from tilelang.utils import side_effect
 import tvm
-from tvm.tir import Buffer
-from tvm.script.ir_builder import tir, IRBuilder
+from tvm.tirx import Buffer
+from tvm.script.ir_builder import tirx, IRBuilder
 
-from tvm.tir.expr import BufferLoad, CallEffectKind, EqualOp, FloatImm, IntImm, NotEqualOp, PrimExpr, StringImm, Var
-from typing import TYPE_CHECKING, Callable, Any, Generic, TypeVar, ForwardRef, Union, Literal, get_origin
+from tvm.tirx.expr import BufferLoad, CallEffectKind, EqualOp, FloatImm, IntImm, NotEqualOp, PrimExpr, StringImm, Var
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, ForwardRef, Literal, get_origin, ParamSpec
+from collections.abc import Callable
+from typing_extensions import Self
 from collections.abc import Hashable
 from collections.abc import Sequence
 
-# Python 3.9 compatibility for ParamSpec and Self
-try:
-    from typing import ParamSpec, Self
-except ImportError:  # Python < 3.11 for Self, < 3.10 for ParamSpec
-    from typing_extensions import ParamSpec, Self
 from .. import dtypes as dt
 from . import utils
 from tilelang.jit.exceptions import JITNoBuilderError, EagerJITBuildError
@@ -40,15 +37,48 @@ def unwrap_expr(expr) -> PrimExpr | int | float:
     """
     unwrap expr and convert it into PrimExpr like
     """
-    if isinstance(expr, tir.meta_var):
+    if isinstance(expr, tirx.meta_var):
         expr = expr.value
     elif isinstance(expr, Ref):
         return expr.load()
     elif is_var(expr):
-        expr = tir.BufferLoad(expr, indices=[0])
+        expr = tirx.BufferLoad(expr, indices=[0])
     elif isinstance(expr, (EqualOp, NotEqualOp)):
         expr = expr.asobject()
     return expr
+
+
+def _dtype_total_bits(dtype: dt.dtype) -> int:
+    return dtype.bits * dtype.lanes
+
+
+def _packed_storage_factor(buffer: Buffer, value) -> int:
+    if isinstance(value, Buffer):
+        return 1
+
+    logical_bits = _dtype_total_bits(buffer.dtype)
+    if logical_bits >= 8:
+        return 1
+
+    storage_dtype = dt.dtype(value.dtype)
+    return _dtype_total_bits(storage_dtype) // logical_bits
+
+
+def _logical_shape_value(value, buffer: Buffer, dim: int):
+    shape = value.shape[dim]
+    if dim == len(buffer.shape) - 1:
+        shape *= _packed_storage_factor(buffer, value)
+    return shape
+
+
+def _logical_stride_value(value, buffer: Buffer, dim: int):
+    if isinstance(value, Buffer):
+        return value.strides[dim]
+
+    stride = value.stride()[dim]
+    if dim != len(buffer.strides) - 1:
+        stride *= _packed_storage_factor(buffer, value)
+    return stride
 
 
 def unwrap_cond(expr):
@@ -128,7 +158,7 @@ class Ref:
         return self.bufload.buffer
 
     def store(self, value):
-        tir.buffer_store(self.bufload.buffer, value, self.bufload.indices)
+        tirx.buffer_store(self.bufload.buffer, value, self.bufload.indices)
 
     def load(self):
         return self.bufload
@@ -137,23 +167,22 @@ class Ref:
 class UnrollForWithStep(SerialForWithStep): ...
 
 
-# Python 3.9 compatibility: avoid PEP 604 unions at runtime
-# Use tuple for isinstance checks and typing.Union for annotations/aliases
+# Runtime frame checks use tuple form; AnyFrame is kept as an annotation alias.
 ContinueOrBreak = (ContinueFrame, BreakFrame)
-AnyFrame = Union[tir.frame.IRBuilderFrame, Frame]
+AnyFrame = tirx.frame.IRBuilderFrame | Frame
 
 TIR_CONTROL_FRAME = (
-    tir.frame.WhileFrame,
-    tir.frame.ForFrame,
-    tir.frame.IfFrame,
-    tir.frame.PrimFuncFrame,
+    tirx.frame.WhileFrame,
+    tirx.frame.ForFrame,
+    tirx.frame.IfFrame,
+    tirx.frame.PrimFuncFrame,
 )
 
 TIR_VAR_SCOPE_FRAME = (
-    tir.frame.WhileFrame,
-    tir.frame.ForFrame,
-    tir.frame.IfFrame,
-    tir.frame.PrimFuncFrame,
+    tirx.frame.WhileFrame,
+    tirx.frame.ForFrame,
+    tirx.frame.IfFrame,
+    tirx.frame.PrimFuncFrame,
     MacroFrame,
     KernelLaunchFrame,
 )
@@ -196,13 +225,15 @@ class Builder(BaseBuilder):
     @contextmanager
     def prim_func(self, name):
         thread_local_storage.builder = self
+        clear_let_values()
         try:
-            with self.ir_builder, self.with_frame(tir.prim_func()):
-                tir.func_name(name)
+            with self.ir_builder, self.with_frame(tirx.prim_func()):
+                tirx.func_name(name)
                 yield
             if self.eager_jit != "phase1" and len(self.out_idx) != self.out_tensor_cnt:
                 raise RuntimeError("Not all tensor allocated from `T.empty` are returned")
         finally:
+            clear_let_values()
             del thread_local_storage.builder
 
     @contextmanager
@@ -266,14 +297,14 @@ class Builder(BaseBuilder):
         self.check_continue_break()
         cond = unwrap_cond(cond)
         if isinstance(cond, PrimExpr):
-            with self.with_frame(tir.If(cond)):
+            with self.with_frame(tirx.If(cond)):
                 yield self._has_if_frame
         else:
             yield cond
 
     def ctx_then(self, val):
         if val is self._has_if_frame:
-            with self.with_frame(tir.Then()):
+            with self.with_frame(tirx.Then()):
                 yield
         else:
             if val:
@@ -281,7 +312,7 @@ class Builder(BaseBuilder):
 
     def ctx_else(self, val):
         if val is self._has_if_frame:
-            with self.with_frame(tir.Else()):
+            with self.with_frame(tirx.Else()):
                 yield
         else:
             if not val:
@@ -291,21 +322,21 @@ class Builder(BaseBuilder):
         val = unwrap_expr(val)
         if val is None:
             pass
-        elif isinstance(val, tir.frame.IRBuilderFrame):
-            if isinstance(val, tir.frame.ForFrame):
+        elif isinstance(val, tirx.frame.IRBuilderFrame):
+            if isinstance(val, tirx.frame.ForFrame):
                 logger.warning(
                     "A for-loop frame is being evaluated as a standalone expression. Did you mean to use it in a `for` statement?",
                     stacklevel=2,
                 )
             self.enter_frame(val)
         elif isinstance(val, PrimExpr):
-            tir.evaluate(val)
+            tirx.evaluate(val)
         elif isinstance(val, (int, bool)):
-            tir.evaluate(tvm.tir.const(val))
+            tirx.evaluate(tvm.tirx.const(val))
         elif isinstance(val, str):
             pass
-        elif isinstance(val, tvm.tir.stmt.BufferStore):
-            tir.buffer_store(val.buffer, val.value, val.indices, val.predicate)
+        elif isinstance(val, tvm.tirx.stmt.BufferStore):
+            tirx.buffer_store(val.buffer, val.value, val.indices, val.predicate)
         elif isinstance(val, (Buffer, Var)):
             pass
         else:
@@ -321,19 +352,19 @@ class Builder(BaseBuilder):
                 if step_value == 0:
                     raise ValueError("Invalid stepped serial: step must be non-zero")
                 if step_value > 0:
-                    real_stop = tir.ceildiv(it.stop - it.start, step_value)
+                    real_stop = tirx.ceildiv(it.stop - it.start, step_value)
                 else:
-                    real_stop = tir.ceildiv(it.start - it.stop, -step_value)
+                    real_stop = tirx.ceildiv(it.start - it.stop, -step_value)
             else:
                 logger.warning(
                     f"Non-constant step `{it.step}` in serial range may produce unexpected results. Consider using a constant step if possible.",
                     stacklevel=2,
                 )
-                real_stop = tir.ceildiv(it.stop - it.start, it.step)
+                real_stop = tirx.ceildiv(it.stop - it.start, it.step)
             if isinstance(it, UnrollForWithStep):
-                real_frame = tir.unroll(real_stop, annotations=it.annotations)
+                real_frame = tirx.unroll(real_stop, annotations=it.annotations)
             elif isinstance(it, SerialForWithStep):
-                real_frame = tir.serial(real_stop, annotations=it.annotations)
+                real_frame = tirx.serial(real_stop, annotations=it.annotations)
             else:
                 raise TypeError(
                     f"Invalid for loop, got {it}({type(it)}), expect one of the following: "
@@ -343,7 +374,7 @@ class Builder(BaseBuilder):
                 IRBuilder.name("_tmp", v)
                 yield it.start + v * it.step
         else:
-            if not isinstance(it, tir.frame.ForFrame):
+            if not isinstance(it, tirx.frame.ForFrame):
                 raise TypeError(
                     f"Invalid for loop, got {it}({type(it)}), expect one of the following: "
                     "range, T.serial, T.grid, T.parallel, T.vectorized, T.unroll, T.thread_binding"
@@ -355,13 +386,13 @@ class Builder(BaseBuilder):
         self.check_continue_break()
         # add a dummy frame for checking code after continue/break
         self.enter_frame(ContinueFrame())
-        tir.evaluate(tir.continue_loop())
+        tirx.evaluate(tirx.continue_loop())
 
     def ctx_break(self):
         self.check_continue_break()
         # add a dummy frame for checking code after continue/break
         self.enter_frame(BreakFrame())
-        tir.evaluate(tir.break_loop())
+        tirx.evaluate(tirx.break_loop())
 
     def ctx_while(self, cond):
         self.check_continue_break()
@@ -379,7 +410,7 @@ class Builder(BaseBuilder):
                     f"Condition: {cond_v} ({type(cond_v)}) => {cond_v_unwrap} ({type(cond_v_unwrap)})\n",
                     stacklevel=2,
                 )
-        with self.with_frame(tir.While(cond_v_unwrap)):
+        with self.with_frame(tirx.While(cond_v_unwrap)):
             yield None
 
     def bind(self, name, value, annot=BaseBuilder.empty):
@@ -396,7 +427,7 @@ class Builder(BaseBuilder):
         # here we do a quick check in prim_func_frame, if the value is pure expr, we directly return it
         if (
             isinstance(value, PrimExpr)
-            and isinstance(self.frames[-1], tir.frame.PrimFuncFrame)
+            and isinstance(self.frames[-1], tirx.frame.PrimFuncFrame)
             and side_effect(value) <= CallEffectKind.Pure.value
         ):
             return value
@@ -443,13 +474,13 @@ class Builder(BaseBuilder):
             orig_value.store(value)
             return orig_value
         if is_var(orig_value) and isinstance(value, (int, float, PrimExpr)):
-            tir.buffer_store(orig_value, value, 0)
+            tirx.buffer_store(orig_value, value, 0)
             return orig_value
 
         # 2. Quick return for trivil types
         if isinstance(value, (tuple, list, tvm.ffi.Array, int, float, str)):
             return value
-        if isinstance(value, tir.IntImm) and value.dtype == "int32":
+        if isinstance(value, tirx.IntImm) and value.dtype == "int32":
             return value.value
         if isinstance(value, (Var, Buffer)):
             # Bind TVM Var/Buffer names and also record scope so reusing the same
@@ -483,7 +514,7 @@ class Builder(BaseBuilder):
         """
         value = unwrap_expr(value)
         # handle bx, by = tl.Kernel(128, 128), rval is frame
-        if isinstance(value, tir.frame.IRBuilderFrame):
+        if isinstance(value, tirx.frame.IRBuilderFrame):
             return self.enter_frame(value)
         else:
             return value
@@ -496,14 +527,14 @@ class Builder(BaseBuilder):
         if name == "_":
             # use _tmp to make the generated tir more readable
             name = "_tmp"
-        if isinstance(value, tir.meta_var):
+        if isinstance(value, tirx.meta_var):
             return value.value
-        elif isinstance(value, tir.frame.IRBuilderFrame):
+        elif isinstance(value, tirx.frame.IRBuilderFrame):
             return self.enter_frame(value)
         elif isinstance(value, OutTensor):
-            arg = tir.arg(
+            arg = tirx.arg(
                 name,
-                tir.buffer(
+                tirx.buffer(
                     shape=value.shape,
                     dtype=value.dtype,
                     strides=value.strides,
@@ -512,14 +543,14 @@ class Builder(BaseBuilder):
             arg._out_idx = self.out_tensor_cnt
             self.out_tensor_cnt += 1
             return arg
-        elif isinstance(value, (Buffer, tir.IterVar, tir.Var)):
+        elif isinstance(value, (Buffer, tirx.IterVar, tirx.Var)):
             IRBuilder.name(name, value)
             return value
         elif isinstance(value, (PrimExpr, BufferRegion)):
-            frame = tir.LetStmt(value)
-            var = frame.var
+            var = tirx.bind(value)
+            register_let_value(var, value)
             IRBuilder.name(name, var)
-            return self.enter_frame(frame)
+            return var
         else:
             return value
 
@@ -528,7 +559,7 @@ class Builder(BaseBuilder):
         if annot is not self.empty:
             logger.warning("Type annotation on slice assignment is not supported and will be ignored.", stacklevel=2)
         if isinstance(lval, Buffer):
-            tir.buffer_store(lval, value, sl)
+            tirx.buffer_store(lval, value, sl)
         else:
             return super().assign_slice(lval, sl, value)
 
@@ -538,7 +569,7 @@ class Builder(BaseBuilder):
             target.store(eval_op(op, target.bufload, aug_value))
             return target
         elif is_var(target):
-            tir.buffer_store(target, eval_op(op, target[0], aug_value), 0)
+            tirx.buffer_store(target, eval_op(op, target[0], aug_value), 0)
             return target
         elif isinstance(target, Buffer):
             raise RuntimeError(
@@ -559,7 +590,7 @@ class Builder(BaseBuilder):
             # LetStmts before match_buffer.
             if (
                 isinstance(res, PrimExpr)
-                and isinstance(self.frames[-1], tir.frame.PrimFuncFrame)
+                and isinstance(self.frames[-1], tirx.frame.PrimFuncFrame)
                 and side_effect(res) <= CallEffectKind.Pure.value
             ):
                 return res
@@ -581,7 +612,7 @@ class Builder(BaseBuilder):
     def aug_assign_slice(self, op, target, sl, aug_value):
         self.check_continue_break()
         if isinstance(target, Buffer):
-            tir.buffer_store(target, eval_op(op, target[sl], aug_value), sl)
+            tirx.buffer_store(target, eval_op(op, target[sl], aug_value), sl)
         else:
             return super().aug_assign_slice(op, target, sl, aug_value)
 
@@ -590,11 +621,11 @@ class Builder(BaseBuilder):
         if isinstance(left, PrimExpr):
             with self.with_frame(BoolOpFrame()):
                 if op == "And":
-                    return tir.And(left, right())
+                    return tirx.And(left, right())
                 if op == "Or":
-                    return tir.Or(left, right())
+                    return tirx.Or(left, right())
                 if op == "Not":
-                    return tir.Not(left)
+                    return tirx.Not(left)
             raise RuntimeError(f"Unsupported boolean operator: {op}")
         else:
             return super().boolop(op, left, right)
@@ -603,7 +634,7 @@ class Builder(BaseBuilder):
         cond = unwrap_cond(cond)
         if isinstance(cond, PrimExpr):
             with self.with_frame(BoolOpFrame()):
-                return tir.if_then_else(cond, then(), otherwise())
+                return tirx.if_then_else(cond, then(), otherwise())
         else:
             return super().ifexp(cond, then, otherwise)
 
@@ -650,7 +681,7 @@ class Builder(BaseBuilder):
 
     def ctx_with(self, ctx):
         self.check_continue_break()
-        if isinstance(ctx, tir.frame.IRBuilderFrame):
+        if isinstance(ctx, tirx.frame.IRBuilderFrame):
             return self.with_frame(ctx)
         else:
             return super().ctx_with(ctx)
@@ -661,7 +692,7 @@ class Builder(BaseBuilder):
         if msg is None:
             msg = "Assertion failed"
         if isinstance(cond, PrimExpr):
-            self.enter_frame(tir.Assert(cond, msg))
+            self.enter_frame(tirx.Assert(cond, msg))
         elif not cond:
             raise AssertionError(msg)
 
@@ -699,7 +730,7 @@ class Builder(BaseBuilder):
 
     def prim_func_arg(self, name, value):
         if isinstance(value, (Buffer, Var)):
-            return tir.arg(name, value)
+            return tirx.arg(name, value)
         elif value is self.empty:
             raise ValueError(f"Argument `{name}` is not annotated")
         elif isinstance(value, Hashable):
@@ -721,7 +752,7 @@ class Builder(BaseBuilder):
         raise ValueError(f"Unknown override: {name}")
 
     def constexpr(self, name: str, dtype: str = "int32") -> Var:
-        var = tir.Var(name, dtype)
+        var = tirx.Var(name, dtype)
         self.constexpr_var.add(var)
         var.orig_name = name
         return var
@@ -745,18 +776,18 @@ _T = TypeVar("_T")
 
 if TYPE_CHECKING:
 
-    class PrimFunc(Generic[_P, _T], tvm.tir.PrimFunc):
-        params: list[tvm.tir.Var | tvm.tir.Buffer]
-        body: tvm.tir.Stmt
+    class PrimFunc(Generic[_P, _T], tvm.tirx.PrimFunc):
+        params: list[tvm.tirx.Var | tvm.tirx.Buffer]
+        body: tvm.tirx.Stmt
         ret_type: tvm.ir.Type
-        buffer_map: Map[tvm.tir.Var, tvm.tir.Buffer]
+        buffer_map: Map[tvm.tirx.Var, tvm.tirx.Buffer]
         attrs: tvm.Attrs | None
         span: Span | None
         ir_gen: IRGenerator[_P, _T] | None
         orig_func: Callable[_P, _T] | None
 
 else:
-    PrimFunc = tvm.tir.PrimFunc
+    PrimFunc = tvm.tirx.PrimFunc
 
 
 @dataclass
@@ -849,7 +880,7 @@ def get_type_hints(func):
     # ```
     #
     # This is incomplete and buggy
-    #   the only bug scenario the function body doesn't use the the parameters
+    #   the only bug scenario the function body doesn't use the parameters
     #   but such define-no-use scenario is very rare in writing kernels
     #
     # ```py
@@ -881,10 +912,7 @@ def get_type_hints(func):
                     continue
                 except Exception:
                     pass
-            if sys.version_info >= (3, 10):
-                value = ForwardRef(value, module=func.__module__)
-            else:
-                value = ForwardRef(value, is_argument=True)
+            value = ForwardRef(value, module=func.__module__)
             hints[name] = _eval_type(value, globalns=globalns, localns=localns)
         else:
             hints[name] = value
@@ -1006,7 +1034,7 @@ class TirTemplate(Generic[_P, _T]):
 
     name: str
     prim_func: PrimFunc[_P, _T]
-    matcher: dict[Var, tuple[tvm.tir.Var, str, int, str]] | None = None
+    matcher: dict[Var, tuple[tvm.tirx.Var, str, int, str]] | None = None
     constexprs: set[Var] = None
     is_lazy_style: bool = False  # True if from lazy-style (returns PrimFunc directly)
     ir_gen: IRGenerator[_P, _T] | None = None
@@ -1047,18 +1075,17 @@ class TirTemplate(Generic[_P, _T]):
         if self.matcher is None:
             return ()
         result = []
+        buffers = {param.name: buffer for param, buffer in self.prim_func.buffer_map.items()}
         for k, ty, i, name in self.matcher.values():
             if name in kwargs:
                 result.append(kwargs.get(name))
             elif k in kwargs:
+                value = kwargs[k]
+                buffer = buffers[k]
                 if ty == "shape":
-                    result.append(kwargs[k].shape[i])
+                    result.append(_logical_shape_value(value, buffer, i))
                 elif ty == "stride":
-                    v = kwargs[k]
-                    if isinstance(v, Buffer):
-                        result.append(v.strides[i])
-                    else:
-                        result.append(kwargs[k].stride()[i])
+                    result.append(_logical_stride_value(value, buffer, i))
             else:
                 raise ValueError(
                     f"Cannot find value for constexpr variable `{name}`\n"
@@ -1082,6 +1109,239 @@ class TirTemplate(Generic[_P, _T]):
         return pf
 
 
+_MISSING_ARG = object()
+_ExtraJITKwargsKey = tuple[tuple[str, Any], ...]
+
+
+def _freeze_jit_key_part(value: Any) -> Any:
+    """Canonicalize supported compile-time values into hashable key parts."""
+
+    if isinstance(value, dict):
+        return (
+            dict,
+            tuple(
+                (_freeze_jit_key_part(key), _freeze_jit_key_part(item_value))
+                for key, item_value in sorted(value.items(), key=lambda item: repr(item[0]))
+            ),
+        )
+    if isinstance(value, list):
+        return list, tuple(_freeze_jit_key_part(item) for item in value)
+    if isinstance(value, set):
+        return set, tuple(sorted((_freeze_jit_key_part(item) for item in value), key=repr))
+    if isinstance(value, tuple):
+        return tuple(_freeze_jit_key_part(item) for item in value)
+
+    if not isinstance(value, Hashable):
+        raise TypeError(f"Unsupported unhashable JIT compile-time cache key value of type {type(value).__qualname__}: {value!r}")
+    return value
+
+
+def _make_jit_key(values: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Build the phase-1 cache key from already ordered compile-time values."""
+
+    return tuple(_freeze_jit_key_part(value) for value in values)
+
+
+@dataclass(frozen=True)
+class _BoundJITArgs:
+    """JIT arguments split into phase-1 key, runtime tensors, and compile kwargs."""
+
+    p1_key: tuple[Any, ...]
+    tensor_args: dict[str, Any]
+    compile_kwargs: dict[str, Any]
+
+
+class _JITArgumentBinder:
+    """Bind Python JIT calls into TileLang's phase-1 cache inputs.
+
+    The binder keeps three pieces of data separate:
+
+    - phase-1 key values: compile-time arguments that identify the TIR template
+    - tensor args: runtime tensors used later for phase-2 shape/stride matching
+    - compile kwargs: raw values passed back to the user's Python JIT function
+
+    The common path avoids inspect.Signature.bind() because this code runs before
+    every cache lookup. Signatures with *args or **kwargs still use Python's
+    binder because their call semantics are harder to reproduce safely.
+    """
+
+    def __init__(
+        self,
+        signature: inspect.Signature,
+        tensor_arg_names: set[str],
+    ):
+        self.signature = signature
+        self.tensor_arg_names = tensor_arg_names
+        self.params = tuple(signature.parameters.values())
+        self.param_names = tuple(param.name for param in self.params)
+        self.param_index = {name: i for i, name in enumerate(self.param_names)}
+        self.defaults = tuple(param.default if param.default is not inspect.Parameter.empty else _MISSING_ARG for param in self.params)
+        self.required_indices = tuple(i for i, value in enumerate(self.defaults) if value is _MISSING_ARG)
+        self.positional_param_count = sum(
+            1 for param in self.params if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        )
+        self.use_signature_bind = any(
+            param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD) for param in self.params
+        )
+
+    def bind(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> _BoundJITArgs:
+        if self.use_signature_bind:
+            return self._bind_with_signature(args, kwargs)
+        return self._bind_fast(args, kwargs)
+
+    def bind_no_tensor_key(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...]:
+        if self.tensor_arg_names:
+            raise ValueError("bind_no_tensor_key is only valid for JIT functions without tensor arguments")
+        if self.use_signature_bind:
+            bound = self.signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            return self._pack_no_tensor_key(bound.arguments)
+        return self._bind_fast_no_tensor_key(args, kwargs)
+
+    @staticmethod
+    def _extra_key(extra_kwargs: dict[str, Any]) -> _ExtraJITKwargsKey:
+        # Extra kwargs are compile-time values for explicit T.const bindings.
+        # Sort names so f(M=1, N=2) and f(N=2, M=1) share one key.
+        return tuple(sorted(extra_kwargs.items()))
+
+    def _pack_no_tensor_key(self, arguments: dict[str, Any]) -> tuple[Any, ...]:
+        """Pack a lazy no-tensor call directly into a phase-1 key."""
+
+        p1_values: list[Any] = []
+        for param in self.params:
+            value = arguments[param.name]
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                # Signature.bind() stores **kwargs as one dict under the
+                # VAR_KEYWORD parameter. Flatten it so each keyword remains a
+                # normal compile-time key component.
+                if value:
+                    p1_values.append(self._extra_key(value))
+            else:
+                p1_values.append(value)
+        return _make_jit_key(tuple(p1_values))
+
+    def _pack_bound_arguments(
+        self,
+        arguments: dict[str, Any],
+        extra_kwargs: dict[str, Any] | None = None,
+    ) -> _BoundJITArgs:
+        p1_values: list[Any] = []
+        tensor_args: dict[str, Any] = {}
+        compile_kwargs: dict[str, Any] = {}
+        extra_kwargs = extra_kwargs or {}
+        for param in self.params:
+            name = param.name
+            value = arguments[name]
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                # Keep **kwargs flattened both in the key and in compile_kwargs;
+                # passing {"kwargs": {...}} would change the user's call form.
+                if value:
+                    p1_values.append(self._extra_key(value))
+                    compile_kwargs.update(value)
+                continue
+            if name in self.tensor_arg_names:
+                # Tensor args are runtime inputs. They do not identify the TIR
+                # template, but they are needed for phase-2 shape/stride keys.
+                tensor_args[name] = value
+            else:
+                p1_values.append(value)
+                compile_kwargs[name] = value
+        if extra_kwargs:
+            p1_values.append(self._extra_key(extra_kwargs))
+            compile_kwargs.update(extra_kwargs)
+        return _BoundJITArgs(_make_jit_key(tuple(p1_values)), tensor_args, compile_kwargs)
+
+    def _bind_with_signature(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> _BoundJITArgs:
+        """Slow path for signatures that need Python's full binding rules."""
+
+        bound = self.signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        return self._pack_bound_arguments(bound.arguments)
+
+    def _bind_fast(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> _BoundJITArgs:
+        """Fast binder for normal positional/keyword-only JIT signatures."""
+
+        if len(args) > self.positional_param_count:
+            raise TypeError(
+                f"too many positional arguments for JIT function: expected at most {self.positional_param_count}, got {len(args)}"
+            )
+
+        values = list(self.defaults)
+        extra_kwargs: dict[str, Any] = {}
+        for i, value in enumerate(args):
+            values[i] = value
+
+        for name, value in kwargs.items():
+            index = self.param_index.get(name)
+            if index is None:
+                # TileLang allows extra compile-time kwargs for explicit T.const bindings.
+                extra_kwargs[name] = value
+                continue
+            if index < len(args):
+                raise TypeError(f"got multiple values for argument '{name}'")
+            values[index] = value
+
+        for index in self.required_indices:
+            if values[index] is _MISSING_ARG and self.param_names[index] not in self.tensor_arg_names:
+                raise TypeError(f"missing a required argument: '{self.param_names[index]}'")
+
+        p1_values: list[Any] = []
+        tensor_args: dict[str, Any] = {}
+        compile_kwargs: dict[str, Any] = {}
+        for name, value in zip(self.param_names, values):
+            if name in self.tensor_arg_names:
+                if value is not _MISSING_ARG:
+                    tensor_args[name] = value
+            else:
+                p1_values.append(value)
+                compile_kwargs[name] = value
+        if extra_kwargs:
+            p1_values.append(self._extra_key(extra_kwargs))
+            compile_kwargs.update(extra_kwargs)
+        return _BoundJITArgs(_make_jit_key(tuple(p1_values)), tensor_args, compile_kwargs)
+
+    def _bind_fast_no_tensor_key(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...]:
+        """Fastest path for lazy factories where every argument is compile-time."""
+
+        if len(args) > self.positional_param_count:
+            raise TypeError(
+                f"too many positional arguments for JIT function: expected at most {self.positional_param_count}, got {len(args)}"
+            )
+
+        if not kwargs:
+            # Common lazy cache-hit form: positional values, no tensor args, no
+            # kwargs. Fill omitted defaults without allocating _BoundJITArgs.
+            if len(args) == len(self.param_names):
+                return _make_jit_key(args)
+            for index in self.required_indices:
+                if index >= len(args):
+                    raise TypeError(f"missing a required argument: '{self.param_names[index]}'")
+            return _make_jit_key(args + self.defaults[len(args) :])
+
+        values = list(self.defaults)
+        extra_kwargs: dict[str, Any] = {}
+        for i, value in enumerate(args):
+            values[i] = value
+
+        for name, value in kwargs.items():
+            index = self.param_index.get(name)
+            if index is None:
+                # TileLang allows extra compile-time kwargs for explicit T.const bindings.
+                extra_kwargs[name] = value
+                continue
+            if index < len(args):
+                raise TypeError(f"got multiple values for argument '{name}'")
+            values[index] = value
+
+        for index in self.required_indices:
+            if values[index] is _MISSING_ARG:
+                raise TypeError(f"missing a required argument: '{self.param_names[index]}'")
+
+        if extra_kwargs:
+            values.append(self._extra_key(extra_kwargs))
+        return _make_jit_key(tuple(values))
+
+
 @dataclass
 class JITFunc(Generic[_P, _T]):
     """
@@ -1101,6 +1361,7 @@ class JITFunc(Generic[_P, _T]):
     """
 
     orig_func: Callable[_P, _T]
+    signature: inspect.Signature
     arg_names: list[str]
     tensor_args: dict[str, Buffer | Var]
     tensor_args_defaults: dict[str, Any]
@@ -1110,17 +1371,11 @@ class JITFunc(Generic[_P, _T]):
     def __post_init__(self):
         # we don't want it to show up in the constructor
         self.p1_cache: dict[Any, TirTemplate[_P, _T]] = {}
+        self._argument_binder = _JITArgumentBinder(self.signature, set(self.tensor_args))
 
     def _parse_phase1_key(self, *args, **kwargs):
-        kwargs.update({k: v for k, v in zip(self.arg_names, args)})
-        tensor_args = {}
-        for k in self.tensor_args:
-            if k in kwargs:
-                tensor_args[k] = kwargs.pop(k)
-            elif k in self.tensor_args_defaults:
-                tensor_args[k] = self.tensor_args_defaults[k]
-        p1_key = tuple(sorted(kwargs.items()))
-        return p1_key, tensor_args, kwargs
+        bound = self._argument_binder.bind(args, kwargs)
+        return bound.p1_key, bound.tensor_args, bound.compile_kwargs
 
     def _is_lazy_style(self, *args, **kwargs) -> bool:
         """
@@ -1150,8 +1405,8 @@ class JITFunc(Generic[_P, _T]):
             prim_func = self.orig_func(*args, **kwargs)
             # lazy jit must return PrimFunc
             if isinstance(prim_func, PrimFunc):
-                p1_key, _, _ = self._parse_phase1_key(*args, **kwargs)
-                self.p1_cache[p1_key] = TirTemplate.from_lazy_style(self.orig_func.__name__, prim_func)
+                bound = self._argument_binder.bind(args, kwargs)
+                self.p1_cache[bound.p1_key] = TirTemplate.from_lazy_style(self.orig_func.__name__, prim_func)
                 return True
             return False
         except (JITNoBuilderError, EagerJITBuildError):
@@ -1181,23 +1436,29 @@ class JITFunc(Generic[_P, _T]):
 
     def parse_args(self, *args, **kwargs):
         """Parse arguments and return cache key and tensor args."""
-        p1_key, tensor_args, kwargs = self._parse_phase1_key(*args, **kwargs)
-        if not tensor_args:
+        if not self.tensor_args:
+            p1_key = self._argument_binder.bind_no_tensor_key(args, kwargs)
             return (p1_key, None), {}
-        tir_temp = self.p1_cache.get(p1_key, None)
+
+        bound = self._argument_binder.bind(args, kwargs)
+        tir_temp = self.p1_cache.get(bound.p1_key, None)
         if tir_temp is None:
             # mode should be set by JITImpl before calling parse_args
-            tir_temp = self._build_tir_template(**kwargs)
-            self.p1_cache[p1_key] = tir_temp
-        p2_key = tir_temp._parse_phase2_key(**tensor_args, **kwargs)
-        return (p1_key, p2_key), tensor_args
+            tir_temp = self._build_tir_template(**bound.compile_kwargs)
+            self.p1_cache[bound.p1_key] = tir_temp
+        p2_key = tir_temp._parse_phase2_key(**bound.tensor_args, **bound.compile_kwargs)
+        return (bound.p1_key, p2_key), bound.tensor_args
 
     def get_tir(self, *args, **kwargs):
-        p1_key, tensor_args, kwargs = self._parse_phase1_key(*args, **kwargs)
-        if p1_key not in self.p1_cache:
+        bound = self._argument_binder.bind(args, kwargs)
+        if bound.p1_key not in self.p1_cache:
             # in legacy gemm, we use lazy tir template to build the tir
-            self.p1_cache[p1_key] = self._build_tir_template(**kwargs)
-        return self.p1_cache[p1_key].get_tir(self.tensor_args, tensor_args, kwargs)
+            self.p1_cache[bound.p1_key] = self._build_tir_template(**bound.compile_kwargs)
+        return self.p1_cache[bound.p1_key].get_tir(
+            self.tensor_args,
+            bound.tensor_args,
+            bound.compile_kwargs,
+        )
 
     def __call__(self, *args, **kwargs):
         return self.get_tir(*args, **kwargs)
@@ -1226,7 +1487,7 @@ def substitute_primfunc(prim_func, vmap):
         return analyzer.simplify(substitute(v, vmap))
 
     def substitute_buffer(buf):
-        return tvm.tir.decl_buffer(
+        return tvm.tirx.decl_buffer(
             data=sub(buf.data),
             shape=[sub(dim) for dim in buf.shape],
             dtype=buf.dtype,
@@ -1267,7 +1528,7 @@ def prim_func(func: Callable[_P, _T] = None, *, eager_jit: bool = False) -> Prim
             tensor_args_defaults = {
                 k: sig.parameters[k].default for k in tensor_args if sig.parameters[k].default is not sig.parameters[k].empty
             }
-            return JITFunc(func, arg_names, tensor_args, tensor_args_defaults, ir_gen)
+            return JITFunc(func, sig, arg_names, tensor_args, tensor_args_defaults, ir_gen)
         else:
             try:
                 builder = Builder()

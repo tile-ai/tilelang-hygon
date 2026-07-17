@@ -114,6 +114,27 @@ def auto_tma_store_copy(M, N, block_M, block_N, dtype, threads):
     return main
 
 
+def full_shape_tma_store_1d(dtype, threads):
+    @T.prim_func
+    def main(
+        C: T.Tensor((128, 128), dtype),
+    ):
+        with T.Kernel(threads=threads):
+            C_shared = T.alloc_shared((128, 128), dtype)
+            T.copy(C_shared, C)
+
+    return main
+
+
+def tma_store_wait_read_option(read):
+    @T.prim_func
+    def main():
+        with T.Kernel(threads=128):
+            T.tma_store_wait(read=read)
+
+    return main
+
+
 def run_auto_tma_store_copy():
     M = N = 256
     block_M = block_N = 128
@@ -129,6 +150,7 @@ def run_auto_tma_store_copy():
     kernel_source = kernel.get_kernel_source()
     assert "tma_store_arrive" in kernel_source, "Expected auto tma_store_arrive in kernel source"
     assert "tma_store_wait" in kernel_source, "Expected auto tma_store_wait in kernel source"
+    assert "tl::tma_store_wait<0, true>();" in kernel_source, "Expected auto tma_store_wait to use default read wait"
 
     profiler = kernel.get_profiler()
 
@@ -136,6 +158,31 @@ def run_auto_tma_store_copy():
         return A
 
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
+
+
+def run_full_shape_tma_store_1d_codegen():
+    program = full_shape_tma_store_1d(T.float32, 128)
+    kernel = tilelang.compile(
+        program,
+        pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True},
+    )
+    kernel_source = kernel.get_kernel_source()
+    assert "tl::tma_store" in kernel_source, "Expected TMA store in kernel source"
+    assert "CUtensorMap" not in kernel_source, "Expected pointer-based 1D TMA store"
+
+
+def run_tma_store_wait_read_option_codegen():
+    default_kernel = tilelang.compile(
+        tma_store_wait_read_option(True),
+        pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True},
+    )
+    no_read_kernel = tilelang.compile(
+        tma_store_wait_read_option(False),
+        pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True},
+    )
+
+    assert "tl::tma_store_wait<0, true>();" in default_kernel.get_kernel_source()
+    assert "tl::tma_store_wait<0, false>();" in no_read_kernel.get_kernel_source()
 
 
 @tilelang.testing.requires_cuda
@@ -154,6 +201,18 @@ def test_tma_store_3_stages():
 @tilelang.testing.requires_cuda_compute_version_ge(9, 0)
 def test_plain_copy_auto_tma_store():
     run_auto_tma_store_copy()
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
+def test_plain_copy_full_shape_tma_store_uses_1d():
+    run_full_shape_tma_store_1d_codegen()
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
+def test_tma_store_wait_read_option_codegen():
+    run_tma_store_wait_read_option_codegen()
 
 
 if __name__ == "__main__":

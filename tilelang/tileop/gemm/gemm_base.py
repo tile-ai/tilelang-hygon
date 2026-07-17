@@ -4,10 +4,11 @@ from dataclasses import dataclass
 from tilelang import tvm as tvm
 from tvm.target import Target
 from tvm.ir import Range
-from tvm import tir
+from tvm import tirx
 from tilelang import language as T
 from tilelang.utils.language import is_shared, is_fragment, is_tensor_memory
 from tilelang.tileop.base import GemmWarpPolicy
+from tilelang.language.dtypes import validate_gemm_ab_dtypes
 from tvm.ir.base import Node
 from tvm.ir import PrimExpr
 
@@ -23,6 +24,19 @@ class GemmBase:
 
     gemm_node: Node
 
+    def __post_init__(self) -> None:
+        validate_gemm_ab_dtypes(
+            self.A.dtype,
+            self.B.dtype,
+            a_in_tmem=is_tensor_memory(self.A),
+            allow_f8f6f4_mixed=self.allow_f8f6f4_mixed_dtypes,
+        )
+
+    @property
+    def allow_f8f6f4_mixed_dtypes(self) -> bool:
+        # TODO(wt): Consider enabling mixed f8f6f4 operands for MMA paths too.
+        return False
+
     def infer_layout(self, target: Target, thread_nums: int):
         raise NotImplementedError("infer_layout is not implemented")
 
@@ -31,8 +45,8 @@ class GemmBase:
         layout_map: dict,
         target: Target,
         thread_bounds: Range,
-        thread_var: tir.Var,
-        mbar_phase_expr: tir.PrimExpr | None = None,
+        thread_var: tirx.Var,
+        mbar_phase_expr: tirx.PrimExpr | None = None,
     ):
         raise NotImplementedError("lower is not implemented")
 
@@ -77,16 +91,14 @@ class GemmBase:
         return getattr(self.gemm_node, "transB", None)
 
     @property
-    def in_dtype(self) -> str:
-        """Input data type for the multiplication.
-
-        For the TS variant, A resides in TMEM with the accumulator dtype, so
-        the actual input dtype is derived from B.
-        """
-        if is_tensor_memory(self.A):
-            return self.B.dtype
-        assert self.A.dtype == self.B.dtype, "A and B must have the same dtype"
+    def a_dtype(self):
+        """A operand dtype."""
         return self.A.dtype
+
+    @property
+    def b_dtype(self):
+        """B operand dtype."""
+        return self.B.dtype
 
     @property
     def accum_dtype(self) -> str:
@@ -94,18 +106,18 @@ class GemmBase:
 
     @property
     def chunk(self) -> int:
-        return self.A.shape[-2] if self.trans_A else self.A.shape[-1]
+        return self.K
 
     @property
-    def A(self) -> tir.Buffer:
+    def A(self) -> tirx.Buffer:
         return getattr(self.gemm_node, "a", None)
 
     @property
-    def B(self) -> tir.Buffer:
+    def B(self) -> tirx.Buffer:
         return getattr(self.gemm_node, "b", None)
 
     @property
-    def C(self) -> tir.Buffer:
+    def C(self) -> tirx.Buffer:
         return getattr(self.gemm_node, "c", None)
 
     @property
@@ -158,10 +170,10 @@ class GemmBase:
 
     @property
     def mbarptr(self) -> PrimExpr:
-        return getattr(self.gemm_node, "mbarPtr", tvm.tir.const(0, T.uint32))
+        return getattr(self.gemm_node, "mbarPtr", tvm.tirx.const(0, T.uint32))
 
     @property
-    def mbar(self) -> tir.BufferLoad | None:
+    def mbar(self) -> tirx.BufferLoad | None:
         return getattr(self.gemm_node, "mbar", None)
 
     @property
@@ -174,7 +186,7 @@ class GemmBase:
             v = ann["use_tf32"]
         except (KeyError, TypeError):
             return False
-        if isinstance(v, tir.IntImm):
+        if isinstance(v, tirx.IntImm):
             return bool(v.value)
         if isinstance(v, (int, bool)):
             return bool(v)
@@ -187,9 +199,25 @@ class GemmBase:
     def C_coords(self):
         coords = getattr(self.gemm_node, "cCoords", None)
         if coords is None or len(coords) == 0:
-            zero = tvm.tir.const(0, T.int32)
+            zero = tvm.tirx.const(0, T.int32)
             return [zero, zero]
         return [coords[i] for i in range(len(coords))]
+
+    @property
+    def SFARegion(self):
+        return getattr(self.gemm_node, "sfaRegion", None)
+
+    @property
+    def SFBRegion(self):
+        return getattr(self.gemm_node, "sfbRegion", None)
+
+    @property
+    def sf_k_start(self) -> PrimExpr:
+        return getattr(self.gemm_node, "sfKStart", tvm.tirx.const(0, T.int32))
+
+    @property
+    def is_blockscaled(self) -> bool:
+        return self.SFARegion is not None and self.SFBRegion is not None
 
     def get_region_base_offsets(self, region):
         """

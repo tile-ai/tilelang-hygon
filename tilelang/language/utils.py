@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from tilelang import tvm as tvm
-from tvm import ir, tir
-from tvm.tir import PrimExpr, BufferLoad, op
+from tvm import ir, tirx
+from tvm.tirx import PrimExpr, BufferLoad, op
 from tilelang import language as T
 from tilelang._typing import BufferLikeType, ShapeType
 
@@ -15,18 +15,18 @@ def region(buffer: BufferLoad, access_type: str, *args: PrimExpr) -> PrimExpr:
     return T.call_intrin("handle", op.Op.get("tl.tileop.region"), buffer, access_type, *args)
 
 
-def buffer_region_to_tile_region(buffer_region: tir.BufferRegion, access_type: str, extents: list[tir.PrimExpr]) -> PrimExpr:
+def buffer_region_to_tile_region(buffer_region: tirx.BufferRegion, access_type: str, extents: list[tirx.PrimExpr]) -> PrimExpr:
     """Clamp extents and return a tl.region call."""
     mins = [r.min for r in buffer_region.region]
     region_extents = [r.extent for r in buffer_region.region]
     assert len(region_extents) >= len(extents), f"region_extents must be >= extents, region_extents = {region_extents}, extents = {extents}"
     clamped_extents = [
-        tir.min(region_extents[i], extents[i]) if i < len(extents) else region_extents[i] for i in range(len(region_extents))
+        tirx.min(region_extents[i], extents[i]) if i < len(extents) else region_extents[i] for i in range(len(region_extents))
     ]
-    return region(tir.BufferLoad(buffer_region.buffer, mins), access_type, *clamped_extents)
+    return region(tirx.BufferLoad(buffer_region.buffer, mins), access_type, *clamped_extents)
 
 
-def buffer_load_to_tile_region(buffer_load: tir.BufferLoad, access_type: str, extents: list[tir.PrimExpr]) -> PrimExpr:
+def buffer_load_to_tile_region(buffer_load: tirx.BufferLoad, access_type: str, extents: list[tirx.PrimExpr]) -> PrimExpr:
     """Scalar-index BufferLoad → tl.region with clamped extents (same as buffer_region path).
 
     Used by ``matrix_load`` / ``ds_read_format`` when ``get_buffer_region_from_load`` returns
@@ -35,8 +35,8 @@ def buffer_load_to_tile_region(buffer_load: tir.BufferLoad, access_type: str, ex
     ``region`` directly without this min(·,1) clamp — MLS helpers keep the same clamp rule as
     ``buffer_region_to_tile_region`` for a synthetic extent-1 region per axis.
     """
-    ranges = [ir.Range.from_min_extent(idx, tir.const(1, idx.dtype)) for idx in buffer_load.indices]
-    br = tir.BufferRegion(buffer_load.buffer, ranges)
+    ranges = [ir.Range.from_min_extent(idx, tirx.const(1, idx.dtype)) for idx in buffer_load.indices]
+    br = tirx.BufferRegion(buffer_load.buffer, ranges)
     return buffer_region_to_tile_region(br, access_type, extents)
 
 
@@ -111,7 +111,7 @@ def linear_index(*args: PrimExpr) -> PrimExpr:
     return linear
 
 
-def get_buffer_region_from_load(buffer_load: tir.BufferLoad, extents: list[PrimExpr] | None = None) -> tir.BufferRegion | None:
+def get_buffer_region_from_load(buffer_load: tirx.BufferLoad, extents: list[PrimExpr] | None = None) -> tirx.BufferRegion | None:
     """
     Get the buffer region from a buffer load.
 
@@ -129,11 +129,11 @@ def get_buffer_region_from_load(buffer_load: tir.BufferLoad, extents: list[PrimE
     if extents is not None:
         assert len(extents) == len(indices), "extents should have the same length as indices"
     for i, indice in enumerate(indices):
-        if isinstance(indice, tir.Ramp):
+        if isinstance(indice, tirx.Ramp):
             assert extents is None, "extents should be provided for BufferLoad with Ramp indices"
             regions.append(ir.Range.from_min_extent(indice.base, indice.lanes))
             found_ramp = True
-        elif isinstance(indice, tir.PrimExpr):
+        elif isinstance(indice, tirx.PrimExpr):
             if extents is not None:
                 regions.append(ir.Range.from_min_extent(indice, extents[i]))
                 found_ramp = True
@@ -142,7 +142,7 @@ def get_buffer_region_from_load(buffer_load: tir.BufferLoad, extents: list[PrimE
         else:
             raise ValueError(f"Unsupported type: {type(indice)} for index {i}")
     if found_ramp:
-        return tir.BufferRegion(buffer, regions)
+        return tirx.BufferRegion(buffer, regions)
     else:
         # NOTE(chaofan): Or we can return a region with extent 1?
         return None
@@ -160,13 +160,13 @@ def get_extent(data: BufferLikeType) -> ShapeType | None:
         The shape/extents as a list-like of PrimExpr (Buffer.shape or list of region item extents), or None if the extent cannot be determined.
     """
 
-    if isinstance(data, tir.Var) and T.has_let_value(data):
+    if isinstance(data, tirx.Var) and T.has_let_value(data):
         data = T.get_let_value(data)
-    if isinstance(data, tir.Buffer):
+    if isinstance(data, tirx.Buffer):
         return data.shape
-    elif isinstance(data, tir.BufferRegion):
+    elif isinstance(data, tirx.BufferRegion):
         return [x.extent for x in data.region]
-    elif isinstance(data, tir.BufferLoad):
+    elif isinstance(data, tirx.BufferLoad):
         region = get_buffer_region_from_load(data)
         if region is None:
             return None

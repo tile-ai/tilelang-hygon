@@ -34,6 +34,7 @@ programming_guides/overview
 programming_guides/language_basics
 programming_guides/instructions
 programming_guides/control_flow
+programming_guides/software_pipeline
 programming_guides/python_compatibility
 programming_guides/autotuning
 programming_guides/type_system
@@ -57,6 +58,13 @@ deeplearning_operators/deepseek_mla
 compiler_internals/letstmt_inline
 compiler_internals/inject_fence_proxy
 compiler_internals/tensor_checks
+:::
+
+:::{toctree}
+:maxdepth: 1
+:caption: DEVELOPER GUIDE
+
+developer_guide/cpp_style
 :::
 
 :::{toctree}

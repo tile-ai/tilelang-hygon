@@ -26,16 +26,9 @@ def run_atomic_add(K, M, N, block_M, block_N, dtype=T.float32):
     kernel = atomic_add_program(K, M, N, block_M, block_N, dtype=dtype)
     import torch
 
-    def ref_program(A, B):
-        for k in range(K):
-            for i in range(M):
-                for j in range(N):
-                    B[i, j] += A[k, i, j]
-
     A = torch.randn(K, M, N, dtype=getattr(torch, dtype)).cuda()
     B = torch.zeros(M, N, dtype=getattr(torch, dtype)).cuda()
-    ref_B = B.clone()
-    ref_program(A, ref_B)
+    ref_B = B + A.sum(dim=0)
     kernel(A, B)
     torch.testing.assert_close(B, ref_B, atol=1e-3, rtol=1e-3)
 
@@ -59,16 +52,9 @@ def run_atomic_memory_order(K, M, N, block_M, block_N, dtype=T.float32):
     kernel = atomic_memory_order_program(K, M, N, block_M, block_N, dtype=dtype)
     import torch
 
-    def ref_program(A, B):
-        for k in range(K):
-            for i in range(M):
-                for j in range(N):
-                    B[i, j] += A[k, i, j]
-
     A = torch.randn(K, M, N, dtype=getattr(torch, dtype)).cuda()
     B = torch.zeros(M, N, dtype=getattr(torch, dtype)).cuda()
-    ref_B = B.clone()
-    ref_program(A, ref_B)
+    ref_B = B + A.sum(dim=0)
     kernel(A, B)
     torch.testing.assert_close(B, ref_B, atol=1e-3, rtol=1e-3)
 
@@ -101,6 +87,54 @@ def run_atomic_addx2(M, N, block_M, block_N, dtype=T.float16):
             ref_B[i, j + 1] += A[i, j + 1]
     kernel(A, B)
     torch.testing.assert_close(B, ref_B, atol=1e-3, rtol=1e-3)
+
+
+@tilelang.jit
+def atomic_add_mixed_dtype_program(N, src_dtype, dst_dtype):
+    @T.prim_func
+    def atomic_add(Src: T.Tensor((N,), src_dtype), Out: T.Tensor((N,), dst_dtype)):
+        with T.Kernel(threads=1):
+            frag = T.alloc_fragment((N,), src_dtype)
+            for i in T.Parallel(N):
+                frag[i] = Src[i]
+            for i in T.Parallel(N):
+                T.atomic_add(Out[i], frag[i])
+
+    return atomic_add
+
+
+def run_atomic_add_mixed_dtype(N, src_dtype, dst_dtype):
+    kernel = atomic_add_mixed_dtype_program(N, src_dtype, dst_dtype)
+    assert "AtomicAddx2" in kernel.get_kernel_source()
+
+    src = torch.arange(1, N + 1, dtype=getattr(torch, src_dtype)).cuda()
+    out = torch.zeros(N, dtype=getattr(torch, dst_dtype)).cuda()
+    kernel(src, out)
+    torch.testing.assert_close(out, src.to(getattr(torch, dst_dtype)), atol=1e-2, rtol=1e-2)
+
+
+@tilelang.jit
+def atomic_addx2_mixed_dtype_program(M, N, block_M, block_N, src_dtype, dst_dtype):
+    @T.prim_func
+    def atomic_addx2(A: T.Tensor((M, N), src_dtype), B: T.Tensor((M, N), dst_dtype)):
+        with T.Kernel(T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=32) as (bx, by):
+            for i, j in T.Parallel(block_M, block_N // 2):
+                idx_i = bx * block_M + i
+                idx_j = by * block_N + j * 2
+                T.atomic_addx2(B[idx_i, idx_j], A[idx_i, idx_j])
+
+    return atomic_addx2
+
+
+def run_atomic_addx2_mixed_dtype(M, N, block_M, block_N, src_dtype, dst_dtype):
+    kernel = atomic_addx2_mixed_dtype_program(M, N, block_M, block_N, src_dtype, dst_dtype)
+    assert "AtomicAddx2" in kernel.get_kernel_source()
+
+    A = torch.randn(M, N, dtype=getattr(torch, src_dtype)).cuda()
+    B = torch.zeros(M, N, dtype=getattr(torch, dst_dtype)).cuda()
+    ref_B = A.to(getattr(torch, dst_dtype))
+    kernel(A, B)
+    torch.testing.assert_close(B, ref_B, atol=1e-2, rtol=1e-2)
 
 
 @tilelang.jit
@@ -168,6 +202,35 @@ def run_atomic_addx4(M, N, block_M, block_N):
 
     kernel(A, B)
     torch.testing.assert_close(B, ref_B, atol=1e-3, rtol=1e-3)
+
+
+@tilelang.jit
+def atomic_addx4_16bit_program(dtype, offset, nthreads):
+    @T.prim_func
+    def atomic_addx4(A: T.Tensor((16,), dtype), B: T.Tensor((16,), dtype)):
+        with T.Kernel(1, threads=nthreads):
+            T.atomic_addx4(B[offset], A[offset])
+
+    return atomic_addx4
+
+
+def run_atomic_addx4_16bit(dtype, offset, nthreads):
+    kernel = atomic_addx4_16bit_program(dtype, offset, nthreads)
+    source = kernel.get_kernel_source()
+    assert "AtomicAddx4" in source
+
+    torch_dtype = getattr(torch, str(dtype))
+    A = torch.zeros(16, dtype=torch_dtype, device="cuda")
+    B_init = torch.zeros(16, dtype=torch_dtype, device="cuda")
+    A[offset : offset + 4] = torch.tensor([1, 2, 3, 4], dtype=torch_dtype, device="cuda")
+    B_init[offset : offset + 4] = torch.tensor([10, 20, 30, 40], dtype=torch_dtype, device="cuda")
+    B = B_init.clone()
+
+    ref_B = B_init.float()
+    ref_B[offset : offset + 4] += nthreads * A[offset : offset + 4].float()
+
+    kernel(A, B)
+    torch.testing.assert_close(B.float(), ref_B, atol=0, rtol=0)
 
 
 @tilelang.jit
@@ -289,15 +352,35 @@ def test_atomic_addx2_float():
 
 
 @tilelang.testing.requires_cuda
+def test_atomic_add_mixed_dtype_fp16():
+    run_atomic_add_mixed_dtype(8, T.float32, T.float16)
+    run_atomic_addx2_mixed_dtype(32, 64, 8, 16, T.float32, T.float16)
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(8, 0)
+def test_atomic_add_mixed_dtype_bf16():
+    run_atomic_add_mixed_dtype(8, T.float32, T.bfloat16)
+    run_atomic_addx2_mixed_dtype(32, 64, 8, 16, T.float32, T.bfloat16)
+
+
+@tilelang.testing.requires_cuda
 def test_atomic_different_memory_orders():
     run_atomic_different_memory_orders(32, 32, 8, 8, dtype=T.float32)
     run_atomic_different_memory_orders(32, 32, 8, 8, dtype=T.float16)
     run_atomic_different_memory_orders(32, 32, 8, 8, dtype=T.bfloat16)
 
 
-# TODO: atomic_addx4 currently not support half
 def test_atomic_addx4():
     run_atomic_addx4(16, 64, 4, 4)
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(8, 0)
+def test_atomic_addx4_16bit():
+    for dtype in (T.float16, T.bfloat16):
+        for offset in (0, 4):
+            run_atomic_addx4_16bit(dtype, offset=offset, nthreads=2)
 
 
 def test_atomic_return_prev():
@@ -349,16 +432,9 @@ def run_tile_atomic_add(K, M, N, block_M, block_N, dtype=T.float32):
     kernel = tile_atomic_add_program(K, M, N, block_M, block_N, dtype=dtype)
     import torch
 
-    def ref_program(A, B):
-        for k in range(K):
-            for i in range(M):
-                for j in range(N):
-                    B[i, j] += A[k, i, j]
-
     A = torch.randn(K, M, N, dtype=getattr(torch, dtype)).cuda()
     B = torch.zeros(M, N, dtype=getattr(torch, dtype)).cuda()
-    ref_B = B.clone()
-    ref_program(A, ref_B)
+    ref_B = B + A.sum(dim=0)
     kernel(A, B)
     torch.testing.assert_close(B, ref_B, atol=1e-3, rtol=1e-3)
 
@@ -524,6 +600,18 @@ def run_atomic_load_store(M, N, block_M, block_N, dtype=T.float32):
     B = torch.zeros(M, N, dtype=getattr(torch, dtype)).cuda()
     kernel(A, B)
     torch.testing.assert_close(B, A, atol=1e-3, rtol=1e-3)
+
+
+@tilelang.testing.requires_cuda
+def test_atomic_or_codegen():
+    @T.prim_func
+    def atomic_or_kernel(A: T.Tensor((1,), T.int32), mask: T.int32):
+        with T.Kernel(1, threads=32):
+            T.atomic_or(A[0], mask, memory_order="release")
+
+    kernel = tilelang.compile(atomic_or_kernel, out_idx=[0], target="cuda")
+    source = kernel.get_kernel_source()
+    assert "AtomicOr" in source
 
 
 def test_atomic_max():

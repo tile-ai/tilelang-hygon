@@ -71,7 +71,7 @@ def main(Q: T.Tensor(shape_q, dtype)):
 The TileLang lower process might yield an error such as:
 
 ```text
-File "/root/TileLang/src/target/codegen_cuda.cc", line 1257
+File "/root/TileLang/src/cuda/codegen/codegen_cuda.cc", line 1257
 ValueError: Check failed: lanes <= 4 (8 vs. 4) : Ramp of more than 4 lanes is not allowed.
 ```
 
@@ -91,7 +91,7 @@ Sometimes, the kernel compiles and runs but produces incorrect results. In such 
 
 ### Post-Processing Callbacks for Generated Source
 
-After code generation (in the codegen pass), TileLang calls a callback function (if registered) to allow post-processing of the generated source code. In `src/target/rt_mod_cuda.cc`:
+After code generation (in the codegen pass), TileLang calls a callback function (if registered) to allow post-processing of the generated source code. In `src/cuda/codegen/rt_mod_cuda.cc`:
 
 ```cpp
 std::string code = cg.Finish();
@@ -192,6 +192,154 @@ C_local inferenced layout:
   Shape: [32, 32] -> [8]
   Thread: _j // 16 * 64 + _i // 16 * 32 + _i % 8 * 4 + _j % 8 // 2
   Index:  [_j % 16 // 8 * 4 + _i % 16 // 8 * 2 + _j % 2]
+```
+
+## Pass Diff: Observing IR Changes Across Passes
+
+TileLang programs are lowered through a sequence of compiler *passes*, each of which may transform the IR. Understanding exactly what each pass changes is essential for debugging incorrect transformations, unexpected optimizations, or missing passes.
+
+TileLang provides a built-in **Pass Diff** tool that automatically captures the IR before and after every pass and generates a human-readable diff report. It works transparently — no code changes are required.
+
+### Quick Start (Environment Variable)
+
+The simplest way to enable pass diff is to set the `TILELANG_PASS_DIFF` environment variable before running your script:
+
+```bash
+# Colored diff printed to the terminal
+TILELANG_PASS_DIFF=terminal python3 my_script.py
+
+# Generate an HTML report
+TILELANG_PASS_DIFF=html python3 my_script.py
+
+# Both terminal output and HTML report
+TILELANG_PASS_DIFF=both python3 my_script.py
+
+# Disabled (default — zero overhead)
+python3 my_script.py
+```
+
+The HTML report is saved to the directory specified by the `TILELANG_PASS_DIFF_OUTPUT` environment variable (default: `tmp/pass_diff_output`). Each run produces a timestamped file, e.g. `pass_diff_20260611_205421.html`.
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TILELANG_PASS_DIFF` | Enable pass diff. Values: `0` (off), `terminal`, `html`, `both` | `0` |
+| `TILELANG_PASS_DIFF_OUTPUT` | Output directory for HTML reports | `tmp/pass_diff_output` |
+
+### HTML Report Features
+
+The HTML report provides a rich diff viewer with:
+
+- **Side-by-side before/after view** for each pass, with color-coded insertions and deletions
+- **Collapsible pass sections** — click a pass header to expand or collapse its diff
+- **Expand context** — when a diff hunk hides unchanged lines, a `⋯ Show N lines above/below` control lets you reveal them
+- **Dark/Light theme toggle** — the default dark theme can be switched via the toolbar button; the preference is persisted across sessions
+- **Copy buttons** — copy the before or after IR of any pass to the clipboard
+- **Summary statistics** — total passes, changed passes, insertions, and deletions shown in the toolbar
+
+```{figure} ../_static/img/pass_diff_html.png
+:width: 600
+:alt: Screenshot of the Pass Diff HTML report
+:align: center
+
+```
+
+### Programmatic API
+
+For more fine-grained control, you can use the `pass_diff` function directly in your code:
+
+```python
+from tilelang.utils.pass_diff import pass_diff
+from tilelang import tvm
+
+# Diff a single pass
+pass_diff(func, tilelang.transform.ThreadSync("shared"))
+
+# Diff a chain of named passes
+pass_diff(func, [
+    ("AnnotateDeviceRegions", tvm.tirx.transform.AnnotateDeviceRegions()),
+    ("SplitHostDevice",       tvm.tirx.transform.SplitHostDevice()),
+    ("ThreadSync",            tilelang.transform.ThreadSync("shared")),
+], mode="html")
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `func` | A `PrimFunc` or `IRModule` to run passes on |
+| `passes` | A single pass or a list of `(name, pass)` tuples |
+| `mode` | `"terminal"`, `"html"`, or `"both"` (default: `"terminal"`) |
+| `context` | Number of context lines in the unified diff (default: 3) |
+| `html_path` | Output path for HTML report (default: `"pass_diff_report.html"`) |
+
+### How It Works
+
+When enabled, the hook monkey-patches `tvm.ir.transform.Pass.__call__` at import time. Every pass invocation is intercepted to capture the IR before and after, compute a unified diff, and emit the result in the chosen format. When disabled (the default), no patching occurs and there is zero overhead.
+
+### Tips
+
+- **Use `terminal` mode** for quick checks — the colored diff is printed as passes run, so you can see changes in real time.
+- **Use `html` mode** for thorough analysis — the report lets you navigate across many passes, expand hidden context, and copy IR snippets.
+- **Combine with `TILELANG_PASS_DIFF_OUTPUT`** to direct reports to a specific location, e.g. when running in CI or comparing across runs.
+- **The hook captures all passes** in the lowering pipeline, including those triggered internally by `tilelang.compile()`. This makes it useful for understanding the full compilation flow.
+
+## Pass Visualizer: Structure-Tree View Across Passes
+
+The **Pass Visualizer** is a complement to Pass Diff. Where Pass Diff shows a line-level diff of the **TVMScript text**, the Pass Visualizer renders the IR as a **structure tree** (the `SBlock` nesting, with `reads` / `writes` / `alloc_buffers` / `annotations` fields) and expands every tile op by field name. It produces a single self-contained, interactive HTML file that steps through each CUDA lowering pass.
+
+This view is most useful when debugging **structural** passes — layout inference, warp specialization, pipelining — where you care about how the IR's block structure and operator semantics change, not just which text lines moved.
+
+### How It Differs From Pass Diff
+
+| Aspect | Pass Diff | Pass Visualizer |
+|--------|-----------|-----------------|
+| Compared object | TVMScript text lines | `SBlock` structure tree |
+| Operator display | Raw one-liner, positional args | Expanded **by field name** (`M=64`, `K=32`, `policy=0`) |
+| Highlighting | Generic `+` / `-` | Per-class: tile op / sync primitive / lowered hardware intrinsic |
+| Trigger | Environment-variable hook, captures the real full pipeline | Explicit CLI, runs the focused lowering prologue |
+
+### Quick Start (CLI)
+
+Run the visualizer on a kernel file that defines a `@tilelang.jit` kernel:
+
+```bash
+python -m tilelang.tools.pass_visualizer.viewer \
+    tilelang/tools/pass_visualizer/examples/gemm_relu.py \
+    --set M=1024 --set N=1024 --set K=1024 \
+    --set block_M=128 --set block_N=128 --set block_K=32 \
+    --out gemm_relu_passes.html
+```
+
+This writes `gemm_relu_passes.html` (the interactive browser) and a sibling `gemm_relu_passes.txt` (a greppable text dump of the same per-pass trees).
+
+| Argument | Description |
+|----------|-------------|
+| `path` | Python file containing a `@tilelang.jit` kernel (positional) |
+| `--factory` | Name of the kernel to analyze (default: first discovered) |
+| `--target` | Compilation target (default: `auto`) |
+| `--set K=V` | Argument forwarded to the kernel factory (repeatable) |
+| `--out` | Output HTML path (default: `<kernel>_passes.html` next to the source) |
+
+### HTML Report Features
+
+- **Left pane**: the ordered pass list, each tagged `changed` / `no-op` with an added/removed line count. Click a pass — or use the <kbd>↑</kbd>/<kbd>↓</kbd> keys — to step through the pipeline.
+- **Right pane**: the structure tree for the selected pass, with lines **added** by that pass highlighted green and lines it **removed** shown ghosted red.
+- **Operator highlighting**: tile ops (e.g. `T.gemm`, `T.copy`), synchronization primitives, and lowered hardware intrinsics (`ptx_mma`, `tma_load`, …) are each colored distinctly, so you can follow a `T.copy` as it lowers into TMA/PTX intrinsics.
+
+### Programmatic API
+
+The core helpers can also be used directly:
+
+```python
+from tilelang.tools.pass_visualizer.viewer import build_pass_data, emit_html
+
+name, stages = build_pass_data(
+    "path/to/kernel.py", factory=None, target="auto",
+    kwargs={"M": 1024, "N": 1024, "K": 1024,
+            "block_M": 128, "block_N": 128, "block_K": 32},
+    source=open("path/to/kernel.py").read(),
+)
+html = emit_html(name, stages)
 ```
 
 ## AutoDD: Automatic Delta Debugging
@@ -299,7 +447,7 @@ A complete example is available in `examples/autodd/`:
 
 ## Conclusion
 
-By carefully examining intermediate representations (IR) before final code generation—and by leveraging runtime printing through `T.print`—one can quickly diagnose where index calculations, copy logic, or other kernel operations deviate from the intended behavior. This two-pronged approach (inspecting IR transformations and using runtime prints) is often sufficient for resolving generation and correctness issues in TileLang programs.
+By carefully examining intermediate representations (IR) before final code generation—and by leveraging runtime printing through `T.print`—one can quickly diagnose where index calculations, copy logic, or other kernel operations deviate from the intended behavior. The **Pass Diff** tool complements this by providing automatic, pass-by-pass visibility into every IR transformation, making it easy to pinpoint exactly which pass introduces an unexpected change. This three-pronged approach (inspecting IR transformations, observing pass-level diffs, and using runtime prints) is often sufficient for resolving generation and correctness issues in TileLang programs.
 
 For complex programs where manual debugging is tedious, **AutoDD** provides automated delta debugging to quickly isolate the minimal code that reproduces a bug.
 

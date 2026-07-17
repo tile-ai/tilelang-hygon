@@ -106,98 +106,33 @@ if not env.is_light_import():
 del _init_logger
 
 
-def _libtorch_cuda_present(lib_dir: Path) -> bool:
-    if sys.platform.startswith("win32"):
-        return (lib_dir / "torch_cuda.dll").is_file()
-    return (lib_dir / "libtorch_cuda.so").is_file() or bool(next(lib_dir.glob("libtorch_cuda*.so"), None))
-
-
-def _libtorch_hip_present(lib_dir: Path) -> bool:
-    if sys.platform.startswith("win32"):
-        return (lib_dir / "torch_hip.dll").is_file()
-    return (lib_dir / "libtorch_hip.so").is_file() or bool(next(lib_dir.glob("libtorch_hip*.so"), None))
-
-
-def _maybe_disable_torch_c_dlpack() -> None:
-    """Align with ``tvm_ffi._optional_torch_c_dlpack.load_torch_c_dlpack_extension``.
-
-    That function first tries ``import torch_c_dlpack_ext`` (pip). That package often
-    dlopens **CUDA**-named libs before tvm-ffi's ROCm JIT path runs, so on ROCm-only
-    PyTorch a missing ``libtorch_cuda.so`` still breaks import even when
-    ``torch.version.hip`` is set.
-
-    We mirror ``torch.cuda.is_available()`` + cuda/hip version branching, then:
-    - **CUDA build** (`torch.version.cuda`): require ``libtorch_cuda`` under ``torch/lib``.
-    - **ROCm build** (`torch.version.hip`, cuda None): if ``torch_c_dlpack_ext`` is
-      installed, require **CUDA** libs (pip path); otherwise require **HIP** libs
-      (tvm-ffi JIT ``device=rocm`` path only).
-    When ``torch.cuda.is_available()`` is false we do nothing (``cpu`` path).
-    """
-    if os.environ.get("TVM_FFI_DISABLE_TORCH_C_DLPACK") is not None:
+def _disable_rocm_tvm_ffi_torch_c_dlpack(torch_module):
+    if getattr(torch_module.version, "hip", None) is None:
         return
+
+    os.environ.setdefault("TVM_FFI_DISABLE_TORCH_C_DLPACK", "1")
     try:
-        import importlib.util
-
-        import torch
-
-        lib_dir = Path(torch.__file__).resolve().parent / "lib"
-        if not lib_dir.is_dir():
-            os.environ["TVM_FFI_DISABLE_TORCH_C_DLPACK"] = "1"
-            return
-
-        if not torch.cuda.is_available():
-            return
-
-        if torch.version.cuda is not None:
-            device = "cuda"
-        elif torch.version.hip is not None:
-            device = "rocm"
-        else:
-            os.environ["TVM_FFI_DISABLE_TORCH_C_DLPACK"] = "1"
-            return
-
-        if device == "cuda":
-            ok = _libtorch_cuda_present(lib_dir)
-        else:
-            # ROCm: pip torch_c_dlpack_ext runs first and typically needs CUDA .so.
-            has_pip_ext = importlib.util.find_spec("torch_c_dlpack_ext") is not None
-            if has_pip_ext:
-                ok = _libtorch_cuda_present(lib_dir)
-            else:
-                ok = _libtorch_hip_present(lib_dir)
-
-        if not ok:
-            os.environ["TVM_FFI_DISABLE_TORCH_C_DLPACK"] = "1"
+        from tvm_ffi import _optional_torch_c_dlpack
     except Exception:
-        pass
-
-
-def _patch_tvm_ffi_torch_c_dlpack_loader() -> None:
-    """Monkey-patch tvm_ffi before `import tvm` (does not modify upstream TVM).
-
-    Official TVM's relax/base_py_module calls load_torch_c_dlpack_extension() again;
-    respect TVM_FFI_DISABLE_TORCH_C_DLPACK and swallow ImportError/OSError.
-    """
-    try:
-        import tvm_ffi._optional_torch_c_dlpack as m
-    except ImportError:
         return
-    _orig = m.load_torch_c_dlpack_extension
 
-    def _safe():
-        if os.environ.get("TVM_FFI_DISABLE_TORCH_C_DLPACK", "0") != "0":
-            return None
-        try:
-            return _orig()
-        except (ImportError, OSError):
-            return None
+    # TVM Relax calls this loader directly while importing, bypassing the
+    # tvm-ffi module-level env guard.
+    def _disabled_torch_c_dlpack_extension(*_args, **_kwargs):
+        return None
 
-    m.load_torch_c_dlpack_extension = _safe
+    _optional_torch_c_dlpack.load_torch_c_dlpack_extension = _disabled_torch_c_dlpack_extension
 
 
 @contextlib.contextmanager
 def _lazy_load_lib():
-    import torch  # noqa: F401 # preload torch to avoid dlopen errors
+    import torch  # preload torch to avoid dlopen errors
+
+    _disable_rocm_tvm_ffi_torch_c_dlpack(torch)
+
+    if sys.platform.startswith("win32"):
+        yield
+        return
 
     old_flags = sys.getdlopenflags()
     old_init = ctypes.CDLL.__init__
@@ -217,23 +152,30 @@ def _lazy_load_lib():
 # Skip heavy imports in light import mode
 if not env.is_light_import():
     with _lazy_load_lib():
-        from .env import enable_cache, disable_cache, is_cache_enabled  # noqa: F401
+        from .env import (  # noqa: F401
+            enable_cache,
+            disable_cache,
+            is_cache_enabled,
+            get_windows_runtime_dll_dirs,
+            prepend_dll_search_path,
+        )
+        from . import libinfo
 
-        _maybe_disable_torch_c_dlpack()
-        _patch_tvm_ffi_torch_c_dlpack_loader()
+        if sys.platform.startswith("win32"):
+            # Make sibling-package DLLs (tvm_ffi, z3) discoverable via PATH,
+            # then register all native dependency dirs with the secure DLL
+            # loader used by Python 3.8+ for absolute-path DLL loads.
+            runtime_dll_dirs = get_windows_runtime_dll_dirs()
+            prepend_dll_search_path(runtime_dll_dirs)
+            dll_dirs = dict.fromkeys([*libinfo.get_dll_directories(), *runtime_dll_dirs])
+            _dll_handles = [os.add_dll_directory(p) for p in dll_dirs]
 
         import tvm
         import tvm.base  # noqa: F401
         from tvm import DataType  # noqa: F401
 
-        # Setup tvm search path before importing tvm
-        from . import libinfo
-
         def _load_tile_lang_lib():
             """Load Tile Lang lib"""
-            if sys.platform.startswith("win32") and sys.version_info >= (3, 8):
-                for path in libinfo.get_dll_directories():
-                    os.add_dll_directory(path)
             lib_path = libinfo.find_lib_path("tilelang")
             return ctypes.CDLL(lib_path), lib_path
 
@@ -243,7 +185,6 @@ if not env.is_light_import():
 
     from .jit import jit, JITKernel, compile, par_compile  # noqa: F401
     from .profiler import Profiler  # noqa: F401
-    from .cache import clear_cache  # noqa: F401
     from .utils import (
         TensorSupplyType,  # noqa: F401
         deprecated,  # noqa: F401
@@ -267,5 +208,16 @@ if not env.is_light_import():
     from .math import *  # noqa: F403
     from . import ir  # noqa: F401
     from . import tileop  # noqa: F401
+    from . import cpu as cpu  # noqa: F401
+    from . import cuda as cuda  # noqa: F401
+    from . import hcu as hcu  # noqa: F401
+    from . import rocm as rocm  # noqa: F401
+    from . import metal as metal  # noqa: F401
 
 del _lazy_load_lib
+
+# Install pass diff hook if TILELANG_PASS_DIFF is enabled (zero overhead when off)
+from .utils.pass_diff_hook import install_pass_diff_hook as _install_pass_diff_hook  # noqa: E402
+
+_install_pass_diff_hook()
+del _install_pass_diff_hook
