@@ -130,5 +130,28 @@ bool IsHcuWdraVgprStmt(const Stmt &stmt) {
   return visitor.found;
 }
 
+bool IsHcuWdraDeclarativeStmt(const Stmt &stmt) {
+  // Allow pure allocate / decl_buffer in WDRA prologue. DeclBuffer may embed
+  // BufferLoad in data=buf.data alias forms that would otherwise trip VGPR
+  // detection when walking the statement.
+  if (stmt->IsInstance<AllocateNode>() || stmt->IsInstance<DeclBufferNode>()) {
+    return true;
+  }
+  if (const auto *attr = stmt.as<AttrStmtNode>()) {
+    if (attr->attr_key == tir::attr::thread_extent ||
+        attr->attr_key == tir::attr::device_scope) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IsHcuWdraPrologueForbiddenStmt(const Stmt &stmt) {
+  if (IsHcuWdraDeclarativeStmt(stmt)) {
+    return false;
+  }
+  return IsHcuWdraVgprStmt(stmt);
+}
+
 } // namespace tl
 } // namespace tvm

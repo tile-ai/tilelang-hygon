@@ -17,6 +17,12 @@ bool IsHcuWdraVgprCall(const tir::CallNode *call);
 /// Return true if this stmt performs VGPR-class work (loads/stores/compute).
 bool IsHcuWdraVgprStmt(const tir::Stmt &stmt);
 
+/// Pure buffer/thread declarations allowed in WDRA prologue (no VGPR work).
+bool IsHcuWdraDeclarativeStmt(const tir::Stmt &stmt);
+
+/// Prologue guard: VGPR-class stmts except declarative allocate/decl_buffer.
+bool IsHcuWdraPrologueForbiddenStmt(const tir::Stmt &stmt);
+
 } // namespace tl
 } // namespace tvm
 

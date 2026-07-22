@@ -554,7 +554,7 @@ private:
             seen_fork = true;
             VisitStmt(stmt);
           } else {
-            ICHECK(!IsHcuWdraVgprStmt(stmt))
+            ICHECK(!IsHcuWdraPrologueForbiddenStmt(stmt))
                 << "HCU WDRA prologue must not contain VGPR-class operations";
             VisitStmt(stmt);
           }
@@ -588,7 +588,7 @@ private:
       }
     }
     if (before_fork_) {
-      ICHECK(!IsHcuWdraVgprStmt(ffi::GetRef<Stmt>(op)))
+      ICHECK(!IsHcuWdraPrologueForbiddenStmt(ffi::GetRef<Stmt>(op)))
           << "HCU WDRA prologue must not contain VGPR-class operations";
     }
     StmtExprVisitor::VisitStmt_(op);
