@@ -7,11 +7,14 @@ from tilelang.intrinsics.hcu_mmac_emitter_utils import (
     block_col_warps_no_recompute,
     build_ds_read_format_tensor_a_template,
     build_ds_read_format_tensor_b_template,
+    check_mls_slice_aligned_to_tile,
     compute_mls_tiles,
     elem_bits,
     hcu_mls_ds_read_dtype_str,
     min_n_per_warp_for_b,
     mls_block_mn_k_from_region,
+    mls_full_and_read_mn_k,
+    retrieve_mls_lds_base_ptr,
 )
 from tilelang.language.utils import get_buffer_region_from_load
 from tilelang.utils.language import is_fragment, retrieve_ptr
@@ -605,11 +608,23 @@ class HCUMatrixCoreIntrinEmitter:
         if self.block_k_warps != 1:
             raise ValueError("ldmatrix_mls_a requires block_k_warps == 1 (MLS ds_read path)")
         mls_trans = not self.a_transposed
-        block_mn, block_k = self._shared_block_mn_k(A_mls_src, mls_trans)
-        tile_mn, tile_k = compute_mls_tiles(mls_trans, block_mn, block_k, self.threads, self.target, elem_bits(A_local_buf.dtype))
+        lds_mn, lds_k, read_mn, read_k, origin_mn, origin_k = mls_full_and_read_mn_k(A_mls_src, mls_trans)
+        # Mls tile / LdsDesc follow the full write shape.
+        tile_mn, tile_k = compute_mls_tiles(mls_trans, lds_mn, lds_k, self.threads, self.target, elem_bits(A_local_buf.dtype))
+        check_mls_slice_aligned_to_tile(
+            origin_mn=origin_mn,
+            origin_k=origin_k,
+            read_mn=read_mn,
+            read_k=read_k,
+            tile_mn=tile_mn,
+            tile_k=tile_k,
+            what="ldmatrix_mls_a",
+        )
         template = build_ds_read_format_tensor_a_template(
-            block_mn=block_mn,
-            block_k=block_k,
+            lds_mn=lds_mn,
+            lds_k=lds_k,
+            read_mn=read_mn,
+            read_k=read_k,
             tile_mn=tile_mn,
             tile_k=tile_k,
             warp_m=self.block_row_warps,
@@ -618,14 +633,24 @@ class HCUMatrixCoreIntrinEmitter:
             dtype_str=hcu_mls_ds_read_dtype_str(A_local_buf.dtype),
             target=self.target,
         )
-        src_ptr = retrieve_ptr(A_mls_src, "r")
+        src_ptr = retrieve_mls_lds_base_ptr(A_mls_src, "r")
         dst_ptr = retrieve_ptr(A_local_buf, "rw")
         warp_id_offset = self.scoped_warp_id_offset()
         self._a_full_k = True
 
         @T.macro
         def _warp_ldmatrix_mls_a(A_local_buf, A_mls_src):
-            T.evaluate(tir.call_extern("handle", template, src_ptr, dst_ptr, warp_id_offset))
+            T.evaluate(
+                tir.call_extern(
+                    "handle",
+                    template,
+                    src_ptr,
+                    dst_ptr,
+                    warp_id_offset,
+                    origin_mn,
+                    origin_k,
+                )
+            )
 
         return _warp_ldmatrix_mls_a(A_local_buf, A_mls_src)
 
@@ -635,12 +660,23 @@ class HCUMatrixCoreIntrinEmitter:
             raise ValueError("ldmatrix_mls_b requires block_k_warps == 1 (MLS ds_read path)")
         self.configure_b_mls(b_mls=True)
         mls_trans = self.b_transposed
-        block_mn, block_k = self._shared_block_mn_k(B_mls_src, mls_trans)
-        tile_mn, tile_k = compute_mls_tiles(mls_trans, block_mn, block_k, self.threads, self.target, elem_bits(B_local_buf.dtype))
+        lds_mn, lds_k, read_mn, read_k, origin_mn, origin_k = mls_full_and_read_mn_k(B_mls_src, mls_trans)
+        tile_mn, tile_k = compute_mls_tiles(mls_trans, lds_mn, lds_k, self.threads, self.target, elem_bits(B_local_buf.dtype))
+        check_mls_slice_aligned_to_tile(
+            origin_mn=origin_mn,
+            origin_k=origin_k,
+            read_mn=read_mn,
+            read_k=read_k,
+            tile_mn=tile_mn,
+            tile_k=tile_k,
+            what="ldmatrix_mls_b",
+        )
         total_warp = self.threads // self.WARP_SIZE
         template = build_ds_read_format_tensor_b_template(
-            block_mn=block_mn,
-            block_k=block_k,
+            lds_mn=lds_mn,
+            lds_k=lds_k,
+            read_mn=read_mn,
+            read_k=read_k,
             tile_mn=tile_mn,
             tile_k=tile_k,
             total_warp=total_warp,
@@ -650,14 +686,24 @@ class HCUMatrixCoreIntrinEmitter:
             dtype_str=hcu_mls_ds_read_dtype_str(B_local_buf.dtype),
             target=self.target,
         )
-        src_ptr = retrieve_ptr(B_mls_src, "r")
+        src_ptr = retrieve_mls_lds_base_ptr(B_mls_src, "r")
         dst_ptr = retrieve_ptr(B_local_buf, "rw")
         warp_id_offset = self.scoped_warp_id_offset()
         self._b_full_k = True
 
         @T.macro
         def _warp_ldmatrix_mls_b(B_local_buf, B_mls_src):
-            T.evaluate(tir.call_extern("handle", template, src_ptr, dst_ptr, warp_id_offset))
+            T.evaluate(
+                tir.call_extern(
+                    "handle",
+                    template,
+                    src_ptr,
+                    dst_ptr,
+                    warp_id_offset,
+                    origin_mn,
+                    origin_k,
+                )
+            )
 
         return _warp_ldmatrix_mls_b(B_local_buf, B_mls_src)
 

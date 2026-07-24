@@ -2,6 +2,9 @@
  * \file propagation_util.h
  * \brief Utilities for buffer producer/consumer propagation (matrix_load,
  * ds_read_format, gemm).
+ *
+ * Register-side propagation continues through `local.fragment` / `local` and
+ * stops at shared-like scopes (`shared` / `shared.dyn` / `shared.tmem`).
  */
 
 #ifndef TVM_TL_OP_PROPAGATION_UTIL_H_

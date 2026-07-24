@@ -73,12 +73,18 @@ FindGemmProducerReading(const PropagationTirCollector *tir,
                                            after_stmt_order);
 }
 
+static bool IsSharedLikeScope(const Buffer &buffer) {
+  const String &scope = buffer.scope();
+  return scope == "shared" || scope == "shared.dyn" || scope == "shared.tmem";
+}
+
 static Optional<TileOperator> PropagateToFindGemmConsumerOpTir(
     Buffer buffer, const PropagationTirCollector *tir, int after_stmt_order) {
   if (!tir)
     return Optional<TileOperator>();
   for (const Buffer &out_buf : tir->GetConsumerOutputs(buffer)) {
-    if (out_buf.scope() != "local.fragment")
+    // Stop at shared: register-side chains (fragment/local) keep propagating.
+    if (IsSharedLikeScope(out_buf))
       continue;
     if (auto rec =
             FindGemmProducerReading(tir, out_buf, buffer, after_stmt_order)) {
@@ -99,7 +105,7 @@ static std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInputTir(
   if (!tir)
     return std::nullopt;
   for (const Buffer &out_buf : tir->GetConsumerOutputs(buffer)) {
-    if (out_buf.scope() != "local.fragment")
+    if (IsSharedLikeScope(out_buf))
       continue;
     if (auto rec =
             FindGemmProducerReading(tir, out_buf, buffer, after_stmt_order)) {
@@ -164,7 +170,9 @@ PropagateToFindProducerMatrixLoadFoundTir(Buffer buffer,
     }
   }
   for (const Buffer &in_buf : tir->GetProducerInputs(buffer)) {
-    if (in_buf.scope() != "local.fragment")
+    // Shared ends the register-side reverse walk; matrix_load on shared is
+    // already handled by ProducerIsMatrixLoad above.
+    if (IsSharedLikeScope(in_buf))
       continue;
     if (PropagateToFindProducerMatrixLoadFoundTir(in_buf, tir))
       return true;

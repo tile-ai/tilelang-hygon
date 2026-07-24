@@ -131,6 +131,8 @@ constexpr MlsTileConfigSet kMlsTileConfigTable[] = {
                       sizeof(kMlsTileConfigsB16NonTrans[0]))},
 };
 
+} // namespace
+
 std::pair<int64_t, int64_t> MlsBlockDims(const Buffer &buf, bool mls_trans) {
   ICHECK(buf->shape.size() >= 2);
   size_t nd = buf->shape.size();
@@ -140,8 +142,6 @@ std::pair<int64_t, int64_t> MlsBlockDims(const Buffer &buf, bool mls_trans) {
   }
   return {*as_const_int(buf->shape[nd - 1]), *as_const_int(buf->shape[nd - 2])};
 }
-
-} // namespace
 
 int MlsScopedWarpIdOffset(const Range &thread_bounds, Target target) {
   if (!is_const_int(thread_bounds->min)) {
@@ -229,6 +229,28 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   ICHECK(dst->shape.size() >= 2)
       << "dst must have rank >= 2; MN×K tile uses the last two dimensions";
   ICHECK(src->shape.size() >= 2) << "src must be 2D";
+
+  // MLS LdsDesc is built from the full last-2 dst shape; forbid last-2 slices.
+  {
+    size_t dr_chk = this->dst_ranges.size();
+    ICHECK(dr_chk >= 2);
+    ICHECK_EQ(dst->shape.size(), dr_chk)
+        << "matrix_load dst buffer rank must match dst region rank";
+    for (size_t i = dr_chk - 2; i < dr_chk; ++i) {
+      const int64_t *min_c = as_const_int(this->dst_ranges[i]->min);
+      const int64_t *ext_c = as_const_int(this->dst_ranges[i]->extent);
+      const int64_t *shape_c = as_const_int(dst->shape[i]);
+      ICHECK(min_c && ext_c && shape_c)
+          << "matrix_load dst last-2 region must be static, dim=" << i;
+      ICHECK_EQ(*min_c, 0) << "matrix_load forbids slicing dst last-2 dims "
+                              "(min must be 0), dim="
+                           << i << " min=" << *min_c;
+      ICHECK_EQ(*ext_c, *shape_c)
+          << "matrix_load forbids slicing dst last-2 dims (extent must equal "
+             "buffer shape), dim="
+          << i << " extent=" << *ext_c << " shape=" << *shape_c;
+    }
+  }
 
   const bool mls_trans = mls_trans_;
   auto [block_mn, block_k] = MlsBlockDims(dst, mls_trans);

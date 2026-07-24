@@ -1,6 +1,17 @@
 /*!
  * \file hoist_mls_resource.cc
  * \brief Hoist HCU MLS resource setup before codegen.
+ *
+ * resource_init is hoisted within each lexical scope but does not cross
+ * threadIdx-partition IfThenElse branches (e.g. WDRA `if tx < N`); for those
+ * producer paths it is inserted at the top of the matching branch instead of
+ * before enclosing loops. Else arms that continue a tx partition ladder (bare
+ * nested if, or SeqStmt prefix then nested partition if) only recurse — they
+ * do not Predeclare across the remaining branches.
+ *
+ * Conditions on get_warp_idx / get_wave_id / get_lane_idx / get_warp_group_idx
+ * are not treated as partitions: TileLang does not narrow the in-scope tx
+ * range for those predicates, so hoisting resource_init outside is safe.
  */
 
 #include <tvm/arith/analyzer.h>
@@ -156,13 +167,55 @@ bool ExprUsesAnyVar(const PrimExpr &expr,
   return found;
 }
 
-void CollectForLoopVars(const Stmt &stmt,
-                        std::unordered_set<const VarNode *> *vars) {
-  tir::PostOrderVisit(stmt, [&](const ObjectRef &node) {
-    if (const auto *for_node = node.as<ForNode>()) {
-      vars->insert(for_node->loop_var.get());
+bool IsThreadWavePartitionIf(
+    const IfThenElseNode *op,
+    const std::unordered_set<const VarNode *> &thread_vars,
+    const std::unordered_set<const VarNode *> &thread_alias_vars,
+    const std::unordered_set<const VarNode *> &seq_thread_aliases);
+
+void CollectForLoopVarsSkipThreadPartition(
+    const Stmt &stmt, const std::unordered_set<const VarNode *> &thread_vars,
+    const std::unordered_set<const VarNode *> &thread_alias_vars,
+    const std::unordered_set<const VarNode *> &seq_thread_aliases,
+    std::unordered_set<const VarNode *> *vars) {
+  if (const auto *seq = stmt.as<SeqStmtNode>()) {
+    for (const Stmt &s : seq->seq) {
+      CollectForLoopVarsSkipThreadPartition(s, thread_vars, thread_alias_vars,
+                                            seq_thread_aliases, vars);
     }
-  });
+    return;
+  }
+  if (const auto *if_node = stmt.as<IfThenElseNode>()) {
+    if (IsThreadWavePartitionIf(if_node, thread_vars, thread_alias_vars,
+                                seq_thread_aliases)) {
+      return;
+    }
+    CollectForLoopVarsSkipThreadPartition(if_node->then_case, thread_vars,
+                                          thread_alias_vars, seq_thread_aliases,
+                                          vars);
+    if (if_node->else_case.defined()) {
+      CollectForLoopVarsSkipThreadPartition(if_node->else_case.value(),
+                                            thread_vars, thread_alias_vars,
+                                            seq_thread_aliases, vars);
+    }
+    return;
+  }
+  if (const auto *for_node = stmt.as<ForNode>()) {
+    vars->insert(for_node->loop_var.get());
+    CollectForLoopVarsSkipThreadPartition(for_node->body, thread_vars,
+                                          thread_alias_vars, seq_thread_aliases,
+                                          vars);
+    return;
+  }
+  if (const auto *attr = stmt.as<AttrStmtNode>()) {
+    // Do not walk into thread launch from outside; AttrStmt visitor owns that
+    // scope.
+    if (attr->attr_key == tir::attr::thread_extent) {
+      return;
+    }
+    CollectForLoopVarsSkipThreadPartition(
+        attr->body, thread_vars, thread_alias_vars, seq_thread_aliases, vars);
+  }
 }
 
 void CollectMlsLoadTileCalls(const Stmt &stmt,
@@ -174,6 +227,93 @@ void CollectMlsLoadTileCalls(const Stmt &stmt,
       }
     }
   });
+}
+
+void CollectMlsLoadTileCallsSkipThreadPartition(
+    const Stmt &stmt, const std::unordered_set<const VarNode *> &thread_vars,
+    const std::unordered_set<const VarNode *> &thread_alias_vars,
+    const std::unordered_set<const VarNode *> &seq_thread_aliases,
+    std::vector<const CallNode *> *calls) {
+  if (const auto *seq = stmt.as<SeqStmtNode>()) {
+    for (const Stmt &s : seq->seq) {
+      CollectMlsLoadTileCallsSkipThreadPartition(
+          s, thread_vars, thread_alias_vars, seq_thread_aliases, calls);
+    }
+    return;
+  }
+  if (const auto *if_node = stmt.as<IfThenElseNode>()) {
+    if (IsThreadWavePartitionIf(if_node, thread_vars, thread_alias_vars,
+                                seq_thread_aliases)) {
+      return;
+    }
+    CollectMlsLoadTileCallsSkipThreadPartition(if_node->then_case, thread_vars,
+                                               thread_alias_vars,
+                                               seq_thread_aliases, calls);
+    if (if_node->else_case.defined()) {
+      CollectMlsLoadTileCallsSkipThreadPartition(if_node->else_case.value(),
+                                                 thread_vars, thread_alias_vars,
+                                                 seq_thread_aliases, calls);
+    }
+    return;
+  }
+  if (const auto *for_node = stmt.as<ForNode>()) {
+    CollectMlsLoadTileCallsSkipThreadPartition(for_node->body, thread_vars,
+                                               thread_alias_vars,
+                                               seq_thread_aliases, calls);
+    return;
+  }
+  if (const auto *attr = stmt.as<AttrStmtNode>()) {
+    // Never collect across thread_extent from the outside; the AttrStmt
+    // visitor establishes thread_vars_ and owns nested hoist.
+    if (attr->attr_key == tir::attr::thread_extent) {
+      return;
+    }
+    CollectMlsLoadTileCallsSkipThreadPartition(
+        attr->body, thread_vars, thread_alias_vars, seq_thread_aliases, calls);
+    return;
+  }
+  CollectMlsLoadTileCalls(stmt, calls);
+}
+
+bool ElseDefersMlsPredeclareToNestedPartition(
+    const Stmt &else_case,
+    const std::unordered_set<const VarNode *> &thread_vars,
+    const std::unordered_set<const VarNode *> &thread_alias_vars,
+    const std::unordered_set<const VarNode *> &seq_thread_aliases) {
+  // Bare nested partition if: `else: if tx < N: ...`
+  if (const auto *if_node = else_case.as<IfThenElseNode>()) {
+    return IsThreadWavePartitionIf(if_node, thread_vars, thread_alias_vars,
+                                   seq_thread_aliases);
+  }
+  // SeqStmt prefix before the next ladder step, e.g.
+  //   else: { sched_barrier; if tx < N: producer else: consumer }
+  // Do not Predeclare on the whole else (would place resource_init before the
+  // inner partition). SeqStmt visitor stops hoist prefix at the partition if;
+  // the nested If visitor Predeclares inside that branch.
+  if (const auto *seq = else_case.as<SeqStmtNode>()) {
+    for (const Stmt &stmt : seq->seq) {
+      if (const auto *if_node = stmt.as<IfThenElseNode>()) {
+        if (IsThreadWavePartitionIf(if_node, thread_vars, thread_alias_vars,
+                                    seq_thread_aliases)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+Stmt PrependStmts(const std::vector<Stmt> &prelude, const Stmt &body) {
+  if (prelude.empty()) {
+    return body;
+  }
+  Array<Stmt> seq;
+  seq.reserve(prelude.size() + 1);
+  for (const Stmt &stmt : prelude) {
+    seq.push_back(stmt);
+  }
+  seq.push_back(body);
+  return seq.size() == 1 ? seq[0] : SeqStmt(seq);
 }
 
 std::string ExprKey(const PrimExpr &expr) {
@@ -205,11 +345,13 @@ Stmt MakeExternStmt(const std::string &symbol,
   return Evaluate(Call(DataType::Int(32), builtin::call_extern(), call_args));
 }
 
-bool UsesThreadOrWavePartition(
+bool UsesThreadIdxPartition(
     const PrimExpr &expr,
     const std::unordered_set<const VarNode *> &thread_vars,
     const std::unordered_set<const VarNode *> &thread_alias_vars,
     const std::unordered_set<const VarNode *> &seq_thread_aliases) {
+  // Only threadIdx / aliases matter for hoist barriers. Warp/wave/lane
+  // predicates do not shrink the lowered tx domain in TileLang today.
   bool found = false;
   tir::PostOrderVisit(expr, [&](const ObjectRef &node) {
     if (found) {
@@ -218,15 +360,6 @@ bool UsesThreadOrWavePartition(
     if (const auto *var = node.as<VarNode>()) {
       if (thread_vars.count(var) || thread_alias_vars.count(var) ||
           seq_thread_aliases.count(var)) {
-        found = true;
-      }
-      return;
-    }
-    if (const auto *call = node.as<CallNode>()) {
-      if (call->op.same_as(get_wave_id()) || call->op.same_as(get_warp_idx()) ||
-          call->op.same_as(get_warp_idx_sync()) ||
-          call->op.same_as(get_lane_idx()) ||
-          call->op.same_as(get_warp_group_idx())) {
         found = true;
       }
     }
@@ -239,8 +372,8 @@ bool IsThreadWavePartitionIf(
     const std::unordered_set<const VarNode *> &thread_vars,
     const std::unordered_set<const VarNode *> &thread_alias_vars,
     const std::unordered_set<const VarNode *> &seq_thread_aliases) {
-  return UsesThreadOrWavePartition(op->condition, thread_vars,
-                                   thread_alias_vars, seq_thread_aliases);
+  return UsesThreadIdxPartition(op->condition, thread_vars, thread_alias_vars,
+                                seq_thread_aliases);
 }
 
 void CollectSeqThreadAliases(
@@ -265,6 +398,12 @@ Stmt BuildHoistEligibleSeqPrefix(
     const std::unordered_set<const VarNode *> &seq_thread_aliases) {
   Array<Stmt> prefix;
   for (const Stmt &stmt : op->seq) {
+    // Do not pull mls_load out from under thread_extent / tx partitions.
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      if (attr->attr_key == tir::attr::thread_extent) {
+        break;
+      }
+    }
     if (const auto *if_node = stmt.as<IfThenElseNode>()) {
       if (IsThreadWavePartitionIf(if_node, thread_vars, thread_alias_vars,
                                   seq_thread_aliases)) {
@@ -318,11 +457,24 @@ public:
       return StmtMutator::VisitStmt_(op);
     }
     ++scope_depth_;
+    std::vector<Stmt> then_prelude;
+    PredeclareMlsResources(op->then_case, nullptr, &then_prelude);
     Stmt then_case = VisitStmt(op->then_case);
+    then_case = PrependStmts(then_prelude, then_case);
     ExpireScopes();
     Optional<Stmt> else_case = op->else_case;
-    if (else_case.defined()) {
+    if (else_case.defined() && ElseDefersMlsPredeclareToNestedPartition(
+                                   else_case.value(), thread_vars_,
+                                   thread_alias_vars_, seq_thread_aliases_)) {
+      // Nested WDRA/thread ladder (optionally under SeqStmt prefix): recurse
+      // only; let the nested partition If own resource_init.
       else_case = VisitStmt(else_case.value());
+      ExpireScopes();
+    } else if (else_case.defined()) {
+      std::vector<Stmt> else_prelude;
+      PredeclareMlsResources(else_case.value(), nullptr, &else_prelude);
+      else_case = VisitStmt(else_case.value());
+      else_case = PrependStmts(else_prelude, else_case.value());
       ExpireScopes();
     }
     --scope_depth_;
@@ -340,13 +492,21 @@ public:
     Stmt hoist_region = BuildHoistEligibleSeqPrefix(
         op, thread_vars_, thread_alias_vars_, seq_thread_aliases_);
     if (hoist_region.defined()) {
-      CollectForLoopVars(hoist_region, &nested_loop_vars);
+      CollectForLoopVarsSkipThreadPartition(
+          hoist_region, thread_vars_, thread_alias_vars_, seq_thread_aliases_,
+          &nested_loop_vars);
     }
 
     ++scope_depth_;
+    // Use partition-aware collection so Alloc/Decl wrappers above an
+    // `if tx` cannot smuggle mls_load into the SeqStmt prologue.
     if (hoist_region.defined()) {
-      PredeclareMlsResources(hoist_region, /*loop_var=*/nullptr, &prelude,
-                             &nested_loop_vars);
+      std::vector<const CallNode *> hoist_calls;
+      CollectMlsLoadTileCallsSkipThreadPartition(
+          hoist_region, thread_vars_, thread_alias_vars_, seq_thread_aliases_,
+          &hoist_calls);
+      PredeclareMlsResourcesFromCalls(hoist_calls, /*loop_var=*/nullptr,
+                                      &prelude, &nested_loop_vars);
     }
 
     Array<Stmt> seq;
@@ -366,8 +526,18 @@ public:
 
   Stmt VisitStmt_(const ForNode *op) final {
     std::vector<Stmt> prelude;
-    PredeclareMlsResources(op->body, op->loop_var.get(), &prelude);
-    PreinitializeMlsWindows(op->body, op->loop_var.get(), &prelude);
+    std::vector<const CallNode *> hoist_calls;
+    CollectMlsLoadTileCallsSkipThreadPartition(
+        op->body, thread_vars_, thread_alias_vars_, seq_thread_aliases_,
+        &hoist_calls);
+    std::unordered_set<const VarNode *> nested_loop_vars;
+    CollectForLoopVarsSkipThreadPartition(
+        op->body, thread_vars_, thread_alias_vars_, seq_thread_aliases_,
+        &nested_loop_vars);
+    nested_loop_vars.insert(op->loop_var.get());
+    PredeclareMlsResourcesFromCalls(hoist_calls, op->loop_var.get(), &prelude);
+    PreinitializeMlsWindowsFromCalls(hoist_calls, op->loop_var.get(), &prelude,
+                                     nested_loop_vars);
 
     ++scope_depth_;
     active_loop_ranges_.push_back(
@@ -468,6 +638,13 @@ private:
       const std::unordered_set<const VarNode *> *forbidden_vars = nullptr) {
     std::vector<const CallNode *> calls;
     CollectMlsLoadTileCalls(body, &calls);
+    PredeclareMlsResourcesFromCalls(calls, loop_var, prelude, forbidden_vars);
+  }
+
+  void PredeclareMlsResourcesFromCalls(
+      const std::vector<const CallNode *> &calls, const VarNode *loop_var,
+      std::vector<Stmt> *prelude,
+      const std::unordered_set<const VarNode *> *forbidden_vars = nullptr) {
     for (const CallNode *call : calls) {
       ICHECK(call->args.size() == 8U || call->args.size() == 9U)
           << "mls_load_tile extern expects symbol, src, stride, mn_len, k_len, "
@@ -508,9 +685,22 @@ private:
     std::vector<const CallNode *> calls;
     CollectMlsLoadTileCalls(body, &calls);
     std::unordered_set<const VarNode *> moving_loop_vars;
-    CollectForLoopVars(body, &moving_loop_vars);
-    moving_loop_vars.insert(loop_var);
+    tir::PostOrderVisit(body, [&](const ObjectRef &node) {
+      if (const auto *for_node = node.as<ForNode>()) {
+        moving_loop_vars.insert(for_node->loop_var.get());
+      }
+    });
+    if (loop_var != nullptr) {
+      moving_loop_vars.insert(loop_var);
+    }
+    PreinitializeMlsWindowsFromCalls(calls, loop_var, prelude,
+                                     moving_loop_vars);
+  }
 
+  void PreinitializeMlsWindowsFromCalls(
+      const std::vector<const CallNode *> &calls, const VarNode *loop_var,
+      std::vector<Stmt> *prelude,
+      const std::unordered_set<const VarNode *> &moving_loop_vars) {
     std::unordered_set<std::string> keys_with_moving_k_base;
     for (const CallNode *call : calls) {
       const auto *sym_node = call->args[0].as<StringImmNode>();
