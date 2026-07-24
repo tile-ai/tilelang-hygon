@@ -49,15 +49,17 @@ public:
   static constexpr int warp_cols = GemmOp::warp_cols;
 
   using ATraits =
-      tl::mls::ds_read_format_traits<tl::sequence<M, K>, MlsTileA, num_warp_m,
-                                     1, A_type, AltA, TransA, HcuArch>;
+      tl::mls::ds_read_format_traits<tl::sequence<M, K>, tl::sequence<M, K>,
+                                     MlsTileA, num_warp_m, 1, A_type, AltA,
+                                     TransA, HcuArch>;
   static constexpr tl::index_t A_local_size = ATraits::GemmTensorSize;
 
   static constexpr tl::index_t WarpN_no_recompute =
       std::min(num_warp_n, N / kMinNPerWarp);
-  using BTraits = tl::mls::ds_read_format_traits<tl::sequence<N, K>, MlsTileB,
-                                                 WarpN_no_recompute, 1, B_type,
-                                                 AltB, TransB, HcuArch>;
+  using BTraits =
+      tl::mls::ds_read_format_traits<tl::sequence<N, K>, tl::sequence<N, K>,
+                                     MlsTileB, WarpN_no_recompute, 1, B_type,
+                                     AltB, TransB, HcuArch>;
   static constexpr tl::index_t B_local_size = BTraits::GemmTensorSize;
 
   static_assert(kPack == 1, "gemm_mls currently requires kPack=1");
@@ -76,14 +78,14 @@ public:
     A_type A_local[A_local_size];
     B_type B_local[B_local_size];
 
-    tl::mls::ds_read_format_tensor_a<tl::sequence<M, K>, MlsTileA, num_warp_m,
-                                     1, A_type, AltA, TransA, HcuArch>(A_lds,
-                                                                       A_local);
+    tl::mls::ds_read_format_tensor_a<tl::sequence<M, K>, tl::sequence<M, K>,
+                                     MlsTileA, num_warp_m, 1, A_type, AltA,
+                                     TransA, HcuArch>(A_lds, A_local);
 
-    tl::mls::ds_read_format_tensor_b<tl::sequence<N, K>, MlsTileB,
-                                     num_warp_m * num_warp_n, num_warp_n, 1,
-                                     B_type, AltB, TransB, HcuArch>(B_lds,
-                                                                    B_local);
+    tl::mls::ds_read_format_tensor_b<
+        tl::sequence<N, K>, tl::sequence<N, K>, MlsTileB,
+        num_warp_m * num_warp_n, num_warp_n, 1, B_type, AltB, TransB, HcuArch>(
+        B_lds, B_local);
 
     GemmOp::body_rr(A_local, B_local, C_local);
   }
@@ -137,9 +139,10 @@ public:
 
   static constexpr tl::index_t WarpN_no_recompute =
       std::min(num_warp_n, N / kMinNPerWarp);
-  using BTraits = tl::mls::ds_read_format_traits<tl::sequence<N, K>, MlsTileB,
-                                                 WarpN_no_recompute, 1, B_type,
-                                                 AltB, TransB, HcuArch>;
+  using BTraits =
+      tl::mls::ds_read_format_traits<tl::sequence<N, K>, tl::sequence<N, K>,
+                                     MlsTileB, WarpN_no_recompute, 1, B_type,
+                                     AltB, TransB, HcuArch>;
   static constexpr tl::index_t B_local_size = BTraits::GemmTensorSize;
 
   static_assert(kPack == 1, "gemm_mls currently requires kPack=1");
@@ -153,10 +156,10 @@ public:
   static TL_DEVICE void body_r_mls(A_type *A_local, TL_LDS_ADDR B_type *B_lds,
                                    C_type *C_local) {
     B_type B_local[B_local_size];
-    tl::mls::ds_read_format_tensor_b<tl::sequence<N, K>, MlsTileB,
-                                     num_warp_m * num_warp_n, num_warp_n, 1,
-                                     B_type, AltB, TransB, HcuArch>(B_lds,
-                                                                    B_local);
+    tl::mls::ds_read_format_tensor_b<
+        tl::sequence<N, K>, tl::sequence<N, K>, MlsTileB,
+        num_warp_m * num_warp_n, num_warp_n, 1, B_type, AltB, TransB, HcuArch>(
+        B_lds, B_local);
     GemmOp::body_rr(A_local, B_local, C_local);
   }
 

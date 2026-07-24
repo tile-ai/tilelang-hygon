@@ -3,18 +3,23 @@
  * \brief Insert s_waitcnt + syncthreads before MLS async consumers on HCU.
  *
  * Runs after InjectSoftwarePipeline (tile-op IR): match producer/consumer on
- * shared Buffer + Region ranges (like cp.async pipeline planning), not on
- * merged dyn-shmem byte offsets.
+ * shared Buffer + overlapping Region ranges (like cp.async pipeline planning),
+ * not on merged dyn-shmem byte offsets.
  *
  * Producers: MatrixLoad -> shared dst region.
  * Consumers: DsReadFormat -> shared src region; Gemm -> shared A/B regions when
  * annotated as MLS-fed (same as cp.async treating Gemm reads as consumers).
  *
+ * Thread/wave partition IfThenElse branches carry mutually exclusive ConstrSet
+ * constraints; producer/consumer pairs across exclusive branches are never
+ * matched and do not contribute to outstanding MLS counts.
+ *
  * Algorithm:
  * 1. Insert count: for each consumer, find matching MatrixLoad producer(s),
  *    count outstanding MLS issues between them, take min vmcnt.
  * 2. Merge: walk consumers in reverse; drop a wait if a stricter wait on the
- *    same shared region appears before its related producer is reached.
+ *    same overlapping shared region appears before its related producer is
+ *    reached.
  */
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/transform.h>
@@ -39,6 +44,7 @@
 #include "op/gemm.h"
 #include "op/operator.h"
 #include "op/utils.h"
+#include "transform/common/constr_visitor.h"
 #include "transform/common/pipeline_utils.h"
 
 namespace tvm {
@@ -68,6 +74,59 @@ bool AnnotationIsTrue(const Map<String, ObjectRef> &annotations,
   return false;
 }
 
+bool UsesThreadOrWavePartition(
+    const PrimExpr &expr,
+    const std::unordered_set<const VarNode *> &thread_vars,
+    const std::unordered_set<const VarNode *> &thread_alias_vars,
+    const std::unordered_set<const VarNode *> &seq_thread_aliases) {
+  bool found = false;
+  tirx::PostOrderVisit(expr, [&](const ObjectRef &node) {
+    if (found) {
+      return;
+    }
+    if (const auto *var = node.as<VarNode>()) {
+      if (thread_vars.count(var) || thread_alias_vars.count(var) ||
+          seq_thread_aliases.count(var)) {
+        found = true;
+      }
+      return;
+    }
+    if (const auto *call = node.as<CallNode>()) {
+      if (call->op.same_as(get_wave_id()) || call->op.same_as(get_warp_idx()) ||
+          call->op.same_as(get_warp_idx_sync()) ||
+          call->op.same_as(get_lane_idx()) ||
+          call->op.same_as(get_warp_group_idx())) {
+        found = true;
+      }
+    }
+  });
+  return found;
+}
+
+bool IsThreadWavePartitionIf(
+    const IfThenElseNode *op,
+    const std::unordered_set<const VarNode *> &thread_vars,
+    const std::unordered_set<const VarNode *> &thread_alias_vars,
+    const std::unordered_set<const VarNode *> &seq_thread_aliases) {
+  return UsesThreadOrWavePartition(op->condition, thread_vars,
+                                   thread_alias_vars, seq_thread_aliases);
+}
+
+void CollectSeqThreadAliases(
+    const SeqStmtNode *op,
+    const std::unordered_set<const VarNode *> &thread_vars,
+    std::unordered_set<const VarNode *> *seq_thread_aliases) {
+  for (const Stmt &stmt : op->seq) {
+    if (const auto *let = stmt.as<BindNode>()) {
+      if (const auto *v = let->value.as<VarNode>()) {
+        if (thread_vars.count(v)) {
+          seq_thread_aliases->insert(let->var.get());
+        }
+      }
+    }
+  }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -83,6 +142,7 @@ struct TimelineEvent {
   int loop_id{-1}; // innermost enclosing loop, -1 if none
   int issue_count{0};
   std::vector<SharedRegion> regions;
+  ConstrSet cset;
 };
 
 struct LoopCtx {
@@ -144,11 +204,14 @@ private:
     // Interleaved pipeline (ds_read A -> reload A -> ds_read B): vmcnt is
     // global, so count MLS producers issued after the previous consumer in this
     // loop body.
+    const TimelineEvent &consumer = timeline_[consumer_idx];
     int prev_consumer = -1;
     for (int i = consumer_idx - 1; i >= 0; --i) {
       if (timeline_[i].kind == EventKind::kConsumer) {
-        prev_consumer = i;
-        break;
+        if (EventsCompatible(timeline_[i], consumer)) {
+          prev_consumer = i;
+          break;
+        }
       }
     }
     if (prev_consumer < 0)
@@ -159,6 +222,8 @@ private:
     int keep = 0;
     for (int i = prev_consumer + 1; i < consumer_idx; ++i) {
       if (timeline_[i].kind != EventKind::kProducer)
+        continue;
+      if (!EventsCompatible(timeline_[i], consumer))
         continue;
       if (timeline_[i].issue_count <= 0)
         return 0;
@@ -239,13 +304,14 @@ private:
 
   int CountOutstandingEpilogue(int prod_idx, int consumer_idx,
                                const LoopCtx *loop, int64_t prod_phase) {
-    int keep = CountOutstanding(prod_idx, loop->end);
+    const TimelineEvent &consumer = timeline_[consumer_idx];
+    int keep = CountOutstanding(prod_idx, loop->end, consumer_idx);
     int producers_per_iter = CountLoopProducers(loop);
     int64_t remaining_iters = loop->extent - 1 - prod_phase;
     if (remaining_iters > 0 && producers_per_iter > 0) {
       keep += static_cast<int>(remaining_iters * producers_per_iter);
     }
-    keep += CountOutstanding(loop->end, consumer_idx);
+    keep += CountOutstanding(loop->end, consumer_idx, consumer_idx);
     if (keep > 63)
       return 0;
     return keep;
@@ -255,8 +321,10 @@ private:
   MatchEpilogueProducer(const TimelineEvent &consumer, const SharedRegion &creg,
                         const LoopCtx *loop) {
     auto matches = [&](const TimelineEvent &prod, int64_t prod_phase) {
+      if (!EventsCompatible(prod, consumer))
+        return false;
       for (const SharedRegion &preg : prod.regions) {
-        if (RegionMatchAtPhase(preg, creg, loop, prod_phase, 0))
+        if (RegionOverlapAtPhase(preg, creg, loop, prod_phase, 0))
           return true;
       }
       return false;
@@ -303,14 +371,17 @@ private:
   std::optional<MatchResult>
   FindProducer(int consumer_idx, const SharedRegion &creg, const LoopCtx *loop,
                std::optional<int64_t> phase, bool wrap) {
+    const TimelineEvent &consumer = timeline_[consumer_idx];
     auto try_producer = [&](int prod_idx, int keep) -> MatchResult {
       return MatchResult{prod_idx, keep};
     };
 
     auto matches = [&](const TimelineEvent &prod, int64_t prod_phase,
                        int64_t cons_phase) {
+      if (!EventsCompatible(prod, consumer))
+        return false;
       for (const SharedRegion &preg : prod.regions) {
-        if (RegionMatchAtPhase(preg, creg, loop, prod_phase, cons_phase))
+        if (RegionOverlapAtPhase(preg, creg, loop, prod_phase, cons_phase))
           return true;
       }
       return false;
@@ -320,8 +391,11 @@ private:
       for (int i = consumer_idx - 1; i >= 0; --i) {
         if (timeline_[i].kind != EventKind::kProducer)
           continue;
+        if (!EventsCompatible(timeline_[i], consumer))
+          continue;
         if (RegionMatchConcrete(timeline_[i].regions, creg)) {
-          return try_producer(i, CountOutstanding(i, consumer_idx));
+          return try_producer(i,
+                              CountOutstanding(i, consumer_idx, consumer_idx));
         }
       }
       return std::nullopt;
@@ -335,7 +409,8 @@ private:
         if (timeline_[i].kind != EventKind::kProducer)
           continue;
         if (matches(timeline_[i], cons_phase, cons_phase)) {
-          return try_producer(i, CountOutstanding(i, consumer_idx));
+          return try_producer(i,
+                              CountOutstanding(i, consumer_idx, consumer_idx));
         }
       }
       return std::nullopt;
@@ -361,10 +436,36 @@ private:
   bool RegionMatchConcrete(const std::vector<SharedRegion> &prods,
                            const SharedRegion &cons) {
     for (const SharedRegion &preg : prods) {
-      if (RegionMatchAtPhase(preg, cons, nullptr, 0, 0))
+      if (RegionOverlapAtPhase(preg, cons, nullptr, 0, 0))
         return true;
     }
     return false;
+  }
+
+  bool EventsCompatible(const TimelineEvent &lhs,
+                        const TimelineEvent &rhs) const {
+    arith::Analyzer analyzer;
+    ConstrSet combined;
+    combined.Extend(lhs.cset);
+    combined.Extend(rhs.cset);
+    combined.Populate(analyzer);
+    PrimExpr conj =
+        tirx::And(lhs.cset.ToConjunction(), rhs.cset.ToConjunction());
+    return !analyzer.CanProve(tirx::Not(conj));
+  }
+
+  ConstrSet GetConstrSet() const {
+    return ConstrSet{.constrs_ = constr_stack_};
+  }
+
+  struct ConstrGuard {
+    std::vector<Constr> &constrs;
+    ~ConstrGuard() { constrs.pop_back(); }
+  };
+
+  template <typename... Args> ConstrGuard MakeGuard(Args... args) {
+    constr_stack_.push_back(Constr(args...));
+    return ConstrGuard{constr_stack_};
   }
 
   PrimExpr EvalExprPhase(const PrimExpr &expr, const LoopCtx *loop,
@@ -381,35 +482,37 @@ private:
                                 EvalExprPhase(range->extent, loop, phase));
   }
 
-  bool ExprEqual(const PrimExpr &lhs, const PrimExpr &rhs) {
-    PrimExpr a = analyzer_.Simplify(lhs);
-    PrimExpr b = analyzer_.Simplify(rhs);
-    if (const int64_t *ai = as_const_int(a)) {
-      if (const int64_t *bi = as_const_int(b))
-        return *ai == *bi;
-    }
-    return analyzer_.CanProve(analyzer_.Simplify(a == b),
-                              arith::ProofStrength::kSymbolicBound);
-  }
-
-  bool RangeEqualAtPhase(const Range &lhs, const Range &rhs,
-                         const LoopCtx *loop, int64_t lhs_phase,
-                         int64_t rhs_phase) {
+  bool RangeOverlapAtPhase(const Range &lhs, const Range &rhs,
+                           const LoopCtx *loop, int64_t lhs_phase,
+                           int64_t rhs_phase) {
     Range l = EvalRangePhase(lhs, loop, lhs_phase);
     Range r = EvalRangePhase(rhs, loop, rhs_phase);
-    return ExprEqual(l->min, r->min) && ExprEqual(l->extent, r->extent);
+    PrimExpr l_end = l->min + l->extent;
+    PrimExpr r_end = r->min + r->extent;
+    PrimExpr overlap = tirx::And(l->min < r_end, r->min < l_end);
+    if (const int64_t *l_min = as_const_int(analyzer_.Simplify(l->min))) {
+      if (const int64_t *l_ext = as_const_int(analyzer_.Simplify(l->extent))) {
+        if (const int64_t *r_min = as_const_int(analyzer_.Simplify(r->min))) {
+          if (const int64_t *r_ext =
+                  as_const_int(analyzer_.Simplify(r->extent))) {
+            return *l_min < *r_min + *r_ext && *r_min < *l_min + *l_ext;
+          }
+        }
+      }
+    }
+    return analyzer_.CanProve(overlap, arith::ProofStrength::kSymbolicBound);
   }
 
-  bool RegionMatchAtPhase(const SharedRegion &prod, const SharedRegion &cons,
-                          const LoopCtx *loop, int64_t prod_phase,
-                          int64_t cons_phase) {
+  bool RegionOverlapAtPhase(const SharedRegion &prod, const SharedRegion &cons,
+                            const LoopCtx *loop, int64_t prod_phase,
+                            int64_t cons_phase) {
     if (!prod.buffer.same_as(cons.buffer))
       return false;
     if (prod.ranges.size() != cons.ranges.size())
       return false;
     for (size_t i = 0; i < prod.ranges.size(); ++i) {
-      if (!RangeEqualAtPhase(prod.ranges[i], cons.ranges[i], loop, prod_phase,
-                             cons_phase)) {
+      if (!RangeOverlapAtPhase(prod.ranges[i], cons.ranges[i], loop, prod_phase,
+                               cons_phase)) {
         return false;
       }
     }
@@ -420,17 +523,20 @@ private:
                               const TimelineEvent &rhs) {
     for (const SharedRegion &lreg : lhs.regions) {
       for (const SharedRegion &rreg : rhs.regions) {
-        if (RegionMatchAtPhase(lreg, rreg, nullptr, 0, 0))
+        if (RegionOverlapAtPhase(lreg, rreg, nullptr, 0, 0))
           return true;
       }
     }
     return false;
   }
 
-  int CountOutstanding(int from_exclusive, int to_exclusive) {
+  int CountOutstanding(int from_exclusive, int to_exclusive, int consumer_idx) {
+    const TimelineEvent &consumer = timeline_[consumer_idx];
     int keep = 0;
     for (int i = from_exclusive + 1; i < to_exclusive; ++i) {
       if (timeline_[i].kind != EventKind::kProducer)
+        continue;
+      if (!EventsCompatible(timeline_[i], consumer))
         continue;
       if (timeline_[i].issue_count <= 0)
         return 0;
@@ -443,9 +549,12 @@ private:
 
   int CountOutstandingLoopCarry(int prod_idx, int consumer_idx,
                                 const LoopCtx *loop) {
-    int keep = CountOutstanding(prod_idx, loop->end);
+    const TimelineEvent &consumer = timeline_[consumer_idx];
+    int keep = CountOutstanding(prod_idx, loop->end, consumer_idx);
     for (int i = loop->begin; i < consumer_idx; ++i) {
       if (timeline_[i].kind != EventKind::kProducer)
+        continue;
+      if (!EventsCompatible(timeline_[i], consumer))
         continue;
       if (timeline_[i].issue_count <= 0)
         return 0;
@@ -505,6 +614,62 @@ private:
         return &(*it);
     }
     return loops_.empty() ? nullptr : &loops_.back();
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tirx::attr::thread_extent) {
+      IterVar iv = Downcast<IterVar>(op->node);
+      const std::string &tag = iv->thread_tag;
+      if (tag.rfind("threadIdx", 0) == 0) {
+        thread_vars_.insert(iv->var.get());
+        Range dom =
+            Range::FromMinExtent(tirx::make_zero(op->value.dtype()), op->value);
+        auto guard = MakeGuard(iv->var, dom);
+        StmtVisitor::VisitStmt_(op);
+        thread_vars_.erase(iv->var.get());
+        return;
+      }
+    }
+    StmtVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const BindNode *op) final {
+    if (const auto *v = op->value.as<VarNode>()) {
+      if (thread_vars_.count(v)) {
+        thread_alias_vars_.insert(op->var.get());
+      }
+    }
+    auto guard = MakeGuard(op->var, op->value);
+    StmtVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) final {
+    if (IsThreadWavePartitionIf(op, thread_vars_, thread_alias_vars_,
+                                seq_thread_aliases_)) {
+      {
+        auto guard = MakeGuard(op->condition);
+        VisitStmt(op->then_case);
+      }
+      if (op->else_case.defined()) {
+        auto guard = MakeGuard(tirx::Not(op->condition));
+        VisitStmt(op->else_case.value());
+      }
+      return;
+    }
+    VisitStmt(op->then_case);
+    if (op->else_case.defined()) {
+      VisitStmt(op->else_case.value());
+    }
+  }
+
+  void VisitStmt_(const SeqStmtNode *op) final {
+    std::unordered_set<const VarNode *> saved_seq_aliases = seq_thread_aliases_;
+    seq_thread_aliases_.clear();
+    CollectSeqThreadAliases(op, thread_vars_, &seq_thread_aliases_);
+    for (const Stmt &stmt : op->seq) {
+      VisitStmt(stmt);
+    }
+    seq_thread_aliases_ = saved_seq_aliases;
   }
 
   void VisitStmt_(const ForNode *op) final {
@@ -572,6 +737,7 @@ private:
     ev.loop_id = loop_stack_.empty() ? -1 : loop_stack_.back();
     ev.issue_count = 1;
     ev.regions = {std::move(reg)};
+    ev.cset = GetConstrSet();
     timeline_.push_back(ev);
   }
 
@@ -582,6 +748,7 @@ private:
     ev.index = static_cast<int>(timeline_.size());
     ev.loop_id = loop_stack_.empty() ? -1 : loop_stack_.back();
     ev.regions = std::move(regs);
+    ev.cset = GetConstrSet();
     timeline_.push_back(ev);
   }
 
@@ -589,6 +756,10 @@ private:
   std::vector<LoopCtx> loops_;
   std::vector<int> loop_stack_;
   std::unordered_map<int, WaitPlan> plan_by_index_;
+  std::vector<Constr> constr_stack_;
+  std::unordered_set<const VarNode *> thread_vars_;
+  std::unordered_set<const VarNode *> thread_alias_vars_;
+  std::unordered_set<const VarNode *> seq_thread_aliases_;
   arith::Analyzer analyzer_;
   bool has_mls_tile_ops_{false};
 };

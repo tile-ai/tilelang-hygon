@@ -24,6 +24,9 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
 /// Logical warp index base for scoped MLS: thread_bounds.min / warp_size.
 int MlsScopedWarpIdOffset(const Range &thread_bounds, Target target);
 
+/// Last-2 buffer dims as (MN, K) according to mls_trans.
+std::pair<int64_t, int64_t> MlsBlockDims(const Buffer &buf, bool mls_trans);
+
 class MatrixLoadNode : public TileOperatorNode {
 public:
   Buffer src, dst;

@@ -8,6 +8,9 @@
  * kernels should pass trans / MLS tile size on `matrix_load` and
  * `ds_read_format` (args or annotations), since warp partition is configured
  * on the kernel side in that style.
+ *
+ * Register-side propagation continues through `local.fragment` / `local` and
+ * stops at shared-like scopes (`shared` / `shared.dyn` / `shared.tmem`).
  */
 
 #ifndef TVM_TL_OP_PROPAGATION_UTIL_H_

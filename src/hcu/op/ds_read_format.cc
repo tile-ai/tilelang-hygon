@@ -231,24 +231,87 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
   int warp_id_offset = MlsScopedWarpIdOffset(T.thread_bounds, T.target);
   bool ds_trans = true;
-  int64_t block_mn = *as_const_int(dst->shape[0]);
-  int64_t block_k = *as_const_int(dst->shape[1]);
+  if (gemm_dep_.defined()) {
+    ds_trans = gemm_dep_.get()->trans;
+  }
+
+  size_t sr = this->src_ranges.size();
+  ICHECK(sr >= 2) << "ds_read_format src region must be at least 2D";
+  ICHECK_EQ(src->shape.size(), sr)
+      << "ds_read_format src buffer rank must match src region rank, got "
+         "shape.size()="
+      << src->shape.size() << " vs region rank=" << sr;
+
+  // Full LDS last-2 (matches matrix_load write / LdsDesc). Read extent +
+  // logical origin from the src region last-2 (scheme A).
+  auto [lds_mn, lds_k] = MlsBlockDims(src, ds_trans);
+  const PrimExpr origin_dim0 = this->src_ranges[sr - 2]->min;
+  const PrimExpr origin_dim1 = this->src_ranges[sr - 1]->min;
+  const PrimExpr extent_dim0 = this->src_ranges[sr - 2]->extent;
+  const PrimExpr extent_dim1 = this->src_ranges[sr - 1]->extent;
+  PrimExpr origin_mn = ds_trans ? origin_dim0 : origin_dim1;
+  PrimExpr origin_k = ds_trans ? origin_dim1 : origin_dim0;
+  PrimExpr read_mn_expr = ds_trans ? extent_dim0 : extent_dim1;
+  PrimExpr read_k_expr = ds_trans ? extent_dim1 : extent_dim0;
+
+  const int64_t *read_mn_c = as_const_int(read_mn_expr);
+  const int64_t *read_k_c = as_const_int(read_k_expr);
+  ICHECK(read_mn_c && read_k_c)
+      << "ds_read_format requires static last-2 read extents, got "
+      << read_mn_expr << ", " << read_k_expr;
+  int64_t read_mn = *read_mn_c;
+  int64_t read_k = *read_k_c;
+
+  // Fragment / gemm tile must match the read extent.
+  int64_t frag_mn =
+      ds_trans ? *as_const_int(dst->shape[0]) : *as_const_int(dst->shape[1]);
+  int64_t frag_k =
+      ds_trans ? *as_const_int(dst->shape[1]) : *as_const_int(dst->shape[0]);
+  ICHECK_EQ(frag_mn, read_mn)
+      << "ds_read_format dst fragment MN must match src read extent MN, got "
+      << frag_mn << " vs " << read_mn;
+  ICHECK_EQ(frag_k, read_k)
+      << "ds_read_format dst fragment K must match src read extent K, got "
+      << frag_k << " vs " << read_k;
+
+  ICHECK(read_mn > 0 && read_k > 0);
+  ICHECK_LE(read_mn, lds_mn);
+  ICHECK_LE(read_k, lds_k);
+
   int tile_mn = 0;
   int tile_k = 0;
   int w_mn = 0;
   int w_k = 0;
+  // Mls tile / LdsDesc must follow the *full* LDS write shape.
+  {
+    int dummy_mn, dummy_k;
+    ComputeMlsWarpPartition(
+        ds_trans, static_cast<int>(lds_mn), static_cast<int>(lds_k), block_size,
+        T.target, src->dtype.bits(), dummy_mn, dummy_k, tile_mn, tile_k);
+  }
+
+  const int64_t *origin_mn_c = as_const_int(origin_mn);
+  const int64_t *origin_k_c = as_const_int(origin_k);
+  ICHECK(origin_mn_c && origin_k_c)
+      << "ds_read_format requires static last-2 logical origins, got "
+      << origin_mn << ", " << origin_k;
+  ICHECK_EQ(*origin_mn_c % tile_mn, 0)
+      << "ds_read_format slice origin_mn=" << *origin_mn_c
+      << " must be divisible by mls_tile_mn=" << tile_mn;
+  ICHECK_EQ(*origin_k_c % tile_k, 0)
+      << "ds_read_format slice origin_k=" << *origin_k_c
+      << " must be divisible by mls_tile_k=" << tile_k;
+  ICHECK_EQ(read_mn % tile_mn, 0)
+      << "ds_read_format slice extent_mn=" << read_mn
+      << " must be divisible by mls_tile_mn=" << tile_mn;
+  ICHECK_EQ(read_k % tile_k, 0)
+      << "ds_read_format slice extent_k=" << read_k
+      << " must be divisible by mls_tile_k=" << tile_k;
+  ICHECK_LE(*origin_mn_c + read_mn, lds_mn);
+  ICHECK_LE(*origin_k_c + read_k, lds_k);
+
   if (gemm_dep_.defined()) {
     const auto *meta = gemm_dep_.get();
-    ds_trans = meta->trans;
-    block_mn =
-        ds_trans ? *as_const_int(dst->shape[0]) : *as_const_int(dst->shape[1]);
-    block_k =
-        ds_trans ? *as_const_int(dst->shape[1]) : *as_const_int(dst->shape[0]);
-    int dummy_mn, dummy_k;
-    ComputeMlsWarpPartition(ds_trans, static_cast<int>(block_mn),
-                            static_cast<int>(block_k), block_size, T.target,
-                            src->dtype.bits(), dummy_mn, dummy_k, tile_mn,
-                            tile_k);
     GemmWarpPolicy policy(meta->gemm_policy);
     const bool a_mls_trans = !meta->gemm_trans_a;
     const bool b_mls_trans = meta->gemm_trans_b;
@@ -262,18 +325,13 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     w_mn = meta->feeds_slot == 0 ? warp_m : warp_n;
     w_k = warp_k_part;
   } else {
-    int dummy_mn, dummy_k;
-    ComputeMlsWarpPartition(ds_trans, static_cast<int>(block_mn),
-                            static_cast<int>(block_k), block_size, T.target,
-                            src->dtype.bits(), dummy_mn, dummy_k, tile_mn,
-                            tile_k);
     const int alt = 1;
     const int elem_bytes = src->dtype.bits() / 8;
     int read_tile_mn, read_tile_k;
     GetReadTileFromMlsTile(ds_trans, tile_mn, tile_k, alt, elem_bytes,
                            read_tile_mn, read_tile_k);
     ComputeDsReadFormatWarpPartition(
-        ds_trans, static_cast<int>(block_mn), static_cast<int>(block_k),
+        ds_trans, static_cast<int>(read_mn), static_cast<int>(read_k),
         block_size, T.target, read_tile_mn, read_tile_k, w_mn, w_k);
   }
 
@@ -294,23 +352,26 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   if (gemm_dep_.defined()) {
     const auto *dep = gemm_dep_.get();
     if (dep->feeds_slot == 0) {
-      ss << "tl::mls::ds_read_format_tensor_a<tl::sequence<" << block_mn << ", "
-         << block_k << ">, tl::sequence<" << tile_mn << ", " << tile_k << ">, "
-         << w_mn << ", " << w_k << ", " << dtype_str << ", 1, "
+      ss << "tl::mls::ds_read_format_tensor_a<tl::sequence<" << lds_mn << ", "
+         << lds_k << ">, tl::sequence<" << read_mn << ", " << read_k
+         << ">, tl::sequence<" << tile_mn << ", " << tile_k << ">, " << w_mn
+         << ", " << w_k << ", " << dtype_str << ", 1, "
          << (ds_trans ? "true" : "false")
          << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ">";
     } else {
       int total_warp = block_size / TargetHcuGetWarpSize(T.target);
-      ss << "tl::mls::ds_read_format_tensor_b<tl::sequence<" << block_mn << ", "
-         << block_k << ">, tl::sequence<" << tile_mn << ", " << tile_k << ">, "
+      ss << "tl::mls::ds_read_format_tensor_b<tl::sequence<" << lds_mn << ", "
+         << lds_k << ">, tl::sequence<" << read_mn << ", " << read_k
+         << ">, tl::sequence<" << tile_mn << ", " << tile_k << ">, "
          << total_warp << ", " << w_mn << ", " << w_k << ", " << dtype_str
          << ", 1, " << (ds_trans ? "true" : "false")
          << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ">";
     }
   } else {
-    ss << "tl::mls::ds_read_format_tensor_common<tl::sequence<" << block_mn
-       << ", " << block_k << ">, tl::sequence<" << tile_mn << ", " << tile_k
-       << ">, " << w_mn << ", " << w_k << ", " << dtype_str << ", 1, "
+    ss << "tl::mls::ds_read_format_tensor_common<tl::sequence<" << lds_mn
+       << ", " << lds_k << ">, tl::sequence<" << read_mn << ", " << read_k
+       << ">, tl::sequence<" << tile_mn << ", " << tile_k << ">, " << w_mn
+       << ", " << w_k << ", " << dtype_str << ", 1, "
        << (ds_trans ? "true" : "false")
        << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ">";
   }
@@ -318,14 +379,9 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   Buffer src_buf = T.buffer_remap.count(src) ? T.buffer_remap[src] : src;
   Buffer dst_buf = T.buffer_remap.count(dst) ? T.buffer_remap[dst] : dst;
 
-  size_t sr = this->src_ranges.size();
-  ICHECK(sr >= 2) << "ds_read_format src region must be at least 2D";
+  // Leading dims only (last-2 handled via logical origin + full LdsDesc).
   PrimExpr src_leading_elem_offset = IntImm(DataType::Int(32), 0);
   if (sr > 2) {
-    ICHECK_EQ(src_buf->shape.size(), sr)
-        << "ds_read_format src buffer rank must match src region rank, got "
-           "shape.size()="
-        << src_buf->shape.size() << " vs region rank=" << sr;
     Array<PrimExpr> src_idx_leading;
     DataType idx_dtype = src_buf->DefaultIndexType();
     for (size_t j = 0; j + 2 < sr; ++j) {
@@ -372,6 +428,8 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   call_args.push_back(src_ptr);
   call_args.push_back(dst_ptr);
   call_args.push_back(IntImm(DataType::Int(32), warp_id_offset));
+  call_args.push_back(Cast(DataType::Int(32), origin_mn));
+  call_args.push_back(Cast(DataType::Int(32), origin_k));
 
   return Evaluate(Call(DataType::Handle(), builtin::call_extern(), call_args));
 }
