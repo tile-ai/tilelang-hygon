@@ -1115,6 +1115,18 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
       return;
     }
 
+    // Mark HCU MLS async loads (mls_load_tile / async_load*) like cp.async so
+    // ThreadSync skips WAW barriers between successive LDS writes; completion
+    // is handled by abarrier_seq / waitcnt, not __syncthreads.
+    if (IsMlsLoadTileExternCall(op) || IsMlsAsyncLoadExternCall(op)) {
+      mls_async_depth_++;
+      for (const auto &a : op->args) {
+        this->VisitExpr(a);
+      }
+      mls_async_depth_--;
+      return;
+    }
+
     // Mark the pointer argument of atomic ops as atomic so the sync planner
     // doesn't insert barriers between atomics.
     auto is_atomic_op = [&]() {
@@ -1248,12 +1260,14 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
         e.scope = scope;
         if (flag->value & 1) {
           e.type = kRead;
-          e.is_async_copy = (tma_depth_ > 0 || cp_async_depth_ > 0);
+          e.is_async_copy =
+              (tma_depth_ > 0 || cp_async_depth_ > 0 || mls_async_depth_ > 0);
           curr_stmt_.access.emplace_back(e);
         }
         if (flag->value & 2) {
           e.type = kWrite;
-          e.is_async_copy = (tma_depth_ > 0 || cp_async_depth_ > 0);
+          e.is_async_copy =
+              (tma_depth_ > 0 || cp_async_depth_ > 0 || mls_async_depth_ > 0);
           curr_stmt_.access.emplace_back(e);
         }
       }
@@ -1492,6 +1506,8 @@ private:
   int tma_depth_{0};
   // Nesting depth of cp.async calls (ptx_cp_async)
   int cp_async_depth_{0};
+  // Nesting depth of HCU MLS async load externs (mls_load_tile / async_load*)
+  int mls_async_depth_{0};
   // Whether we're visiting the pointer argument expression of an atomic call
   // (e.g., atomic_add/atomic_max/atomic_load). When > 0, accesses produced by
   // the pointer metadata ops are tagged as atomic.
