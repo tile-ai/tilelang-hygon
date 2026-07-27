@@ -47,7 +47,7 @@ test:
     - git merge origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME --no-edit
     - git submodule update --init --recursive
     # 编译
-    - pip install torch==${TORCH_VERSION} triton cismi
+    - pip install torch==${TORCH_VERSION} triton==3.6.0 cismi hcusmi
     - pip install -r requirements.txt -r requirements-dev.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     - NO_TOOLCHAIN_VERSION=1 NO_GIT_VERSION=1 bash das-build.sh
     - pip install dist/*.whl
@@ -88,7 +88,7 @@ publish:
     - test -n "${latest_run}" && cp "${src_dir}/${latest_run}.run" ./ && chmod +x "${latest_run}.run" && yes | bash "${latest_run}.run" && echo "AICC 安装完成" || echo "跳过 AICC 安装"
     - git submodule update --init --recursive
     # 编译
-    - pip install torch==${TORCH_VERSION} ciupload
+    - pip install torch==${TORCH_VERSION} ciupload hcusmi
     - pip install -r requirements.txt -r requirements-dev.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     - NO_TOOLCHAIN_VERSION=1 NO_GIT_VERSION=1 bash das-build.sh
     # repair wheel
