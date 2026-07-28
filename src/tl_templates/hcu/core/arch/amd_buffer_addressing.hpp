@@ -1,5 +1,8 @@
+// Copyright (c) 2018-2024 Advanced Micro Devices, Inc.
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2018-2024, , Inc. All rights reserved.
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+// Derived from ck_tile buffer-addressing headers. See ../vendor/NOTICE.md.
 
 #pragma once
 

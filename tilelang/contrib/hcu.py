@@ -4,18 +4,66 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import warnings
 
 import tvm_ffi
 from tvm.base import py_str
 from tvm.contrib import utils
-from tvm.contrib.rocm import find_rocm_path, get_rocm_arch
 from tvm.target import Target
 
 from tilelang.engine.callback import register_hip_postproc_callback
-from tilelang.env import TILELANG_TEMPLATE_PATH, get_hip_compiler
+from tilelang.env import TILELANG_TEMPLATE_PATH
 from tilelang.transform.pass_config import PassConfigKey
+
+
+def get_hcu_compiler() -> str:
+    """Resolve the HIP/offload compiler for HCU toolchains."""
+    return "aicc" if shutil.which("aicc") else "hipcc"
+
+
+def _is_hcu_toolchain(toolchain_path: str) -> bool:
+    """Return True when an HCU/DTK environment is detected."""
+    if "dtk" in os.path.normpath(toolchain_path).lower():
+        return True
+    return shutil.which("hy-smi") is not None
+
+
+def find_hcu_path() -> str:
+    """Find the HCU/DTK toolchain root."""
+    if "ROCM_PATH" in os.environ:
+        return os.environ["ROCM_PATH"]
+    if os.path.isdir("/opt/dtk"):
+        return "/opt/dtk"
+    hip_exe = shutil.which(get_hcu_compiler())
+    if hip_exe:
+        return os.path.realpath(os.path.join(hip_exe, "../.."))
+    raise RuntimeError("Cannot find HCU toolchain path")
+
+
+def get_hcu_arch(hcu_path: str | None = None) -> str:
+    """Return gfx* architecture string from rocminfo for HCU devices."""
+    gpu_arch = "gfx900"
+    hcu_path = hcu_path or find_hcu_path()
+    rocminfo = os.path.join(hcu_path, "bin", "rocminfo")
+    if not os.path.isfile(rocminfo):
+        print(f"HCU toolchain not detected at {hcu_path}, using default {gpu_arch}")
+        return gpu_arch
+    try:
+        rocminfo_output = subprocess.check_output([rocminfo]).decode("utf-8")
+        match = re.search(r"Name:\s+(gfx\d+[a-zA-Z]*)", rocminfo_output)
+        if match:
+            gpu_arch = match.group(1)
+        return gpu_arch
+    except subprocess.CalledProcessError:
+        print(
+            f"Unable to execute rocminfo command, "
+            f"please ensure HCU toolchain is installed and you have an HCU device on your system. "
+            f"using default {gpu_arch}."
+        )
+        return gpu_arch
+
 
 _GLOBAL_KERNEL_RE = re.compile(
     r'extern\s+"C"\s+__global__\s+\w+(?:\s+__launch_bounds__\s*\([^)]*\))?\s+(\w+)\s*\(',
@@ -131,9 +179,9 @@ def _pass_config_truthy(pass_configs: dict | None, key: PassConfigKey) -> bool:
 
 def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
     # DTK toolchain (e.g. ROCM_PATH=/opt/dtk/...) uses its own defaults; do not inject LLVM hacks.
-    # If get_hip_compiler() resolves to aicc (on PATH), still apply the LLVM tuning flags below.
+    # If get_hcu_compiler() resolves to aicc (on PATH), still apply the LLVM tuning flags below.
     rocm_path = os.environ.get("ROCM_PATH", "")
-    if ("dtk" in rocm_path.lower() or os.path.isdir("/opt/dtk")) and get_hip_compiler() != "aicc":
+    if ("dtk" in rocm_path.lower() or os.path.isdir("/opt/dtk")) and get_hcu_compiler() != "aicc":
         return []
     if arch in ["gfx928", "gfx936", "gfx938", "gfx92a", "gfx946"]:
         flags = [
@@ -299,8 +347,7 @@ def compile_hcu(
 ):
     """Compile HIP device code for HCU with DTK/aicc tuning flags."""
     if arch is None:
-        rocm_path = find_rocm_path()
-        arch = get_rocm_arch(rocm_path)
+        arch = get_hcu_arch(find_hcu_path())
 
     temp = utils.tempdir()
     if target_format not in ["hsaco"]:
@@ -324,7 +371,7 @@ def compile_hcu(
         _debug_log(f"returning asm-built hsaco bytes={len(data)} target={file_target}")
         return data
 
-    cmd = [get_hip_compiler()]
+    cmd = [get_hcu_compiler()]
     cmd += ["-O3", "-c"]
     if isinstance(arch, str):
         cmd += [f"--offload-arch={arch}"]

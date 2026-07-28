@@ -8,7 +8,7 @@
 
 Tile Language (**tile-lang**) is a concise domain-specific language for high-performance GPU kernels (GEMM, FlashAttention, LinearAttention, etc.). It uses a Pythonic syntax and a [TVM](https://tvm.apache.org/)-based compiler stack so developers can focus on operator logic while the compiler handles low-level optimizations.
 
-**tilelang-hygon** is a Hygon DCU–focused fork of [TileLang](https://github.com/tile-ai/tilelang). We adapt the compilation pipeline (passes, codegen, and runtime) for the Hygon toolchain, so operators written in the TileLang DSL can run on Hygon DCU with minimal changes.
+**tilelang-hygon** is a Hygon HCU–focused fork of [TileLang](https://github.com/tile-ai/tilelang). We adapt the compilation pipeline (passes, codegen, and runtime) for the Hygon toolchain, so operators written in the TileLang DSL can run on Hygon HCU with minimal changes.
 
 tilelang-hygon supports almost all upstream TileLang syntax.
 
@@ -16,12 +16,12 @@ tilelang-hygon supports almost all upstream TileLang syntax.
 
 ## Latest News
 
-- **v0.1.12-release** — Based on TileLang v0.1.12 for Hygon DCU. Use `build.sh` for source builds.
-- **v0.1.9-release** — Based on TileLang v0.1.9 for Hygon DCU. Use `build.sh` for source builds.
+- **v0.1.12-release** — Based on TileLang v0.1.12 for Hygon HCU. Use `build.sh` for source builds.
+- **v0.1.9-release** — Based on TileLang v0.1.9 for Hygon HCU. Use `build.sh` for source builds.
 
 ## Tested Devices
 
-tilelang-hygon has been tested on **Hygon DCU-2G** and **DCU-3G**.
+tilelang-hygon has been tested on **Hygon HCU-2G** and **HCU-3G**.
 
 **Toolchain**: requires **Hygon DTK**. Source the DTK environment before `build.sh` or compiling kernels.
 
@@ -61,7 +61,7 @@ Below is the upstream GEMM example with layout annotation, pipelining, and optio
 import tilelang
 import tilelang.language as T
 
-# Default / auto selects HCU on Hygon DCU; or pass target="hcu" explicitly.
+# Default / auto selects HCU on Hygon HCU; or pass target="hcu" explicitly.
 @tilelang.jit
 def matmul_relu(
     A, B,
@@ -119,15 +119,15 @@ print(f"Latency: {profiler.do_bench()} ms")
 
 ### Performance-tuned kernels
 
-These are the kernels we actively optimize on Hygon DCU; use them as references for production-oriented tuning:
+These are the kernels we actively optimize on Hygon HCU; use them as references for production-oriented tuning:
 
 - [GEMM](./perf/gemm/) — vanilla / persistent / split-K / Stream-K variants with benchmarking
 - [Sparse MLA forward](./perf/sparse_mla/) — tuned sparse multi-head latent attention forward kernel
 
 ### Upstream reference examples
 
-The [`examples/`](./examples/) tree is inherited from upstream TileLang and is a good place to learn DSL patterns. For now, we have not yet dedicated performance tuning to these cases on Hygon DCU.
+The [`examples/`](./examples/) tree is inherited from upstream TileLang and is a good place to learn DSL patterns. For now, we have not yet dedicated performance tuning to these cases on Hygon HCU.
 
 ## Acknowledgments
 
-We thank the [TileLang](https://github.com/tile-ai/tilelang) and [TVM](https://github.com/apache/tvm) communities. tilelang-hygon is derived from TileLang and adapted for Hygon DCU.
+We thank the [TileLang](https://github.com/tile-ai/tilelang) and [TVM](https://github.com/apache/tvm) communities. tilelang-hygon is derived from TileLang and adapted for Hygon HCU.

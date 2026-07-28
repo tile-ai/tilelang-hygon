@@ -25,12 +25,15 @@ from tvm.runtime import Executable
 from tilelang.engine.param import KernelParam
 from tilelang.utils.language import get_prim_func_name
 from tilelang import env
-from tilelang.env import get_hip_compiler
 from tilelang.jit import JITKernel
 from tilelang.jit.adapter.base import CachedTextSource
 from tilelang.jit.diagnostics import jit_phase
-from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
-from tilelang.contrib.hcu import get_hcu_compile_flags
+from tilelang.contrib.hcu import (
+    find_hcu_path,
+    get_hcu_arch,
+    get_hcu_compiler,
+    get_hcu_compile_flags,
+)
 from tilelang.contrib.hip_resource_info import dump_to_file, load_from_file
 from tilelang import __version__
 
@@ -43,13 +46,13 @@ def _make_obj(
 ):
     """Re-compile device_kernel.cu for debug artifacts (asm / LLVM IR / host .so)."""
     src_path = src if isinstance(src, str) else src.name
-    arch = get_rocm_arch(find_rocm_path())
+    arch = get_hcu_arch(find_hcu_path())
     obj_file = tempfile.NamedTemporaryFile(mode="w", suffix=f".{fmt}", delete=False)
     obj_file_path = obj_file.name
     obj_file.close()
 
     command = [
-        get_hip_compiler(),
+        get_hcu_compiler(),
         "-O3",
         "-std=c++17",
         f"--offload-arch={arch}",

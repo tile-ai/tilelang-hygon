@@ -599,7 +599,7 @@ def ebarrier_arrive(ebar_id: int | Var, wave_count: int | Var = 1):
 
 
 def _pack_s_waitcnt_imm(cnt: int, flag: str) -> int:
-    """Pack a named wait counter into the AMD s_waitcnt immediate encoding."""
+    """Pack a named wait counter into the HCU s_waitcnt immediate encoding."""
     if not isinstance(cnt, int):
         raise TypeError(f"Expect cnt to be int, but got {type(cnt)}.")
 
@@ -622,13 +622,13 @@ def _pack_s_waitcnt_imm(cnt: int, flag: str) -> int:
 
 
 def s_waitcnt(cnt: int = 0, flag: str = "vmcnt"):
-    """Wait for AMD HCU ops tracked by vmcnt/lgkmcnt/expcnt (``__builtin_amdgcn_s_waitcnt``)."""
+    """Wait for HCU ops tracked by vmcnt/lgkmcnt/expcnt (``__builtin_amdgcn_s_waitcnt``)."""
     imm = _pack_s_waitcnt_imm(cnt, flag)
     return tirx.call_extern("int32", "__builtin_amdgcn_s_waitcnt", tirx.IntImm("int32", imm))
 
 
 def sched_barrier(mask: int = 0):
-    """Insert an AMD scheduler barrier (``__builtin_amdgcn_sched_barrier``). HIP/HCU only."""
+    """Insert an HCU scheduler barrier (``__builtin_amdgcn_sched_barrier``). HIP/HCU only."""
     return tirx.call_extern("void", "__builtin_amdgcn_sched_barrier", tirx.IntImm("int32", mask))
 
 
@@ -671,7 +671,7 @@ def get_lane_idx(
     Parameters
     ----------
     warp_size : Optional[int, PrimExpr]
-        Logical warp (or wavefront) size. Defaults to 32 on NVIDIA and 64 on AMD.
+        Logical warp (or wavefront) size. Defaults to 32 on NVIDIA and 64 on HIP/HCU.
 
     Example
     -------
@@ -756,7 +756,7 @@ def get_warp_group_idx(
     Parameters
     ----------
     warp_size : Optional[int, PrimExpr]
-        Logical warp size to use (defaults to 32 on NVIDIA / 64 on AMD).
+        Logical warp size to use (defaults to 32 on NVIDIA / 64 on HIP/HCU).
     warps_per_group : Optional[int, PrimExpr]
         Number of warps per warp-group. Defaults to 4 on NVIDIA architectures.
 

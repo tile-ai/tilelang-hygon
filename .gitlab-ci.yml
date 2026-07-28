@@ -39,8 +39,10 @@ test:
     - cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
     - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
     # 安装 AICC
-    - latest_run=$(ls /ArchivedFile/ai_cc/nightly/dtk_llvm_*.run 2>/dev/null | sort -t '_' -k4 -nr | head -n1)
-    - '[ -n "${latest_run}" ] && cp ${latest_run} ./ && chmod +x $(basename ${latest_run}) && yes | bash $(basename ${latest_run}) && echo "AICC 安装完成" || echo "跳过 AICC 安装"'
+    - src_dir="/ArchivedFile/ai_cc/nightly"
+    - latest_run=$(cd "$src_dir" && ls -t dtk_llvm_*.run 2>/dev/null | head -n1)
+    - 'echo "完整安装包路径: ${src_dir}/${latest_run}"'
+    - test -n "${latest_run}" && cp "${src_dir}/${latest_run}" ./ && chmod +x "${latest_run}" && yes | bash "${latest_run}" && echo "AICC 安装完成" || echo "跳过 AICC 安装"
     # 合并目标分支
     - git config user.email "ci@tilelang.local" && git config user.name "CI"
     - git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
@@ -83,9 +85,9 @@ publish:
     - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
     # 安装 AICC
     - src_dir="/ArchivedFile/ai_cc/nightly"
-    - latest_run=$(cd "$src_dir" && ls dtk_llvm_*.run 2>/dev/null | sed 's/\.run$//' | sort -t '_' -k4 -nr | head -n1)
-    - 'echo "完整安装包路径: ${src_dir}/${latest_run}.run"'
-    - test -n "${latest_run}" && cp "${src_dir}/${latest_run}.run" ./ && chmod +x "${latest_run}.run" && yes | bash "${latest_run}.run" && echo "AICC 安装完成" || echo "跳过 AICC 安装"
+    - latest_run=$(cd "$src_dir" && ls -t dtk_llvm_*.run 2>/dev/null | head -n1)
+    - 'echo "完整安装包路径: ${src_dir}/${latest_run}"'
+    - test -n "${latest_run}" && cp "${src_dir}/${latest_run}" ./ && chmod +x "${latest_run}" && yes | bash "${latest_run}" && echo "AICC 安装完成" || echo "跳过 AICC 安装"
     - git submodule update --init --recursive
     # 编译
     - pip install torch==${TORCH_VERSION} ciupload hcusmi

@@ -294,8 +294,6 @@ def find_rocm_path():
 def get_rocm_llvm_bin_dir() -> str:
     """Directory containing ``ld.lld`` under the ROCm root.
 
-    Prefer ``<ROCM_PATH>/aillvm/bin`` (HCU / AICC toolchain layout) when that
-    directory exists; otherwise use ``<ROCM_PATH>/llvm/bin`` (standard ROCm).
     Respects ``ROCM_PATH`` / ``ROCM_HOME`` when set.
     """
     if "ROCM_PATH" in os.environ:
@@ -305,7 +303,4 @@ def get_rocm_llvm_bin_dir() -> str:
             rocm = find_rocm_path()
         except RuntimeError:
             rocm = "/opt/rocm"
-    aillvm_bin = os.path.join(rocm, "aillvm", "bin")
-    if os.path.isdir(aillvm_bin):
-        return aillvm_bin
     return os.path.join(rocm, "llvm", "bin")
