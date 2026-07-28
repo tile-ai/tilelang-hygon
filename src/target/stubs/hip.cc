@@ -216,10 +216,16 @@ bool HIPDriverAPI::is_available() { return get_handle() != nullptr; }
 HIPDriverAPI *HIPDriverAPI::get() {
   static HIPDriverAPI singleton = CreateHIPDriverAPI();
   if (!is_available()) {
+#ifdef USE_HCU
+    throw std::runtime_error(
+        "HIP runtime library not found. "
+        "Install the HCU toolchain before using TileLang's HCU backend.");
+#else
     throw std::runtime_error(
         "HIP runtime library (libamdhip64.so) not found. "
         "Install ROCm (or import a ROCm-enabled framework like PyTorch) before "
         "using TileLang's ROCm backend.");
+#endif
   }
   return &singleton;
 }

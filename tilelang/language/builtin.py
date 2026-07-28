@@ -544,7 +544,7 @@ def get_lane_idx(
     Parameters
     ----------
     warp_size : Optional[int, PrimExpr]
-        Logical warp (or wavefront) size. Defaults to 32 on NVIDIA and 64 on AMD.
+        Logical warp (or wavefront) size. Defaults to 32 on NVIDIA and 64 on HIP/HCU.
 
     Example
     -------
@@ -629,7 +629,7 @@ def get_warp_group_idx(
     Parameters
     ----------
     warp_size : Optional[int, PrimExpr]
-        Logical warp size to use (defaults to 32 on NVIDIA / 64 on AMD).
+        Logical warp size to use (defaults to 32 on NVIDIA / 64 on HIP/HCU).
     warps_per_group : Optional[int, PrimExpr]
         Number of warps per warp-group. Defaults to 4 on NVIDIA architectures.
 
@@ -1327,7 +1327,7 @@ def async_gld_sld_fence(cnt: int = 0):
 
 
 def _pack_s_waitcnt_imm(cnt: int, flag: Literal["vmcnt", "lgkmcnt", "expcnt"]) -> int:
-    """Pack a named wait counter into the AMD s_waitcnt immediate encoding."""
+    """Pack a named wait counter into the HCU s_waitcnt immediate encoding."""
     if not isinstance(cnt, int):
         raise TypeError(f"Expect cnt to be int, but got {type(cnt)}.")
 
@@ -1350,7 +1350,7 @@ def _pack_s_waitcnt_imm(cnt: int, flag: Literal["vmcnt", "lgkmcnt", "expcnt"]) -
 
 
 def s_waitcnt(cnt: int = 0, flag: Literal["vmcnt", "lgkmcnt", "expcnt"] = "vmcnt"):
-    """Wait for AMD HCU operations tracked by a specific wait counter.
+    """Wait for HCU operations tracked by a specific wait counter.
 
     This helper packs the requested counter into the immediate expected by
     ``__builtin_amdgcn_s_waitcnt``. By default, ``T.s_waitcnt(cnt)`` is treated
@@ -1370,7 +1370,7 @@ def s_waitcnt(cnt: int = 0, flag: Literal["vmcnt", "lgkmcnt", "expcnt"] = "vmcnt
 
 
 def sched_barrier(mask: int = 0):
-    """Insert an AMD scheduler barrier.
+    """Insert an HCU scheduler barrier.
 
     HIP/HCU only. Lowers to ``__builtin_amdgcn_sched_barrier(mask)``.
 

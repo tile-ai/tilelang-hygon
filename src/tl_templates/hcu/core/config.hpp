@@ -1,5 +1,8 @@
+// Copyright (c) 2018-2024 Advanced Micro Devices, Inc.
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2018-2024, , Inc. All rights reserved.
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+// Derived from ck_tile/core/config.hpp. See ../vendor/NOTICE.md.
 
 #pragma once
 
@@ -132,18 +135,6 @@
 #define TL_USE_AMD_LDS_DIRECT_LOAD_INLINE_ASM 1
 #endif
 
-#ifndef TL_USE_AMD_BUFFER_LOAD
-#define TL_USE_AMD_BUFFER_LOAD 1
-#endif
-
-#ifndef TL_USE_AMD_BUFFER_STORE
-#define TL_USE_AMD_BUFFER_STORE 1
-#endif
-
-#ifndef TL_USE_AMD_BUFFER_ATOMIC_ADD_INTEGER
-#define TL_USE_AMD_BUFFER_ATOMIC_ADD_INTEGER 1
-#endif
-
 #ifndef TL_USE_PK4_LAYOUT_SHUFFLE
 #define TL_USE_PK4_LAYOUT_SHUFFLE 1
 #endif
@@ -192,22 +183,6 @@
 #define TL_BLOCK_MAX_LDS_SIZE 131072
 #else
 #define TL_BLOCK_MAX_LDS_SIZE 65536
-#endif
-
-// buffer atomic add: floating point
-#ifndef __HIP_DEVICE_COMPILE__ // for host code
-#define TL_USE_AMD_BUFFER_ATOMIC_ADD_FLOAT 1
-#elif defined(__gfx9__) || defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || \
-    defined(__gfx938__) // for GPU code
-#define TL_USE_AMD_BUFFER_ATOMIC_ADD_FLOAT 1
-#else // for GPU code
-#define TL_USE_AMD_BUFFER_ATOMIC_ADD_FLOAT 0
-#endif
-
-#if (defined(__gfx90a__) || defined(__gfx94__)) // for GPU code
-#define TL_USE_AMD_BUFFER_ATOMIC_MAX_FLOAT64 1
-#else
-#define TL_USE_AMD_BUFFER_ATOMIC_MAX_FLOAT64 0
 #endif
 
 #ifndef TL_EXPERIMENTAL_USE_MEMCPY_FOR_VECTOR_ACCESS

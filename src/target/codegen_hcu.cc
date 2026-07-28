@@ -476,7 +476,7 @@ bool CodeGenTileLangHCU::LoadWillUseAmdBufferOpsWithPredicate(
 
 bool CodeGenTileLangHCU::StoreWillUseAmdBufferOpsWithPredicate(
     const BufferStoreNode *op) const {
-  // Predicate is only threaded into tl::amd_buffer_store when
+  // Predicate is only threaded into buffer_store when
   // VisitStmt_(BufferStore) takes the direct path, or into
   // PrintVecStoreWithPredicate when CodeGenC::VisitStmt_ (BufferStore) calls
   // PrintVecStore (unequal lanes + contiguous ramp, not float4).
@@ -1335,9 +1335,9 @@ void CodeGenTileLangHCU::PrintVecStoreWithPredicate(const BufferNode *buffer,
   }
 
   auto desc = GetBufferDesc(t, buffer, base);
-  // Convert value to thread_buffer and use amd_buffer_store
-  // amd_buffer_store signature:
-  //   amd_buffer_store<type, num_elements>(src_thread_data, dst_ptr,
+  // Convert value to thread_buffer and use buffer_store
+  // buffer_store signature:
+  //   buffer_store<type, num_elements>(src_thread_data, dst_ptr,
   //   dst_offset,
   //                                        is_valid, element_space_size)
   // Convert the value expression to a thread_buffer using bit_cast
@@ -1694,7 +1694,7 @@ std::string CodeGenTileLangHCU::GetBufferRef(DataType t,
 
 void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
   // Optimize if_then_else(cond, BufferLoad/Cast(BufferLoad), zeros) to use
-  // amd_buffer_load with predicate instead of if-else.
+  // buffer_load with predicate instead of if-else.
   if (op->op.same_as(builtin::if_then_else()) && op->args.size() == 3) {
     const BufferLoadNode *load = ExtractBufferLoad(op->args[1]);
     if (load && IsProvablyZeroOrZeroBroadcast(op->args[2]) &&

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2018-2025, , Inc. All rights reserved.
+// Copyright (c) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <tl_templates/hcu/core/config.hpp>
 #include <tl_templates/hcu/core/utility/bit_cast.hpp>

@@ -1,17 +1,18 @@
 // TileLang HCU device header umbrella (trimmed from composable_kernel
-// descriptor stack). AMD MIT parts: see vendor/NOTICE.md. HCU MLS/matrix paths
-// live under mls/.
+// descriptor stack). Third-party MIT parts: see vendor/NOTICE.md. HCU
+// MLS/matrix paths live under mls/.
 
 #pragma once
 
 #include <tl_templates/hcu/core/config.hpp>
 
-// algorithm (AMD MIT)
+// algorithm (CK MIT)
 #include <tl_templates/hcu/core/algorithm/coordinate_transform.hpp>
 #include <tl_templates/hcu/core/algorithm/indexing_adaptor.hpp>
 #include <tl_templates/hcu/core/algorithm/space_filling_curve.hpp>
 
-// arch: AMD buffer + HCU target helpers (MLS-specific arch is under mls/)
+// arch: buffer addressing + HCU target helpers (MLS-specific arch is under
+// mls/)
 #include <tl_templates/hcu/core/arch/amd_buffer_addressing.hpp>
 #include <tl_templates/hcu/core/arch/arch.hpp>
 #include <tl_templates/hcu/core/arch/utility.hpp>
@@ -36,7 +37,7 @@
 #include <tl_templates/hcu/core/numeric/type_convert.hpp>
 #include <tl_templates/hcu/core/numeric/vector_type.hpp>
 
-// tensor (AMD MIT descriptor stack)
+// tensor (CK MIT descriptor stack)
 #include <tl_templates/hcu/core/tensor/tensor_adaptor.hpp>
 #include <tl_templates/hcu/core/tensor/tensor_adaptor_coordinate.hpp>
 #include <tl_templates/hcu/core/tensor/tensor_coordinate.hpp>

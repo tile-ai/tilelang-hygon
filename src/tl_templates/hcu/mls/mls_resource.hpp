@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 // MLS resource descriptor helpers (trimmed from ck_tile hcu_matrix_addressing).

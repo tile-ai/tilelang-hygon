@@ -231,9 +231,16 @@ def have_matrixcore(compute_version=None):
     return False
 
 
+def _is_hcu_toolchain(rocm_path: str) -> bool:
+    """Return True when HCU/DTK environment is detected."""
+    if "dtk" in os.path.normpath(rocm_path).lower():
+        return True
+    return shutil.which("hy-smi") is not None
+
+
 @tvm_ffi.register_global_func("tvm_callback_rocm_get_arch", override=True)
 def get_rocm_arch(rocm_path="/opt/rocm"):
-    """Utility function to get the AMD GPU architecture
+    """Utility function to get the GPU architecture for ROCm/HIP targets.
 
     Parameters
     ----------
@@ -243,7 +250,7 @@ def get_rocm_arch(rocm_path="/opt/rocm"):
     Returns
     -------
     gpu_arch : str
-        The AMD GPU architecture
+        The target GPU architecture (e.g. gfx900)
     """
     gpu_arch = "gfx900"
     # check if rocm is installed (path exists and rocminfo is present)
@@ -264,11 +271,18 @@ def get_rocm_arch(rocm_path="/opt/rocm"):
             gpu_arch = match.group(1)
         return gpu_arch
     except subprocess.CalledProcessError:
-        print(
-            f"Unable to execute rocminfo command, \
+        if _is_hcu_toolchain(rocm_path):
+            print(
+                f"Unable to execute rocminfo command, \
+                please ensure HCU toolchain is installed and you have an HCU device on your system.\
+                    using default {gpu_arch}."
+            )
+        else:
+            print(
+                f"Unable to execute rocminfo command, \
                 please ensure ROCm is installed and you have an AMD GPU on your system.\
                     using default {gpu_arch}."
-        )
+            )
         return gpu_arch
 
 

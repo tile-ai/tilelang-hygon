@@ -48,8 +48,8 @@ public:
                             std::ostream &os) final;
   std::string CastFromTo(std::string value, DataType from,
                          DataType target) final;
-  // Override IfThenElse to fold amd_buffer_load/store with predicate when
-  // if-else contains only buffer load/store and zeros.
+  // Override IfThenElse to fold buffer_load/store with predicate when if-else
+  // contains only buffer load/store and zeros.
   void VisitStmt_(const IfThenElseNode *op) final;
 
   // overload visitor
@@ -70,7 +70,7 @@ public:
 
 protected:
   // Override BufferStore lowering so we can emit CK buffer store ops for
-  // global memory using amd_buffer_store.
+  // global memory using buffer_store.
   void VisitStmt_(const BufferStoreNode *op) final;
   void VisitStmt_(const LetStmtNode *op) final;
   void VisitStmt_(const EvaluateNode *op) final;
@@ -110,7 +110,7 @@ private:
   bool IsCollapsibleRedundantIfElse(const IfThenElseNode *op) const;
   /// True if expr is literal zero, Cast(zero), Broadcast(zero), or
   /// Broadcast(Var) where Var's LetStmt RHS was recorded in
-  /// let_initializer_expr_for_predicate_. Used so amd_buffer_load can fold
+  /// let_initializer_expr_for_predicate_. Used so buffer_load can fold
   /// outer if/else into a predicate.
   bool IsProvablyZeroOrZeroBroadcast(const PrimExpr &expr) const;
   bool CanUseVMBufferOps(const BufferNode *buffer, int num_elements) const {
@@ -131,7 +131,7 @@ private:
   /// (e.g. Cast(BufferLoad)) so outer dtype matches lowering.
   bool LoadWillUseAmdBufferOpsWithPredicate(const PrimExpr &value_expr) const;
   /// True iff BufferStore lowering consumes predicate_stack_ (same conditions
-  /// as VisitStmt_(BufferStore) amd_buffer_store path + CodeGenC BufferStore →
+  /// as VisitStmt_(BufferStore) buffer_store path + CodeGenC BufferStore →
   /// PrintVecStore → PrintVecStoreWithPredicate). Keep in sync with those; see
   /// comments on LoadWillUseAmdBufferOpsWithPredicate.
   bool StoreWillUseAmdBufferOpsWithPredicate(const BufferStoreNode *op) const;

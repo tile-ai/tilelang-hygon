@@ -47,8 +47,7 @@ enum class GemmInst : uint8_t {
   kMFMA,
   kScalar,
   kWMMA,
-  kHCUMMAC, ///< AMD HCU matrix core (distinct from CDNA MFMA; Python
-            ///< GemmHCUMMAC)
+  kHCUMMAC, ///< HCU matrix core
 };
 
 /// Convert GemmInst enum to string for debugging

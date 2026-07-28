@@ -9,7 +9,7 @@ class GemmInst(IntEnum):
     MFMA = 3
     Scalar = 4
     WMMA = 5  # AMD RDNA WMMA (gfx11/gfx12)
-    HCUMMAC = 6  # AMD HCU matrix core (distinct from CDNA MFMA)
+    HCUMMAC = 6  # HCU matrix core
 
     def is_mma(self) -> bool:
         return self == GemmInst.MMA

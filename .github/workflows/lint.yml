@@ -1,11 +1,8 @@
 # Hygon mirror CI: format / static checks only (self-hosted container, no GPU/DTK).
 # Upstream full CI lives on tile-ai/tilelang (.github/workflows/ci.yml).
 #
-# Branch gating (GitHub → Settings → Secrets and variables → Actions → Variables):
-#   LINT_PUSH_BRANCHES      comma-separated push targets, e.g. main,v0.1.9-release,staging
-#   LINT_PR_BASE_BRANCHES   comma-separated PR base branches, e.g. main,v0.1.9-release,staging
-# Add a branch name in the web UI to enable lint; no workflow edit required.
-# workflow_dispatch always runs.
+# Branch gating via repo variables LINT_PUSH_BRANCHES / LINT_PR_BASE_BRANCHES
+# (comma-separated). workflow_dispatch always runs.
 #
 # Uses the same Harbor dev image as HCU CI (already on nmz runners). Do not use
 # library/python images — Docker Hub pulls fail on internal runners.
@@ -54,7 +51,7 @@ jobs:
     runs-on: nmz4-lint
     timeout-minutes: 30
     container:
-      image: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
+      image: ${{ vars.HCU_DEV_CONTAINER_IMAGE }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
