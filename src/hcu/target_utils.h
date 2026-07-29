@@ -1,6 +1,6 @@
 /*!
  * \file hcu/target_utils.h
- * \brief HCU (Hygon DCU) target attribute helpers.
+ * \brief HCU target attribute helpers.
  */
 #ifndef TVM_TL_HCU_TARGET_UTILS_H_
 #define TVM_TL_HCU_TARGET_UTILS_H_

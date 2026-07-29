@@ -102,8 +102,6 @@ TVM_REGISTER_TARGET_KIND("hcu", kDLROCM)
     .add_attr_option<ffi::String>("mcpu")
     .add_attr_option<ffi::String>("mtriple")
     .add_attr_option<ffi::Array<ffi::String>>("mattr")
-    // Per workgroup/block (not per wave/SIMD). Hygon DCU matches HIP/CUDA:
-    // up to 1024 threads per block (16 waves of 64).
     .add_attr_option<int64_t>("max_num_threads",
                               refl::DefaultValue(int64_t{1024}))
     .add_attr_option<int64_t>("max_threads_per_block",

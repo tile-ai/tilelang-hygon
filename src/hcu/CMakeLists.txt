@@ -1,4 +1,4 @@
-# HCU backend: Hygon DCU target helpers, codegen, transforms, and TVM HIP
+# HCU backend: target helpers, codegen, transforms, and TVM HIP
 # runtime (USE_ROCM=ON — TVM's switch for HIP device runtime).
 #
 # ROCm ALWAYS sources (e.g. target_utils.cc for TargetIsRocm) stay in
@@ -31,7 +31,7 @@ include(${TVM_SOURCE}/cmake/utils/FindROCM.cmake)
 find_rocm(${USE_ROCM})
 
 if(NOT ROCM_FOUND)
-  message(FATAL_ERROR "HCU build requires DTK SDK with libamdhip64.")
+  message(FATAL_ERROR "HCU build requires DTK SDK.")
 endif()
 
 message(STATUS "HCU build: using DTK headers from ${ROCM_INCLUDE_DIRS}")

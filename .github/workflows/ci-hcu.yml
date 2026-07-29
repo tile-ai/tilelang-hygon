@@ -1,20 +1,12 @@
-# Hygon DCU / HCU self-hosted CI (opt-in).
+# Hygon HCU self-hosted CI (opt-in).
 #
 # Aligns with GitLab (.gitlab-ci.yml): nmz runner + dev base image, das-build.sh, wheel install.
 # GitLab does not set `image:` in-repo; runner tag `nmz` binds the same Harbor dev image.
 #
-# Setup checklist:
-#   1. Self-hosted runner with Docker and label: self-hosted
-#   2. Job container must include --privileged (required for hy-smi/CIsmi in bridge network; nmz27 tested)
-#   3. Do not pass --network=host in options (conflicts with GHA github_network_*)
-#   4. DTK/AICC via PKG_BASE_URL download into container /opt/dtk
-#   5. Runner can pull job image and reach http://10.16.1.201:8000
-#   6. Set repo variables (Settings → Actions → Variables) to enable auto-runs:
-#        HCU_CI_PUSH_BRANCHES=main,v0.1.9-release
-#        HCU_CI_PR_BASE_BRANCHES=main,v0.1.9-release
-#      Add branch names in the web UI without editing this workflow.
-#      workflow_dispatch always runs.
-#   7. Set repo secret TILEKERNELS_GITHUB_TOKEN (fine-grained PAT, Contents read on HYGON-AI/TileKernels-das)
+# Branch gating via repo variables HCU_CI_PUSH_BRANCHES / HCU_CI_PR_BASE_BRANCHES
+# (comma-separated). workflow_dispatch always runs.
+# Job container must include --privileged (hy-smi/CIsmi). Do not pass --network=host
+# (conflicts with GHA github_network_*).
 name: HCU CI
 
 on:
@@ -46,11 +38,10 @@ env:
   COLUMNS: "100"
   FORCE_COLOR: "1"
   CLICOLOR_FORCE: "1"
-  TILELANG_TARGET: hip
-  # Match GitLab CI variables (.gitlab-ci.yml)
-  PIP_INDEX_URL: "http://10.16.1.201:9929/nightly/dtk2604/+simple/"
-  PIP_TRUSTED_HOST: "10.16.1.201"
-  PKG_BASE_URL: "http://10.16.1.201:8000"
+  # Match GitLab CI variables (.gitlab-ci.yml); infra URLs from repo variables
+  PIP_INDEX_URL: ${{ vars.HCU_PIP_INDEX_URL }}
+  PIP_TRUSTED_HOST: ${{ vars.HCU_PIP_TRUSTED_HOST }}
+  PKG_BASE_URL: ${{ vars.HCU_PKG_BASE_URL }}
   DTK_VERSION: "dtk26.04"
   DTK_PKG_NAME: "DTK-26.04-rc4-centos8-x86_64.tar.gz"
   TORCH_VERSION: "2.10.0"
@@ -74,7 +65,7 @@ jobs:
     runs-on: nmz4-test
     timeout-minutes: 180
     container:
-      image: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
+      image: ${{ vars.HCU_DEV_CONTAINER_IMAGE }}
       # --privileged required for hy-smi/CIsmi; verified on nmz27 Harbor image + bridge network
       options: --privileged --ipc=host --shm-size=64g --group-add=video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ulimit stack=-1:-1 --ulimit memlock=-1:-1 --device=/dev/kfd --device=/dev/dri -v /usr/local/hyhal:/usr/local/hyhal:ro -v /opt/hyhal:/opt/hyhal:ro
     steps:

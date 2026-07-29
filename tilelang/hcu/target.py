@@ -41,7 +41,6 @@ def with_hcu_target_attrs(target: Target) -> Target:
     target_dict = dict(target.export())
     # mtriple: LLVM target triple for device codegen / offline compile.
     target_dict.setdefault("mtriple", _HCU_DEVICE_TRIPLE)
-    # Workgroup/block limits (not wave/SIMD). DCU supports 1024 threads/block.
     target_dict.setdefault("max_num_threads", 1024)
     target_dict.setdefault("max_threads_per_block", 1024)
     if arch in HCU_MCPU_SET:
