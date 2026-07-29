@@ -38,7 +38,6 @@ env:
   COLUMNS: "100"
   FORCE_COLOR: "1"
   CLICOLOR_FORCE: "1"
-  TILELANG_TARGET: hip
   # Match GitLab CI variables (.gitlab-ci.yml); infra URLs from repo variables
   PIP_INDEX_URL: ${{ vars.HCU_PIP_INDEX_URL }}
   PIP_TRUSTED_HOST: ${{ vars.HCU_PIP_TRUSTED_HOST }}

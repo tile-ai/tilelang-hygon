@@ -8,6 +8,8 @@ variables:
   DTK_PKG: "/ArchivedFile/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz"
   DEVPI_URL: "http://10.16.1.201:9929/"
   CISMI_TIMEOUT: "3600"
+  TILEKERNELS_REF: "staging"
+  TILEKERNELS_DIR: "/opt/TileKernels"
 
 .torch_matrix: &torch_matrix
   - TORCH_VERSION: ["2.10.0"]
@@ -55,10 +57,11 @@ test:
     - pip install dist/*.whl
     - pip install numpy==1.24.3 allure-pytest pytest-xdist
     # 回归测试
-    - git clone -b staging http://gitlab-ci-token:${CI_JOB_TOKEN}@42.228.13.241:10068/dcutoolkit/deeplearing/TileKernels.git /opt/TileKernels
+    - test -n "${HCU_TILEKERNELS_GIT_URL}" || (echo "HCU_TILEKERNELS_GIT_URL is not set" && exit 1)
+    - git clone -b ${TILEKERNELS_REF} http://gitlab-ci-token:${CI_JOB_TOKEN}@${HCU_TILEKERNELS_GIT_URL} ${TILEKERNELS_DIR}
     - export HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout ${CISMI_TIMEOUT})
     - >-
-      REPO_DIR=/opt/TileKernels
+      REPO_DIR=${TILEKERNELS_DIR}
       TILELANG_CACHE_DIR=./cache_test
       TEST_RESULTS_DIR=${CI_PROJECT_DIR}/das-results
       GENERATE_ALLURE_REPORT=1
