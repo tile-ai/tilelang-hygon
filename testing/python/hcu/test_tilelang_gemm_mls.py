@@ -6,7 +6,8 @@ import pytest
 import tilelang as tl
 import tilelang.language as T
 import tilelang.testing
-from hcu_test_utils import target_supports_mls
+import torch
+from hcu_test_utils import target_supports_mls, target_supports_mls_b4
 
 
 pytestmark = [
@@ -15,6 +16,15 @@ pytestmark = [
         reason="matrix_load tests require an MLS-supported HCU target",
     ),
 ]
+
+
+def _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2):
+    ins = profiler._get_inputs()
+    ref_out = ref_program(*ins)
+    torch.cuda.synchronize()
+    lib_out = profiler.func(*ins)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(lib_out.cpu(), ref_out.cpu(), atol=atol, rtol=rtol)
 
 
 def _waitcnt_imms(source: str) -> list[int]:
@@ -428,7 +438,8 @@ def run_gemm_mls_b_only(
     profiler = kernel.get_profiler()
 
     def ref_program(A, B):
-        import torch
+        A = A.cpu()
+        B = B.cpu()
 
         if trans_A:
             A = A.T
@@ -439,7 +450,7 @@ def run_gemm_mls_b_only(
             B = B.to(torch.float32)
         return (A @ B).to(torch.__getattribute__(out_dtype))
 
-    profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
+    _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2)
 
 
 def run_gemm_mls(
@@ -481,7 +492,8 @@ def run_gemm_mls(
     profiler = kernel.get_profiler()
 
     def ref_program(A, B):
-        import torch
+        A = A.cpu()
+        B = B.cpu()
 
         if trans_A:
             A = A.T
@@ -492,7 +504,7 @@ def run_gemm_mls(
             B = B.to(torch.float32)
         return (A @ B).to(torch.__getattribute__(out_dtype))
 
-    profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
+    _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2)
 
 
 def run_gemm_mls_ds_read_format(
@@ -535,7 +547,8 @@ def run_gemm_mls_ds_read_format(
     profiler = kernel.get_profiler()
 
     def ref_program(A, B):
-        import torch
+        A = A.cpu()
+        B = B.cpu()
 
         if trans_A:
             A = A.T
@@ -546,7 +559,7 @@ def run_gemm_mls_ds_read_format(
             B = B.to(torch.float32)
         return (A @ B).to(torch.__getattribute__(out_dtype))
 
-    profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
+    _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2)
 
 
 def run_gemm_mls_copy_a_mls_b_ds(
@@ -589,7 +602,8 @@ def run_gemm_mls_copy_a_mls_b_ds(
     profiler = kernel.get_profiler()
 
     def ref_program(A, B):
-        import torch
+        A = A.cpu()
+        B = B.cpu()
 
         if trans_A:
             A = A.T
@@ -600,7 +614,7 @@ def run_gemm_mls_copy_a_mls_b_ds(
             B = B.to(torch.float32)
         return (A @ B).to(torch.__getattribute__(out_dtype))
 
-    profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
+    _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2)
 
 
 def run_gemm_mls_ds_read_format_mul_scale(
@@ -642,7 +656,8 @@ def run_gemm_mls_ds_read_format_mul_scale(
     profiler = kernel.get_profiler()
 
     def ref_program(A, B):
-        import torch
+        A = A.cpu()
+        B = B.cpu()
 
         if trans_A:
             A = A.T
@@ -650,104 +665,107 @@ def run_gemm_mls_ds_read_format_mul_scale(
             B = B.T
         return (scale_a * scale_b * (A @ B)).to(torch.__getattribute__(out_dtype))
 
-    profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
+    _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2)
 
 
-def test_gemm_shared_A_False_mls_B_True_1():
-    """trans_A=False, trans_B=True. Single block: A(32,64), B(32,64), C(32,32)."""
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads",
+    [
+        pytest.param(32, 32, 64, False, True, 32, 32, 64, 128, id="at_bn_m32_n32_k64_bm32_bn32_bk64_t128_b16"),
+    ],
+)
+def test_gemm_mls_b_only(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
+    """GEMM with A via shared copy and B via MLS."""
     run_gemm_mls_b_only(
-        M=32,
-        N=32,
-        K=64,
-        trans_A=False,
-        trans_B=True,
+        M=M,
+        N=N,
+        K=K,
+        trans_A=trans_A,
+        trans_B=trans_B,
         in_dtype="float16",
         out_dtype="float32",
         dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=128,
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+        num_threads=num_threads,
     )
 
 
-def test_gemm_mls_A_False_B_True_1():
-    """trans_A=False, trans_B=True. Single block: A(32,64), B(32,64), C(32,32)."""
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads",
+    [
+        pytest.param(16, 16, 32, False, True, 16, 16, 32, 64, id="at_bn_m16_n16_k32_bm16_bn16_bk32_t64_b16"),
+        pytest.param(16, 16, 64, False, True, 16, 16, 64, 128, id="at_bn_m16_n16_k64_bm16_bn16_bk64_t128_b16"),
+        pytest.param(16, 16, 64, False, True, 16, 16, 64, 64, id="at_bn_m16_n16_k64_bm16_bn16_bk64_t64_b16"),
+        pytest.param(16, 16, 128, False, True, 16, 16, 128, 64, id="at_bn_m16_n16_k128_bm16_bn16_bk128_t64_b16"),
+        pytest.param(32, 32, 64, False, True, 32, 32, 64, 128, id="at_bn_m32_n32_k64_bm32_bn32_bk64_t128_b16"),
+        pytest.param(64, 64, 16, True, False, 64, 64, 16, 64, id="an_bt_m64_n64_k16_bm64_bn64_bk16_t64_b16"),
+        pytest.param(64, 64, 64, True, False, 64, 64, 64, 128, id="an_bt_m64_n64_k64_bm64_bn64_bk64_t128_b16"),
+    ],
+)
+def test_gemm_mls_b16(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
+    """B16 GEMM cases covering gfx946 MLS LDS layouts without duplicate legacy cases."""
     run_gemm_mls(
-        M=32,
-        N=32,
-        K=64,
-        trans_A=False,
-        trans_B=True,
+        M=M,
+        N=N,
+        K=K,
+        trans_A=trans_A,
+        trans_B=trans_B,
         in_dtype="float16",
         out_dtype="float32",
         dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=128,
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+        num_threads=num_threads,
     )
 
 
-def test_gemm_mls_A_False_B_True_2():
-    """trans_A=False, trans_B=True. Multi-block: A(64,64), B(64,64), C(64,64), block 32x32x64."""
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads",
+    [
+        pytest.param(64, 64, 64, False, True, 32, 32, 64, 128, id="at_bn_multi_block"),
+        pytest.param(96, 96, 198, False, True, 64, 64, 128, 128, id="at_bn_non_power_of_two"),
+        pytest.param(64, 64, 32, True, False, 64, 64, 32, 128, id="an_bt_single_block"),
+        pytest.param(64, 64, 64, True, False, 32, 32, 64, 128, id="an_bt_multi_block"),
+        pytest.param(96, 96, 241, True, False, 64, 64, 128, 128, id="an_bt_non_power_of_two"),
+        pytest.param(32, 32, 64, False, False, 32, 32, 64, 128, id="an_bn_single_block"),
+        pytest.param(64, 64, 64, False, False, 32, 32, 64, 128, id="an_bn_multi_block"),
+        pytest.param(96, 96, 242, False, False, 64, 64, 128, 128, id="an_bn_non_power_of_two"),
+        pytest.param(32, 32, 64, True, True, 32, 32, 64, 128, id="at_bt_single_block"),
+        pytest.param(64, 64, 64, True, True, 32, 32, 64, 128, id="at_bt_multi_block"),
+        pytest.param(96, 96, 242, True, True, 64, 64, 128, 128, id="at_bt_non_power_of_two"),
+    ],
+)
+def test_gemm_mls_f16(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
+    """Legacy float16 MLS GEMM coverage across transpose modes and grid shapes."""
     run_gemm_mls(
-        M=64,
-        N=64,
-        K=64,
-        trans_A=False,
-        trans_B=True,
+        M=M,
+        N=N,
+        K=K,
+        trans_A=trans_A,
+        trans_B=trans_B,
         in_dtype="float16",
         out_dtype="float32",
         dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=128,
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+        num_threads=num_threads,
     )
 
 
-def test_gemm_mls_A_False_B_True_2_stage0():
-    """trans_A=False, trans_B=True. Multi-iteration K loop with stage0 pipeline."""
-    run_gemm_mls(
-        M=64,
-        N=64,
-        K=256,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=32,
-        num_threads=128,
-        num_stages=0,
-    )
-
-
-def test_gemm_mls_A_False_B_True_2_stage1():
-    """trans_A=False, trans_B=True. Multi-iteration K loop with stage1 pipeline."""
-    run_gemm_mls(
-        M=64,
-        N=64,
-        K=256,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=32,
-        num_threads=128,
-        num_stages=1,
-        verify_source=_assert_mls_direct_stage1_waitcnt,
-    )
-
-
-def test_gemm_mls_A_False_B_True_2_stage2():
-    """trans_A=False, trans_B=True. Multi-iteration K loop with stage2 pipeline."""
+@pytest.mark.parametrize(
+    "num_stages, verify_source",
+    [
+        pytest.param(0, None, id="stage0"),
+        pytest.param(1, _assert_mls_direct_stage1_waitcnt, id="stage1"),
+        pytest.param(2, _assert_mls_direct_stage2_waitcnt, id="stage2"),
+    ],
+)
+def test_gemm_mls_f16_pipeline(num_stages, verify_source):
+    """Float16 direct MLS GEMM with explicit pipeline-stage waitcnt checks."""
     run_gemm_mls(
         M=64,
         N=64,
@@ -761,547 +779,83 @@ def test_gemm_mls_A_False_B_True_2_stage2():
         block_N=32,
         block_K=32,
         num_threads=128,
-        num_stages=2,
-        verify_source=_assert_mls_direct_stage2_waitcnt,
-    )
-    """trans_A=False, trans_B=True. Non-power-of-2, multi-loop: M=96, N=96, K=192 (2x2x2 blocks)."""
-    run_gemm_mls(
-        M=96,
-        N=96,
-        K=198,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=64,
-        block_N=64,
-        block_K=128,
-        num_threads=128,
+        num_stages=num_stages,
+        verify_source=verify_source,
     )
 
 
-def test_gemm_mls_A_True_B_False_1():
-    """trans_A=True, trans_B=False. Single block: A(64,32), B(32,64), C(64,64)."""
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads",
+    [
+        pytest.param(64, 64, 32, True, False, 64, 64, 32, 64, id="an_bt_64x32_single"),
+        pytest.param(64, 64, 41, True, False, 64, 64, 32, 64, id="an_bt_64x32_kmask"),
+        pytest.param(128, 128, 32, True, False, 64, 64, 32, 64, id="an_bt_64x32_multi_block"),
+        pytest.param(128, 128, 32, True, False, 128, 128, 32, 64, id="an_bt_128x16_single"),
+        pytest.param(256, 256, 32, True, False, 128, 128, 32, 64, id="an_bt_128x16_multi_block"),
+        pytest.param(256, 256, 32, True, False, 256, 256, 32, 128, id="an_bt_128x16_multi_tile"),
+        pytest.param(16, 16, 64, False, True, 16, 16, 64, 64, id="at_bn_16x64_single"),
+        pytest.param(32, 32, 64, False, True, 16, 16, 64, 64, id="at_bn_16x64_multi_block"),
+        pytest.param(32, 32, 64, False, True, 32, 32, 64, 64, id="at_bn_32x64_single"),
+        pytest.param(64, 64, 64, False, True, 64, 64, 64, 128, id="at_bn_32x64_multi_block"),
+        pytest.param(16, 16, 128, False, True, 16, 16, 128, 64, id="at_bn_16x128_single"),
+        pytest.param(32, 32, 256, False, True, 16, 16, 128, 64, id="at_bn_16x128_multi_block"),
+        pytest.param(32, 32, 256, False, True, 32, 32, 128, 64, id="at_bn_16x128_multi_tile"),
+    ],
+)
+def test_gemm_mls_fp8(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
+    """Float8 MLS GEMM coverage for AN/BT and AT/BN tile shapes."""
     run_gemm_mls(
-        M=64,
-        N=64,
-        K=32,
-        trans_A=True,
-        trans_B=False,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=64,
-        block_N=64,
-        block_K=32,
-        num_threads=128,
-    )
-
-
-# AN BT
-def test_gemm_mls_A_True_B_False_2():
-    """trans_A=True, trans_B=False. Multi-block: A(64,64), B(64,64), C(64,64), block 32x32x64."""
-    run_gemm_mls(
-        M=64,
-        N=64,
-        K=64,
-        trans_A=True,
-        trans_B=False,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=128,
-    )
-
-
-def test_gemm_mls_A_True_B_False_3():
-    """trans_A=True, trans_B=False. Non-power-of-2, multi-loop: M=96, N=96, K=192 (2x2x2 blocks)."""
-    run_gemm_mls(
-        M=96,
-        N=96,
-        K=241,
-        trans_A=True,
-        trans_B=False,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=64,
-        block_N=64,
-        block_K=128,
-        num_threads=128,
-    )
-
-
-def test_gemm_mls_A_False_B_False_1():
-    """trans_A=False, trans_B=False. Single block: A(32,64), B(64,32), C(32,32)."""
-    run_gemm_mls(
-        M=32,
-        N=32,
-        K=64,
-        trans_A=False,
-        trans_B=False,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=128,
-    )
-
-
-def test_gemm_mls_A_False_B_False_2():
-    """trans_A=False, trans_B=False. Multi-block: A(64,64), B(64,64), C(64,64), block 32x32x64."""
-    run_gemm_mls(
-        M=64,
-        N=64,
-        K=64,
-        trans_A=False,
-        trans_B=False,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=128,
-    )
-
-
-def test_gemm_mls_A_False_B_False_3():
-    """trans_A=False, trans_B=False. Non-power-of-2, multi-loop: M=96, N=96, K=192 (2x2x2 blocks)."""
-    run_gemm_mls(
-        M=96,
-        N=96,
-        K=242,
-        trans_A=False,
-        trans_B=False,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=64,
-        block_N=64,
-        block_K=128,
-        num_threads=128,
-    )
-
-
-def test_gemm_mls_A_True_B_True_1():
-    """trans_A=True, trans_B=True. Single block: A(64,32), B(64,32), C(32,32)."""
-    run_gemm_mls(
-        M=32,
-        N=32,
-        K=64,
-        trans_A=True,
-        trans_B=True,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=128,
-    )
-
-
-def test_gemm_mls_A_True_B_True_2():
-    """trans_A=True, trans_B=True. Multi-block: A(64,64), B(64,64), C(64,64), block 32x32x64."""
-    run_gemm_mls(
-        M=64,
-        N=64,
-        K=64,
-        trans_A=True,
-        trans_B=True,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=128,
-    )
-
-
-def test_gemm_mls_A_True_B_True_3():
-    """trans_A=True, trans_B=True. Non-power-of-2, multi-loop: M=96, N=96, K=192 (2x2x2 blocks)."""
-    run_gemm_mls(
-        M=96,
-        N=96,
-        K=242,
-        trans_A=True,
-        trans_B=True,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=64,
-        block_N=64,
-        block_K=128,
-        num_threads=128,
-    )
-
-
-# -------------------------------------
-# AN/BT matrix_load_64x16_b8 cases
-# -------------------------------------
-
-
-# NOTE: actually Compiler would choose matrix_load_64x32_b8
-#       to test this, please comment out 64x32 in kMlsTileConfigsB8NonTrans table
-def test_gemm_mls_A_True_mls_B_False_64x16_SingleBlock_fp8():
-    """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
-    run_gemm_mls(
-        M=64,
-        N=64,
-        K=32,
-        trans_A=True,
-        trans_B=False,
+        M=M,
+        N=N,
+        K=K,
+        trans_A=trans_A,
+        trans_B=trans_B,
         in_dtype="float8_e4m3fn",
         out_dtype="float32",
         dtypeAccum="float32",
-        block_M=64,
-        block_N=64,
-        block_K=32,
-        num_threads=64,
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+        num_threads=num_threads,
     )
 
 
-# -------------------------------------
-# AN/BT matrix_load_64x32_b8 cases
-# -------------------------------------
-
-
-def test_gemm_mls_A_True_mls_B_False_64x32_SingleBlock_fp8():
-    """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
-    run_gemm_mls(
-        M=64,
-        N=64,
-        K=32,
-        trans_A=True,
-        trans_B=False,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=64,
-        block_N=64,
-        block_K=32,
-        num_threads=64,
-    )
-
-
-def test_gemm_mls_A_True_mls_B_False_64x16_SingleBlock_KMask_fp8():
-    """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
-    run_gemm_mls(
-        M=64,
-        N=64,
-        K=41,
-        trans_A=True,
-        trans_B=False,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=64,
-        block_N=64,
-        block_K=32,
-        num_threads=64,
-    )
-
-
-def test_gemm_mls_A_True_mls_B_False_64x32_MultiBlock_fp8():
-    """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
-    run_gemm_mls(
-        M=128,
-        N=128,
-        K=32,
-        trans_A=True,
-        trans_B=False,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=64,
-        block_N=64,
-        block_K=32,
-        num_threads=64,
-    )
-
-
-# -------------------------------------
-# AN/BT matrix_load_128x16_b8 cases
-# -------------------------------------
-
-
-def test_gemm_mls_A_True_mls_B_False_128x16_SingleBlock_fp8():
-    """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
-    run_gemm_mls(
-        M=128,
-        N=128,
-        K=32,
-        trans_A=True,
-        trans_B=False,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=128,
-        block_N=128,
-        block_K=32,
-        num_threads=64,
-    )
-
-
-def test_gemm_mls_A_True_mls_B_False_128x16_MultiBlock_fp8():
-    """trans_A=True, trans_B=False. Multi block float8 test: A(32,256), B(32,256), C(64,64)."""
-    run_gemm_mls(
-        M=256,
-        N=256,
-        K=32,
-        trans_A=True,
-        trans_B=False,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=128,
-        block_N=128,
-        block_K=32,
-        num_threads=64,
-    )
-
-
-def test_gemm_mls_A_True_mls_B_False_128x16_MultiTile_fp8():
-    """trans_A=True, trans_B=False. Multi block float8 test: A(32,256), B(32,256), C(64,64)."""
-    run_gemm_mls(
-        M=256,
-        N=256,
-        K=32,
-        trans_A=True,
-        trans_B=False,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=256,
-        block_N=256,
-        block_K=32,
-        num_threads=128,
-    )
-
-
-# -----------------------------------------
-# AT/BN  matrix_load_trans_64x16_b8 cases
-# -----------------------------------------
-
-
-def test_gemm_mls_A_False_mls_B_True_16x64_SingleBlock_fp8():
-    """trans_A=False, trans_B=True. Single block float8 test: A(16,64), B(16,64), C(16,16)."""
-    run_gemm_mls(
-        M=16,
-        N=16,
-        K=64,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=16,
-        block_N=16,
-        block_K=64,
-        num_threads=64,
-    )
-
-
-def test_gemm_mls_A_False_mls_B_True_16x64_MultiBlock_fp8():
-    """trans_A=False, trans_B=True. Multi block_MN float8 test: A(32,64), B(32,64), C(32,32)."""
-    run_gemm_mls(
-        M=32,
-        N=32,
-        K=64,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=16,
-        block_N=16,
-        block_K=64,
-        num_threads=64,
-    )
-
-
-# -----------------------------------------
-# AT/BN matrix_load_trans_64x32_b8 cases
-# -----------------------------------------
-
-
-def test_gemm_mls_A_False_B_True_1_32x64_SingleBlock_fp8():
-    """trans_A=True, trans_B=False. Both A and B from mls + ds_read_format -> gemm."""
-    run_gemm_mls(
-        M=32,
-        N=32,
-        K=64,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=64,
-    )
-
-
-def test_gemm_mls_A_False_B_True_1_32x64_MultiBlock():
-    """trans_A=False, trans_B=True. Both A and B from mls + ds_read_format -> gemm."""
-    run_gemm_mls(
-        M=64,
-        N=64,
-        K=64,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=64,
-        block_N=64,
-        block_K=64,
-        num_threads=128,
-    )
-
-
-# -----------------------------------------
-# AT/BN matrix_load_trans_128x16_b8 cases
-# -----------------------------------------
-
-
-def test_gemm_mls_A_True_mls_B_False_16x128_SingleBlock_fp8():
-    """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
-    run_gemm_mls(
-        M=16,
-        N=16,
-        K=128,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=16,
-        block_N=16,
-        block_K=128,
-        num_threads=64,
-    )
-
-
-def test_gemm_mls_A_True_mls_B_False_16x128_MultiBlock_fp8():
-    """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
-    run_gemm_mls(
-        M=32,
-        N=32,
-        K=256,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=16,
-        block_N=16,
-        block_K=128,
-        num_threads=64,
-    )
-
-
-def test_gemm_mls_A_True_mls_B_False_16x128_MultiTile_fp8():
-    """trans_A=True, trans_B=False. Single block float8 test: A(32,64), B(32,64), C(64,64)."""
-    run_gemm_mls(
-        M=32,
-        N=32,
-        K=256,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=128,
-        num_threads=64,
-    )
-
-
-def test_gemm_mls_ds_A_True_B_True_1():
-    """trans_A=True, trans_B=True. Both A and B from mls + ds_read_format -> gemm. Single block."""
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads",
+    [
+        pytest.param(32, 32, 64, True, True, 32, 32, 64, 128, id="at_bt_single_block"),
+        pytest.param(64, 64, 64, True, True, 32, 32, 64, 128, id="at_bt_multi_block"),
+        pytest.param(64, 64, 32, True, False, 64, 64, 32, 128, id="an_bt_single_block"),
+        pytest.param(32, 32, 64, False, True, 32, 32, 64, 128, id="at_bn_single_block"),
+    ],
+)
+def test_gemm_mls_ds_read_format_f16(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
+    """Float16 matrix_load -> ds_read_format -> GEMM coverage."""
     run_gemm_mls_ds_read_format(
-        M=32,
-        N=32,
-        K=64,
-        trans_A=True,
-        trans_B=True,
+        M=M,
+        N=N,
+        K=K,
+        trans_A=trans_A,
+        trans_B=trans_B,
         in_dtype="float16",
         out_dtype="float32",
         dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=128,
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+        num_threads=num_threads,
     )
 
 
-def test_gemm_mls_ds_A_True_B_True_2():
-    """trans_A=True, trans_B=True. Both A and B from mls + ds_read_format -> gemm. Multi-block."""
-    run_gemm_mls_ds_read_format(
-        M=64,
-        N=64,
-        K=64,
-        trans_A=True,
-        trans_B=True,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=128,
-    )
-
-
-def test_gemm_mls_ds_A_True_B_False_1():
-    """trans_A=True, trans_B=False. Both A and B from mls + ds_read_format -> gemm."""
-    run_gemm_mls_ds_read_format(
-        M=64,
-        N=64,
-        K=32,
-        trans_A=True,
-        trans_B=False,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=64,
-        block_N=64,
-        block_K=32,
-        num_threads=128,
-    )
-
-
-def test_gemm_mls_ds_A_False_B_True_1():
-    """trans_A=False, trans_B=True. Both A and B from mls + ds_read_format -> gemm."""
-    run_gemm_mls_ds_read_format(
-        M=32,
-        N=32,
-        K=64,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=128,
-    )
-
-
-def test_gemm_mls_ds_A_False_B_True_stage1():
-    """trans_A=False, trans_B=True. Stage1 matrix_load -> ds_read_format -> gemm."""
+@pytest.mark.parametrize(
+    "num_stages, verify_source",
+    [
+        pytest.param(1, _assert_mls_ds_stage1_waitcnt, id="stage1"),
+        pytest.param(2, _assert_mls_ds_stage2_waitcnt, id="stage2"),
+    ],
+)
+def test_gemm_mls_ds_read_format_f16_pipeline(num_stages, verify_source):
+    """Float16 matrix_load -> ds_read_format -> GEMM with pipeline waitcnt checks."""
     run_gemm_mls_ds_read_format(
         M=32,
         N=32,
@@ -1315,33 +869,20 @@ def test_gemm_mls_ds_A_False_B_True_stage1():
         block_N=32,
         block_K=64,
         num_threads=128,
-        num_stages=1,
-        verify_source=_assert_mls_ds_stage1_waitcnt,
+        num_stages=num_stages,
+        verify_source=verify_source,
     )
 
 
-def test_gemm_mls_ds_A_False_B_True_stage2():
-    """trans_A=False, trans_B=True. Pipelined matrix_load -> ds_read_format -> gemm."""
-    run_gemm_mls_ds_read_format(
-        M=32,
-        N=32,
-        K=256,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=128,
-        num_stages=2,
-        verify_source=_assert_mls_ds_stage2_waitcnt,
-    )
-
-
-def test_gemm_mls_copy_a_mls_b_ds_A_False_B_True_stage1():
-    """A via T.copy->fragment, B via matrix_load->ds_read_format->gemm, stage1."""
+@pytest.mark.parametrize(
+    "num_stages, verify_source",
+    [
+        pytest.param(1, _assert_mls_copy_a_mls_b_ds_stage1_waitcnt, id="stage1"),
+        pytest.param(2, _assert_mls_copy_a_mls_b_ds_stage2_waitcnt, id="stage2"),
+    ],
+)
+def test_gemm_mls_copy_a_mls_b_ds_f16_pipeline(num_stages, verify_source):
+    """A via T.copy and B via matrix_load -> ds_read_format with pipeline waitcnt checks."""
     run_gemm_mls_copy_a_mls_b_ds(
         M=32,
         N=32,
@@ -1355,131 +896,55 @@ def test_gemm_mls_copy_a_mls_b_ds_A_False_B_True_stage1():
         block_N=32,
         block_K=64,
         num_threads=128,
-        num_stages=1,
-        verify_source=_assert_mls_copy_a_mls_b_ds_stage1_waitcnt,
+        num_stages=num_stages,
+        verify_source=verify_source,
     )
 
 
-def test_gemm_mls_copy_a_mls_b_ds_A_False_B_True_stage2():
-    """A via T.copy->fragment, B via matrix_load->ds_read_format->gemm, stage2."""
-    run_gemm_mls_copy_a_mls_b_ds(
-        M=32,
-        N=32,
-        K=256,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float16",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=128,
-        num_stages=2,
-        verify_source=_assert_mls_copy_a_mls_b_ds_stage2_waitcnt,
-    )
-
-
-def test_gemm_mls_ds_A_True_B_False_64x32_SingleBlock_fp8():
-    """trans_A=True, trans_B=False. FP8 ds_read_format coverage for 64x32 b8 shape."""
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads",
+    [
+        pytest.param(64, 64, 32, True, False, 64, 64, 32, 64, id="an_bt_64x32_single"),
+        pytest.param(128, 128, 32, True, False, 128, 128, 32, 64, id="an_bt_128x16_single"),
+        pytest.param(16, 16, 64, False, True, 16, 16, 64, 64, id="at_bn_16x64_single"),
+        pytest.param(32, 32, 64, False, True, 32, 32, 64, 64, id="at_bn_32x64_single"),
+        pytest.param(16, 16, 128, False, True, 16, 16, 128, 64, id="at_bn_16x128_single"),
+    ],
+)
+def test_gemm_mls_ds_read_format_fp8(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
+    """Float8 matrix_load -> ds_read_format -> GEMM coverage."""
     run_gemm_mls_ds_read_format(
-        M=64,
-        N=64,
-        K=32,
-        trans_A=True,
-        trans_B=False,
+        M=M,
+        N=N,
+        K=K,
+        trans_A=trans_A,
+        trans_B=trans_B,
         in_dtype="float8_e4m3fn",
         out_dtype="float32",
         dtypeAccum="float32",
-        block_M=64,
-        block_N=64,
-        block_K=32,
-        num_threads=64,
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+        num_threads=num_threads,
     )
 
 
-def test_gemm_mls_ds_A_True_B_False_128x16_SingleBlock_fp8():
-    """trans_A=True, trans_B=False. FP8 ds_read_format coverage for 128x16 b8 shape."""
-    run_gemm_mls_ds_read_format(
-        M=128,
-        N=128,
-        K=32,
-        trans_A=True,
-        trans_B=False,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=128,
-        block_N=128,
-        block_K=32,
-        num_threads=64,
-    )
-
-
-def test_gemm_mls_ds_A_False_B_True_16x64_SingleBlock_fp8():
-    """trans_A=False, trans_B=True. FP8 ds_read_format coverage for 16x64 b8 shape (alt=1)."""
-    run_gemm_mls_ds_read_format(
-        M=16,
-        N=16,
-        K=64,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=16,
-        block_N=16,
-        block_K=64,
-        num_threads=64,
-    )
-
-
-def test_gemm_mls_ds_A_False_B_True_32x64_SingleBlock_fp8():
-    """trans_A=False, trans_B=True. FP8 ds_read_format coverage for 32x64 b8 shape."""
-    run_gemm_mls_ds_read_format(
-        M=32,
-        N=32,
-        K=64,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=64,
-        num_threads=64,
-    )
-
-
-def test_gemm_mls_ds_A_False_B_True_16x128_SingleBlock_fp8():
-    """trans_A=False, trans_B=True. FP8 ds_read_format coverage for 16x128 b8 shape."""
-    run_gemm_mls_ds_read_format(
-        M=16,
-        N=16,
-        K=128,
-        trans_A=False,
-        trans_B=True,
-        in_dtype="float8_e4m3fn",
-        out_dtype="float32",
-        dtypeAccum="float32",
-        block_M=16,
-        block_N=16,
-        block_K=128,
-        num_threads=64,
-    )
-
-
-def test_gemm_mls_ds_mul_scale_1():
-    """Both A and B from mls + ds_read_format + mul scale -> gemm."""
+@pytest.mark.parametrize(
+    "scale_a, scale_b",
+    [
+        pytest.param(0.5, 0.2, id="scale_a_0_5_b_0_2"),
+    ],
+)
+def test_gemm_mls_ds_read_format_mul_scale(scale_a, scale_b):
+    """matrix_load -> ds_read_format -> scaling -> GEMM."""
     run_gemm_mls_ds_read_format_mul_scale(
         M=32,
         N=32,
         K=64,
         trans_A=False,
         trans_B=True,
-        scale_a=0.5,
-        scale_b=0.2,
+        scale_a=scale_a,
+        scale_b=scale_b,
         in_dtype="float16",
         out_dtype="float32",
         dtypeAccum="float32",
@@ -1541,11 +1006,153 @@ def run_mls_ds_read_format_copy_to_global(
     profiler = kernel.get_profiler()
 
     def ref_program(A):
-        import torch
-
+        A = A.cpu()
         return A.to(torch.__getattribute__(out_dtype))
 
-    profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
+    _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2)
+
+
+def mls_ds_read_format_b4_copy_to_global(
+    M,
+    K,
+    block_M,
+    block_K,
+    threads,
+):
+    """b4 matrix_load -> ds_read_format -> copy(fragment to global). No gemm."""
+    in_dtype = "float4_e2m1fn"
+    out_dtype = in_dtype
+    A_shape = (M, K)
+    shared_shape = (block_M, block_K)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor(A_shape, in_dtype),
+        C: T.Tensor(A_shape, out_dtype),
+    ):
+        with T.Kernel(T.ceildiv(K, block_K), T.ceildiv(M, block_M), threads=threads) as (bk, bm):
+            A_shared = T.alloc_shared(shared_shape, in_dtype)
+            A_fragment = T.alloc_fragment(shared_shape, in_dtype)
+            T.matrix_load(A[bm * block_M, bk * block_K], A_shared)
+            T.ds_read_format(A_shared, A_fragment)
+            T.copy(A_fragment, C[bm * block_M, bk * block_K])
+
+    return main
+
+
+def _assert_b4_mls_ds_source(source: str, tile_mn: int, tile_k: int, trans: bool) -> None:
+    expected_tile = f"tl::sequence<{tile_mn}, {tile_k}>"
+    assert expected_tile in source, f"expected MLS tile {expected_tile} in generated source"
+    assert "tl::pk_fp4_t" in source
+    assert "tl::mls::ds_read_format" in source
+    assert "padbyte" not in source
+    assert "tl::hcu_target_enum::gfx946" in source
+    if trans:
+        assert "true, tl::hcu_target_enum::gfx946" in source
+    else:
+        assert "false, tl::hcu_target_enum::gfx946" in source
+
+
+def run_mls_ds_read_format_b4_copy_to_global(
+    M,
+    K,
+    block_M,
+    block_K,
+    num_threads=128,
+):
+    program = mls_ds_read_format_b4_copy_to_global(
+        M,
+        K,
+        block_M,
+        block_K,
+        num_threads,
+    )
+    kernel = tl.compile(program, out_idx=[1])
+    _assert_b4_mls_ds_source(
+        kernel.get_kernel_source(),
+        block_M,
+        block_K,
+        True,
+    )
+    profiler = kernel.get_profiler()
+
+    rows = torch.arange(M, device="cuda", dtype=torch.uint8)[:, None]
+    cols = torch.arange(K, device="cuda", dtype=torch.uint8)[None, :]
+    logical = (rows * 3 + cols * 5 + rows // 7 + cols // 11) & 0x0F
+    A_storage = (logical[:, 0::2] | (logical[:, 1::2] << 4)).to(torch.uint8)
+    A = A_storage.view(torch.int8)
+    torch.cuda.synchronize()
+    lib_out = profiler.func(A)
+    torch.cuda.synchronize()
+    lib_storage = lib_out.view(torch.uint8).cpu()
+    torch.testing.assert_close(lib_storage, A_storage.cpu(), rtol=0, atol=0)
+
+
+def _fp4_e2m1fn_decode(logical: torch.Tensor) -> torch.Tensor:
+    table = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        device=logical.device,
+        dtype=torch.float32,
+    )
+    return table[(logical & 0x0F).long()]
+
+
+def _pack_fp4_last_dim(logical: torch.Tensor) -> torch.Tensor:
+    logical = logical.to(torch.uint8)
+    return (logical[..., 0::2] | (logical[..., 1::2] << 4)).contiguous().view(torch.int8)
+
+
+def run_gemm_mls_ds_read_format_b4(
+    M=32,
+    N=32,
+    K=128,
+    trans_A=False,
+    trans_B=True,
+    block_M=32,
+    block_N=32,
+    block_K=128,
+    num_threads=64,
+):
+    program = matmul_mls_ds_read_format(
+        M,
+        N,
+        K,
+        block_M,
+        block_N,
+        block_K,
+        trans_A,
+        trans_B,
+        "float4_e2m1fn",
+        "float32",
+        "float32",
+        num_threads,
+    )
+    kernel = tl.compile(program, out_idx=[2])
+    profiler = kernel.get_profiler()
+
+    A_shape = (K, M) if trans_A else (M, K)
+    B_shape = (N, K) if trans_B else (K, N)
+    a_rows = torch.arange(A_shape[0], device="cuda", dtype=torch.uint8)[:, None]
+    a_cols = torch.arange(A_shape[1], device="cuda", dtype=torch.uint8)[None, :]
+    b_rows = torch.arange(B_shape[0], device="cuda", dtype=torch.uint8)[:, None]
+    b_cols = torch.arange(B_shape[1], device="cuda", dtype=torch.uint8)[None, :]
+    A_logical = (a_rows * 3 + a_cols * 5 + a_rows // 7 + a_cols // 11) & 0x0F
+    B_logical = (b_rows * 7 + b_cols * 2 + b_rows // 5 + b_cols // 13) & 0x0F
+    A = _pack_fp4_last_dim(A_logical)
+    B = _pack_fp4_last_dim(B_logical)
+
+    torch.cuda.synchronize()
+    lib_out = profiler.func(A, B)
+    torch.cuda.synchronize()
+
+    A_ref = _fp4_e2m1fn_decode(A_logical.cpu())
+    B_ref = _fp4_e2m1fn_decode(B_logical.cpu())
+    if trans_A:
+        A_ref = A_ref.T
+    if trans_B:
+        B_ref = B_ref.T
+    ref = A_ref @ B_ref
+    torch.testing.assert_close(lib_out.cpu(), ref, rtol=1e-2, atol=1e-1)
 
 
 def matmul_mls_n_loop(
@@ -1616,23 +1223,91 @@ def run_gemm_mls_n_loop(
     profiler = kernel.get_profiler()
 
     def ref_program(A, B):
-        import torch
-
+        A = A.cpu()
+        B = B.cpu()
         return (A @ B).to(torch.__getattribute__(out_dtype))
 
-    profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
+    _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2)
 
 
-def test_mls_ds_read_format_copy_to_global_1():
+@pytest.mark.parametrize(
+    "M, K, block_M, block_K, num_threads",
+    [
+        pytest.param(16, 64, 16, 64, 128, id="16x32_B1_W2K_b16"),
+        pytest.param(16, 64, 16, 64, 64, id="16x64_B1_W1_b16"),
+        pytest.param(64, 64, 64, 64, 128, id="16x64_B1_W4M_b16"),
+        pytest.param(16, 128, 16, 128, 64, id="16x64_B1_W1_4KB_b16"),
+        pytest.param(16, 128, 16, 128, 128, id="16x64_B1_W2_4KB_b16"),
+        pytest.param(32, 128, 32, 128, 128, id="16x64_B1_W2_8KB_b16"),
+        pytest.param(32, 128, 32, 128, 256, id="16x64_B1_W4_8KB_b16"),
+        pytest.param(32, 32, 32, 32, 64, id="32x32"),
+    ],
+)
+def test_mls_ds_read_format_copy_to_global(M, K, block_M, block_K, num_threads):
     """matrix_load -> ds_read_format -> copy(fragment to global). No gemm."""
     run_mls_ds_read_format_copy_to_global(
-        M=32,
-        K=64,
-        block_M=32,
-        block_K=64,
+        M=M,
+        K=K,
+        block_M=block_M,
+        block_K=block_K,
         in_dtype="float16",
         out_dtype="float16",
-        num_threads=128,
+        num_threads=num_threads,
+    )
+
+
+@pytest.mark.skipif(
+    not target_supports_mls_b4(),
+    reason="b4 matrix_load is only supported on gfx946",
+)
+@pytest.mark.parametrize(
+    "M, K, block_M, block_K, num_threads",
+    [
+        pytest.param(32, 128, 32, 128, 64, id="b4_format_32x128_t64"),
+        pytest.param(32, 128, 32, 128, 128, id="b4_format_32x128_t128"),
+        pytest.param(64, 256, 32, 128, 128, id="b4_format_64x256_mktiles_t128"),
+        pytest.param(32, 256, 32, 256, 64, id="b4_format_32x256_trans_t64"),
+    ],
+)
+def test_mls_ds_read_format_b4_copy_to_global(M, K, block_M, block_K, num_threads):
+    """b4 matrix_load -> ds_read_format -> copy(fragment to global). No gemm."""
+    run_mls_ds_read_format_b4_copy_to_global(
+        M=M,
+        K=K,
+        block_M=block_M,
+        block_K=block_K,
+        num_threads=num_threads,
+    )
+
+
+@pytest.mark.skipif(
+    not target_supports_mls_b4(),
+    reason="b4 matrix_load/mmac is only supported on gfx946",
+)
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads",
+    [
+        pytest.param(32, 32, 128, False, True, 32, 32, 128, 64, id="at_bn_m32_n32_k128_t64"),
+        pytest.param(32, 32, 256, False, True, 32, 32, 256, 64, id="at_bn_m32_n32_k256_t64"),
+        pytest.param(32, 32, 256, False, True, 32, 32, 256, 128, id="at_bn_m32_n32_k256_t128"),
+        pytest.param(64, 32, 256, False, True, 32, 32, 256, 64, id="at_bn_m64_n32_k256_t64"),
+        pytest.param(128, 128, 64, True, False, 128, 128, 64, 64, id="an_bt_m128_n128_k64_t64"),
+        pytest.param(128, 128, 64, True, False, 128, 128, 64, 128, id="an_bt_m128_n128_k64_t128"),
+        pytest.param(256, 256, 128, True, False, 128, 128, 64, 128, id="an_bt_m256_n256_k128_t128"),
+    ],
+)
+def test_gemm_mls_b4_nopad(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
+    """b4 nopad GEMM cases covering both asymmetric transpose modes."""
+    run_gemm_mls_ds_read_format_b4(
+        M=M,
+        N=N,
+        K=K,
+        trans_A=trans_A,
+        trans_B=trans_B,
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+        num_threads=num_threads,
     )
 
 

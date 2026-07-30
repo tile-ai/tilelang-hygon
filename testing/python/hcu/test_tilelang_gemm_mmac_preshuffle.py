@@ -23,7 +23,6 @@ def tl_matmul(
     b_preshuffle=False,
     b_g2l_load=False,
 ):
-
     micro_size_x = micro_size_y = micro_size_k = 16
 
     if in_dtype in {"float8_e4m3fnuz", "int8"}:

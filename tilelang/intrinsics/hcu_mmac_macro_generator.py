@@ -71,6 +71,7 @@ class HCUMatrixCoreIntrinEmitter:
         "float8_e5m2": "e5m2",
         "float8_e4m3fnuz": "e4m3fnuz",
         "float8_e4m3fn": "e4m3fn",
+        "float4_e2m1fn": "fp4",
     }
 
     k_pack = 1
@@ -207,6 +208,7 @@ class HCUMatrixCoreIntrinEmitter:
             "float8_e4m3fnuz": "fp8",
             "float8_e4m3fn": "fp8",
             "float8_e5m2": "bf8",
+            "float4_e2m1fn": "fp4",
         }[in_dtype]
 
         target = self.target
@@ -220,6 +222,10 @@ class HCUMatrixCoreIntrinEmitter:
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_fp8_fp8_lit_lts"
             elif in_abbr == "bf8":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_bf8_bf8_lit_lts"
+            elif in_abbr == "fp4":
+                if out_dtype_abbrv != "f32":
+                    raise AssertionError("HCU fp4 MMAC currently only supports float32 accum")
+                self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_fp4_lit_lts"
             elif in_abbr == "i8":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_i8_lit_clamp_lts"
             elif in_abbr == "tf32":
@@ -237,6 +243,8 @@ class HCUMatrixCoreIntrinEmitter:
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_fp8_fp8"
             elif in_abbr == "bf8":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_bf8_bf8"
+            elif in_abbr == "fp4":
+                raise AssertionError("HCU fp4 MMAC requires lit/lts target support")
             elif in_abbr == "i8":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_i8"
             elif in_abbr == "tf32":
@@ -323,7 +331,11 @@ class HCUMatrixCoreIntrinEmitter:
 
     def configure_b_mls(self, *, b_mls: bool = True) -> None:
         """Update N-side recompute metadata when B is loaded from MLS LDS."""
-        self.min_n_per_warp = min_n_per_warp_for_b(b_mls=b_mls, b_mls_trans=self.b_transposed)
+        self.min_n_per_warp = min_n_per_warp_for_b(
+            b_mls=b_mls,
+            b_mls_trans=self.b_transposed,
+            element_bits=DataType(self.b_dtype).bits,
+        )
         self._initialize_block_warp_tiles(self.block_m, self.block_n)
 
     def _shared_block_mn_k(self, src: Buffer | BufferLoad | BufferRegion, mls_trans: bool) -> tuple[int, int]:

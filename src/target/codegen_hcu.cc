@@ -672,7 +672,8 @@ std::string MlsBaseTemplateFromLoadTile(const std::string &sym) {
       << "mls_load_tile expects at least 8 template args";
   std::ostringstream os;
   os << "tl::mls::tilelang_mls_base<";
-  for (size_t i = 0; i < 8; ++i) {
+  const size_t base_arg_count = args.size() > 10 ? 9 : 8;
+  for (size_t i = 0; i < base_arg_count; ++i) {
     if (i != 0)
       os << ", ";
     os << args[i];
@@ -695,8 +696,11 @@ MlsLastLoadTemplateArgs(const std::string &sym) {
   const std::string prefix = "tl::mls::mls_load_tile<";
   auto args = SplitTopLevelTemplateArgs(
       sym.substr(prefix.size(), sym.size() - prefix.size() - 1));
-  std::string check_last_load = args.size() > 8 ? args[8] : "true";
-  std::string last_load = args.size() > 9 ? args[9] : "false";
+  const size_t check_idx = args.size() > 10 ? 9 : 8;
+  const size_t last_idx = args.size() > 10 ? 10 : 9;
+  std::string check_last_load =
+      args.size() > check_idx ? args[check_idx] : "true";
+  std::string last_load = args.size() > last_idx ? args[last_idx] : "false";
   return {check_last_load, last_load};
 }
 
@@ -919,16 +923,65 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
   // Try to use CK buffer store for global memory when enabled.
   DataType value_dtype = op->value.dtype();
   DataType element_dtype = op->buffer->dtype;
+  PrimExpr index_expr = op->indices[0];
+  Var buffer_var = op->buffer->data;
 
   if (TryToEmitLDSBufferOp(op))
     return;
+
+  if (element_dtype.is_float4_e2m1fn() && element_dtype.is_scalar()) {
+    auto emit_fp4_store = [&](const std::string &index,
+                              const std::string &value) {
+      PrintIndent();
+      std::string pred = GetCurrentPredicate();
+      if (pred != "true") {
+        stream << "if (" << pred << ") ";
+      }
+      stream << "tl::store_packed_fp4_lane(" << GetVarID(buffer_var.get())
+             << ", " << index << ", " << value << ");\n";
+    };
+
+    if (value_dtype.lanes() == 1) {
+      emit_fp4_store(PrintExpr(index_expr), PrintExpr(op->value));
+      return;
+    }
+
+    const RampNode *ramp_index = index_expr.as<RampNode>();
+    if (ramp_index) {
+      int vec_scope = BeginScope();
+      std::string value = SSAGetID(PrintExpr(op->value), value_dtype);
+      PrintIndent();
+      std::string pred = GetCurrentPredicate();
+      if (pred != "true") {
+        stream << "if (" << pred << ") ";
+      }
+      stream << "tl::store_packed_fp4_vector<" << value_dtype.lanes() << ">("
+             << GetVarID(buffer_var.get()) << ", "
+             << PrintExpr(ramp_index->base) << ", "
+             << PrintExpr(ramp_index->stride) << ", " << value << ");\n";
+      EndScope(vec_scope);
+      return;
+    }
+
+    int vec_scope = BeginScope();
+    std::string value = SSAGetID(PrintExpr(op->value), value_dtype);
+    for (int i = 0; i < value_dtype.lanes(); ++i) {
+      std::ostringstream lane_index;
+      std::string index = SSAGetID(PrintExpr(index_expr), index_expr.dtype());
+      PrintVecElemLoad(index, index_expr.dtype(), i, lane_index);
+      std::ostringstream lane_value;
+      PrintVecElemLoad(value, value_dtype, i, lane_value);
+      emit_fp4_store(lane_index.str(), lane_value.str());
+    }
+    EndScope(vec_scope);
+    return;
+  }
 
   // Only handle the common case where lanes match; otherwise, fall back to the
   // default CodeGenC implementation (which may invoke PrintVecStore to emit
   // buffer/vectorized store instructions).
   if (value_dtype.lanes() == element_dtype.lanes()) {
-    BufferDesc desc =
-        GetBufferDesc(value_dtype, op->buffer.get(), op->indices[0]);
+    BufferDesc desc = GetBufferDesc(value_dtype, op->buffer.get(), index_expr);
     if (CanUseVMBufferOps(op->buffer.get(), value_dtype.lanes())) {
       std::string value = PrintExpr(op->value);
 
@@ -954,6 +1007,31 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
 
   // Fallback to the base implementation which emits vectorized stores.
   CodeGenC::VisitStmt_(op);
+}
+
+void CodeGenTileLangHCU::VisitExpr_(const BufferLoadNode *op,
+                                    std::ostream &os) {
+  DataType value_dtype = op->dtype;
+  if (!value_dtype.is_float4_e2m1fn() || value_dtype.lanes() == 1) {
+    CodeGenC::VisitExpr_(op, os);
+    return;
+  }
+
+  ICHECK_EQ(op->indices.size(), 1)
+      << "Load from non-flat memory not supported.";
+  ICHECK(!op->predicate.defined())
+      << "Predicated buffer load is not supported.";
+
+  const RampNode *ramp_index = op->indices[0].as<RampNode>();
+  if (!ramp_index) {
+    CodeGenC::VisitExpr_(op, os);
+    return;
+  }
+
+  std::string vid = GetVarID(op->buffer->data.get());
+  os << "tl::load_packed_fp4_vector<" << value_dtype.lanes() << ">(" << vid
+     << ", " << PrintExpr(ramp_index->base) << ", "
+     << PrintExpr(ramp_index->stride) << ")";
 }
 
 void CodeGenTileLangHCU::BindThreadIndex(const IterVar &iv) {
@@ -1059,6 +1137,21 @@ void CodeGenTileLangHCU::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
     enable_fp8_ = true;
     os << GetFP8Type(t);
     return;
+  } else if (t.is_float4_e2m1fn()) {
+    if (t.is_scalar()) {
+      os << "tl::pk_fp4_t";
+      return;
+    } else if (t.lanes() <= 4) {
+      os << "int16_t";
+      return;
+    } else if (t.lanes() <= 8) {
+      os << "int";
+      return;
+    } else if (t.lanes() <= 16) {
+      os << "int2";
+      return;
+    }
+    fail = true;
   } else if (t == DataType::Bool()) {
     os << "bool";
     return;
@@ -1364,6 +1457,7 @@ void CodeGenTileLangHCU::PrintVecElemLoad(const std::string &vec, DataType t,
 
   static const char access[] = {'x', 'y', 'z', 'w'};
   ICHECK(i >= 0 && i < (t.bits() == 8                        ? 16
+                        : t.is_float4_e2m1fn()               ? 16
                         : (t.lanes() == 16)                  ? 16
                         : (t.lanes() == 32)                  ? 32
                         : (t.bits() == 16 || t.bits() == 32) ? 8
@@ -1388,6 +1482,16 @@ void CodeGenTileLangHCU::PrintVecElemLoad(const std::string &vec, DataType t,
   } else if (t.is_bfloat16()) {
     os << "((bfloat16x2*)(&(" << vec << "." << access[i / 2] << ")))->"
        << access[i % 2];
+  } else if (t.is_float4_e2m1fn()) {
+    if (t.lanes() <= 8) {
+      int nibble_shift = i * 4;
+      os << "((" << vec << " >> " << nibble_shift << ") & 0xF)";
+    } else {
+      int word = i / 8;
+      int nibble_shift = (i % 8) * 4;
+      os << "((" << vec << "." << access[word] << " >> " << nibble_shift
+         << ") & 0xF)";
+    }
   } else if (t.lanes() > 4 && t.lanes() <= 8) {
     std::string type_name;
     if (t.bits() == 16) {
@@ -1418,6 +1522,7 @@ void CodeGenTileLangHCU::PrintVecElemStore(const std::string &vec, DataType t,
   this->PrintIndent();
   static const char access[] = {'x', 'y', 'z', 'w'};
   ICHECK(i >= 0 && i < (t.bits() == 8                        ? 16
+                        : t.is_float4_e2m1fn()               ? 16
                         : (t.lanes() == 16)                  ? 16
                         : (t.lanes() == 32)                  ? 32
                         : (t.bits() == 16 || t.bits() == 32) ? 8
@@ -1446,6 +1551,19 @@ void CodeGenTileLangHCU::PrintVecElemStore(const std::string &vec, DataType t,
   } else if (t.is_bfloat16()) {
     stream << "((bfloat16_t*)(&(" << vec << "." << access[i / 2] << ")))["
            << (i % 2) << "] = " << value << ";\n";
+  } else if (t.is_float4_e2m1fn()) {
+    int nibble_shift = (t.lanes() <= 8) ? i * 4 : (i % 8) * 4;
+    std::string mask = "0xF";
+    std::string dst =
+        (t.lanes() <= 8) ? vec : (vec + "." + std::string(1, access[i / 8]));
+    if (i == 0) {
+      stream << dst << " = ((" << value << " & " << mask << ") << "
+             << nibble_shift << ");\n";
+    } else {
+      stream << dst << " = (" << dst << " & ~(" << mask << " << "
+             << nibble_shift << ")) | ((" << value << " & " << mask << ") << "
+             << nibble_shift << ");\n";
+    }
   } else if (t.lanes() > 4 && t.lanes() <= 8) {
     std::string type_name;
     if (t.bits() == 16) {
@@ -1675,10 +1793,11 @@ std::string CodeGenTileLangHCU::GetBufferRef(DataType t,
     // This is a special case, because CodegenCUDA::PrintType()
     // returns "int" for bool and for 4-bit integers. In most cases,
     // we divide by the number of lanes to determine the index.
-    // However, the backing type for scalar int4 and scalar bool is
-    // int32.  Therefore, we need to divide by the ratio of their
-    // sizes in that case.
-    int div_factor = (t.lanes() == 1) ? (32 / t.bits()) : t.lanes();
+    // However, scalar float4_e2m1fn uses tl::pk_fp4_t as a byte storage
+    // type, while scalar int4/bool use int32 storage.
+    int div_factor = (t.is_float4_e2m1fn() && t.lanes() == 1)
+                         ? 2
+                         : ((t.lanes() == 1) ? (32 / t.bits()) : t.lanes());
 
     os << "*("
        << "(" << ptr_cast(t) << vid << ")"
@@ -2114,6 +2233,9 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
         {"float8_e5m2x8", "int32x2"},
         {"float8_e5m2fnuzx4", "fp8_e5_4_t"},
         {"float8_e5m2fnuzx8", "int32x2"},
+        {"float4_e2m1fn", "tl::pk_fp4_t"},
+        {"float4_e2m1fnx8", "int32_t"},
+        {"float4_e2m1fnx16", "int32x2"},
         {"float32x16", "float32x16"},
         {"float32x32", "float32x32"}};
 
@@ -2742,6 +2864,31 @@ void CodeGenTileLangHCU::PrintVecElemLoadExpr(DataType t, int i,
       os << ",";
     else
       os << "}";
+    return;
+  }
+
+  if (t.is_float4_e2m1fn()) {
+    if (t.lanes() <= 8) {
+      if (i != 0) {
+        os << " | ";
+      }
+      os << "((static_cast<int>(static_cast<uint8_t>(" << value
+         << ")) & 0x0f) << " << (i * 4) << ")";
+      return;
+    }
+    ICHECK_LE(t.lanes(), 16);
+    if (i == 0) {
+      os << "(int2){";
+    } else if (i == 8) {
+      os << ", ";
+    } else {
+      os << " | ";
+    }
+    os << "((static_cast<int>(static_cast<uint8_t>(" << value
+       << ")) & 0x0f) << " << ((i % 8) * 4) << ")";
+    if (i == t.lanes() - 1) {
+      os << "}";
+    }
     return;
   }
 

@@ -89,14 +89,14 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
 
 
 def _compute_hcu_warp_partition(gemm, thread_nums: int, target: Target, meta) -> tuple[int, int, int]:
-    element_byte_size = DataType(gemm.in_dtype).bits // 8
+    element_bits = DataType(gemm.in_dtype).bits
     _ffi_api.GemmWarpPolicyComputeWarpPartitionHCU(
         gemm.policy,
         int(gemm.M),
         int(gemm.N),
         int(gemm.K),
         int(gemm.k_pack),
-        int(element_byte_size),
+        int(element_bits),
         int(thread_nums),
         target,
         int(GemmInst.HCUMMAC),

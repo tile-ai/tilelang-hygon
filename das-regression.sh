@@ -309,7 +309,7 @@ fi
 pytest_status=0
 PYTHONPATH="${TILELANG_REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}" TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR}" \
   python -m pytest -p no:warnings --rootdir="${PYTEST_ROOTDIR}" \
-    "${extra_pytest_args[@]}" "${allure_args[@]}" "${ALL_NODEIDS[@]}" || pytest_status=$?
+    -x "${extra_pytest_args[@]}" "${allure_args[@]}" "${ALL_NODEIDS[@]}" || pytest_status=$?
 
 if [[ "${GENERATE_ALLURE_REPORT}" == "1" ]]; then
   if command -v allure >/dev/null 2>&1; then

@@ -9,9 +9,21 @@
  */
 
 #include <tl_templates/hcu/core.hpp>
+#include <tl_templates/hcu/mls/mls_param_traits.hpp>
 
 namespace tl {
 namespace mls {
+
+template <typename T, typename = void> struct ds_read_format_storage_type {
+  using type = T;
+};
+
+template <typename T>
+struct ds_read_format_storage_type<
+    T, std::enable_if_t<(mls_elem_bits_v<::tl::remove_cvref_t<T>> == 4 &&
+                         sizeof(::tl::remove_cvref_t<T>) == 1)>> {
+  using type = uint8_t;
+};
 
 template <typename Impl> struct DsreadmFormatAttribute {
   using ImplType = ::tl::remove_cvref_t<Impl>;
@@ -38,7 +50,9 @@ template <typename Impl> struct DsreadmFormatAttribute {
   template <typename T, ::tl::index_t offset>
   TL_DEVICE auto operator()(TL_LDS_ADDR T *smem_ptr,
                             ::tl::number<offset>) const {
-    using VectorType = ::tl::ext_vector_t<T, kVectorLength>;
+    using StorageT =
+        typename ds_read_format_storage_type<::tl::remove_cvref_t<T>>::type;
+    using VectorType = ::tl::ext_vector_t<StorageT, kVectorLength>;
     using RetType = ::tl::thread_buffer<VectorType, 1>;
 
     RetType ret;
@@ -319,6 +333,100 @@ struct DsreadmFormatAttributeImpl_MT32x32_B8_ALT2 {
         __builtin_hcu_ds_read_matrix_trans_format_u8(
             ptr, offset, static_cast<char>(0x2), static_cast<char>(0x2),
             static_cast<char>(0x1)));
+  }
+};
+
+// b4 format path: input/output stay packed b4.
+struct DsreadmFormatAttributeImpl_M32x64_B4 {
+  static constexpr ::tl::index_t kMN = 32;
+  static constexpr ::tl::index_t kK = 64;
+
+  static constexpr ::tl::index_t kMNStoreLane = 16;
+  static constexpr ::tl::index_t kKStoreLane = 4;
+
+  static constexpr ::tl::index_t kMN0StorePerLane = 2;
+  static constexpr ::tl::index_t kMN1StorePerLane = 1;
+  static constexpr ::tl::index_t kKStorePerLane = 16;
+
+  static constexpr ::tl::index_t kMNInterleave = 1;
+  // b4 store counts are logical fp4; vector length counts packed bytes.
+  static constexpr ::tl::index_t kVectorLength =
+      (kMN0StorePerLane * kMN1StorePerLane * kKStorePerLane) / 2;
+
+  template <typename T, ::tl::index_t offset>
+  TL_DEVICE void operator()(TL_LDS_ADDR T *smem,
+                            ::tl::ext_vector_t<T, kVectorLength> &ret,
+                            ::tl::number<offset>) const {
+    using StorageT =
+        typename ds_read_format_storage_type<::tl::remove_cvref_t<T>>::type;
+    TL_LDS_ADDR unsigned char *ptr =
+        reinterpret_cast<TL_LDS_ADDR unsigned char *>(smem);
+    ret = ::tl::bit_cast<::tl::ext_vector_t<StorageT, kVectorLength>>(
+        __builtin_hcu_ds_read_matrix_format_u4(
+            ptr, offset, static_cast<char>(0x2), static_cast<char>(0x3),
+            static_cast<char>(0x0)));
+  }
+};
+
+struct DsreadmFormatAttributeImpl_MT32x64_B4 {
+  static constexpr ::tl::index_t kMN = 32;
+  static constexpr ::tl::index_t kK = 64;
+
+  static constexpr ::tl::index_t kMNStoreLane = 16;
+  static constexpr ::tl::index_t kKStoreLane = 4;
+
+  static constexpr ::tl::index_t kMN0StorePerLane = 1;
+  static constexpr ::tl::index_t kMN1StorePerLane = 2;
+  static constexpr ::tl::index_t kKStorePerLane = 16;
+
+  static constexpr ::tl::index_t kMNInterleave = 1;
+  // b4 store counts are logical fp4; vector length counts packed bytes.
+  static constexpr ::tl::index_t kVectorLength =
+      (kMN0StorePerLane * kMN1StorePerLane * kKStorePerLane) / 2;
+
+  template <typename T, ::tl::index_t offset>
+  TL_DEVICE void operator()(TL_LDS_ADDR T *smem,
+                            ::tl::ext_vector_t<T, kVectorLength> &ret,
+                            ::tl::number<offset>) const {
+    using StorageT =
+        typename ds_read_format_storage_type<::tl::remove_cvref_t<T>>::type;
+    TL_LDS_ADDR unsigned char *ptr =
+        reinterpret_cast<TL_LDS_ADDR unsigned char *>(smem);
+    ret = ::tl::bit_cast<::tl::ext_vector_t<StorageT, kVectorLength>>(
+        __builtin_hcu_ds_read_matrix_trans_format_u4(
+            ptr, offset, static_cast<char>(0x3), static_cast<char>(0x2),
+            static_cast<char>(0x0)));
+  }
+};
+
+struct DsreadmFormatAttributeImpl_MT16x128_B4 {
+  static constexpr ::tl::index_t kMN = 16;
+  static constexpr ::tl::index_t kK = 128;
+
+  static constexpr ::tl::index_t kMNStoreLane = 8;
+  static constexpr ::tl::index_t kKStoreLane = 8;
+
+  static constexpr ::tl::index_t kMN0StorePerLane = 1;
+  static constexpr ::tl::index_t kMN1StorePerLane = 2;
+  static constexpr ::tl::index_t kKStorePerLane = 16;
+
+  static constexpr ::tl::index_t kMNInterleave = 1;
+  // b4 store counts are logical fp4; vector length counts packed bytes.
+  static constexpr ::tl::index_t kVectorLength =
+      (kMN0StorePerLane * kMN1StorePerLane * kKStorePerLane) / 2;
+
+  template <typename T, ::tl::index_t offset>
+  TL_DEVICE void operator()(TL_LDS_ADDR T *smem,
+                            ::tl::ext_vector_t<T, kVectorLength> &ret,
+                            ::tl::number<offset>) const {
+    using StorageT =
+        typename ds_read_format_storage_type<::tl::remove_cvref_t<T>>::type;
+    TL_LDS_ADDR unsigned char *ptr =
+        reinterpret_cast<TL_LDS_ADDR unsigned char *>(smem);
+    ret = ::tl::bit_cast<::tl::ext_vector_t<StorageT, kVectorLength>>(
+        __builtin_hcu_ds_read_matrix_trans_format_u4(
+            ptr, offset, static_cast<char>(0x4), static_cast<char>(0x1),
+            static_cast<char>(0x0)));
   }
 };
 

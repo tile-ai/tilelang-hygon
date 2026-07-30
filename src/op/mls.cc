@@ -11,6 +11,7 @@
 #include "operator.h"
 #include "region.h"
 #include <algorithm>
+#include <optional>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
@@ -27,6 +28,188 @@ static PrimExpr ToInt64ConstOrVar(const PrimExpr &expr) {
     return IntImm(DataType::Int(64), *p);
   }
   return expr;
+}
+
+static int64_t CeilDiv(int64_t x, int64_t y) { return (x + y - 1) / y; }
+
+static int64_t DTypeStorageBits(DataType dtype) {
+  return static_cast<int64_t>(dtype.bits()) * dtype.lanes();
+}
+
+Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
+                                              int mls_tile_mn, int mls_tile_k,
+                                              bool trans, Target target) {
+  const auto hcu_arch = TargetIsHCU(target) ? GetHcuArchString(target) : "";
+  if (!TargetIsHCU(target) || (hcu_arch != "gfx946" && hcu_arch != "gfx92a") ||
+      dst->shape.size() < 2) {
+    return std::nullopt;
+  }
+
+  const size_t nd = dst->shape.size();
+  const int64_t *dim0 = as_const_int(dst->shape[nd - 2]);
+  const int64_t *dim1 = as_const_int(dst->shape[nd - 1]);
+  if (dim0 == nullptr || dim1 == nullptr) {
+    return std::nullopt;
+  }
+
+  int64_t leading_count = 1;
+  for (size_t i = 0; i + 2 < nd; ++i) {
+    const int64_t *dim = as_const_int(dst->shape[i]);
+    if (dim == nullptr) {
+      return std::nullopt;
+    }
+    leading_count *= *dim;
+  }
+
+  const int64_t block_mn = trans ? *dim0 : *dim1;
+  const int64_t block_k = trans ? *dim1 : *dim0;
+  if (block_mn <= 0 || block_k <= 0 || mls_tile_mn <= 0 || mls_tile_k <= 0 ||
+      block_mn % mls_tile_mn != 0 || block_k % mls_tile_k != 0) {
+    return std::nullopt;
+  }
+
+  const int64_t tile_issue_mn = block_mn / mls_tile_mn;
+  const int64_t tile_issue_k = block_k / mls_tile_k;
+  const int64_t logical_elements = block_mn * block_k;
+  int64_t packed_elements = logical_elements;
+  const int64_t bits_per_elem = DTypeStorageBits(dst->dtype);
+  int64_t packed_bytes = -1;
+
+  auto bytes_to_elements = [&](int64_t bytes) {
+    ICHECK_EQ((bytes * 8) % bits_per_elem, 0)
+        << "MLS packed byte size must be divisible by element storage bits";
+    return (bytes * 8) / bits_per_elem;
+  };
+
+  auto elements_to_bytes = [&](int64_t elements) {
+    return CeilDiv(elements * bits_per_elem, 8);
+  };
+
+  auto packed_bytes_for_4k_slots = [](int64_t contiguous_tiles,
+                                      int64_t payload_bytes) {
+    constexpr int64_t kSlotStrideBytes = 4096;
+    constexpr int64_t kSlotsPerGroup = 4;
+    if (contiguous_tiles <= 0) {
+      return int64_t{0};
+    }
+    const int64_t groups = CeilDiv(contiguous_tiles, kSlotsPerGroup);
+    const int64_t last_group_tiles =
+        contiguous_tiles - (groups - 1) * kSlotsPerGroup;
+    return (groups - 1) * (kSlotStrideBytes + kSlotsPerGroup * payload_bytes) +
+           kSlotStrideBytes + last_group_tiles * payload_bytes;
+  };
+
+  if (dst->dtype.bits() == 16 && trans && mls_tile_mn == 16 &&
+      mls_tile_k == 64) {
+    if (tile_issue_mn < 4 && tile_issue_k > 1) {
+      packed_bytes = packed_bytes_for_4k_slots(
+          tile_issue_mn * tile_issue_k,
+          elements_to_bytes(mls_tile_mn * (mls_tile_k / 2)));
+    } else {
+      packed_bytes = packed_bytes_for_4k_slots(
+          tile_issue_mn * tile_issue_k,
+          elements_to_bytes(mls_tile_mn * (mls_tile_k / 2)));
+    }
+  } else if (dst->dtype.bits() == 16 && !trans && mls_tile_mn == 64 &&
+             mls_tile_k == 16) {
+    if (tile_issue_k < 4 && tile_issue_mn > 1) {
+      packed_bytes = packed_bytes_for_4k_slots(
+          tile_issue_mn * tile_issue_k,
+          elements_to_bytes((mls_tile_mn / 2) * mls_tile_k));
+    } else {
+      packed_bytes = packed_bytes_for_4k_slots(
+          tile_issue_mn * tile_issue_k,
+          elements_to_bytes((mls_tile_mn / 2) * mls_tile_k));
+    }
+  } else if (dst->dtype.bits() == 8 && !trans && mls_tile_mn == 128 &&
+             mls_tile_k == 16) {
+    packed_bytes = packed_bytes_for_4k_slots(
+        tile_issue_mn * tile_issue_k,
+        elements_to_bytes((mls_tile_mn / 2) * mls_tile_k));
+  } else if (dst->dtype.bits() == 8 && trans && mls_tile_mn == 16 &&
+             mls_tile_k == 128) {
+    packed_bytes = packed_bytes_for_4k_slots(
+        tile_issue_mn * tile_issue_k,
+        elements_to_bytes(mls_tile_mn * (mls_tile_k / 2)));
+  } else if (dst->dtype.bits() == 4 && !trans && mls_tile_mn == 256 &&
+             mls_tile_k == 16) {
+    packed_bytes = packed_bytes_for_4k_slots(
+        tile_issue_mn * tile_issue_k,
+        elements_to_bytes((mls_tile_mn / 2) * mls_tile_k));
+  } else if (dst->dtype.bits() == 4 && trans && mls_tile_mn == 16 &&
+             mls_tile_k == 256) {
+    packed_bytes = packed_bytes_for_4k_slots(
+        tile_issue_mn * tile_issue_k,
+        elements_to_bytes(mls_tile_mn * (mls_tile_k / 2)));
+  }
+
+  if (packed_bytes > 0) {
+    packed_elements = bytes_to_elements(packed_bytes);
+  }
+
+  if (packed_elements <= logical_elements) {
+    return std::nullopt;
+  }
+  return Integer(leading_count * packed_bytes);
+}
+
+Optional<PrimExpr> TryGetMlsPackedLeadingElemOffset(const Buffer &buffer,
+                                                    const Array<Range> &ranges,
+                                                    int mls_tile_mn,
+                                                    int mls_tile_k, bool trans,
+                                                    Target target) {
+  if (ranges.size() <= 2 || buffer->shape.size() != ranges.size()) {
+    return std::nullopt;
+  }
+
+  auto actual_size_bytes = TryGetMlsDstActualSizeBytes(
+      buffer, mls_tile_mn, mls_tile_k, trans, target);
+  if (!actual_size_bytes) {
+    return std::nullopt;
+  }
+
+  int64_t leading_count = 1;
+  for (size_t i = 0; i + 2 < buffer->shape.size(); ++i) {
+    const int64_t *dim = as_const_int(buffer->shape[i]);
+    if (dim == nullptr) {
+      return std::nullopt;
+    }
+    leading_count *= *dim;
+  }
+  if (leading_count <= 0) {
+    return std::nullopt;
+  }
+
+  const int64_t *actual_bytes = as_const_int(actual_size_bytes.value());
+  if (actual_bytes == nullptr) {
+    return std::nullopt;
+  }
+  const int64_t bits_per_elem = DTypeStorageBits(buffer->dtype);
+  ICHECK_EQ((*actual_bytes * 8) % (leading_count * bits_per_elem), 0)
+      << "MLS packed leading offset must be representable in logical elements";
+  const int64_t packed_tile_elems =
+      (*actual_bytes * 8) / (leading_count * bits_per_elem);
+  if (packed_tile_elems <= 0) {
+    return std::nullopt;
+  }
+
+  DataType idx_dtype = buffer->DefaultIndexType();
+  PrimExpr leading_index = make_const(idx_dtype, 0);
+  PrimExpr stride = make_const(idx_dtype, 1);
+  for (int i = static_cast<int>(ranges.size()) - 3; i >= 0; --i) {
+    PrimExpr min = ranges[i]->min;
+    if (min.dtype() != idx_dtype) {
+      min = cast(idx_dtype, min);
+    }
+    leading_index = leading_index + min * stride;
+    PrimExpr dim = buffer->shape[i];
+    if (dim.dtype() != idx_dtype) {
+      dim = cast(idx_dtype, dim);
+    }
+    stride = stride * dim;
+  }
+
+  return leading_index * make_const(idx_dtype, packed_tile_elems);
 }
 
 MatrixLoad::MatrixLoad(Array<PrimExpr> args,
@@ -85,11 +268,16 @@ struct MlsTileConfig {
 };
 
 struct MlsTileConfigSet {
+  int elem_bits;
   const MlsTileConfig *trans;
   int trans_count;
   const MlsTileConfig *non_trans;
   int non_trans_count;
 };
+
+template <int N> constexpr int ArraySize(const MlsTileConfig (&)[N]) {
+  return N;
+}
 
 constexpr MlsTileConfig kMlsTileConfigsB16Trans[] = {
     {16, 64, true},
@@ -115,21 +303,38 @@ constexpr MlsTileConfig kMlsTileConfigsB8NonTrans[] = {
     {64, 16, false},
 };
 
-constexpr MlsTileConfigSet kMlsTileConfigTable[] = {
-    {nullptr, 0, nullptr, 0},
-    {kMlsTileConfigsB8Trans,
-     static_cast<int>(sizeof(kMlsTileConfigsB8Trans) /
-                      sizeof(kMlsTileConfigsB8Trans[0])),
-     kMlsTileConfigsB8NonTrans,
-     static_cast<int>(sizeof(kMlsTileConfigsB8NonTrans) /
-                      sizeof(kMlsTileConfigsB8NonTrans[0]))},
-    {kMlsTileConfigsB16Trans,
-     static_cast<int>(sizeof(kMlsTileConfigsB16Trans) /
-                      sizeof(kMlsTileConfigsB16Trans[0])),
-     kMlsTileConfigsB16NonTrans,
-     static_cast<int>(sizeof(kMlsTileConfigsB16NonTrans) /
-                      sizeof(kMlsTileConfigsB16NonTrans[0]))},
+constexpr MlsTileConfig kMlsTileConfigsB4Trans[] = {
+    {16, 256, false},
+    {16, 128, false},
 };
+
+constexpr MlsTileConfig kMlsTileConfigsB4NonTrans[] = {
+    {256, 16, false},
+    {128, 16, false},
+};
+
+constexpr MlsTileConfigSet kMlsTileConfigTable[] = {
+    {4, kMlsTileConfigsB4Trans, ArraySize(kMlsTileConfigsB4Trans),
+     kMlsTileConfigsB4NonTrans, ArraySize(kMlsTileConfigsB4NonTrans)},
+    {8, kMlsTileConfigsB8Trans, ArraySize(kMlsTileConfigsB8Trans),
+     kMlsTileConfigsB8NonTrans, ArraySize(kMlsTileConfigsB8NonTrans)},
+    {16, kMlsTileConfigsB16Trans, ArraySize(kMlsTileConfigsB16Trans),
+     kMlsTileConfigsB16NonTrans, ArraySize(kMlsTileConfigsB16NonTrans)},
+};
+
+const MlsTileConfigSet &GetMlsTileConfigSet(int elem_bits, Target target) {
+  if (elem_bits == 4) {
+    ICHECK_EQ(GetHcuArchString(target), "gfx946")
+        << "b4 matrix_load is only supported on gfx946";
+  }
+  for (const auto &config_set : kMlsTileConfigTable) {
+    if (config_set.elem_bits == elem_bits) {
+      return config_set;
+    }
+  }
+  LOG(FATAL) << "matrix_load unsupported element bitwidth: " << elem_bits;
+  return kMlsTileConfigTable[0];
+}
 
 } // namespace
 
@@ -160,7 +365,7 @@ int MlsScopedWarpIdOffset(const Range &thread_bounds, Target target) {
 }
 
 /*
- * MLS tile size rules (MN interleave=1, b16):
+ * MLS tile size rules (MN interleave=1):
  * num_warps = block_size / TargetGetWarpSize(target); warp_mn * warp_k =
  * num_warps. One warp group extent in K = warp_k * mlsTilesizeK. If > block_k,
  * warps repeat load.
@@ -169,9 +374,6 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
                              int block_size, Target target, int elem_bits,
                              int &warp_mn, int &warp_k, int &mls_tile_mn,
                              int &mls_tile_k) {
-  const int elem_bytes = elem_bits / 8;
-  ICHECK(elem_bytes == 1 || elem_bytes == 2) << "b16 or b8 only";
-
   int num_warps = block_size / TargetGetWarpSize(target);
   ICHECK(num_warps >= 1) << "num_warps must be >= 1";
 
@@ -196,7 +398,7 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
     return true;
   };
 
-  const MlsTileConfigSet &config_set = kMlsTileConfigTable[elem_bytes];
+  const MlsTileConfigSet &config_set = GetMlsTileConfigSet(elem_bits, target);
   const MlsTileConfig *configs =
       trans ? config_set.trans : config_set.non_trans;
   int config_count =
@@ -285,6 +487,8 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
     dtype_str = "tl::fp8_t";
   } else if (src->dtype.is_float8_e5m2() || src->dtype.is_float8_e5m2fnuz()) {
     dtype_str = "tl::bf8_t";
+  } else if (src->dtype.is_float4_e2m1fn()) {
+    dtype_str = "tl::pk_fp4_t";
   } else {
     LOG(FATAL) << "matrix_load unsupported dtype: " << src->dtype;
   }
@@ -295,8 +499,8 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
      << ", " << warp_k << ", " << dtype_str << ", 1, "
      << (mls_trans ? "true" : "false")
      << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
-     << (check_last_load ? "true" : "false") << ", "
-     << (last_load ? "true" : "false") << ">";
+     << dst->dtype.bits() << ", " << (check_last_load ? "true" : "false")
+     << ", " << (last_load ? "true" : "false") << ">";
 
   Buffer src_buf = T.buffer_remap.count(src) ? T.buffer_remap[src] : src;
   Buffer dst_buf = T.buffer_remap.count(dst) ? T.buffer_remap[dst] : dst;
@@ -332,18 +536,23 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
         << "matrix_load dst buffer rank must match dst region rank, got "
            "shape.size()="
         << dst_buf->shape.size() << " vs region rank=" << dr;
-    Array<PrimExpr> dst_idx_leading;
-    DataType dst_idx_dtype = dst_buf->DefaultIndexType();
-    for (size_t j = 0; j + 2 < dr; ++j) {
-      dst_idx_leading.push_back(this->dst_ranges[j]->min);
+    if (auto packed_offset = TryGetMlsPackedLeadingElemOffset(
+            dst_buf, this->dst_ranges, tile_mn, tile_k, mls_trans, T.target)) {
+      dst_leading_elem_offset = packed_offset.value();
+    } else {
+      Array<PrimExpr> dst_idx_leading;
+      DataType dst_idx_dtype = dst_buf->DefaultIndexType();
+      for (size_t j = 0; j + 2 < dr; ++j) {
+        dst_idx_leading.push_back(this->dst_ranges[j]->min);
+      }
+      dst_idx_leading.push_back(make_const(dst_idx_dtype, 0));
+      dst_idx_leading.push_back(make_const(dst_idx_dtype, 0));
+      Array<PrimExpr> dst_offs = dst_buf.OffsetOf(dst_idx_leading);
+      ICHECK_EQ(dst_offs.size(), 1u)
+          << "matrix_load dst OffsetOf expects a single flat offset, got size="
+          << dst_offs.size();
+      dst_leading_elem_offset = dst_offs[0];
     }
-    dst_idx_leading.push_back(make_const(dst_idx_dtype, 0));
-    dst_idx_leading.push_back(make_const(dst_idx_dtype, 0));
-    Array<PrimExpr> dst_offs = dst_buf.OffsetOf(dst_idx_leading);
-    ICHECK_EQ(dst_offs.size(), 1u)
-        << "matrix_load dst OffsetOf expects a single flat offset, got size="
-        << dst_offs.size();
-    dst_leading_elem_offset = dst_offs[0];
   }
 
   auto dst_ptr =
@@ -360,7 +569,17 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   call_args.push_back(dst_ptr);
   call_args.push_back(IntImm(DataType::Int(32), warp_id_offset));
 
-  return Evaluate(Call(DataType::Handle(), builtin::call_extern(), call_args));
+  Stmt stmt =
+      Evaluate(Call(DataType::Handle(), builtin::call_extern(), call_args));
+  if (auto actual_size_bytes = TryGetMlsDstActualSizeBytes(
+          dst_buf, tile_mn, tile_k, mls_trans, T.target)) {
+    Map<String, PrimExpr> actual_size_bytes_map;
+    actual_size_bytes_map.Set(dst_buf->data->name_hint,
+                              actual_size_bytes.value());
+    stmt = AttrStmt(actual_size_bytes_map, tl::attr::kMlsActualSizeBytesMap,
+                    Integer(0), std::move(stmt));
+  }
+  return stmt;
 }
 
 TIR_REGISTER_TL_TILE_OP(MatrixLoad, matrix_load)

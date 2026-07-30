@@ -7,6 +7,7 @@
 #define TVM_TL_OP_MLS_H_
 
 #include "operator.h"
+#include <tvm/target/target.h>
 
 namespace tvm {
 namespace tl {
@@ -22,9 +23,17 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
 
 /// Logical warp index base for scoped MLS: thread_bounds.min / warp_size.
 int MlsScopedWarpIdOffset(const Range &thread_bounds, Target target);
+TVM_DLL Optional<Integer>
+TryGetMlsDstActualSizeBytes(const Buffer &dst, int mls_tile_mn, int mls_tile_k,
+                            bool trans, Target target);
 
 /// Last-2 buffer dims as (MN, K) according to mls_trans.
 std::pair<int64_t, int64_t> MlsBlockDims(const Buffer &buf, bool mls_trans);
+
+TVM_DLL Optional<PrimExpr>
+TryGetMlsPackedLeadingElemOffset(const Buffer &buffer,
+                                 const Array<Range> &ranges, int mls_tile_mn,
+                                 int mls_tile_k, bool trans, Target target);
 
 class MatrixLoadNode : public TileOperatorNode {
 public:

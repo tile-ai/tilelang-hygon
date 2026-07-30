@@ -95,10 +95,10 @@ public:
                                            GemmInst gemm_inst) const;
 
   std::tuple<int, int, int>
-  computeWarpPartitionHCU(int M, int N, int K, int k_pack,
-                          int element_byte_size, int block_size, Target target,
-                          GemmInst gemm_inst, bool A_from_mls = false,
-                          bool B_from_mls = false, bool A_mls_trans = true,
+  computeWarpPartitionHCU(int M, int N, int K, int k_pack, int element_bits,
+                          int block_size, Target target, GemmInst gemm_inst,
+                          bool A_from_mls = false, bool B_from_mls = false,
+                          bool A_mls_trans = true,
                           bool B_mls_trans = true) const;
 
   bool isSquare() const {

@@ -368,6 +368,69 @@ private:
   size_t scope_level_{0};
 };
 
+class SharedMemorySpecialSizeCollector : public StmtExprVisitor {
+public:
+  static std::unordered_map<const VarNode *, PrimExpr>
+  Collect(const Stmt &stmt) {
+    SharedMemorySpecialSizeCollector collector;
+    collector(stmt);
+    return collector.buffer_size_bytes_;
+  }
+
+private:
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tl::attr::kMlsActualSizeBytesMap) {
+      if (auto map = op->node.as<Map<String, PrimExpr>>()) {
+        for (const auto &[var_name, actual_size_bytes] : map.value()) {
+          pending_buffer_size_bytes_[std::string(var_name)] = actual_size_bytes;
+        }
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const EvaluateNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    if (call == nullptr || !tl::IsMlsLoadTileExternCall(call)) {
+      return StmtExprVisitor::VisitStmt_(op);
+    }
+
+    ICHECK(call->args.size() == 8U || call->args.size() == 9U)
+        << "mls_load_tile extern expects symbol, src, stride, mn_len, k_len, "
+           "mn_base, k_base, dst[, warp_id_offset]";
+    const PrimExpr &dst_ptr_expr = call->args[7];
+    const auto *dst_ptr_call = dst_ptr_expr.as<CallNode>();
+    if (dst_ptr_call == nullptr ||
+        !dst_ptr_call->op.same_as(builtin::tvm_access_ptr()) ||
+        dst_ptr_call->args.size() < 2) {
+      LOG(DEBUG) << "SharedMemorySpecialSizeCollector: unexpected dst_ptr for "
+                 << "lowered MLS extern call, value=" << dst_ptr_expr;
+      return StmtExprVisitor::VisitStmt_(op);
+    }
+
+    const auto *buffer_var = dst_ptr_call->args[1].as<VarNode>();
+    if (buffer_var == nullptr) {
+      LOG(DEBUG) << "SharedMemorySpecialSizeCollector: failed to recover dst "
+                 << "buffer var from lowered MLS extern call, dst_ptr="
+                 << dst_ptr_expr;
+      return StmtExprVisitor::VisitStmt_(op);
+    }
+
+    auto it =
+        pending_buffer_size_bytes_.find(std::string(buffer_var->name_hint));
+    if (it != pending_buffer_size_bytes_.end()) {
+      LOG(DEBUG)
+          << "SharedMemorySpecialSizeCollector: found lowered MLS size for "
+          << buffer_var->name_hint << ", actual_size_bytes=" << it->second;
+      buffer_size_bytes_[buffer_var] = it->second;
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  std::unordered_map<const VarNode *, PrimExpr> buffer_size_bytes_;
+  std::unordered_map<std::string, PrimExpr> pending_buffer_size_bytes_;
+};
+
 class SharedMemoryAlignmentPlanner : public StmtExprVisitor {
 
 public:
@@ -454,6 +517,10 @@ public:
    */
   void PlanReuse(const Stmt &stmt, bool is_dynamic = true,
                  bool enable_aggressive_merge = false, bool verbose = false) {
+    auto collected_special_size_bytes =
+        SharedMemorySpecialSizeCollector::Collect(stmt);
+    special_size_bytes_.insert(collected_special_size_bytes.begin(),
+                               collected_special_size_bytes.end());
     SharedMemLinearAccessPatternFinder finder(is_dynamic,
                                               enable_aggressive_merge, verbose);
     finder(stmt);
@@ -483,8 +550,7 @@ private:
           auto alloc_it = shmem_allocs_.find(buffer_var_node);
           if (alloc_it != shmem_allocs_.end()) {
             const AllocateNode *alloc = alloc_it->second;
-            PrimExpr buffer_size_bytes =
-                alloc->extents[0] * alloc->dtype.bytes() * alloc->dtype.lanes();
+            PrimExpr buffer_size_bytes = GetAllocSizeBytes(alloc);
             LOG(DEBUG) << "    Buffer: " << buffer_var_node->name_hint
                        << " (Type: " << alloc->dtype << ")"
                        << ", Start Offset: " << byte_offset
@@ -637,7 +703,15 @@ private:
     auto it = buffer_byte_offsets_.find(buffer_var.get());
     ICHECK(it != buffer_byte_offsets_.end())
         << "buffer_var = " << buffer_var->name_hint << ", dtype = " << dtype;
-    return indexdiv(it->second, dtype.bytes() * dtype.lanes());
+    return indexdiv(it->second * 8, dtype.bits() * dtype.lanes());
+  }
+
+  PrimExpr GetAllocSizeBytes(const AllocateNode *alloc) const {
+    auto it = special_size_bytes_.find(alloc->buffer_var.get());
+    if (it != special_size_bytes_.end()) {
+      return it->second;
+    }
+    return alloc->extents[0] * alloc->dtype.bytes() * alloc->dtype.lanes();
   }
 
   // Wrapper function to determine if the shared memory allocation for a
@@ -1220,12 +1294,24 @@ private:
         }
         size_expr = size_expr * e;
       }
+      if (auto special_it = special_size_bytes_.find(var);
+          special_it != special_size_bytes_.end()) {
+        size_expr = special_it->second;
+        size_dtype = size_expr.dtype();
+      }
       info.size_dtype = size_dtype;
       info.size_expr = size_expr;
 
-      int64_t const_extent = alloc->ConstantAllocationSize();
-      if (const_extent >= 0) {
-        info.const_size_bytes = const_extent * bytes_per_elem;
+      if (auto special_it = special_size_bytes_.find(var);
+          special_it != special_size_bytes_.end()) {
+        if (const int64_t *size_bytes = as_const_int(special_it->second)) {
+          info.const_size_bytes = *size_bytes;
+        }
+      } else {
+        int64_t const_extent = alloc->ConstantAllocationSize();
+        if (const_extent >= 0) {
+          info.const_size_bytes = const_extent * bytes_per_elem;
+        }
       }
 
       buf_infos.push_back(std::move(info));
@@ -1387,6 +1473,8 @@ private:
   PrimExpr merged_alloc_size_{0};
   // The mapping from the original buffer var to its offset in the merged buffer
   std::unordered_map<const VarNode *, PrimExpr> buffer_byte_offsets_;
+  // Per-buffer allocation size overrides for special shared-memory layouts.
+  std::unordered_map<const VarNode *, PrimExpr> special_size_bytes_;
   // The mapping from the original buffer objects to their location in the
   // merged buffer.
   std::unordered_map<const BufferNode *, Buffer> buffer_remap_;
@@ -1408,12 +1496,28 @@ Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
                                   align_bytes);
     rewriter.PlanReuse(stmt, true, enable_aggressive_merge);
     stmt = rewriter(std::move(stmt));
+  } else if (collector.dyn_shmem_allocs_.size() == 1) {
+    auto special_size_bytes = SharedMemorySpecialSizeCollector::Collect(stmt);
+    if (!special_size_bytes.empty()) {
+      SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_, true, verbose,
+                                    align_bytes);
+      rewriter.PlanReuse(stmt, true, enable_aggressive_merge);
+      stmt = rewriter(std::move(stmt));
+    }
   }
   if (merge_static_smem && collector.static_shmem_allocs_.size() > 1) {
     SharedMemoryRewriter rewriter(collector.static_shmem_allocs_, false,
                                   verbose, align_bytes);
     rewriter.PlanReuse(stmt, false, enable_aggressive_merge);
     stmt = rewriter(std::move(stmt));
+  } else if (merge_static_smem && collector.static_shmem_allocs_.size() == 1) {
+    auto special_size_bytes = SharedMemorySpecialSizeCollector::Collect(stmt);
+    if (!special_size_bytes.empty()) {
+      SharedMemoryRewriter rewriter(collector.static_shmem_allocs_, false,
+                                    verbose, align_bytes);
+      rewriter.PlanReuse(stmt, false, enable_aggressive_merge);
+      stmt = rewriter(std::move(stmt));
+    }
   }
   return stmt;
 }

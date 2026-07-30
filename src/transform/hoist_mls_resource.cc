@@ -88,7 +88,8 @@ std::string MlsBaseTemplateFromLoadTile(const std::string &sym) {
       << "mls_load_tile expects at least 8 template args";
   std::ostringstream os;
   os << "tl::mls::tilelang_mls_base<";
-  for (size_t i = 0; i < 8; ++i) {
+  const size_t base_arg_count = args.size() > 10 ? 9 : 8;
+  for (size_t i = 0; i < base_arg_count; ++i) {
     if (i != 0)
       os << ", ";
     os << args[i];
@@ -111,8 +112,11 @@ MlsLastLoadTemplateArgs(const std::string &sym) {
   auto args = SplitTopLevelTemplateArgs(
       sym.substr(std::strlen(kMlsLoadTilePrefix),
                  sym.size() - std::strlen(kMlsLoadTilePrefix) - 1));
-  std::string check_last_load = args.size() > 8 ? args[8] : "true";
-  std::string last_load = args.size() > 9 ? args[9] : "false";
+  const size_t check_idx = args.size() > 10 ? 9 : 8;
+  const size_t last_idx = args.size() > 10 ? 10 : 9;
+  std::string check_last_load =
+      args.size() > check_idx ? args[check_idx] : "true";
+  std::string last_load = args.size() > last_idx ? args[last_idx] : "false";
   return {check_last_load, last_load};
 }
 

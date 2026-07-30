@@ -140,6 +140,8 @@ def hcu_mls_ds_read_dtype_str(dtype) -> str:
         return "tl::fp8_t"
     if "e5m2" in s:
         return "tl::bf8_t"
+    if "float4_e2m1fn" in s:
+        return "tl::pk_fp4_t"
     if "bfloat16" in s or s == "bf16":
         return "bfloat16_t"
     if ("float16" in s or s in ("fp16", "half")) and "float8" not in s:
@@ -195,9 +197,9 @@ def build_ds_read_format_tensor_b_template(
     )
 
 
-def min_n_per_warp_for_b(*, b_mls: bool, b_mls_trans: bool) -> int:
+def min_n_per_warp_for_b(*, b_mls: bool, b_mls_trans: bool, element_bits: int | None = None) -> int:
     """Match ``gemm_mls`` / ``ds_read_format_tensor_b`` MinNPerWarp."""
-    if b_mls and not b_mls_trans:
+    if b_mls and (element_bits == 4 or not b_mls_trans):
         return 32
     return 16
 

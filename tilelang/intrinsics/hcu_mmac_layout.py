@@ -246,6 +246,8 @@ def _micro_to_local_layout_fn(element_bits: int, micro_k: int) -> Callable:
         if micro_k <= 32:
             return shared_16x32_to_local_64x8_layout_A
         return shared_16x64_to_local_64x16_layout_A
+    if element_bits == 4:
+        return shared_16x64_to_local_64x16_layout_A
     raise ValueError(f"unsupported element bitwidth={element_bits}")
 
 

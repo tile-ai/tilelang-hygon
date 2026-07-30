@@ -184,7 +184,7 @@ GemmInst GemmNode::getGemmInst(int block_size, Target target) const {
 }
 
 std::tuple<int, int, int> GemmWarpPolicyNode::computeWarpPartitionHCU(
-    int M, int N, int K, int k_pack, int element_byte_size, int block_size,
+    int M, int N, int K, int k_pack, int element_bits, int block_size,
     Target target, GemmInst gemm_inst, bool A_from_mls, bool B_from_mls,
     bool A_mls_trans, bool B_mls_trans) const {
   bool use_mls = A_from_mls || B_from_mls;
@@ -196,16 +196,28 @@ std::tuple<int, int, int> GemmWarpPolicyNode::computeWarpPartitionHCU(
   int m_warp = 1, n_warp = 1, k_warp = 1;
   int kMPerWarp = 16; // Rows processed by a single warp
   int kNPerWarp = 16; // Columns processed by a single warp
-  if (A_from_mls && !A_mls_trans) {
-    kMPerWarp = 32; // min ds_read_format tilesize
+  if (element_bits == 4) {
+    // b4 no-pad on gfx946:
+    // - trans ds_read_matrix_format supports 16x128, so atbn can use MN=16.
+    // - non-trans b4 only supports 32x64, so anbt needs MN=32.
+    if (A_from_mls && !A_mls_trans) {
+      kMPerWarp = 32; // b4 non-trans ds_read_format min MN tile
+    }
+    if (B_from_mls && !B_mls_trans) {
+      kNPerWarp = 32; // b4 non-trans ds_read_format min MN tile
+    }
+  } else {
+    if (A_from_mls && !A_mls_trans) {
+      kMPerWarp = 32; // min ds_read_format tilesize
+    }
+    if (B_from_mls && !B_mls_trans) {
+      kNPerWarp = 32; // min ds_read_format tilesize
+    }
   }
-  if (B_from_mls && !B_mls_trans) {
-    kNPerWarp = 32; // min ds_read_format tilesize
-  }
-  ICHECK(element_byte_size == 1 || element_byte_size == 2 ||
-         element_byte_size == 4)
-      << "element byte width=" << element_byte_size;
-  int kKPerWarp = k_pack * (32 / element_byte_size);
+  ICHECK(element_bits == 4 || element_bits == 8 || element_bits == 16 ||
+         element_bits == 32)
+      << "element bitwidth=" << element_bits;
+  int kKPerWarp = k_pack * (256 / element_bits);
 
   ICHECK(M % kMPerWarp == 0)
       << "M must be divisible by " << kMPerWarp << ", but got " << M;
@@ -697,10 +709,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef().def(
       "tl.GemmWarpPolicyComputeWarpPartitionHCU",
       [](GemmWarpPolicy policy, int M, int N, int K, int k_pack,
-         int element_byte_size, int block_size, Target target, int gemm_inst,
+         int element_bits, int block_size, Target target, int gemm_inst,
          bool A_from_mls, bool B_from_mls, bool A_mls_trans, bool B_mls_trans) {
         policy->computeWarpPartitionHCU(
-            M, N, K, k_pack, element_byte_size, block_size, target,
+            M, N, K, k_pack, element_bits, block_size, target,
             static_cast<GemmInst>(gemm_inst), A_from_mls, B_from_mls,
             A_mls_trans, B_mls_trans);
       });
