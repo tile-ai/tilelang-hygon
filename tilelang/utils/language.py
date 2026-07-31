@@ -77,6 +77,11 @@ def is_shared_dynamic(buffer: BufferLikeType) -> bool:
     return buffer.scope() == "shared.dyn"
 
 
+def is_scale_buffer(buffer: BufferLikeType) -> bool:
+    """Check if the buffer is an HCU scale_buffer (scope ``shared.scale``)."""
+    return buffer.scope() == "shared.scale"
+
+
 def is_tensor_memory(buffer: BufferLikeType) -> bool:
     """
     Check if the buffer is in tensor memory scope (e.g., shared.tmem).

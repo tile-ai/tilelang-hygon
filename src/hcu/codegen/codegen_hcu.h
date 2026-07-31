@@ -171,6 +171,11 @@ private:
   bool enable_fp8_{false};
   // whether need gemm_mls.h (when gemm uses MLS or matrix_load exists)
   bool enable_gemm_mls_{false};
+  // whether need scale_buffer.hpp (ds_scale_copy / mmac_scale_fp4)
+  bool enable_scale_buffer_{false};
+  // IndexMap-generated compile-time LDS layout descriptors, deduplicated by
+  // stable functor name and emitted after scale_buffer.hpp is included.
+  std::unordered_map<std::string, std::string> scale_layout_functors_;
   // The size of the barrier array in shared memory
   int barrier_count_ = -1;
   // whether need mma.h

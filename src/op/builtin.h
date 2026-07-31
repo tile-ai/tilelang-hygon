@@ -70,6 +70,7 @@ static constexpr const char *kLexicalAllocScope = "lexical_alloc_scope";
 // Set by LowerAndValidateHcuWdra on gfx946 WDRA kernels.
 static constexpr const char *kHcuWdra = "tl.hcu_wdra";
 static constexpr const char *kHcuWdraWavesPerTg = "tl.hcu_wdra_waves_per_tg";
+static constexpr const char *kHcuScaleBufferSize = "tl.hcu_scale_buffer_size";
 // AttrStmt key carrying Map<String, PrimExpr> from MLS destination buffer data
 // Var name to the byte size required by the backend LDS layout.
 static constexpr const char *kMlsActualSizeBytesMap =

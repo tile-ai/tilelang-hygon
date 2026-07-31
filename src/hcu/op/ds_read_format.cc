@@ -15,6 +15,7 @@
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 
+#include <algorithm>
 #include <map>
 
 namespace tvm {
@@ -96,7 +97,7 @@ std::string DsReadFormatDTypeString(DataType dtype) {
   if (dtype.is_float8_e5m2() || dtype.is_float8_e5m2fnuz()) {
     return "tl::bf8_t";
   }
-  if (dtype.is_float4_e2m1fn()) {
+  if (dtype.is_float4()) {
     return "tl::pk_fp4_t";
   }
   if (dtype.is_uint() && dtype.bits() == 8) {
@@ -133,12 +134,13 @@ DsReadMlsPhysicalInfo InferDsReadMlsPhysicalInfo(const Buffer &src, bool trans,
                                                  Target target) {
   auto [lds_mn, lds_k] = MlsBlockDims(src, trans);
   DsReadMlsPhysicalInfo info{0, 0, 0, 0, src->dtype.bits()};
-  ComputeMlsWarpPartition(trans, static_cast<int>(lds_mn),
-                          static_cast<int>(lds_k), block_size, target,
-                          src->dtype.bits(), info.warp_mn, info.warp_k,
-                          info.tile_mn, info.tile_k);
-  info.element_bits = GetMlsLdsPhysicalBits(src->dtype, trans, info.tile_mn,
-                                            info.tile_k, target);
+  const bool fp4 = src->dtype.is_float4();
+  const int requested_lds_bits = src->dtype.bits();
+  ComputeMlsWarpPartition(
+      trans, static_cast<int>(lds_mn), static_cast<int>(lds_k), block_size,
+      target, fp4 ? 4 : src->dtype.bits(), info.warp_mn, info.warp_k,
+      info.tile_mn, info.tile_k, requested_lds_bits);
+  info.element_bits = src->dtype.bits();
   return info;
 }
 
@@ -149,30 +151,16 @@ LayoutMap InferLayoutWithGemmDep(const DsReadFormatNode *self,
   GemmWarpPolicy policy(meta->gemm_policy);
   int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
   int element_bits = self->dst->dtype.bits();
-  if (self->src->dtype.is_float4_e2m1fn()) {
-    element_bits =
-        InferDsReadMlsPhysicalInfo(self->src, meta->trans, block_size, T.target)
-            .element_bits;
-  }
   const bool a_mls_trans = !meta->gemm_trans_a;
   const bool b_mls_trans = meta->gemm_trans_b;
-  hcu::ComputeWarpPartitionHCU(*policy.get(), meta->gemm_m, meta->gemm_n,
-                               meta->gemm_k, meta->gemm_k_pack, element_bits,
-                               block_size, T.target, meta->a_from_mls,
-                               meta->b_from_mls, a_mls_trans, b_mls_trans);
+  hcu::HcuMnPerWarp floors = hcu::ComputeWarpPartitionHCU(
+      *policy.get(), meta->gemm_m, meta->gemm_n, meta->gemm_k,
+      meta->gemm_k_pack, element_bits, block_size, T.target, meta->a_from_mls,
+      meta->b_from_mls, a_mls_trans, b_mls_trans, meta->min_m_per_warp,
+      meta->min_n_per_warp);
   int warp_m = policy->m_warp;
   int warp_n = policy->n_warp;
   int warp_k = policy->k_warp;
-  int min_n_per_warp = 16;
-  if (meta->feeds_slot == 1) {
-    if (element_bits == 4) {
-      // gfx946 b4 no-pad: B trans can use 16x128 reads, while B non-trans
-      // only has 32x64 reads.
-      min_n_per_warp = b_mls_trans ? 16 : 32;
-    } else {
-      min_n_per_warp = b_mls_trans ? 16 : 32;
-    }
-  }
   Fragment fragment =
       meta->feeds_slot == 0
           ? makeGemmFragmentAHCU(meta->gemm_m, meta->gemm_n, meta->gemm_k,
@@ -181,7 +169,7 @@ LayoutMap InferLayoutWithGemmDep(const DsReadFormatNode *self,
           : makeGemmFragmentBHCU(meta->gemm_m, meta->gemm_n, meta->gemm_k,
                                  warp_m, warp_n, warp_k, element_bits,
                                  meta->gemm_k_pack, meta->gemm_trans_b,
-                                 min_n_per_warp);
+                                 floors.n_per_warp);
   auto layout = fragment->BindThreadRange(T.thread_bounds);
   if (T.layout_map.count(self->dst)) {
     if (!StructuralEqual()(layout, T.layout_map[self->dst])) {
@@ -356,9 +344,16 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   tile_mn = info.tile_mn;
   tile_k = info.tile_k;
   const int lds_physical_bits = info.element_bits;
-  int reg_bits = dst->dtype.bits();
-  if (src->dtype.is_float4_e2m1fn() && lds_physical_bits == 8) {
-    reg_bits = 8;
+  const int reg_bits = dst->dtype.bits();
+  if (src->dtype.is_float4()) {
+    ICHECK(dst->dtype.is_float4())
+        << "ds_read_format FP4 source requires packed/unpacked FP4 fragment, "
+           "got dst dtype="
+        << dst->dtype;
+    ICHECK(!(src->dtype.is_float4_e2m1_unpacked() &&
+             dst->dtype.is_float4_e2m1fn()))
+        << "ds_read_format does not support unpacked-b8 LDS to packed-b4 "
+           "fragment compression";
   }
 
   const int64_t *origin_mn_c = as_const_int(origin_mn);
@@ -389,7 +384,8 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     hcu::ComputeWarpPartitionHCU(*policy.get(), meta->gemm_m, meta->gemm_n,
                                  meta->gemm_k, meta->gemm_k_pack, reg_bits,
                                  block_size, T.target, meta->a_from_mls,
-                                 meta->b_from_mls, a_mls_trans, b_mls_trans);
+                                 meta->b_from_mls, a_mls_trans, b_mls_trans,
+                                 meta->min_m_per_warp, meta->min_n_per_warp);
     int warp_m = policy->m_warp;
     int warp_n = policy->n_warp;
     int warp_k_part = policy->k_warp;
@@ -407,7 +403,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   }
 
   std::string dtype_str = DsReadFormatDTypeString(src->dtype);
-  std::string target_dtype_str = src->dtype.is_float4_e2m1fn() && reg_bits == 8
+  std::string target_dtype_str = dst->dtype.is_float4_e2m1_unpacked()
                                      ? "uint8_t"
                                      : DsReadFormatDTypeString(dst->dtype);
 

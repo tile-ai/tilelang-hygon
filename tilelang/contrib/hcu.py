@@ -335,19 +335,13 @@ def _compile_asm_with_aillvm(asm_input, arch, file_target, temp, verbose=False):
     if verbose:
         print(_sanitize_hcu_visible_text(py_str(compile_ret.stdout)))
     if compile_ret.returncode != 0:
-        raise RuntimeError(
-            "Assembly compile error:\n"
-            + _sanitize_hcu_visible_text(py_str(compile_ret.stdout))
-        )
+        raise RuntimeError("Assembly compile error:\n" + _sanitize_hcu_visible_text(py_str(compile_ret.stdout)))
 
     link_ret = subprocess.run(link_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if verbose:
         print(_sanitize_hcu_visible_text(py_str(link_ret.stdout)))
     if link_ret.returncode != 0:
-        raise RuntimeError(
-            "Assembly link error:\n"
-            + _sanitize_hcu_visible_text(py_str(link_ret.stdout))
-        )
+        raise RuntimeError("Assembly link error:\n" + _sanitize_hcu_visible_text(py_str(link_ret.stdout)))
 
 
 def compile_hcu(

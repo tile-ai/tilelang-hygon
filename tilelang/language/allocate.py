@@ -225,6 +225,21 @@ def alloc_cluster_barrier(arrive_count: int | list[int]) -> Buffer:
     return buffer
 
 
+def alloc_scale_buffer(shape: ShapeType, dtype: DType = "uint8") -> Buffer:
+    """Allocate a logical HCU scale_buffer view (scope ``shared.scale``).
+
+    Physical ``start_row`` / slot occupancy are assigned by the HCU
+    AllocateScaleBuffer + RewriteScaleBufferRowBase passes. Scale major-order is
+    declared on ``T.gemm_blockscaled`` via ``a_scale_k_major`` /
+    ``b_scale_k_major``, not on this buffer.
+
+    Rank is 2D only. Multi-stage pingpong should use two 2D buffers (two
+    ``row_base``s), not a stage dimension on ``shared.scale``.
+    """
+    assert len(shape) == 2, "scale_buffer shape must be 2D (use two buffers for pingpong)"
+    return T.sblock_alloc_buffer(shape, dtype, scope="shared.scale")
+
+
 def alloc_tmem(shape: ShapeType, dtype: DType) -> Buffer:
     """
     Allocate a Tensor Memory (TMEM) buffer for use with 5th generation Tensor Core operations (e.g., TCGEN5.MMA).

@@ -35,6 +35,13 @@ def _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2):
     torch.testing.assert_close(lib_out.cpu(), ref_out.cpu(), atol=atol, rtol=rtol)
 
 
+def _mls_dst_dtype(src_dtype):
+    """gfx92a MLS expands packed FP4 into an explicitly unpacked LDS view."""
+    if current_hcu_arch_string() == "gfx92a" and str(src_dtype) == "float4_e2m1fn":
+        return T.float4_e2m1_unpacked
+    return src_dtype
+
+
 def _waitcnt_imms(source: str) -> list[int]:
     return [int(x) for x in re.findall(rf"{_WAITCNT_RE}\((\d+)\)", source)]
 
@@ -170,6 +177,7 @@ def matmul_mls(
     B_shape = (N, K) if trans_B else (K, N)
     A_shared_shape = (block_K, block_M) if trans_A else (block_M, block_K)
     B_shared_shape = (block_N, block_K) if trans_B else (block_K, block_N)
+    mls_dtype = _mls_dst_dtype(in_dtype)
 
     @T.prim_func
     def main(
@@ -178,8 +186,8 @@ def matmul_mls(
         C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-            A_shared = T.alloc_shared(A_shared_shape, in_dtype)
-            B_shared = T.alloc_shared(B_shared_shape, in_dtype)
+            A_shared = T.alloc_shared(A_shared_shape, mls_dtype)
+            B_shared = T.alloc_shared(B_shared_shape, mls_dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
@@ -212,12 +220,14 @@ def matmul_mls_ds_read_format(
     threads,
     num_stages=0,
     k_pack=1,
+    mls_dtype=None,
 ):
     """GEMM with both A and B: matrix_load -> ds_read_format -> gemm."""
     A_shape = (K, M) if trans_A else (M, K)
     B_shape = (N, K) if trans_B else (K, N)
     A_shared_shape = (block_K, block_M) if trans_A else (block_M, block_K)
     B_shared_shape = (block_N, block_K) if trans_B else (block_K, block_N)
+    mls_dtype = _mls_dst_dtype(in_dtype) if mls_dtype is None else mls_dtype
 
     @T.prim_func
     def main(
@@ -226,10 +236,10 @@ def matmul_mls_ds_read_format(
         C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-            A_shared = T.alloc_shared(A_shared_shape, in_dtype)
-            B_shared = T.alloc_shared(B_shared_shape, in_dtype)
-            A_fragment = T.alloc_fragment(A_shared_shape, in_dtype)
-            B_fragment = T.alloc_fragment(B_shared_shape, in_dtype)
+            A_shared = T.alloc_shared(A_shared_shape, mls_dtype)
+            B_shared = T.alloc_shared(B_shared_shape, mls_dtype)
+            A_fragment = T.alloc_fragment(A_shared_shape, mls_dtype)
+            B_fragment = T.alloc_fragment(B_shared_shape, mls_dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
@@ -269,6 +279,8 @@ def matmul_mls_ds_read_format_mixed(
     B_shape = (N, K) if trans_B else (K, N)
     A_shared_shape = (block_K, block_M) if trans_A else (block_M, block_K)
     B_shared_shape = (block_N, block_K) if trans_B else (block_K, block_N)
+    a_mls_dtype = _mls_dst_dtype(a_dtype)
+    b_mls_dtype = _mls_dst_dtype(b_dtype)
 
     @T.prim_func
     def main(
@@ -277,8 +289,8 @@ def matmul_mls_ds_read_format_mixed(
         C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-            A_shared = T.alloc_shared(A_shared_shape, a_dtype)
-            B_shared = T.alloc_shared(B_shared_shape, b_dtype)
+            A_shared = T.alloc_shared(A_shared_shape, a_mls_dtype)
+            B_shared = T.alloc_shared(B_shared_shape, b_mls_dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=0):
@@ -1186,8 +1198,10 @@ def run_gemm_mls_ds_read_format_b4(
     block_N=32,
     block_K=128,
     num_threads=64,
+    direct_shared=False,
 ):
-    program = matmul_mls_ds_read_format(
+    builder = matmul_mls if direct_shared else matmul_mls_ds_read_format
+    program = builder(
         M,
         N,
         K,
@@ -1253,6 +1267,7 @@ def run_gemm_mls_ds_read_format_b4_pad(
         "float32",
         "float32",
         num_threads,
+        mls_dtype=T.float4_e2m1_unpacked,
     )
     kernel = tl.compile(program, out_idx=[2])
     source = kernel.get_kernel_source()
@@ -1333,7 +1348,7 @@ def run_gemm_mls_mix_f4f6f8(
     assert "__builtin_hcu_mmac_f32_16x16x32_f8f6f4" in source
     assert "__builtin_hcu_mmac_f32_16x16x64_fp4" not in source
     if arch == "gfx946":
-        assert "uint8_t, 4, 8>" in source
+        assert "uint8_t, 4, 8" in source
         assert "__builtin_hcu_mmac_f32_16x16x32_f8f6f4_lit_lts" in source
     else:
         assert "uint8_t, 8, 8>" in source
@@ -1484,7 +1499,7 @@ def test_mls_ds_read_format_b4_copy_to_global(M, K, block_M, block_K, num_thread
 
 @pytest.mark.skipif(
     not target_supports_mls_b4(),
-    reason="b4 matrix_load/mmac is only supported on gfx946",
+    reason="packed FP4 matrix_load source is only supported on gfx92a/gfx946",
 )
 @pytest.mark.parametrize(
     "M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads",
@@ -1499,7 +1514,7 @@ def test_mls_ds_read_format_b4_copy_to_global(M, K, block_M, block_K, num_thread
     ],
 )
 def test_gemm_mls_b4_nopad(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
-    """b4 nopad GEMM cases covering both asymmetric transpose modes."""
+    """FP4-source GEMM; gfx92a explicitly expands the matrix_load destination to b8."""
     run_gemm_mls_ds_read_format_b4(
         M=M,
         N=N,
@@ -1510,6 +1525,26 @@ def test_gemm_mls_b4_nopad(M, N, K, trans_A, trans_B, block_M, block_N, block_K,
         block_N=block_N,
         block_K=block_K,
         num_threads=num_threads,
+    )
+
+
+@pytest.mark.skipif(
+    not target_supports_mls_b4(),
+    reason="packed FP4 matrix_load source is only supported on gfx92a/gfx946",
+)
+def test_gemm_mls_b4_shared_k32_auto_expand():
+    """Packed FP4 LDS is expanded by the implicit ds_read when native K64 cannot fit."""
+    run_gemm_mls_ds_read_format_b4(
+        M=128,
+        N=128,
+        K=32,
+        trans_A=True,
+        trans_B=False,
+        block_M=128,
+        block_N=128,
+        block_K=32,
+        num_threads=64,
+        direct_shared=True,
     )
 
 

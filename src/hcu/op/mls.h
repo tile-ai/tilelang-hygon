@@ -19,12 +19,7 @@ using namespace ffi;
 void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
                              int block_size, Target target, int elem_bits,
                              int &warp_mn, int &warp_k, int &mls_tile_mn,
-                             int &mls_tile_k);
-
-/// Physical element bits written to LDS for an MLS tile. For fp4, this can
-/// differ from the logical/source bits when matrix_load expands b4 to b8.
-int GetMlsLdsPhysicalBits(DataType dtype, bool trans, int mls_tile_mn,
-                          int mls_tile_k, Target target);
+                             int &mls_tile_k, int requested_lds_bits = 0);
 
 /// Logical warp index base for scoped MLS: thread_bounds.min / warp_size.
 int MlsScopedWarpIdOffset(const Range &thread_bounds, Target target);

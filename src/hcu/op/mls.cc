@@ -336,25 +336,7 @@ const MlsTileConfigSet &GetMlsTileConfigSet(int elem_bits, Target target) {
   return kMlsTileConfigTable[0];
 }
 
-bool IsFp4B8LdsTile(bool trans, int mls_tile_mn, int mls_tile_k) {
-  return (!trans && mls_tile_mn == 64 && mls_tile_k == 16) ||
-         (trans && mls_tile_mn == 16 && mls_tile_k == 64);
-}
-
 } // namespace
-
-int GetMlsLdsPhysicalBits(DataType dtype, bool trans, int mls_tile_mn,
-                          int mls_tile_k, Target target) {
-  if (!TargetIsHCU(target) || !dtype.is_float4_e2m1fn()) {
-    return dtype.bits();
-  }
-  const std::string arch = GetHcuArchString(target);
-  if ((arch == "gfx92a" || arch == "gfx946") &&
-      IsFp4B8LdsTile(trans, mls_tile_mn, mls_tile_k)) {
-    return 8;
-  }
-  return dtype.bits();
-}
 
 std::pair<int64_t, int64_t> MlsBlockDims(const Buffer &buf, bool mls_trans) {
   ICHECK(buf->shape.size() >= 2);
@@ -391,7 +373,7 @@ int MlsScopedWarpIdOffset(const Range &thread_bounds, Target target) {
 void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
                              int block_size, Target target, int elem_bits,
                              int &warp_mn, int &warp_k, int &mls_tile_mn,
-                             int &mls_tile_k) {
+                             int &mls_tile_k, int requested_lds_bits) {
   int num_warps = block_size / TargetHcuGetWarpSize(target);
   ICHECK(num_warps >= 1) << "num_warps must be >= 1";
 
@@ -444,8 +426,12 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
   };
 
   if (elem_bits == 4) {
+    ICHECK(requested_lds_bits == 0 || requested_lds_bits == 4 ||
+           requested_lds_bits == 8)
+        << "FP4 matrix_load requested LDS bits must be 0/4/8, got "
+        << requested_lds_bits;
     const std::string arch = GetHcuArchString(target);
-    if (arch == "gfx946") {
+    if (requested_lds_bits != 8 && arch == "gfx946") {
       const MlsTileConfig *b4_configs =
           trans ? kMlsTileConfigsB4Trans : kMlsTileConfigsB4NonTrans;
       int b4_config_count = trans ? ArraySize(kMlsTileConfigsB4Trans)
@@ -453,10 +439,15 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
       if (try_configs(b4_configs, b4_config_count)) {
         return;
       }
-    } else {
+    } else if (arch != "gfx946") {
       ICHECK_EQ(arch, "gfx92a")
           << "b4 matrix_load is only supported on gfx946; fp4 b8 LDS "
              "fallback is supported on gfx92a/gfx946";
+    }
+    if (requested_lds_bits == 4) {
+      LOG(FATAL) << "No packed-b4 MLS tile config for trans=" << trans
+                 << " block_mn=" << block_mn << " block_k=" << block_k
+                 << " num_warps=" << num_warps << " target=" << arch;
     }
     const MlsTileConfig *fp4_b8_configs =
         trans ? kMlsTileConfigsFp4B8Trans : kMlsTileConfigsFp4B8NonTrans;
@@ -526,12 +517,23 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
   int warp_id_offset = MlsScopedWarpIdOffset(T.thread_bounds, T.target);
   int tile_mn, tile_k, warp_m, warp_k;
+  const bool src_fp4 = src->dtype.is_float4();
+  const int requested_lds_bits = dst->dtype.bits();
+  ICHECK(!src_fp4 || src->dtype.is_float4_e2m1fn())
+      << "matrix_load global FP4 source must use packed float4_e2m1fn, got "
+      << src->dtype;
+  ICHECK(!src_fp4 || dst->dtype.is_float4())
+      << "matrix_load FP4 destination must be packed or unpacked FP4, got "
+      << dst->dtype;
+  ICHECK(!src_fp4 || GetHcuArchString(T.target) != "gfx92a" ||
+         dst->dtype.is_float4_e2m1_unpacked())
+      << "gfx92a FP4 matrix_load destination must use "
+         "float4_e2m1_unpacked, got "
+      << dst->dtype;
   ComputeMlsWarpPartition(mls_trans, static_cast<int>(block_mn),
                           static_cast<int>(block_k), block_size, T.target,
-                          src->dtype.bits(), warp_m, warp_k, tile_mn, tile_k);
-  const int lds_physical_bits =
-      GetMlsLdsPhysicalBits(src->dtype, mls_trans, tile_mn, tile_k, T.target);
-
+                          src_fp4 ? 4 : src->dtype.bits(), warp_m, warp_k,
+                          tile_mn, tile_k, requested_lds_bits);
   size_t nr = this->src_ranges.size();
   ICHECK(nr >= 2);
   PrimExpr block_mn_base, block_k_base;
@@ -562,6 +564,7 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
     LOG(FATAL) << "matrix_load unsupported dtype: " << src->dtype;
   }
 
+  const int lds_physical_bits = dst->dtype.bits();
   std::stringstream ss;
   ss << "tl::mls::mls_load_tile<tl::sequence<" << block_mn << ", " << block_k
      << ">, tl::sequence<" << tile_mn << ", " << tile_k << ">, " << warp_m
@@ -663,14 +666,14 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef().def(
       "tl.ComputeMlsWarpPartition",
       [](bool trans, int block_mn, int block_k, int block_size, Target target,
-         int elem_bits) {
+         int elem_bits, int requested_lds_bits = 0) {
         int warp_mn = 0;
         int warp_k = 0;
         int mls_tile_mn = 0;
         int mls_tile_k = 0;
         ComputeMlsWarpPartition(trans, block_mn, block_k, block_size, target,
                                 elem_bits, warp_mn, warp_k, mls_tile_mn,
-                                mls_tile_k);
+                                mls_tile_k, requested_lds_bits);
         return Array<Integer>{Integer(warp_mn), Integer(warp_k),
                               Integer(mls_tile_mn), Integer(mls_tile_k)};
       });

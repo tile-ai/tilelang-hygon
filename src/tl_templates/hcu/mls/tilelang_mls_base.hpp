@@ -359,27 +359,29 @@ struct tilelang_mls_base {
   }
 
   template <typename T, bool check_last_load = true, bool last_load = false>
-  TL_DEVICE void async_mls_load_asm(TL_LDS_ADDR T *smem,
+  TL_DEVICE void async_mls_load_asm(TL_LDS_ADDR void *smem,
                                     ::tl::index_t block_k_base) {
+    auto *typed_smem = reinterpret_cast<TL_LDS_ADDR T *>(smem);
     if constexpr (check_last_load) {
       const bool last_load_rt = (block_k_base + BlockSizeK > k_length_raw_);
-      async_mls_load_asm_impl_rt(smem, ::tl::bool_constant<false>{},
+      async_mls_load_asm_impl_rt(typed_smem, ::tl::bool_constant<false>{},
                                  last_load_rt);
     } else {
-      async_mls_load_asm_impl_ct<T, false, last_load>(smem);
+      async_mls_load_asm_impl_ct<T, false, last_load>(typed_smem);
     }
   }
 
   template <typename T, bool bps = false, bool check_k_filter = true,
             bool check_mn_filter = true>
-  TL_DEVICE void async_mls_load_asm_mn(TL_LDS_ADDR T *smem,
+  TL_DEVICE void async_mls_load_asm_mn(TL_LDS_ADDR void *smem,
                                        ::tl::index_t block_mn_base) {
+    auto *typed_smem = reinterpret_cast<TL_LDS_ADDR T *>(smem);
     bool last_mn_load_rt = false;
     if constexpr (check_mn_filter) {
       last_mn_load_rt = (block_mn_base + BlockSizeMN > mn_length_raw_);
     }
     async_mls_load_asm_impl_rt_mn<T, bps, check_k_filter, check_mn_filter>(
-        smem, ::tl::bool_constant<bps>{}, block_mn_base, last_mn_load_rt);
+        typed_smem, ::tl::bool_constant<bps>{}, block_mn_base, last_mn_load_rt);
   }
 
   TL_DEVICE void move_base(const ::tl::index_t block_k_base) {
@@ -466,7 +468,7 @@ TL_DEVICE void
 mls_load_tile(DataType *p_data, ::tl::index_t mls_stride,
               ::tl::index_t mn_length_raw, ::tl::index_t k_length_raw,
               ::tl::index_t block_mn_base, ::tl::index_t block_k_base,
-              TL_LDS_ADDR DataType *smem, ::tl::index_t warp_id_offset = 0) {
+              TL_LDS_ADDR void *smem, ::tl::index_t warp_id_offset = 0) {
   using MlsBase = tilelang_mls_base<BlockSize, MlsTileSize, WarpMN, WarpK,
                                     DataType, Alt, Trans, HcuArch, DstBits>;
   MlsBase mls(p_data, mls_stride, mn_length_raw, k_length_raw, warp_id_offset);
@@ -474,8 +476,9 @@ mls_load_tile(DataType *p_data, ::tl::index_t mls_stride,
   // ::tl::number<0>{})); mls.update_base(block_k_base);
   mls.set_window_origin(
       ::tl::make_array<::tl::index_t>(block_mn_base, block_k_base));
+  auto *typed_smem = reinterpret_cast<TL_LDS_ADDR DataType *>(smem);
   mls.template async_mls_load_asm<DataType, check_last_load, last_load>(
-      smem, block_k_base);
+      typed_smem, block_k_base);
 }
 
 } // namespace mls

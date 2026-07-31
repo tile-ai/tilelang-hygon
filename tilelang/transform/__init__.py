@@ -47,6 +47,26 @@ def AnnotateMlsGemmDep():
     return _ffi_api.AnnotateMlsGemmDep()  # type: ignore
 
 
+def AnnotateScaleGemmDep():
+    """Bind copy_scale producers to gemm_blockscaled consumers (HCU only)."""
+    return _ffi_api.AnnotateScaleGemmDep()  # type: ignore
+
+
+def InsertScaleBufferSync():
+    """Insert sync_threads between copy_scale and gemm_blockscaled (skip WS)."""
+    return _ffi_api.InsertScaleBufferSync()  # type: ignore
+
+
+def AllocateScaleBuffer():
+    """Allocate/rewrite scale row bases while copy_scale/gemm tileops still exist.
+
+    Uses AnnotateScaleGemmDep clues + threadIdx.x to ComputeScaleWarpSeg and
+    size each shared.scale (no separate PlanScaleBufferRows pass). Sets
+    hcu_scale_buffer_size.
+    """
+    return _ffi_api.AllocateScaleBuffer()  # type: ignore
+
+
 def PrepareMlsSharedMemoryAllocation():
     """Prepare HCU MLS shared-memory allocation metadata for merge planning."""
     return _ffi_api.PrepareMlsSharedMemoryAllocation()  # type: ignore

@@ -74,6 +74,10 @@ public:
     smem_alignment_map_ = std::move(smem_alignment_map);
   }
 
+  void SetHcuScaleBufferSize(Integer slots) {
+    hcu_scale_buffer_size_ = std::move(slots);
+  }
+
   void SetHostFuncSignature(const tirx::PrimFunc &func) {
     host_buffer_map_ = func->buffer_map;
   }
@@ -117,6 +121,7 @@ private:
   Map<tirx::Var, tirx::Buffer> host_buffer_map_;
   Array<tirx::Var> non_restrict_params_;
   Optional<Array<Integer>> cluster_dims_{std::nullopt};
+  Optional<Integer> hcu_scale_buffer_size_{std::nullopt};
   // Per-buffer shared-memory alignment requirements (kSmemAlignmentMap)
   // propagated from the host PrimFunc onto each split device kernel.
   Map<String, IntImm> smem_alignment_map_;
@@ -414,6 +419,12 @@ private:
     if (!smem_alignment_map_.empty()) {
       device_attrs.Set(tl::kSmemAlignmentMap, smem_alignment_map_);
     }
+    if (hcu_scale_buffer_size_.defined()) {
+      // AllocateScaleBuffer runs pre-split; codegen needs this on the device
+      // PrimFunc for hcu_scale_buffer_size(...) and scale_buffer.hpp include.
+      device_attrs.Set(tl::attr::kHcuScaleBufferSize,
+                       hcu_scale_buffer_size_.value());
+    }
     if (code_block_source_) {
       device_attrs.Set(tl::attr::kCodeBlockSource, code_block_source_.value());
     }
@@ -480,6 +491,11 @@ tirx::PrimFunc SplitHostDevice(tirx::PrimFunc func, IRModule *device_mod,
   if (auto opt = func->GetAttr<Map<String, IntImm>>(tl::kSmemAlignmentMap)) {
     splitter.SetSmemAlignmentMap(opt.value());
     func = tvm::WithoutAttr(std::move(func), tl::kSmemAlignmentMap);
+  }
+  // Propagate HCU scale_buffer slot count set by AllocateScaleBuffer.
+  if (auto opt = func->GetAttr<Integer>(tl::attr::kHcuScaleBufferSize)) {
+    splitter.SetHcuScaleBufferSize(opt.value());
+    func = tvm::WithoutAttr(std::move(func), tl::attr::kHcuScaleBufferSize);
   }
 
   if (auto body = splitter(func->body); !body.same_as(func->body)) {

@@ -120,15 +120,19 @@ def compute_mls_tiles(
     block_k: int,
     block_size: int,
     target: Target,
-    elem_bits: int,
+    dtype,
 ) -> tuple[int, int]:
+    dtype = DataType(dtype)
+    src_bits = 4 if dtype.is_float4() else int(dtype.bits)
+    requested_lds_bits = int(dtype.bits)
     _warp_mn, _warp_k, tile_mn, tile_k = _ffi_api.ComputeMlsWarpPartition(
         bool(mls_trans),
         int(block_mn),
         int(block_k),
         int(block_size),
         target,
-        int(elem_bits),
+        src_bits,
+        requested_lds_bits,
     )
     return int(tile_mn), int(tile_k)
 
@@ -140,7 +144,7 @@ def hcu_mls_ds_read_dtype_str(dtype) -> str:
         return "tl::fp8_t"
     if "e5m2" in s:
         return "tl::bf8_t"
-    if "float4_e2m1fn" in s:
+    if DataType(dtype).is_float4():
         return "tl::pk_fp4_t"
     if "bfloat16" in s or s == "bf16":
         return "bfloat16_t"
@@ -199,6 +203,7 @@ def build_ds_read_format_tensor_b_template(
     target_dtype_str: str | None = None,
     lds_bits: int | None = None,
     reg_bits: int | None = None,
+    min_n_per_warp: int = 0,
 ) -> str:
     arch = get_hcu_arch_string(target)
     trans = "true" if mls_trans else "false"
@@ -209,23 +214,36 @@ def build_ds_read_format_tensor_b_template(
         if reg_bits is None:
             raise ValueError("lds_bits requires reg_bits")
         target_type += f", {int(lds_bits)}, {int(reg_bits)}"
+    elif min_n_per_warp:
+        # ExtraMinNPerWarp follows three defaulted template parameters, so spell
+        # those defaults explicitly when no widened target type was requested.
+        target_type = f", {dtype_str}, tl::mls::mls_elem_bits_v<{dtype_str}>, tl::mls::mls_elem_bits_v<{dtype_str}>"
+    extra_floor = f", {int(min_n_per_warp)}" if min_n_per_warp else ""
     return (
         f"tl::mls::ds_read_format_tensor_b<tl::sequence<{lds_block_mn}, {lds_block_k}>, "
         f"tl::sequence<{ds_read_mn}, {ds_read_k}>, tl::sequence<{tile_mn}, {tile_k}>, "
         f"{total_warp}, {warp_n}, {warp_k}, {dtype_str}, 1, {trans}, "
-        f"tl::hcu_target_enum::{arch}{target_type}>"
+        f"tl::hcu_target_enum::{arch}{target_type}{extra_floor}>"
     )
-
-
-def min_n_per_warp_for_b(*, b_mls: bool, b_mls_trans: bool, element_bits: int | None = None) -> int:
-    """Match ``gemm_mls`` / ``ds_read_format_tensor_b`` MinNPerWarp."""
-    if b_mls and (element_bits == 4 or not b_mls_trans):
-        return 32
-    return 16
 
 
 def block_col_warps_no_recompute(block_n: int, block_col_warps: int, min_n_per_warp: int) -> int:
     return min(block_col_warps, block_n // min_n_per_warp)
+
+
+def scale_format_min_n_per_warp(scale_format_b: int | None) -> int:
+    """Intrinsic ScaleB MN-atom floor (format ids match ``ScaleFormat``)."""
+    if scale_format_b == 5:  # MN4
+        return 64
+    if scale_format_b in (3, 4):  # K2MN2 / MN2
+        return 32
+    return 16
+
+
+def default_min_n_per_warp_for_b(*, b_from_mls: bool, b_mls_trans: bool, element_bits: int, scale_format_b: int | None = None) -> int:
+    """Default final N floor for direct emitter construction."""
+    mls_floor = 32 if b_from_mls and (element_bits == 4 or not b_mls_trans) else 16
+    return max(mls_floor, scale_format_min_n_per_warp(scale_format_b))
 
 
 def elem_bits(dtype) -> int:
@@ -234,7 +252,7 @@ def elem_bits(dtype) -> int:
 
 def is_f8f6f4_operand_dtype(dtype) -> bool:
     dtype_str = str(dtype)
-    return "float4_e2m1fn" in dtype_str or "float8_e4m3" in dtype_str or "float8_e5m2" in dtype_str
+    return DataType(dtype).is_float4() or "float8_e4m3" in dtype_str or "float8_e5m2" in dtype_str
 
 
 def hcu_mls_lds_bits(dtype, *, mls_trans: bool, tile_mn: int, tile_k: int, target: Target) -> int:
@@ -242,6 +260,8 @@ def hcu_mls_lds_bits(dtype, *, mls_trans: bool, tile_mn: int, tile_k: int, targe
     from tilelang.hcu.target import get_hcu_arch_string
 
     bits = elem_bits(dtype)
+    if DataType(dtype).is_float4_e2m1_unpacked():
+        return 8
     if bits != 4:
         return bits
     arch = get_hcu_arch_string(target)

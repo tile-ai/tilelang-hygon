@@ -28,7 +28,7 @@ def target_supports_mls() -> bool:
 
 
 def target_supports_mls_b4() -> bool:
-    """Return whether the active target supports b4 MLS matrix_load tests."""
+    """Return whether the target supports packed FP4 as an MLS source."""
     try:
         target = tvm.target.Target(determine_target("auto"))
         return target_is_hcu(target) and get_hcu_arch_string(target) in ("gfx92a", "gfx946")
@@ -52,3 +52,20 @@ def current_hcu_arch_string() -> str:
         return get_hcu_arch_string(target) if target_is_hcu(target) else ""
     except Exception:
         return ""
+
+
+# First-release gemm_blockscaled (FP4xFP4 + E8M0) requires lit/lts + scale builtins.
+BLOCKSCALED_SUPPORTED_HCU_ARCHES = frozenset({"gfx946"})
+
+
+def target_supports_blockscaled(target=None) -> bool:
+    """Return whether ``target`` can compile HCU gemm_blockscaled (gfx946).
+
+    Defaults to ``determine_target("auto")`` like other helpers. Pass an explicit
+    target when offline-compiling for gfx946 on a non-matching auto detect.
+    """
+    try:
+        tgt = tvm.target.Target(target if target is not None else determine_target("auto"))
+        return target_is_hcu(tgt) and get_hcu_arch_string(tgt) in BLOCKSCALED_SUPPORTED_HCU_ARCHES
+    except Exception:
+        return False

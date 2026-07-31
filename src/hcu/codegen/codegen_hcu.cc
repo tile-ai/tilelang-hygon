@@ -14,6 +14,7 @@
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -134,8 +135,8 @@ RealABType GetF8F6F4OperandType(const std::string &dtype) {
     return RealABType::kBF6;
   }
   if (HasPrefix(dtype, "float4_e2m1fn") ||
-      HasPrefix(dtype, "float4_e2m1_unpacked") || dtype == "uint8" ||
-      HasPrefix(dtype, "uint8x")) {
+      HasPrefix(dtype, "float4_e2m1_unpacked") ||
+      HasPrefix(dtype, "custom[float4_e2m1_unpacked]")) {
     return RealABType::kFP4;
   }
   LOG(FATAL) << "Unsupported f8f6f4 MMAC operand dtype: " << dtype;
@@ -438,6 +439,11 @@ void CodeGenTileLangHCU::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
     stream << " __attribute__((hcu_wdra_waves_per_tg(" << waves.value()->value
            << ")))";
   }
+  if (auto slots = f->GetAttr<Integer>(tl::attr::kHcuScaleBufferSize)) {
+    enable_scale_buffer_ = true;
+    stream << " __attribute__((hcu_scale_buffer_size(" << slots.value()->value
+           << ")))";
+  }
   LaunchConfigExtractor extractor;
   extractor(f->body);
   arith::Analyzer analyzer;
@@ -475,6 +481,20 @@ std::string CodeGenTileLangHCU::Finish() {
   decl_stream << "#include <tl_templates/hcu/threadblock_swizzle.h>\n";
   decl_stream << "#include <tl_templates/hcu/debug.h>\n";
   decl_stream << "#include <tl_templates/hcu/barrier.h>\n";
+  if (enable_scale_buffer_) {
+    decl_stream << "#include <tl_templates/hcu/scale/scale_buffer.hpp>\n";
+  }
+  if (!scale_layout_functors_.empty()) {
+    std::vector<std::string> names;
+    names.reserve(scale_layout_functors_.size());
+    for (const auto &entry : scale_layout_functors_) {
+      names.push_back(entry.first);
+    }
+    std::sort(names.begin(), names.end());
+    for (const auto &name : names) {
+      decl_stream << scale_layout_functors_.at(name);
+    }
+  }
   decl_stream << "\n";
   return CodeGenC::Finish();
 }
@@ -928,6 +948,19 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
     const auto *extern_sym = call->args[0].as<StringImmNode>();
     if (extern_sym) {
       const std::string sym = extern_sym->value;
+      if (sym == "__tl_hcu_register_scale_layout_functor") {
+        ICHECK_EQ(call->args.size(), 3U)
+            << "scale layout registration expects symbol, name, source";
+        const auto *name = call->args[1].as<StringImmNode>();
+        const auto *source = call->args[2].as<StringImmNode>();
+        ICHECK(name && source) << "scale layout name/source must be strings";
+        auto [it, inserted] =
+            scale_layout_functors_.emplace(name->value, source->value);
+        ICHECK(inserted || it->second == source->value)
+            << "conflicting generated scale layout functor " << name->value;
+        enable_scale_buffer_ = true;
+        return;
+      }
       const std::string resource_init_prefix = "tl::mls::resource_init<";
       const std::string async_load_prefix = "tl::mls::async_load<";
       const std::string async_load_mn_prefix = "tl::mls::async_load_mn<";
@@ -1100,6 +1133,39 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
 
   if (TryToEmitLDSBufferOp(op))
     return;
+
+  // Packed FP4 indices count logical nibbles, while storage addresses count
+  // pairs. Preserve a contiguous packed payload for shared/local stores.
+  if (IsFp4PackedVectorStore(value_dtype, element_dtype) &&
+      !CanUseVMBufferOps(op->buffer.get(), value_dtype.lanes())) {
+    ICHECK_EQ(op->indices.size(), 1);
+    const auto *ramp = op->indices[0].as<RampNode>();
+    ICHECK(ramp) << "HCU packed fp4 shared/local store requires a ramp";
+    const int64_t *stride = as_const_int(ramp->stride);
+    ICHECK(stride && *stride == 1)
+        << "HCU packed fp4 shared/local store requires logical stride 1";
+    const int lanes = value_dtype.lanes();
+    const int64_t *ramp_lanes = as_const_int(ramp->lanes);
+    ICHECK(ramp_lanes && *ramp_lanes == lanes);
+    Fp4PackedVectorDesc fp4_desc = GetFp4PackedVectorDesc(lanes);
+    ICHECK(CanProveMultiple(ramp->base, fp4_desc.lanes))
+        << "HCU packed fp4 shared/local store requires base aligned to "
+        << fp4_desc.lanes << " logical fp4 elements, got " << ramp->base;
+
+    std::string scope = GetPtrStorageScope(op->buffer->data);
+    ICHECK(scope == "shared" || scope == "shared.dyn" || scope == "local" ||
+           scope == "local.var")
+        << "Unexpected packed fp4 store scope: " << scope;
+    std::string pred = GetCurrentPredicate();
+    PrintIndent();
+    if (pred != "true")
+      stream << "if (" << pred << ") ";
+    stream << "*(reinterpret_cast<" << fp4_desc.c_type << "*>("
+           << GetVarID(op->buffer->data.get()) << ") + (("
+           << PrintExpr(ramp->base) << ") / " << fp4_desc.lanes
+           << ")) = " << PrintExpr(op->value) << ";\n";
+    return;
+  }
 
   // Only handle the common case where lanes match; otherwise, fall back to the
   // default CodeGenC implementation (which may invoke PrintVecStore to emit
@@ -1279,6 +1345,11 @@ void CodeGenTileLangHCU::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
     enable_fp8_ = true;
     os << GetFP8Type(t);
     return;
+  } else if (t.is_float4_e2m1_unpacked()) {
+    // Restricted HCU operand-storage tag.  Legality is checked before
+    // codegen; shared and local.fragment both use one uint8 slot per FP4.
+    os << "uint8_t";
+    return;
   } else if (t.is_float4_e2m1fn()) {
     if (t.is_scalar()) {
       os << "tl::pk_fp4_t";
@@ -1291,6 +1362,9 @@ void CodeGenTileLangHCU::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
       return;
     } else if (t.lanes() <= 16) {
       os << "int2";
+      return;
+    } else if (t.lanes() == 32) {
+      os << "tl::uint8x16_t";
       return;
     }
     fail = true;
@@ -2447,14 +2521,16 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       lts = ", 0";
     }
     if (prefix.find("_f8f6f4") != std::string::npos) {
-      std::string real_a_dtype =
-          GetStringImmAnnotation(op->annotations, "tl.hcu_mmac_a_dtype")
-              .value_or(A_dtype);
-      std::string real_b_dtype =
-          GetStringImmAnnotation(op->annotations, "tl.hcu_mmac_b_dtype")
-              .value_or(B_dtype);
+      auto real_a_dtype =
+          GetStringImmAnnotation(op->annotations, "tl.hcu_mmac_a_dtype");
+      auto real_b_dtype =
+          GetStringImmAnnotation(op->annotations, "tl.hcu_mmac_b_dtype");
+      ICHECK(real_a_dtype && real_b_dtype)
+          << "f8f6f4 MMAC requires tl.hcu_mmac_a_dtype and "
+             "tl.hcu_mmac_b_dtype annotations with the logical operand "
+             "types; packed uint8 register types are ambiguous";
       lit = ", " +
-            std::to_string(GetF8F6F4RealABTypeId(real_a_dtype, real_b_dtype));
+            std::to_string(GetF8F6F4RealABTypeId(*real_a_dtype, *real_b_dtype));
       lts = prefix.find("_lit_lts") != std::string::npos ? ", 1, 0" : "";
     }
 

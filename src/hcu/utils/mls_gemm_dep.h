@@ -44,6 +44,9 @@ public:
   bool a_from_mls{false};
   bool b_from_mls{false};
   int gemm_policy{0};
+  // Blockscaled ScaleFormat MN-atom floors; set by AnnotateScaleGemmDep.
+  int min_m_per_warp{0};
+  int min_n_per_warp{0};
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.MlsGemmDepMeta", MlsGemmDepMetaNode,
                                     Object);
@@ -61,7 +64,9 @@ public:
         .def_ro("gemm_trans_b", &MlsGemmDepMetaNode::gemm_trans_b)
         .def_ro("a_from_mls", &MlsGemmDepMetaNode::a_from_mls)
         .def_ro("b_from_mls", &MlsGemmDepMetaNode::b_from_mls)
-        .def_ro("gemm_policy", &MlsGemmDepMetaNode::gemm_policy);
+        .def_ro("gemm_policy", &MlsGemmDepMetaNode::gemm_policy)
+        .def_ro("min_m_per_warp", &MlsGemmDepMetaNode::min_m_per_warp)
+        .def_ro("min_n_per_warp", &MlsGemmDepMetaNode::min_n_per_warp);
   }
 };
 

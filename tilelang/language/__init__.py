@@ -48,6 +48,7 @@ from .allocate import (
     alloc_barrier,  # noqa: F401
     alloc_cluster_barrier,  # noqa: F401
     alloc_tmem,  # noqa: F401
+    alloc_scale_buffer,  # noqa: F401
     alloc_reducer,  # noqa: F401
     alloc_descriptor,  # noqa: F401
     alloc_wgmma_desc,  # noqa: F401
@@ -60,6 +61,7 @@ from .copy_op import (  # noqa: F401
     copy,
     matrix_load,
     ds_read_format,
+    copy_scale,
     async_copy,
     tma_copy,
     tma_gather4,
@@ -70,9 +72,21 @@ from .copy_op import (  # noqa: F401
     c2d_im2col,
     copy_cluster,
 )
+from .scale_view import (  # noqa: F401
+    ScaleFormat,
+    ScaleView,
+    scale_identity,
+    scale_k2_interleaved,
+    scale_k4_interleaved,
+    scale_k2mn2_interleaved,
+    scale_mn2_interleaved,
+    scale_mn4_interleaved,
+    scale_view,
+)
 from tilelang.tileop.base import GemmWarpPolicy  # noqa: F401
 from .gemm_op import (  # noqa: F401
     gemm,
+    gemm_blockscaled,
     wgmma_gemm,
     tcgen05_gemm,
     tcgen05_gemm_blockscaled,

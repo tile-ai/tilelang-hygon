@@ -165,6 +165,125 @@ def ds_read_format(
     return tirx.call_intrin("handle", tirx.op.Op.get("tl.tileop.ds_read_format"), src_region, dst_region)
 
 
+def copy_scale(
+    src,
+    dst: tirx.Buffer | tirx.BufferLoad | tirx.BufferRegion,
+    *,
+    op_ctrl: int = 0,
+):
+    """Copy LDS scale tile into HCU ``shared.scale`` via ``ds_scale_copy_ds2buf``.
+
+    Scale major-order / granularity are taken from the consumer
+    ``T.gemm_blockscaled`` by ``AnnotateScaleGemmDep``. ``op_ctrl`` selects the
+    hardware write width (0: 8bit/1row, 1: 16bit/2row, 2: 32bit/4row).
+    """
+    from tilelang.utils.language import is_scale_buffer
+    from .scale_view import ScaleView
+
+    scale_src = src if isinstance(src, ScaleView) else None
+    if scale_src is not None:
+        src = scale_src.buffer
+        expected_op_ctrl = {
+            "identity": 0,
+            "k2": 1,
+            "k4": 2,
+            "k2mn2": 2,
+            "mn2": 1,
+            "mn4": 2,
+        }[scale_src.format.name]
+        assert op_ctrl == expected_op_ctrl, f"copy_scale format {scale_src.format.name} requires op_ctrl={expected_op_ctrl}, got {op_ctrl}"
+        tile_k = scale_src.extent[0]
+        tile_k_value = int(tile_k.value) if isinstance(tile_k, tirx.IntImm) else None
+        if tile_k_value is not None:
+            if scale_src.format.name == "k2" and tile_k_value % 2 != 0:
+                raise ValueError("copy_scale K2 ScaleView requires tile K divisible by 2")
+            if scale_src.format.name == "k4" and tile_k_value % 4 != 0:
+                raise ValueError("copy_scale K4 ScaleView requires tile K divisible by 4")
+            if scale_src.format.name == "k2mn2" and tile_k_value % 2 != 0:
+                raise ValueError("copy_scale K2MN2 ScaleView requires even tile K")
+    elif op_ctrl != 0:
+        raise ValueError("copy_scale op_ctrl>0 requires a ScaleView with an explicit interleaved ScaleFormat")
+
+    def _get_extent(data):
+        if isinstance(data, tirx.Var) and T.has_let_value(data):
+            data = T.get_let_value(data)
+        if isinstance(data, tirx.Buffer):
+            return list(data.shape)
+        if isinstance(data, tirx.BufferRegion):
+            return [x.extent for x in data.region]
+        if isinstance(data, tirx.BufferLoad):
+            region = get_buffer_region_from_load(data)
+            if region is None:
+                return None
+            return [x.extent for x in region.region]
+        return None
+
+    def _get_buffer(data):
+        if isinstance(data, tirx.Buffer):
+            return data
+        if isinstance(data, (tirx.BufferLoad, tirx.BufferRegion)):
+            return data.buffer
+        return None
+
+    src_buf = _get_buffer(src)
+    dst_buf = _get_buffer(dst)
+    assert src_buf is not None, "copy_scale src must be Buffer / BufferLoad / BufferRegion"
+    assert dst_buf is not None, "copy_scale dst must be Buffer / BufferLoad / BufferRegion"
+    assert is_shared(src_buf), f"copy_scale src must be shared LDS, got scope={src_buf.scope()}"
+    assert is_scale_buffer(dst_buf), f"copy_scale dst must be shared.scale, got scope={dst_buf.scope()}"
+    assert op_ctrl in (0, 1, 2), f"copy_scale op_ctrl must be 0/1/2, got {op_ctrl}"
+
+    src_extent = _get_extent(src)
+    dst_extent = _get_extent(dst)
+    assert src_extent is not None or dst_extent is not None, "copy_scale: src/dst must have extent"
+    src_extent = list(src_extent) if src_extent else list(dst_extent)
+    dst_extent = list(dst_extent) if dst_extent else list(src_extent)
+    if scale_src is None:
+        src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)
+
+    def _to_region(data, access_type, per_buffer_extents):
+        if isinstance(data, tirx.Var) and T.has_let_value(data):
+            data = T.get_let_value(data)
+        if isinstance(data, tirx.Buffer):
+            return to_buffer_region(data, access_type=access_type, extents=per_buffer_extents)
+        if isinstance(data, tirx.BufferRegion):
+            return buffer_region_to_tile_region(data, access_type, per_buffer_extents)
+        if isinstance(data, tirx.BufferLoad):
+            region = get_buffer_region_from_load(data)
+            if region is None:
+                return buffer_load_to_tile_region(data, access_type, per_buffer_extents)
+            return buffer_region_to_tile_region(region, access_type, per_buffer_extents)
+        return buffer_load_to_tile_region(data, access_type, per_buffer_extents)
+
+    src_region = _to_region(src, "r", src_extent)
+    dst_region = _to_region(dst, "w", dst_extent)
+    args = [
+        src_region,
+        dst_region,
+        tirx.IntImm("int32", int(op_ctrl)),
+    ]
+    if scale_src is not None:
+        parent_k, parent_mn = scale_src.logical_shape
+        origin_k, origin_mn = scale_src.origin
+        tile_k, tile_mn = scale_src.extent
+        args.extend(
+            [
+                tirx.IntImm("int32", scale_src.format.format_id),
+                parent_k,
+                parent_mn,
+                origin_k,
+                origin_mn,
+                tile_k,
+                tile_mn,
+            ]
+        )
+    return tirx.call_intrin(
+        "handle",
+        tirx.op.Op.get("tl.tileop.copy_scale"),
+        *args,
+    )
+
+
 def _normalize_copy_regions(
     src: BufferLikeType, dst: BufferLikeType
 ) -> tuple[

@@ -448,6 +448,150 @@ def tcgen05_gemm_blockscaled(
     )
 
 
+def gemm_blockscaled(
+    A: BufferLikeType,
+    B: BufferLikeType,
+    C: BufferLikeType,
+    ScaleA_sbuf: BufferLikeType,
+    ScaleB_sbuf: BufferLikeType,
+    transpose_A: bool = False,
+    transpose_B: bool = False,
+    policy: GemmWarpPolicy = GemmWarpPolicy.Square,
+    clear_accum: bool = False,
+    k_pack: int = 1,
+    *,
+    sf_a_granularity_k: int,
+    sf_b_granularity_k: int,
+    sf_a_granularity_m: int = 1,
+    sf_b_granularity_n: int = 1,
+    a_scale_k_major: bool = False,
+    b_scale_k_major: bool = False,
+) -> tirx.PrimExpr:
+    """HCU block-scaled GEMM consuming ``shared.scale`` buffers.
+
+    Scale major-order is declared here (``a/b_scale_k_major``) and consumed by
+    ``T.copy_scale`` via ``AnnotateScaleGemmDep``. First release supports
+    FP4×FP4 + E8M0 (``mmac_scale``) only.
+    """
+    from tilelang.utils.language import is_scale_buffer
+
+    def legalize(arg):
+        if isinstance(arg, tirx.Var) and T.has_let_value(arg):
+            return T.get_let_value(arg).buffer
+        return arg
+
+    ScaleA_sbuf = legalize(ScaleA_sbuf)
+    ScaleB_sbuf = legalize(ScaleB_sbuf)
+    sfa_buf = ScaleA_sbuf.buffer if isinstance(ScaleA_sbuf, (tirx.BufferLoad, tirx.BufferRegion)) else ScaleA_sbuf
+    sfb_buf = ScaleB_sbuf.buffer if isinstance(ScaleB_sbuf, (tirx.BufferLoad, tirx.BufferRegion)) else ScaleB_sbuf
+    assert is_scale_buffer(sfa_buf), f"ScaleA must be shared.scale, got {sfa_buf.scope()}"
+    assert is_scale_buffer(sfb_buf), f"ScaleB must be shared.scale, got {sfb_buf.scope()}"
+    assert sf_a_granularity_k > 0 and sf_b_granularity_k > 0
+    assert sf_a_granularity_m > 0 and sf_b_granularity_n > 0
+
+    SFA_region = to_buffer_region(ScaleA_sbuf)
+    SFB_region = to_buffer_region(ScaleB_sbuf)
+    SFA_arg = buffer_region_to_tile_region(SFA_region, "r", list(retrieve_shape(SFA_region)))
+    SFB_arg = buffer_region_to_tile_region(SFB_region, "r", list(retrieve_shape(SFB_region)))
+
+    ann = {
+        "sf_a_granularity_k": tirx.const(int(sf_a_granularity_k), "int32"),
+        "sf_b_granularity_k": tirx.const(int(sf_b_granularity_k), "int32"),
+        "sf_a_granularity_m": tirx.const(int(sf_a_granularity_m), "int32"),
+        "sf_b_granularity_n": tirx.const(int(sf_b_granularity_n), "int32"),
+        "a_scale_k_major": tirx.const(1 if a_scale_k_major else 0, "int32"),
+        "b_scale_k_major": tirx.const(1 if b_scale_k_major else 0, "int32"),
+        "tl.hcu_blockscaled": tirx.const(1, "int32"),
+    }
+
+    # Reuse tl.tileop.gemm slots: args[19]/20] = SFA/SFB (same as NV blockscaled).
+    def legalize_arguments(arg: BufferLikeType | tirx.Var) -> BufferLikeType:
+        if isinstance(arg, tirx.Var) and T.has_let_value(arg):
+            return T.get_let_value(arg).buffer
+        return arg
+
+    A = legalize_arguments(A)
+    B = legalize_arguments(B)
+    C = legalize_arguments(C)
+    A_region = to_buffer_region(A)
+    B_region = to_buffer_region(B)
+    C_region = to_buffer_region(C)
+    A_shape = retrieve_shape(A_region)
+    B_shape = retrieve_shape(B_region)
+    C_shape = retrieve_shape(C_region)
+    assert len(C_shape) == 2, "current only support C as a 2D tensor"
+    M, N = C_shape
+    M_A = A_shape[-1] if transpose_A else A_shape[-2]
+    K = A_shape[-2] if transpose_A else A_shape[-1]
+    N_B = B_shape[-2] if transpose_B else B_shape[-1]
+    K_B = B_shape[-1] if transpose_B else B_shape[-2]
+    assert prim_expr_equal(M_A, M), f"T.gemm_blockscaled M shape check failed: M_A={M_A}, M_C={M}"
+    assert prim_expr_equal(K, K_B), f"T.gemm_blockscaled K shape check failed: K_A={K}, K_B={K_B}"
+    assert prim_expr_equal(N_B, N), f"T.gemm_blockscaled N shape check failed: N_B={N_B}, N_C={N}"
+
+    # Force scale shape == block / granularity (design §4.1).
+    def _scale_mn_k(shape, k_major: bool):
+        assert len(shape) >= 2, "scale buffer must be at least 2D"
+        if k_major:
+            return shape[-2], shape[-1]  # (MN, K)
+        return shape[-1], shape[-2]  # (K, MN) -> MN, K
+
+    sfa_shape = retrieve_shape(SFA_region)
+    sfb_shape = retrieve_shape(SFB_region)
+    sfa_mn, sfa_k = _scale_mn_k(sfa_shape, a_scale_k_major)
+    sfb_mn, sfb_k = _scale_mn_k(sfb_shape, b_scale_k_major)
+    assert prim_expr_equal(sfa_mn * sf_a_granularity_m, M), (
+        f"ScaleA MN shape mismatch: scale_mn*gran_m={sfa_mn}*{sf_a_granularity_m} != block_M={M}"
+    )
+    assert prim_expr_equal(sfa_k * sf_a_granularity_k, K), (
+        f"ScaleA K shape mismatch: scale_k*gran_k={sfa_k}*{sf_a_granularity_k} != block_K={K}"
+    )
+    assert prim_expr_equal(sfb_mn * sf_b_granularity_n, N), (
+        f"ScaleB N shape mismatch: scale_n*gran_n={sfb_mn}*{sf_b_granularity_n} != block_N={N}"
+    )
+    assert prim_expr_equal(sfb_k * sf_b_granularity_k, K), (
+        f"ScaleB K shape mismatch: scale_k*gran_k={sfb_k}*{sf_b_granularity_k} != block_K={K}"
+    )
+
+    A_stride = retrieve_stride(A_region)
+    B_stride = retrieve_stride(B_region)
+    A_offset = retrieve_offset(A_region)
+    B_offset = retrieve_offset(B_region)
+    assert A_offset[-2] == 0, "The offset of the first dimension of A must be 0"
+    assert B_offset[-2] == 0, "The offset of the first dimension of B must be 0"
+    C_coords = [r.min for r in C_region.region]
+    A_arg = buffer_region_to_tile_region(A_region, "r", [r for r in A_shape])
+    B_arg = buffer_region_to_tile_region(B_region, "r", [r for r in B_shape])
+    C_arg = buffer_region_to_tile_region(C_region, "rw", [r for r in C_shape])
+
+    return tirx.call_intrin(
+        "handle",
+        tirx.op.Op.get("tl.tileop.gemm"),
+        A_arg,
+        B_arg,
+        C_arg,
+        transpose_A,
+        transpose_B,
+        M,
+        N,
+        K,
+        policy,
+        clear_accum,
+        A_stride[-2],
+        B_stride[-2],
+        A_offset[-1],
+        B_offset[-1],
+        k_pack,
+        0,  # wg_wait
+        tirx.const(0, dtype="int32"),  # mbar placeholder
+        C_coords[0],
+        C_coords[1],
+        SFA_arg,
+        SFB_arg,
+        annotations=ann,
+    )
+
+
 def make_blockscaled_gemm_layout(
     C: BufferLikeType,
     A: BufferLikeType,

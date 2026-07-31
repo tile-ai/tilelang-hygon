@@ -9,15 +9,16 @@ from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import (
     build_ds_read_format_tensor_b_template,
     check_mls_slice_aligned_to_tile,
     compute_mls_tiles,
+    default_min_n_per_warp_for_b,
     elem_bits,
     hcu_mls_lds_bits,
     hcu_mls_ds_read_dtype_str,
     hcu_mmac_k_dim_for_operand,
     is_f8f6f4_operand_dtype,
-    min_n_per_warp_for_b,
     mls_block_mn_k_from_region,
     mls_full_and_read_mn_k,
     retrieve_mls_lds_base_ptr,
+    scale_format_min_n_per_warp,
 )
 from tilelang.language.utils import get_buffer_region_from_load
 from tilelang.utils.language import is_fragment, retrieve_ptr
@@ -39,10 +40,11 @@ def _normalize_dtype_str(dtype) -> str:
     is True but the object is still a ``DataType``. Passing that into ``tirx.Call``
     args fails (``Array[index N: DataType]``). Always coerce to a builtin ``str``.
     """
-    if type(dtype) is str:
-        return dtype
     try:
-        return str(DataType(dtype))
+        dt = DataType(dtype)
+        if dt.is_float4_e2m1_unpacked():
+            return "custom[float4_e2m1_unpacked]8"
+        return str(dt)
     except Exception:
         s = str(dtype)
         if s.startswith("dtype(") and "'" in s:
@@ -86,6 +88,7 @@ class HCUMatrixCoreIntrinEmitter:
         "float8_e4m3fnuz": "e4m3fnuz",
         "float8_e4m3fn": "e4m3fn",
         "float4_e2m1fn": "fp4",
+        "custom[float4_e2m1_unpacked]8": "fp4",
     }
 
     k_pack = 1
@@ -114,6 +117,9 @@ class HCUMatrixCoreIntrinEmitter:
         thread_var: Var | None = None,
         thread_bounds_min: int = 0,
         min_n_per_warp: int | None = None,
+        b_from_mls: bool = False,
+        b_mls_trans: bool | None = None,
+        scale_format_b: int | None = None,
         use_tf32: bool = False,
         fp4_mmac_mode: str = "native",
     ):
@@ -148,8 +154,16 @@ class HCUMatrixCoreIntrinEmitter:
         self._initialize_b_preshuffle(b_preshuffle)
 
         if min_n_per_warp is None:
-            min_n_per_warp = min_n_per_warp_for_b(b_mls=False, b_mls_trans=b_transposed)
+            if b_mls_trans is None:
+                b_mls_trans = b_transposed
+            min_n_per_warp = default_min_n_per_warp_for_b(
+                b_from_mls=b_from_mls,
+                b_mls_trans=b_mls_trans,
+                element_bits=8 if self.fp4_mmac_mode == "f8f6f4" else DataType(self.b_dtype).bits,
+                scale_format_b=scale_format_b,
+            )
         self.min_n_per_warp = int(min_n_per_warp)
+        self.scale_format_b = scale_format_b
         self._initialize_block_warp_tiles(block_m, block_n)
 
         self.reduce_k = reduce_k
@@ -242,6 +256,7 @@ class HCUMatrixCoreIntrinEmitter:
             "float8_e4m3fn": "fp8",
             "float8_e5m2": "bf8",
             "float4_e2m1fn": "fp4",
+            "custom[float4_e2m1_unpacked]8": "fp4",
         }[in_dtype]
 
         target = self.target
@@ -369,15 +384,6 @@ class HCUMatrixCoreIntrinEmitter:
             return self.inner_k_per_warp() * self.warp_cols * self.k_pack * self.local_size_b
         return self.warp_cols * self.k_pack * self.local_size_b
 
-    def configure_b_mls(self, *, b_mls: bool = True) -> None:
-        """Update N-side recompute metadata when B is loaded from MLS LDS."""
-        self.min_n_per_warp = min_n_per_warp_for_b(
-            b_mls=b_mls,
-            b_mls_trans=self.b_transposed,
-            element_bits=8 if self.fp4_mmac_mode == "f8f6f4" else DataType(self.b_dtype).bits,
-        )
-        self._initialize_block_warp_tiles(self.block_m, self.block_n)
-
     def _shared_block_mn_k(self, src: Buffer | BufferLoad | BufferRegion, mls_trans: bool) -> tuple[int, int]:
         region = self._legalize_to_buffer_region(src)
         return mls_block_mn_k_from_region(region, mls_trans)
@@ -389,7 +395,7 @@ class HCUMatrixCoreIntrinEmitter:
             block_k,
             self.threads,
             self.target,
-            elem_bits(dtype),
+            dtype,
         )
 
     def get_ldmatrix_index_map(self, is_b=False):
@@ -404,6 +410,8 @@ class HCUMatrixCoreIntrinEmitter:
             shared_16x8_to_local_64x2_layout_B,
             shared_16x64_to_local_64x16_layout_A,
             shared_16x64_to_local_64x16_layout_B,
+            shared_16x128_to_local_64x32_layout_A,
+            shared_16x128_to_local_64x32_layout_B,
             thread_id_shared_access_64x1_to_16x4_layout_A,
             thread_id_shared_access_64x1_to_4x16_layout_B,
             thread_id_shared_access_64x2_to_16x8_layout_A,
@@ -414,6 +422,8 @@ class HCUMatrixCoreIntrinEmitter:
             thread_id_shared_access_64x8_to_16x32_layout_B,
             thread_id_shared_access_64x16_to_16x64_layout_A,
             thread_id_shared_access_64x16_to_16x64_layout_B,
+            thread_id_shared_access_64x32_to_16x128_layout_A,
+            thread_id_shared_access_64x32_to_16x128_layout_B,
         )
 
         k_dim = self.k_dim * self.k_pack
@@ -471,8 +481,19 @@ class HCUMatrixCoreIntrinEmitter:
                 reverse_index_map = (
                     thread_id_shared_access_64x16_to_16x64_layout_A if transposed else thread_id_shared_access_64x16_to_16x64_layout_B
                 )
+        elif k_dim == 128:
+            index_map = shared_16x128_to_local_64x32_layout_B if transposed else shared_16x128_to_local_64x32_layout_A
+            reverse_index_map = (
+                thread_id_shared_access_64x32_to_16x128_layout_B if transposed else thread_id_shared_access_64x32_to_16x128_layout_A
+            )
+
+            if is_b:
+                index_map = shared_16x128_to_local_64x32_layout_A if transposed else shared_16x128_to_local_64x32_layout_B
+                reverse_index_map = (
+                    thread_id_shared_access_64x32_to_16x128_layout_A if transposed else thread_id_shared_access_64x32_to_16x128_layout_B
+                )
         else:
-            raise ValueError("k_dim must be 4 or 16 or 32 or 64 currently")
+            raise ValueError("k_dim must be 4, 8, 16, 32, 64, or 128 currently")
 
         return index_map, reverse_index_map
 
@@ -569,7 +590,20 @@ class HCUMatrixCoreIntrinEmitter:
         warp_k_tile = self.chunk // self.block_k_warps
         return warp_k_idx * warp_k_tile
 
-    def ldmatrix_a(self, A_local_buf, A_shared_buf: Buffer | BufferLoad | BufferRegion, ki, rk=0):
+    def ldmatrix_a(
+        self,
+        A_local_buf,
+        A_shared_buf: Buffer | BufferLoad | BufferRegion,
+        ki,
+        rk=0,
+        *,
+        full_k: bool = False,
+    ):
+        """Load one K-atom from shared into local.
+
+        When ``full_k`` is True, write into a full-K local buffer at offset
+        ``ki * warp_rows * k_pack * local_size_a`` (for mmac_scale packing).
+        """
         warp_row_tiles = self.warp_row_tiles
         warp_rows = self.warp_rows
         chunk = self.chunk
@@ -580,6 +614,8 @@ class HCUMatrixCoreIntrinEmitter:
         is_transposed = self.a_transposed
         thread_binding = self.get_thread_binding()
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=False)
+        # Per-ki local stride when packing into a full-K register file.
+        ki_stride = warp_rows * k_pack * local_size_a if full_k else 0
 
         A_region = self._legalize_to_buffer_region(A_shared_buf)
         A_buf = A_region.buffer
@@ -597,22 +633,44 @@ class HCUMatrixCoreIntrinEmitter:
         ):
             tx, _, warp_m = self.extract_thread_binding(thread_binding)
             k_base = rk * chunk + ki * (k_pack * micro_size_k) + self._k_base(thread_binding)
+            local_base = ki * ki_stride
             if is_transposed:
                 for i in T.serial(warp_rows):
                     for local_id in T.vectorized(k_pack * local_size_a):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
                         l, r = (k_base, warp_m * warp_row_tiles + i * micro_size_x)
-                        A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[tuple(A_other) + (A_base0 + l + row, A_base1 + r + col)]
+                        A_local_buf[local_base + i * k_pack * local_size_a + local_id] = A_buf[
+                            tuple(A_other) + (A_base0 + l + row, A_base1 + r + col)
+                        ]
             else:
                 for i in T.serial(warp_rows):
                     for local_id in T.vectorized(k_pack * local_size_a):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
                         l, r = (warp_m * warp_row_tiles + i * micro_size_x, k_base)
-                        A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[tuple(A_other) + (A_base0 + l + row, A_base1 + r + col)]
+                        A_local_buf[local_base + i * k_pack * local_size_a + local_id] = A_buf[
+                            tuple(A_other) + (A_base0 + l + row, A_base1 + r + col)
+                        ]
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)
 
-    def ldmatrix_b(self, B_local_buf, B_shared_buf: Buffer | BufferLoad | BufferRegion, ki, rk=0):
+    def ldmatrix_a_fullk(self, A_local_buf, A_shared_buf: Buffer | BufferLoad | BufferRegion, ki, rk=0):
+        """Like ``ldmatrix_a``, but store slice ``ki`` into a full-K local buffer."""
+        return self.ldmatrix_a(A_local_buf, A_shared_buf, ki, rk=rk, full_k=True)
+
+    def ldmatrix_b(
+        self,
+        B_local_buf,
+        B_shared_buf: Buffer | BufferLoad | BufferRegion,
+        ki,
+        rk=0,
+        *,
+        full_k: bool = False,
+    ):
+        """Load one K-atom from shared into local.
+
+        When ``full_k`` is True, write into a full-K local buffer at offset
+        ``ki * warp_cols * k_pack * local_size_b`` (for mmac_scale packing).
+        """
         warp_col_tiles = self.warp_col_tiles
         warp_cols = self.warp_cols
         chunk = self.chunk
@@ -623,6 +681,7 @@ class HCUMatrixCoreIntrinEmitter:
         is_transposed = self.b_transposed
         thread_binding = self.get_thread_binding()
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=True)
+        ki_stride = warp_cols * k_pack * local_size_b if full_k else 0
 
         B_region = self._legalize_to_buffer_region(B_shared_buf)
         B_buf = B_region.buffer
@@ -640,20 +699,29 @@ class HCUMatrixCoreIntrinEmitter:
         ):
             tx, warp_n, _ = self.extract_thread_binding(thread_binding)
             k_base = rk * chunk + ki * (k_pack * micro_size_k) + self._k_base(thread_binding)
+            local_base = ki * ki_stride
             if is_transposed:
                 for j in T.serial(warp_cols):
                     for local_id in T.vectorized(k_pack * local_size_b):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
                         l, r = (warp_n * warp_col_tiles + j * micro_size_y, k_base)
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[tuple(B_other) + (B_base0 + l + row, B_base1 + r + col)]
+                        B_local_buf[local_base + j * k_pack * local_size_b + local_id] = B_buf[
+                            tuple(B_other) + (B_base0 + l + row, B_base1 + r + col)
+                        ]
             else:
                 for j in T.serial(warp_cols):
                     for local_id in T.vectorized(k_pack * local_size_b):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
                         l, r = (k_base, warp_n * warp_col_tiles + j * micro_size_y)
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[tuple(B_other) + (B_base0 + l + row, B_base1 + r + col)]
+                        B_local_buf[local_base + j * k_pack * local_size_b + local_id] = B_buf[
+                            tuple(B_other) + (B_base0 + l + row, B_base1 + r + col)
+                        ]
 
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
+
+    def ldmatrix_b_fullk(self, B_local_buf, B_shared_buf: Buffer | BufferLoad | BufferRegion, ki, rk=0):
+        """Like ``ldmatrix_b``, but store slice ``ki`` into a full-K local buffer."""
+        return self.ldmatrix_b(B_local_buf, B_shared_buf, ki, rk=rk, full_k=True)
 
     def ldmatrix_mls_a(self, A_local_buf, A_mls_src: Buffer | BufferLoad | BufferRegion):
         """MLS LDS -> 1D ``local`` in gemm ``body_rr`` layout (C ``ds_read_format_tensor_a``)."""
@@ -662,9 +730,15 @@ class HCUMatrixCoreIntrinEmitter:
         mls_trans = not self.a_transposed
         lds_block_mn, lds_block_k, ds_read_mn, ds_read_k, origin_mn, origin_k = mls_full_and_read_mn_k(A_mls_src, mls_trans)
         # Mls tile / LdsDesc follow the full write shape.
-        src_bits = elem_bits(self.a_dtype)
         reg_bits = 8 if self.fp4_mmac_mode == "f8f6f4" else elem_bits(A_local_buf.dtype)
-        tile_mn, tile_k = compute_mls_tiles(mls_trans, lds_block_mn, lds_block_k, self.threads, self.target, src_bits)
+        tile_mn, tile_k = compute_mls_tiles(
+            mls_trans,
+            lds_block_mn,
+            lds_block_k,
+            self.threads,
+            self.target,
+            self.a_dtype,
+        )
         lds_bits = hcu_mls_lds_bits(self.a_dtype, mls_trans=mls_trans, tile_mn=tile_mn, tile_k=tile_k, target=self.target)
         check_mls_slice_aligned_to_tile(
             origin_mn=origin_mn,
@@ -716,12 +790,17 @@ class HCUMatrixCoreIntrinEmitter:
         """MLS LDS -> 1D ``local`` in gemm ``body_rr`` layout (C ``ds_read_format_tensor_b``)."""
         if self.block_k_warps != 1:
             raise ValueError("ldmatrix_mls_b requires block_k_warps == 1 (MLS ds_read path)")
-        self.configure_b_mls(b_mls=True)
         mls_trans = self.b_transposed
         lds_block_mn, lds_block_k, ds_read_mn, ds_read_k, origin_mn, origin_k = mls_full_and_read_mn_k(B_mls_src, mls_trans)
-        src_bits = elem_bits(self.b_dtype)
         reg_bits = 8 if self.fp4_mmac_mode == "f8f6f4" else elem_bits(B_local_buf.dtype)
-        tile_mn, tile_k = compute_mls_tiles(mls_trans, lds_block_mn, lds_block_k, self.threads, self.target, src_bits)
+        tile_mn, tile_k = compute_mls_tiles(
+            mls_trans,
+            lds_block_mn,
+            lds_block_k,
+            self.threads,
+            self.target,
+            self.b_dtype,
+        )
         lds_bits = hcu_mls_lds_bits(self.b_dtype, mls_trans=mls_trans, tile_mn=tile_mn, tile_k=tile_k, target=self.target)
         check_mls_slice_aligned_to_tile(
             origin_mn=origin_mn,
@@ -749,6 +828,7 @@ class HCUMatrixCoreIntrinEmitter:
             target_dtype_str="uint8_t" if self.fp4_mmac_mode == "f8f6f4" else None,
             lds_bits=lds_bits if self.fp4_mmac_mode == "f8f6f4" else None,
             reg_bits=reg_bits if self.fp4_mmac_mode == "f8f6f4" else None,
+            min_n_per_warp=self.min_n_per_warp,
         )
         src_ptr = retrieve_mls_lds_base_ptr(B_mls_src, "r")
         dst_ptr = retrieve_ptr(B_local_buf, "rw")
@@ -830,6 +910,61 @@ class HCUMatrixCoreIntrinEmitter:
 
         return _warp_mma(A_local_buf, B_local_buf, C_local_buf)
 
+    def mmac_scale_fp4(
+        self,
+        A_local_buf,
+        B_local_buf,
+        C_local_buf,
+        *,
+        m0_wave_base: PrimExpr,
+        gran_m: int,
+        gran_ka: int,
+        gran_n: int,
+        gran_kb: int,
+        scale_shape_m: int,
+        scale_shape_ka: int,
+        scale_shape_n: int,
+        scale_shape_kb: int,
+        scale_format_a: int,
+        scale_format_b: int,
+        real_ab_type: int,
+    ):
+        """Issue one scale MMAC call_extern (native FP4 or padded F8F6F4)."""
+        required_min_n = scale_format_min_n_per_warp(scale_format_b)
+        if self.min_n_per_warp < required_min_n:
+            raise ValueError(
+                f"ScaleB format {scale_format_b} requires min_n_per_warp >= {required_min_n}, "
+                f"but emitter was constructed with {self.min_n_per_warp}; pass scale_format_b "
+                "when min_n_per_warp is inferred"
+            )
+        warp_rows = int(self.warp_rows)
+        warp_cols = int(self.warp_cols)
+        num_k_atoms = int(self.inner_k_per_warp())
+        template = (
+            f"tl::hcu::mmac_scale_fp4_body<"
+            f"{warp_rows}, {warp_cols}, {num_k_atoms}, "
+            f"{int(gran_m)}, {int(gran_ka)}, {int(gran_n)}, {int(gran_kb)}, "
+            f"{int(scale_shape_m)}, {int(scale_shape_ka)}, "
+            f"{int(scale_shape_n)}, {int(scale_shape_kb)}, "
+            f"{int(scale_format_a)}, {int(scale_format_b)}, "
+            f"{int(self.k_pack)}, {int(self.micro_size_k)}, {int(real_ab_type)}>"
+        )
+
+        @T.macro
+        def _warp_mmac_scale(A_local_buf, B_local_buf, C_local_buf, m0_wave_base):
+            T.evaluate(
+                tirx.call_extern(
+                    "handle",
+                    template,
+                    A_local_buf.data,
+                    B_local_buf.data,
+                    C_local_buf.data,
+                    m0_wave_base,
+                )
+            )
+
+        return _warp_mmac_scale(A_local_buf, B_local_buf, C_local_buf, m0_wave_base)
+
     def stmatrix(self, C_local_buf, C_buf, pid_m=None, pid_n=None):
         block_row_warps = self.block_row_warps
         block_col_warps = self.block_col_warps
@@ -904,6 +1039,9 @@ class HCUMatrixCorePreshuffleIntrinEmitter(HCUMatrixCoreIntrinEmitter):
         target: Target | None = None,
         thread_var: Var | None = None,
         min_n_per_warp: int | None = None,
+        b_from_mls: bool = False,
+        b_mls_trans: bool | None = None,
+        scale_format_b: int | None = None,
         use_tf32: bool = False,
     ):
         super().__init__(
@@ -926,6 +1064,9 @@ class HCUMatrixCorePreshuffleIntrinEmitter(HCUMatrixCoreIntrinEmitter):
             target=target,
             thread_var=thread_var,
             min_n_per_warp=min_n_per_warp,
+            b_from_mls=b_from_mls,
+            b_mls_trans=b_mls_trans,
+            scale_format_b=scale_format_b,
             use_tf32=use_tf32,
         )
         self._initialize_preshuffle(a_preshuffle, b_preshuffle)

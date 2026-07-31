@@ -188,6 +188,30 @@ def shared_16x64_to_local_64x16_layout_B(i, j):
     return thread_id, local
 
 
+def thread_id_shared_access_64x32_to_16x128_layout_A(thread_id, local_id):
+    i = thread_id % 16
+    j = local_id + (thread_id // 16) * 32
+    return i, j
+
+
+def shared_16x128_to_local_64x32_layout_A(i, j):
+    thread_id = i + 16 * (j // 32)
+    local = j % 32
+    return thread_id, local
+
+
+def thread_id_shared_access_64x32_to_16x128_layout_B(thread_id, local_id):
+    i = local_id + (thread_id // 16) * 32
+    j = thread_id % 16
+    return i, j
+
+
+def shared_16x128_to_local_64x32_layout_B(i, j):
+    thread_id = j + 16 * (i // 32)
+    local = i % 32
+    return thread_id, local
+
+
 def make_mmac_swizzle_layout(shared_buf, vecSize=8):
     dtype = shared_buf.dtype
     shape = shared_buf.shape
@@ -245,9 +269,15 @@ def _micro_to_local_layout_fn(element_bits: int, micro_k: int) -> Callable:
     if element_bits == 8:
         if micro_k <= 32:
             return shared_16x32_to_local_64x8_layout_A
-        return shared_16x64_to_local_64x16_layout_A
+        if micro_k <= 64:
+            return shared_16x64_to_local_64x16_layout_A
+        if micro_k <= 128:
+            return shared_16x128_to_local_64x32_layout_A
     if element_bits == 4:
-        return shared_16x64_to_local_64x16_layout_A
+        if micro_k <= 64:
+            return shared_16x64_to_local_64x16_layout_A
+        if micro_k <= 128:
+            return shared_16x128_to_local_64x32_layout_A
     raise ValueError(f"unsupported element bitwidth={element_bits}")
 
 
