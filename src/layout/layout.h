@@ -281,7 +281,7 @@ Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
 Fragment makeDsReadFormatFragmentHCU(const int block_mn, const int block_k,
                                      const int num_warp_mn,
                                      const int num_warp_k,
-                                     const int element_size,
+                                     const int fragment_bits,
                                      const int num_warp_mn_no_recompute,
                                      bool trans);
 

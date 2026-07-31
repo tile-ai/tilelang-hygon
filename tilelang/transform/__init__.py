@@ -47,6 +47,11 @@ def AnnotateMlsGemmDep():
     return _ffi_api.AnnotateMlsGemmDep()  # type: ignore
 
 
+def PrepareMlsSharedMemoryAllocation():
+    """Prepare HCU MLS shared-memory allocation metadata for merge planning."""
+    return _ffi_api.PrepareMlsSharedMemoryAllocation()  # type: ignore
+
+
 def LayoutInference():
     """LayoutInference
 

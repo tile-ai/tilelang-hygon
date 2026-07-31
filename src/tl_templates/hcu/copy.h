@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <tl_templates/hcu/common.h>
+#include <type_traits>
 
 #include <tl_templates/hcu/core/arch/amd_buffer_addressing.hpp>
 
@@ -17,6 +18,82 @@ using index_t = u32;
 using tl::int32x4_t;
 
 namespace tl {
+
+namespace detail {
+
+template <int Lanes>
+using packed_fp4_vector_t =
+    std::conditional_t<(Lanes <= 4), int16_t,
+                       std::conditional_t<(Lanes <= 8), int, int2>>;
+
+} // namespace detail
+
+TL_DEVICE uint8_t load_packed_fp4_lane(const void *base_ptr,
+                                       int logical_index) {
+  const uint8_t *p = reinterpret_cast<const uint8_t *>(base_ptr);
+  return static_cast<uint8_t>(
+      (p[logical_index >> 1] >> ((logical_index & 1) * 4)) & 0x0f);
+}
+
+template <typename T>
+TL_DEVICE void store_packed_fp4_lane(void *base_ptr, int logical_index,
+                                     T value) {
+  uint8_t *p = reinterpret_cast<uint8_t *>(base_ptr);
+  const uint8_t v = static_cast<uint8_t>(value) & 0x0f;
+  uint8_t &b = p[logical_index >> 1];
+  if (logical_index & 1) {
+    b = (b & 0x0f) | (v << 4);
+  } else {
+    b = (b & 0xf0) | v;
+  }
+}
+
+template <int Lanes>
+TL_DEVICE detail::packed_fp4_vector_t<Lanes>
+load_packed_fp4_vector(const void *base_ptr, int logical_base,
+                       int logical_stride) {
+  static_assert(Lanes > 1 && Lanes <= 16,
+                "load_packed_fp4_vector supports 2..16 lanes");
+  using Vec = detail::packed_fp4_vector_t<Lanes>;
+  uint32_t lo = 0;
+  uint32_t hi = 0;
+#pragma unroll
+  for (int i = 0; i < Lanes; ++i) {
+    const uint8_t v =
+        load_packed_fp4_lane(base_ptr, logical_base + i * logical_stride);
+    if (i < 8) {
+      lo |= static_cast<uint32_t>(v) << (i * 4);
+    } else {
+      hi |= static_cast<uint32_t>(v) << ((i - 8) * 4);
+    }
+  }
+  if constexpr (Lanes <= 8) {
+    return static_cast<Vec>(lo);
+  } else {
+    return Vec{static_cast<int>(lo), static_cast<int>(hi)};
+  }
+}
+
+template <int Lanes, typename Vec>
+TL_DEVICE void store_packed_fp4_vector(void *base_ptr, int logical_base,
+                                       int logical_stride, Vec value) {
+  static_assert(Lanes > 1 && Lanes <= 16,
+                "store_packed_fp4_vector supports 2..16 lanes");
+  uint32_t lo = 0;
+  uint32_t hi = 0;
+  if constexpr (Lanes <= 8) {
+    lo = static_cast<uint32_t>(value);
+  } else {
+    lo = static_cast<uint32_t>(value.x);
+    hi = static_cast<uint32_t>(value.y);
+  }
+#pragma unroll
+  for (int i = 0; i < Lanes; ++i) {
+    const uint32_t word = i < 8 ? lo : hi;
+    store_packed_fp4_lane(base_ptr, logical_base + i * logical_stride,
+                          (word >> ((i % 8) * 4)) & 0x0f);
+  }
+}
 
 namespace detail {
 

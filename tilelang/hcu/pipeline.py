@@ -73,6 +73,7 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.AnnotateDeviceRegions()(mod)
     mod = tilelang.transform.SplitHostDevice()(mod)
     mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
+    mod = tilelang.transform.PrepareMlsSharedMemoryAllocation()(mod)
 
     enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
     disable_reuse = should_disable_shared_memory_reuse(pass_ctx=pass_ctx)

@@ -28,7 +28,7 @@ namespace hcu {
 constexpr const char *kHCUMMAC = "hcu.mmac";
 
 void ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M, int N,
-                             int K, int k_pack, int element_byte_size,
+                             int K, int k_pack, int element_bits,
                              int block_size, Target target, bool A_from_mls,
                              bool B_from_mls, bool A_mls_trans,
                              bool B_mls_trans) {
@@ -41,16 +41,27 @@ void ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M, int N,
   int m_warp = 1, n_warp = 1, k_warp = 1;
   int kMPerWarp = 16;
   int kNPerWarp = 16;
-  if (A_from_mls && !A_mls_trans) {
-    kMPerWarp = 32;
+  if (element_bits == 4) {
+    // b4 no-pad on gfx946: trans reads can use MN=16, while non-trans b4
+    // ds_read_format only has MN=32 tiles.
+    if (A_from_mls && !A_mls_trans) {
+      kMPerWarp = 32;
+    }
+    if (B_from_mls && !B_mls_trans) {
+      kNPerWarp = 32;
+    }
+  } else {
+    if (A_from_mls && !A_mls_trans) {
+      kMPerWarp = 32;
+    }
+    if (B_from_mls && !B_mls_trans) {
+      kNPerWarp = 32;
+    }
   }
-  if (B_from_mls && !B_mls_trans) {
-    kNPerWarp = 32;
-  }
-  ICHECK(element_byte_size == 1 || element_byte_size == 2 ||
-         element_byte_size == 4)
-      << "element byte width=" << element_byte_size;
-  int kKPerWarp = k_pack * (32 / element_byte_size);
+  ICHECK(element_bits == 4 || element_bits == 8 || element_bits == 16 ||
+         element_bits == 32)
+      << "element bitwidth=" << element_bits;
+  int kKPerWarp = k_pack * (256 / element_bits);
 
   ICHECK(M % kMPerWarp == 0)
       << "M must be divisible by " << kMPerWarp << ", but got " << M;
@@ -194,13 +205,13 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef().def(
       "tl.GemmWarpPolicyComputeWarpPartitionHCU",
       [](GemmWarpPolicy policy, int M, int N, int K, int k_pack,
-         int element_byte_size, int block_size, Target target, int gemm_inst,
+         int element_bits, int block_size, Target target, int gemm_inst,
          bool A_from_mls, bool B_from_mls, bool A_mls_trans, bool B_mls_trans) {
         (void)gemm_inst;
         ICHECK(policy.defined());
         hcu::ComputeWarpPartitionHCU(
-            *policy.get(), M, N, K, k_pack, element_byte_size, block_size,
-            target, A_from_mls, B_from_mls, A_mls_trans, B_mls_trans);
+            *policy.get(), M, N, K, k_pack, element_bits, block_size, target,
+            A_from_mls, B_from_mls, A_mls_trans, B_mls_trans);
       });
 }
 

@@ -27,11 +27,12 @@ namespace mls {
 
 template <typename BlockSize, typename MlsTileSize, ::tl::index_t WarpMN,
           ::tl::index_t WarpK, typename DataType, ::tl::index_t Alt, bool Trans,
-          ::tl::hcu_target_enum HcuArch>
+          ::tl::hcu_target_enum HcuArch,
+          ::tl::index_t DstBits = mls_elem_bits_v<DataType>>
 struct tilelang_mls_base {
-  using Traits =
-      tile_window_mls_param_traits<BlockSize, MlsTileSize, WarpMN, WarpK,
-                                   sizeof(DataType) * 8, Alt, Trans, HcuArch>;
+  using Traits = tile_window_mls_param_traits<BlockSize, MlsTileSize, WarpMN,
+                                              WarpK, mls_elem_bits_v<DataType>,
+                                              DstBits, Alt, Trans, HcuArch>;
   using Detail = typename Traits::Detail;
   using MlsAtom = typename Detail::MlsAtom; // both generic and ck_tile Detail
                                             // expose MlsAtom
@@ -158,18 +159,20 @@ struct tilelang_mls_base {
 
       constexpr auto mfmt = ::tl::mls::detail::mfmt_traits<Alt>::value;
 
-      DataType *ptr_offset = p_data_;
+      uint8_t *ptr_offset = reinterpret_cast<uint8_t *>(p_data_);
       if constexpr (Trans) {
         const ::tl::index_t offset_elems =
             warp_coord_mn * mls_stride_ + warp_coord_k;
-        ptr_offset += offset_elems;
+        ptr_offset += ::tl::mls::mls_storage_traits<
+            DataType>::logical_offset_to_byte_offset(offset_elems);
         mls_res_(i) =
             ::tl::mls::make_mls_resource(static_cast<const void *>(ptr_offset),
                                          mls_stride_, 0, mls_mn_filter, mfmt);
       } else {
         const ::tl::index_t offset_elems =
             warp_coord_k * mls_stride_ + warp_coord_mn;
-        ptr_offset += offset_elems;
+        ptr_offset += ::tl::mls::mls_storage_traits<
+            DataType>::logical_offset_to_byte_offset(offset_elems);
         mls_res_(i) =
             ::tl::mls::make_mls_resource(static_cast<const void *>(ptr_offset),
                                          mls_stride_, mls_mn_filter, 0, mfmt);
@@ -258,9 +261,15 @@ struct tilelang_mls_base {
         MlsAtom::template load<moffset, true>(
             reinterpret_cast<uintptr_t>(smem + mls_lds_offset_[i]),
             mls_res_[access_idx_mn], moffset, ::tl::bool_constant<true>{});
-      } else if constexpr (HcuArch == ::tl::hcu_target_enum::gfx946) {
+      } else if constexpr (HcuArch == ::tl::hcu_target_enum::gfx946 ||
+                           HcuArch == ::tl::hcu_target_enum::gfx92a) {
+        TL_LDS_ADDR uint8_t *smem_bytes =
+            reinterpret_cast<TL_LDS_ADDR uint8_t *>(smem);
+        const auto lds_byte_offset =
+            ::tl::mls::mls_storage_traits<T>::logical_offset_to_byte_offset(
+                mls_lds_offset_[i]);
         MlsAtom::template load<moffset, true, bps>(
-            reinterpret_cast<uintptr_t>(smem + mls_lds_offset_[i]),
+            reinterpret_cast<uintptr_t>(smem_bytes + lds_byte_offset),
             mls_res_[access_idx_mn], moffset, ::tl::bool_constant<true>{},
             ::tl::bool_constant<bps>{});
       }
@@ -290,9 +299,15 @@ struct tilelang_mls_base {
         MlsAtom::template load<moffset, true>(
             reinterpret_cast<uintptr_t>(smem + mls_lds_offset_[i]),
             mls_res_[access_idx_mn], moffset, ::tl::bool_constant<true>{});
-      } else if constexpr (HcuArch == ::tl::hcu_target_enum::gfx946) {
+      } else if constexpr (HcuArch == ::tl::hcu_target_enum::gfx946 ||
+                           HcuArch == ::tl::hcu_target_enum::gfx92a) {
+        TL_LDS_ADDR uint8_t *smem_bytes =
+            reinterpret_cast<TL_LDS_ADDR uint8_t *>(smem);
+        const auto lds_byte_offset =
+            ::tl::mls::mls_storage_traits<T>::logical_offset_to_byte_offset(
+                mls_lds_offset_[i]);
         MlsAtom::template load<moffset, true, bps>(
-            reinterpret_cast<uintptr_t>(smem + mls_lds_offset_[i]),
+            reinterpret_cast<uintptr_t>(smem_bytes + lds_byte_offset),
             mls_res_[access_idx_mn], moffset, ::tl::bool_constant<true>{},
             ::tl::bool_constant<bps>{});
       }
@@ -331,9 +346,15 @@ struct tilelang_mls_base {
         MlsAtom::template load<moffset, true>(
             reinterpret_cast<uintptr_t>(smem + mls_lds_offset_[i]),
             mls_res_[access_idx_mn], moffset, ::tl::bool_constant<true>{});
-      } else if constexpr (HcuArch == ::tl::hcu_target_enum::gfx946) {
+      } else if constexpr (HcuArch == ::tl::hcu_target_enum::gfx946 ||
+                           HcuArch == ::tl::hcu_target_enum::gfx92a) {
+        TL_LDS_ADDR uint8_t *smem_bytes =
+            reinterpret_cast<TL_LDS_ADDR uint8_t *>(smem);
+        const auto lds_byte_offset =
+            ::tl::mls::mls_storage_traits<T>::logical_offset_to_byte_offset(
+                mls_lds_offset_[i]);
         MlsAtom::template load<moffset, true, bps>(
-            reinterpret_cast<uintptr_t>(smem + mls_lds_offset_[i]),
+            reinterpret_cast<uintptr_t>(smem_bytes + lds_byte_offset),
             mls_res_[access_idx_mn], moffset, ::tl::bool_constant<true>{},
             ::tl::bool_constant<bps>{});
       }
@@ -367,10 +388,11 @@ struct tilelang_mls_base {
   TL_DEVICE void move_base(const ::tl::index_t block_k_base) {
     ::tl::index_t addr_byte_offset;
     if constexpr (Trans) {
-      addr_byte_offset = block_k_base * ::tl::number<sizeof(DataType)>{};
+      addr_byte_offset = ::tl::mls::mls_storage_traits<
+          DataType>::logical_offset_to_byte_offset(block_k_base);
     } else {
-      addr_byte_offset =
-          block_k_base * mls_stride_ * ::tl::number<sizeof(DataType)>{};
+      addr_byte_offset = ::tl::mls::mls_storage_traits<
+          DataType>::logical_offset_to_byte_offset(block_k_base * mls_stride_);
     }
     ::tl::static_for<0, NumWarpAccessMN, 1>{}([&](auto i) {
       ::tl::mls::move_mls_addr_base(mls_res_(i), addr_byte_offset);
@@ -380,10 +402,11 @@ struct tilelang_mls_base {
   TL_DEVICE void update_base(const ::tl::index_t block_k_base) {
     ::tl::index_t addr_byte_offset;
     if constexpr (Trans) {
-      addr_byte_offset = block_k_base * ::tl::number<sizeof(DataType)>{};
+      addr_byte_offset = ::tl::mls::mls_storage_traits<
+          DataType>::logical_offset_to_byte_offset(block_k_base);
     } else {
-      addr_byte_offset =
-          block_k_base * mls_stride_ * ::tl::number<sizeof(DataType)>{};
+      addr_byte_offset = ::tl::mls::mls_storage_traits<
+          DataType>::logical_offset_to_byte_offset(block_k_base * mls_stride_);
     }
     ::tl::static_for<0, NumWarpAccessMN, 1>{}([&](auto i) {
       update_mls_addr_base(mls_res_(i), mls_base_addr_(i), addr_byte_offset);
@@ -394,13 +417,17 @@ struct tilelang_mls_base {
     ::tl::static_for<0, NumWarpAccessMN, 1>{}([&](auto i) {
       const auto warp_coord_mn = block_mn_base + mls_mn_offset_(i);
 
-      DataType *ptr_offset = p_data_;
+      uint8_t *ptr_offset = reinterpret_cast<uint8_t *>(p_data_);
       if constexpr (Trans) {
-        ptr_offset +=
+        const ::tl::index_t offset_elems =
             warp_coord_mn * mls_stride_ + mls_k_origin_ + mls_k_offset_(i);
+        ptr_offset += ::tl::mls::mls_storage_traits<
+            DataType>::logical_offset_to_byte_offset(offset_elems);
       } else {
-        ptr_offset +=
+        const ::tl::index_t offset_elems =
             (mls_k_origin_ + mls_k_offset_(i)) * mls_stride_ + warp_coord_mn;
+        ptr_offset += ::tl::mls::mls_storage_traits<
+            DataType>::logical_offset_to_byte_offset(offset_elems);
       }
       mls_base_addr_(i) = reinterpret_cast<uintptr_t>(ptr_offset);
       update_mls_addr_base(mls_res_(i), mls_base_addr_(i), 0);
@@ -435,15 +462,16 @@ struct tilelang_mls_base {
  */
 template <typename BlockSize, typename MlsTileSize, ::tl::index_t WarpMN,
           ::tl::index_t WarpK, typename DataType, ::tl::index_t Alt, bool Trans,
-          ::tl::hcu_target_enum HcuArch, bool check_last_load = true,
-          bool last_load = false>
+          ::tl::hcu_target_enum HcuArch,
+          ::tl::index_t DstBits = mls_elem_bits_v<DataType>,
+          bool check_last_load = true, bool last_load = false>
 TL_DEVICE void
 mls_load_tile(DataType *p_data, ::tl::index_t mls_stride,
               ::tl::index_t mn_length_raw, ::tl::index_t k_length_raw,
               ::tl::index_t block_mn_base, ::tl::index_t block_k_base,
               TL_LDS_ADDR DataType *smem, ::tl::index_t warp_id_offset = 0) {
   using MlsBase = tilelang_mls_base<BlockSize, MlsTileSize, WarpMN, WarpK,
-                                    DataType, Alt, Trans, HcuArch>;
+                                    DataType, Alt, Trans, HcuArch, DstBits>;
   MlsBase mls(p_data, mls_stride, mn_length_raw, k_length_raw, warp_id_offset);
   // mls.set_window_origin(::tl::make_array<::tl::index_t>(block_mn_base,
   // ::tl::number<0>{})); mls.update_base(block_k_base);

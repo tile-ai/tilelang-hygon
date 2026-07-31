@@ -140,6 +140,8 @@ def hcu_mls_ds_read_dtype_str(dtype) -> str:
         return "tl::fp8_t"
     if "e5m2" in s:
         return "tl::bf8_t"
+    if "float4_e2m1fn" in s:
+        return "tl::pk_fp4_t"
     if "bfloat16" in s or s == "bf16":
         return "bfloat16_t"
     if ("float16" in s or s in ("fp16", "half")) and "float8" not in s:
@@ -149,10 +151,10 @@ def hcu_mls_ds_read_dtype_str(dtype) -> str:
 
 def build_ds_read_format_tensor_a_template(
     *,
-    lds_mn: int,
-    lds_k: int,
-    read_mn: int,
-    read_k: int,
+    lds_block_mn: int,
+    lds_block_k: int,
+    ds_read_mn: int,
+    ds_read_k: int,
     tile_mn: int,
     tile_k: int,
     warp_m: int,
@@ -164,18 +166,18 @@ def build_ds_read_format_tensor_a_template(
     arch = get_hcu_arch_string(target)
     trans = "true" if mls_trans else "false"
     return (
-        f"tl::mls::ds_read_format_tensor_a<tl::sequence<{lds_mn}, {lds_k}>, "
-        f"tl::sequence<{read_mn}, {read_k}>, tl::sequence<{tile_mn}, {tile_k}>, "
+        f"tl::mls::ds_read_format_tensor_a<tl::sequence<{lds_block_mn}, {lds_block_k}>, "
+        f"tl::sequence<{ds_read_mn}, {ds_read_k}>, tl::sequence<{tile_mn}, {tile_k}>, "
         f"{warp_m}, {warp_k}, {dtype_str}, 1, {trans}, tl::hcu_target_enum::{arch}>"
     )
 
 
 def build_ds_read_format_tensor_b_template(
     *,
-    lds_mn: int,
-    lds_k: int,
-    read_mn: int,
-    read_k: int,
+    lds_block_mn: int,
+    lds_block_k: int,
+    ds_read_mn: int,
+    ds_read_k: int,
     tile_mn: int,
     tile_k: int,
     total_warp: int,
@@ -188,16 +190,16 @@ def build_ds_read_format_tensor_b_template(
     arch = get_hcu_arch_string(target)
     trans = "true" if mls_trans else "false"
     return (
-        f"tl::mls::ds_read_format_tensor_b<tl::sequence<{lds_mn}, {lds_k}>, "
-        f"tl::sequence<{read_mn}, {read_k}>, tl::sequence<{tile_mn}, {tile_k}>, "
+        f"tl::mls::ds_read_format_tensor_b<tl::sequence<{lds_block_mn}, {lds_block_k}>, "
+        f"tl::sequence<{ds_read_mn}, {ds_read_k}>, tl::sequence<{tile_mn}, {tile_k}>, "
         f"{total_warp}, {warp_n}, {warp_k}, {dtype_str}, 1, {trans}, "
         f"tl::hcu_target_enum::{arch}>"
     )
 
 
-def min_n_per_warp_for_b(*, b_mls: bool, b_mls_trans: bool) -> int:
+def min_n_per_warp_for_b(*, b_mls: bool, b_mls_trans: bool, element_bits: int | None = None) -> int:
     """Match ``gemm_mls`` / ``ds_read_format_tensor_b`` MinNPerWarp."""
-    if b_mls and not b_mls_trans:
+    if b_mls and (element_bits == 4 or not b_mls_trans):
         return 32
     return 16
 

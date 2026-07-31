@@ -70,6 +70,16 @@ static constexpr const char *kLexicalAllocScope = "lexical_alloc_scope";
 // Set by LowerAndValidateHcuWdra on gfx946 WDRA kernels.
 static constexpr const char *kHcuWdra = "tl.hcu_wdra";
 static constexpr const char *kHcuWdraWavesPerTg = "tl.hcu_wdra_waves_per_tg";
+// AttrStmt key carrying Map<String, PrimExpr> from MLS destination buffer data
+// Var name to the byte size required by the backend LDS layout.
+static constexpr const char *kMlsActualSizeBytesMap =
+    "tl.mls_actual_size_bytes_map";
+// PrimFunc-level attribute carrying Map<String, PrimExpr> from shared buffer
+// data Var name to an allocation-size override in bytes. Backend-specific
+// preparation passes may populate this; MergeSharedMemoryAllocations consumes
+// it without depending on the backend-specific source of the override.
+static constexpr const char *kSharedMemoryAllocationSizeBytesMap =
+    "tl.shared_memory_allocation_size_bytes_map";
 } // namespace attr
 
 inline ffi::Optional<PrimExpr> GetAnnotatedMbarPhaseExpr(

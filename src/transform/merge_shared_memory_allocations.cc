@@ -454,9 +454,11 @@ public:
       const std::unordered_map<const VarNode *, const AllocBufferNode *>
           &shmem_allocs,
       bool is_dynamic = true, bool verbose = false, int align_bytes = 0,
-      bool preserve_aliases = true)
+      bool preserve_aliases = true,
+      std::unordered_map<std::string, PrimExpr> special_size_bytes_by_name = {})
       : is_dynamic_{is_dynamic}, shmem_allocs_{shmem_allocs}, verbose_{verbose},
-        align_bytes_{align_bytes}, preserve_aliases_{preserve_aliases} {
+        align_bytes_{align_bytes}, preserve_aliases_{preserve_aliases},
+        special_size_bytes_by_name_(std::move(special_size_bytes_by_name)) {
     if (!is_dynamic) {
       merged_buf_var_ =
           Var("buf_shmem", PointerType(PrimType(DataType::UInt(8)), "shared"));
@@ -472,6 +474,7 @@ public:
                  bool disable_reuse = false,
                  const std::unordered_map<const VarNode *, int>
                      &explicit_alignments = {}) {
+    ResolveSpecialSizeBytes();
     SharedMemLinearAccessPatternFinder finder(is_dynamic,
                                               enable_aggressive_merge, verbose);
     finder(stmt);
@@ -503,6 +506,16 @@ public:
   }
 
 private:
+  void ResolveSpecialSizeBytes() {
+    special_size_bytes_.clear();
+    for (const auto &[var, alloc] : shmem_allocs_) {
+      auto it = special_size_bytes_by_name_.find(std::string(var->name_hint));
+      if (it != special_size_bytes_by_name_.end()) {
+        special_size_bytes_[var] = it->second;
+      }
+    }
+  }
+
   std::vector<Stmt> MakeAliasBindings() const {
     struct AliasInfo {
       const VarNode *var{nullptr};
@@ -589,6 +602,10 @@ private:
         }
         size_expr = size_expr * e;
       }
+      if (auto special_it = special_size_bytes_.find(var);
+          special_it != special_size_bytes_.end()) {
+        size_expr = special_it->second;
+      }
 
       int alignment = align_bytes_;
       auto align_it = shmem_alignment_map_.find(var);
@@ -630,6 +647,10 @@ private:
             PrimExpr buffer_size_bytes = alloc->buffer->shape[0] *
                                          alloc->buffer->dtype.bytes() *
                                          alloc->buffer->dtype.lanes();
+            if (auto special_it = special_size_bytes_.find(buffer_var_node);
+                special_it != special_size_bytes_.end()) {
+              buffer_size_bytes = special_it->second;
+            }
             LOG(DEBUG) << "    Buffer: " << buffer_var_node->name_hint
                        << " (Type: " << alloc->buffer->dtype << ")"
                        << ", Start Offset: " << byte_offset
@@ -812,7 +833,7 @@ private:
     auto it = buffer_byte_offsets_.find(buffer_var.get());
     ICHECK(it != buffer_byte_offsets_.end())
         << "buffer_var = " << buffer_var->name_hint << ", dtype = " << dtype;
-    return indexdiv(it->second, dtype.bytes() * dtype.lanes());
+    return indexdiv(it->second * 8, dtype.bits() * dtype.lanes());
   }
 
   bool HasBufferOffset(const Var &buffer_var) {
@@ -1424,12 +1445,24 @@ private:
         }
         size_expr = size_expr * e;
       }
+      if (auto special_it = special_size_bytes_.find(var);
+          special_it != special_size_bytes_.end()) {
+        size_expr = special_it->second;
+        size_dtype = size_expr.dtype();
+      }
       info.size_dtype = size_dtype;
       info.size_expr = size_expr;
 
-      auto const_size = GetRef<AllocBuffer>(alloc).ConstantAllocationSize();
-      if (const_size.has_value()) {
-        info.const_size_bytes = const_size.value() * bytes_per_elem;
+      if (auto special_it = special_size_bytes_.find(var);
+          special_it != special_size_bytes_.end()) {
+        if (const int64_t *size_bytes = as_const_int(special_it->second)) {
+          info.const_size_bytes = *size_bytes;
+        }
+      } else {
+        auto const_size = GetRef<AllocBuffer>(alloc).ConstantAllocationSize();
+        if (const_size.has_value()) {
+          info.const_size_bytes = const_size.value() * bytes_per_elem;
+        }
       }
 
       buf_infos.push_back(std::move(info));
@@ -1591,6 +1624,9 @@ private:
   PrimExpr merged_alloc_size_{0};
   // The mapping from the original buffer var to its offset in the merged buffer
   std::unordered_map<const VarNode *, PrimExpr> buffer_byte_offsets_;
+  // Per-buffer allocation size overrides for special shared-memory layouts.
+  std::unordered_map<const VarNode *, PrimExpr> special_size_bytes_;
+  std::unordered_map<std::string, PrimExpr> special_size_bytes_by_name_;
   // The mapping from the original buffer objects to their location in the
   // merged buffer.
   std::unordered_map<const BufferNode *, Buffer> buffer_remap_;
@@ -1606,13 +1642,14 @@ private:
   bool preserve_aliases_{true};
 };
 
-Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
-                                  bool enable_aggressive_merge,
-                                  int align_bytes = 16, bool verbose = false,
-                                  bool preserve_aliases = true,
-                                  bool disable_reuse = false,
-                                  const std::unordered_map<std::string, int>
-                                      &explicit_alignments_by_name = {}) {
+Stmt MergeSharedMemoryAllocations(
+    Stmt stmt, bool merge_static_smem, bool enable_aggressive_merge,
+    int align_bytes = 16, bool verbose = false, bool preserve_aliases = true,
+    bool disable_reuse = false,
+    const std::unordered_map<std::string, int> &explicit_alignments_by_name =
+        {},
+    const std::unordered_map<std::string, PrimExpr>
+        &special_size_bytes_by_name = {}) {
   AllocateCollector collector;
   collector(stmt);
   // The kSmemAlignmentMap attribute is keyed by buffer-var name (names are
@@ -1633,9 +1670,29 @@ Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
         }
         return resolved;
       };
+  auto has_special_size =
+      [&](const std::unordered_map<const VarNode *, const AllocBufferNode *>
+              &allocs) {
+        for (const auto &[var, alloc] : allocs) {
+          if (special_size_bytes_by_name.count(std::string(var->name_hint))) {
+            return true;
+          }
+        }
+        return false;
+      };
   if (collector.dyn_shmem_allocs_.size() > 1) {
     SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_, true, verbose,
-                                  align_bytes, preserve_aliases);
+                                  align_bytes, preserve_aliases,
+                                  special_size_bytes_by_name);
+    rewriter.PlanReuse(stmt, true,
+                       disable_reuse ? false : enable_aggressive_merge, false,
+                       disable_reuse, resolve(collector.dyn_shmem_allocs_));
+    stmt = rewriter(std::move(stmt));
+  } else if (collector.dyn_shmem_allocs_.size() == 1 &&
+             has_special_size(collector.dyn_shmem_allocs_)) {
+    SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_, true, verbose,
+                                  align_bytes, preserve_aliases,
+                                  special_size_bytes_by_name);
     rewriter.PlanReuse(stmt, true,
                        disable_reuse ? false : enable_aggressive_merge, false,
                        disable_reuse, resolve(collector.dyn_shmem_allocs_));
@@ -1643,7 +1700,17 @@ Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
   }
   if (merge_static_smem && collector.static_shmem_allocs_.size() > 1) {
     SharedMemoryRewriter rewriter(collector.static_shmem_allocs_, false,
-                                  verbose, align_bytes, preserve_aliases);
+                                  verbose, align_bytes, preserve_aliases,
+                                  special_size_bytes_by_name);
+    rewriter.PlanReuse(stmt, false,
+                       disable_reuse ? false : enable_aggressive_merge, false,
+                       disable_reuse, resolve(collector.static_shmem_allocs_));
+    stmt = rewriter(std::move(stmt));
+  } else if (merge_static_smem && collector.static_shmem_allocs_.size() == 1 &&
+             has_special_size(collector.static_shmem_allocs_)) {
+    SharedMemoryRewriter rewriter(collector.static_shmem_allocs_, false,
+                                  verbose, align_bytes, preserve_aliases,
+                                  special_size_bytes_by_name);
     rewriter.PlanReuse(stmt, false,
                        disable_reuse ? false : enable_aggressive_merge, false,
                        disable_reuse, resolve(collector.static_shmem_allocs_));
@@ -1679,11 +1746,18 @@ Pass MergeSharedMemoryAllocations(bool enable_aggressive_merge = false,
         explicit_alignments[std::string(name)] = static_cast<int>(align->value);
       }
     }
+    std::unordered_map<std::string, PrimExpr> special_size_bytes;
+    if (auto opt = f->GetAttr<Map<String, PrimExpr>>(
+            attr::kSharedMemoryAllocationSizeBytesMap)) {
+      for (const auto &[name, size_bytes] : opt.value()) {
+        special_size_bytes[std::string(name)] = size_bytes;
+      }
+    }
     auto *n = f.CopyOnWrite();
     n->body = tl::MergeSharedMemoryAllocations(
         std::move(n->body), merge_static_smem, enable_aggressive_merge,
         align_bytes, debug_merge_shared_memory_allocations, preserve_aliases,
-        disable_reuse, explicit_alignments);
+        disable_reuse, explicit_alignments, special_size_bytes);
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.MergeSharedMemoryAllocations",

@@ -91,14 +91,14 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
 
 
 def _compute_hcu_warp_partition(gemm, thread_nums: int, target: Target, meta) -> tuple[int, int, int]:
-    element_byte_size = DataType(gemm.a_dtype).bits // 8
+    element_bits = DataType(gemm.a_dtype).bits
     _ffi_api.GemmWarpPolicyComputeWarpPartitionHCU(
         gemm.policy,
         int(gemm.M),
         int(gemm.N),
         int(gemm.K),
         int(gemm.k_pack),
-        int(element_byte_size),
+        int(element_bits),
         int(thread_nums),
         target,
         0,  # gemm_inst unused; HCU warp partition is target-gated in C++
@@ -126,7 +126,8 @@ def _make_hcu_emitter(
     thread_var: tirx.Var,
     thread_bounds_min: int = 0,
 ) -> HCUMatrixCoreIntrinEmitter:
-    min_n_per_warp = 32 if (meta.b_from_mls and not meta.b_mls_trans) else 16
+    element_bits = DataType(gemm.b_dtype).bits
+    min_n_per_warp = 32 if (meta.b_from_mls and (element_bits == 4 or not meta.b_mls_trans)) else 16
     return HCUMatrixCoreIntrinEmitter(
         a_dtype=gemm.a_dtype,
         b_dtype=gemm.b_dtype,

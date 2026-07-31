@@ -27,6 +27,16 @@ int MlsScopedWarpIdOffset(const Range &thread_bounds, Target target);
 /// Last-2 buffer dims as (MN, K) according to mls_trans.
 std::pair<int64_t, int64_t> MlsBlockDims(const Buffer &buf, bool mls_trans);
 
+Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
+                                              int mls_tile_mn, int mls_tile_k,
+                                              bool trans, Target target);
+
+Optional<PrimExpr> TryGetMlsPackedLeadingElemOffset(const Buffer &buffer,
+                                                    const Array<Range> &ranges,
+                                                    int mls_tile_mn,
+                                                    int mls_tile_k, bool trans,
+                                                    Target target);
+
 class MatrixLoadNode : public TileOperatorNode {
 public:
   Buffer src, dst;

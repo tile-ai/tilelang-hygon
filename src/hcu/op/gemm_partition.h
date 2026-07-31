@@ -12,7 +12,7 @@ namespace tl {
 namespace hcu {
 
 void ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M, int N,
-                             int K, int k_pack, int element_byte_size,
+                             int K, int k_pack, int element_bits,
                              int block_size, Target target, bool A_from_mls,
                              bool B_from_mls, bool A_mls_trans,
                              bool B_mls_trans);

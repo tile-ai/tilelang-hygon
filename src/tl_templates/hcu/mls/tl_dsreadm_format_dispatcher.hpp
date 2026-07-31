@@ -79,6 +79,22 @@ template <> struct DsreadmFormatDispatcher<1, 32, 32, 2, true> {
       DsreadmFormatAttribute<DsreadmFormatAttributeImpl_MT32x32_B8_ALT2>;
 };
 
+// --------------------------------
+// DS_READ_MATRIX_FORMAT_B4
+// --------------------------------
+
+template <> struct DsreadmFormatDispatcher<4, 32, 64, 1, false> {
+  using Type = DsreadmFormatAttribute<DsreadmFormatAttributeImpl_M32x64_B4>;
+};
+
+template <> struct DsreadmFormatDispatcher<4, 32, 64, 1, true> {
+  using Type = DsreadmFormatAttribute<DsreadmFormatAttributeImpl_MT32x64_B4>;
+};
+
+template <> struct DsreadmFormatDispatcher<4, 16, 128, 1, true> {
+  using Type = DsreadmFormatAttribute<DsreadmFormatAttributeImpl_MT16x128_B4>;
+};
+
 } // namespace impl
 
 template <::tl::index_t ElemBytes, ::tl::index_t Row, ::tl::index_t Col,

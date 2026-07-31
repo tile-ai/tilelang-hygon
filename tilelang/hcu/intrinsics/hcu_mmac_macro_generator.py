@@ -79,6 +79,7 @@ class HCUMatrixCoreIntrinEmitter:
         "float8_e5m2": "e5m2",
         "float8_e4m3fnuz": "e4m3fnuz",
         "float8_e4m3fn": "e4m3fn",
+        "float4_e2m1fn": "fp4",
     }
 
     k_pack = 1
@@ -216,6 +217,7 @@ class HCUMatrixCoreIntrinEmitter:
             "float8_e4m3fnuz": "fp8",
             "float8_e4m3fn": "fp8",
             "float8_e5m2": "bf8",
+            "float4_e2m1fn": "fp4",
         }[in_dtype]
 
         target = self.target
@@ -229,6 +231,10 @@ class HCUMatrixCoreIntrinEmitter:
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_fp8_fp8_lit_lts"
             elif in_abbr == "bf8":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_bf8_bf8_lit_lts"
+            elif in_abbr == "fp4":
+                if out_dtype_abbrv != "f32":
+                    raise AssertionError("HCU fp4 MMAC currently only supports float32 accum")
+                self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_fp4_lit_lts"
             elif in_abbr == "i8":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_i8_lit_clamp_lts"
             elif in_abbr == "tf32":
@@ -246,6 +252,8 @@ class HCUMatrixCoreIntrinEmitter:
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_fp8_fp8"
             elif in_abbr == "bf8":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_bf8_bf8"
+            elif in_abbr == "fp4":
+                raise AssertionError("HCU fp4 MMAC requires lit/lts target support")
             elif in_abbr == "i8":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_i8"
             elif in_abbr == "tf32":
@@ -332,7 +340,11 @@ class HCUMatrixCoreIntrinEmitter:
 
     def configure_b_mls(self, *, b_mls: bool = True) -> None:
         """Update N-side recompute metadata when B is loaded from MLS LDS."""
-        self.min_n_per_warp = min_n_per_warp_for_b(b_mls=b_mls, b_mls_trans=self.b_transposed)
+        self.min_n_per_warp = min_n_per_warp_for_b(
+            b_mls=b_mls,
+            b_mls_trans=self.b_transposed,
+            element_bits=DataType(self.b_dtype).bits,
+        )
         self._initialize_block_warp_tiles(self.block_m, self.block_n)
 
     def _shared_block_mn_k(self, src: Buffer | BufferLoad | BufferRegion, mls_trans: bool) -> tuple[int, int]:
@@ -617,23 +629,23 @@ class HCUMatrixCoreIntrinEmitter:
         if self.block_k_warps != 1:
             raise ValueError("ldmatrix_mls_a requires block_k_warps == 1 (MLS ds_read path)")
         mls_trans = not self.a_transposed
-        lds_mn, lds_k, read_mn, read_k, origin_mn, origin_k = mls_full_and_read_mn_k(A_mls_src, mls_trans)
+        lds_block_mn, lds_block_k, ds_read_mn, ds_read_k, origin_mn, origin_k = mls_full_and_read_mn_k(A_mls_src, mls_trans)
         # Mls tile / LdsDesc follow the full write shape.
-        tile_mn, tile_k = compute_mls_tiles(mls_trans, lds_mn, lds_k, self.threads, self.target, elem_bits(A_local_buf.dtype))
+        tile_mn, tile_k = compute_mls_tiles(mls_trans, lds_block_mn, lds_block_k, self.threads, self.target, elem_bits(A_local_buf.dtype))
         check_mls_slice_aligned_to_tile(
             origin_mn=origin_mn,
             origin_k=origin_k,
-            read_mn=read_mn,
-            read_k=read_k,
+            read_mn=ds_read_mn,
+            read_k=ds_read_k,
             tile_mn=tile_mn,
             tile_k=tile_k,
             what="ldmatrix_mls_a",
         )
         template = build_ds_read_format_tensor_a_template(
-            lds_mn=lds_mn,
-            lds_k=lds_k,
-            read_mn=read_mn,
-            read_k=read_k,
+            lds_block_mn=lds_block_mn,
+            lds_block_k=lds_block_k,
+            ds_read_mn=ds_read_mn,
+            ds_read_k=ds_read_k,
             tile_mn=tile_mn,
             tile_k=tile_k,
             warp_m=self.block_row_warps,
@@ -669,23 +681,23 @@ class HCUMatrixCoreIntrinEmitter:
             raise ValueError("ldmatrix_mls_b requires block_k_warps == 1 (MLS ds_read path)")
         self.configure_b_mls(b_mls=True)
         mls_trans = self.b_transposed
-        lds_mn, lds_k, read_mn, read_k, origin_mn, origin_k = mls_full_and_read_mn_k(B_mls_src, mls_trans)
-        tile_mn, tile_k = compute_mls_tiles(mls_trans, lds_mn, lds_k, self.threads, self.target, elem_bits(B_local_buf.dtype))
+        lds_block_mn, lds_block_k, ds_read_mn, ds_read_k, origin_mn, origin_k = mls_full_and_read_mn_k(B_mls_src, mls_trans)
+        tile_mn, tile_k = compute_mls_tiles(mls_trans, lds_block_mn, lds_block_k, self.threads, self.target, elem_bits(B_local_buf.dtype))
         check_mls_slice_aligned_to_tile(
             origin_mn=origin_mn,
             origin_k=origin_k,
-            read_mn=read_mn,
-            read_k=read_k,
+            read_mn=ds_read_mn,
+            read_k=ds_read_k,
             tile_mn=tile_mn,
             tile_k=tile_k,
             what="ldmatrix_mls_b",
         )
         total_warp = self.threads // self.WARP_SIZE
         template = build_ds_read_format_tensor_b_template(
-            lds_mn=lds_mn,
-            lds_k=lds_k,
-            read_mn=read_mn,
-            read_k=read_k,
+            lds_block_mn=lds_block_mn,
+            lds_block_k=lds_block_k,
+            ds_read_mn=ds_read_mn,
+            ds_read_k=ds_read_k,
             tile_mn=tile_mn,
             tile_k=tile_k,
             total_warp=total_warp,
