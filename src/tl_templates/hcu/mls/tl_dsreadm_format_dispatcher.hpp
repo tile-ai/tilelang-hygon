@@ -21,6 +21,9 @@ template <::tl::index_t ElemBytes, ::tl::index_t Row, ::tl::index_t Col,
           ::tl::index_t Alt, bool Trans>
 struct DsreadmFormatDispatcher;
 
+template <::tl::index_t Row, ::tl::index_t Col, ::tl::index_t Alt, bool Trans>
+struct DsreadmPadByteDispatcher;
+
 // M32x16 B16 non-trans Alt1
 template <> struct DsreadmFormatDispatcher<2, 32, 16, 1, false> {
   using Type = DsreadmFormatAttribute<DsreadmFormatAttributeImpl_M32x16_B16>;
@@ -95,6 +98,22 @@ template <> struct DsreadmFormatDispatcher<4, 16, 128, 1, true> {
   using Type = DsreadmFormatAttribute<DsreadmFormatAttributeImpl_MT16x128_B4>;
 };
 
+// --------------------------------
+// DS_READ_MATRIX_PADBYTE_B4
+// --------------------------------
+
+template <::tl::index_t Alt>
+struct DsreadmPadByteDispatcher<32, 32, Alt, false> {
+  using Type = DsreadmPadByteAttribute<
+      DsreadmFormatAttributeImpl_M32x32_B4_PADBYTE<Alt>>;
+};
+
+template <::tl::index_t Alt>
+struct DsreadmPadByteDispatcher<32, 32, Alt, true> {
+  using Type = DsreadmPadByteAttribute<
+      DsreadmFormatAttributeImpl_MT32x32_B4_PADBYTE<Alt>>;
+};
+
 } // namespace impl
 
 template <::tl::index_t ElemBytes, ::tl::index_t Row, ::tl::index_t Col,
@@ -102,6 +121,10 @@ template <::tl::index_t ElemBytes, ::tl::index_t Row, ::tl::index_t Col,
 using DsreadmFormatDispatcher =
     typename impl::DsreadmFormatDispatcher<ElemBytes, Row, Col, Alt,
                                            Trans>::Type;
+
+template <::tl::index_t Row, ::tl::index_t Col, ::tl::index_t Alt, bool Trans>
+using DsreadmPadByteDispatcher =
+    typename impl::DsreadmPadByteDispatcher<Row, Col, Alt, Trans>::Type;
 
 } // namespace mls
 } // namespace tl

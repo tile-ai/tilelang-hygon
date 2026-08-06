@@ -257,6 +257,10 @@ struct mls_traits<tl::mls::gfx946_mls_64x16_b8, Alt> {
 };
 
 template <::tl::index_t Alt>
+struct mls_traits<tl::mls::gfx946_mls_64x16_fp4, Alt>
+    : mls_traits<tl::mls::gfx946_mls_64x16_b8, Alt> {};
+
+template <::tl::index_t Alt>
 struct mls_traits<tl::mls::gfx946_mls_16x64_trans_b8, Alt> {
   static_assert(Alt == 1 || Alt == 2 || Alt == 4,
                 "Unsupported interleave config");
@@ -264,6 +268,10 @@ struct mls_traits<tl::mls::gfx946_mls_16x64_trans_b8, Alt> {
   static constexpr auto kK = ::tl::number<64>{};
   static constexpr auto PackedShape = ::tl::make_tuple(kMN, kK);
 };
+
+template <::tl::index_t Alt>
+struct mls_traits<tl::mls::gfx946_mls_16x64_trans_fp4, Alt>
+    : mls_traits<tl::mls::gfx946_mls_16x64_trans_b8, Alt> {};
 
 template <::tl::index_t Alt>
 struct mls_traits<tl::mls::gfx946_mls_64x32_b8, Alt> {

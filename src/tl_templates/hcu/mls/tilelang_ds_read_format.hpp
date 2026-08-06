@@ -30,7 +30,8 @@ namespace mls {
 template <typename LdsBlockSize, typename DsReadBlockSize, typename MlsTileSize,
           ::tl::index_t WarpMN, ::tl::index_t WarpK, typename DataType,
           ::tl::index_t Alt, bool Trans, ::tl::hcu_target_enum HcuArch,
-          ::tl::index_t DstBits = mls_elem_bits_v<DataType>>
+          ::tl::index_t LdsBits = mls_elem_bits_v<DataType>,
+          ::tl::index_t RegBits = LdsBits>
 struct ds_read_format_traits {
   static constexpr ::tl::index_t ReadBlockSizeMN =
       DsReadBlockSize::at(::tl::number<0>{});
@@ -38,12 +39,13 @@ struct ds_read_format_traits {
       DsReadBlockSize::at(::tl::number<1>{});
 
   static constexpr ::tl::index_t Bits = mls_elem_bits_v<DataType>;
+  static constexpr ::tl::index_t LdsPhysicalBits = LdsBits;
 
   using LdsTraits = mls_lds_desc_param_traits<LdsBlockSize, MlsTileSize, Bits,
-                                              Bits, Alt, Trans, HcuArch>;
+                                              LdsBits, Alt, Trans, HcuArch>;
   using MlsAtom = typename LdsTraits::MlsAtom;
   using DsFormatInst =
-      typename mls_ds_traits<MlsAtom, Bits, DstBits, Alt>::Type;
+      typename mls_ds_traits<MlsAtom, Bits, LdsBits, RegBits, Alt>::Type;
 
   static constexpr auto LdsDesc = LdsTraits::get_tile_lds_desc();
 
@@ -71,11 +73,11 @@ struct ds_read_format_traits {
   // Matches gemm.h body_rr: a_ptr = A_local + (ki * warp_rows + Mi) * vec_size
   static constexpr ::tl::index_t MmacMNSize = 16;
   static constexpr ::tl::index_t MmacKSize =
-      Bits == 4 ? 64 : (Bits == 16 ? 16 : 32);
+      RegBits == 4 ? 64 : (RegBits == 16 ? 16 : 32);
   static constexpr ::tl::index_t GemmWarpRows = PerWarpMN / MmacMNSize;
   static constexpr ::tl::index_t GemmInnerK = PerWarpK / MmacKSize;
   // VecSize is in storage elements; for b4 it counts packed bytes.
-  static constexpr ::tl::index_t VecSize = Bits == 4 ? 8 : 8 / sizeof(DataType);
+  static constexpr ::tl::index_t VecSize = RegBits == 4 ? 8 : 64 / RegBits;
   static constexpr ::tl::index_t GemmTensorSize =
       GemmInnerK * GemmWarpRows * VecSize;
 };
@@ -98,21 +100,23 @@ struct ds_read_format_traits {
 template <typename LdsBlockSize, typename DsReadBlockSize, typename MlsTileSize,
           ::tl::index_t WarpMN, ::tl::index_t WarpK, typename DataType,
           ::tl::index_t Alt, bool Trans, ::tl::hcu_target_enum HcuArch,
-          typename TargetType = DataType>
+          typename TargetType = DataType,
+          ::tl::index_t LdsBits = mls_elem_bits_v<DataType>,
+          ::tl::index_t RegBits = mls_elem_bits_v<TargetType>>
 TL_DEVICE void
-ds_read_format_tensor(TL_LDS_ADDR DataType *smem_ptr, TargetType *target,
+ds_read_format_tensor(TL_LDS_ADDR DataType *smem_ptr, void *target,
                       ::tl::index_t warp_mn_idx, ::tl::index_t warp_k_idx,
                       ::tl::index_t origin_mn = 0, ::tl::index_t origin_k = 0) {
-  using Traits =
-      ds_read_format_traits<LdsBlockSize, DsReadBlockSize, MlsTileSize, WarpMN,
-                            WarpK, DataType, Alt, Trans, HcuArch,
-                            mls_elem_bits_v<TargetType>>;
+  using Traits = ds_read_format_traits<LdsBlockSize, DsReadBlockSize,
+                                       MlsTileSize, WarpMN, WarpK, DataType,
+                                       Alt, Trans, HcuArch, LdsBits, RegBits>;
 
   using DsFormatInst = typename Traits::DsFormatInst;
   using StorageTargetType = typename ds_read_format_storage_type<
       ::tl::remove_cvref_t<TargetType>>::type;
   using vector_t =
       ::tl::ext_vector_t<StorageTargetType, DsFormatInst::kVectorLength>;
+  TargetType *target_typed = reinterpret_cast<TargetType *>(target);
 
   constexpr ::tl::index_t NumMMAC_MN = DsFormatInst::kMN / Traits::MmacMNSize;
   constexpr ::tl::index_t NumMMAC_K = DsFormatInst::kK / Traits::MmacKSize;
@@ -122,10 +126,11 @@ ds_read_format_tensor(TL_LDS_ADDR DataType *smem_ptr, TargetType *target,
                 "DsFormatInst vector length must match mmac blocks * vec_size");
 
   const ::tl::index_t warp_lds_byte_offset =
-      ::tl::mls::mls_storage_traits<DataType>::logical_offset_to_byte_offset(
-          Traits::LdsDesc.calculate_offset(::tl::make_multi_index(
-              origin_mn + warp_mn_idx * Traits::PerWarpMN,
-              origin_k + warp_k_idx * Traits::PerWarpK)));
+      ::tl::mls::mls_lds_physical_storage_traits<Traits::LdsPhysicalBits>::
+          logical_offset_to_byte_offset(
+              Traits::LdsDesc.calculate_offset(::tl::make_multi_index(
+                  origin_mn + warp_mn_idx * Traits::PerWarpMN,
+                  origin_k + warp_k_idx * Traits::PerWarpK)));
   TL_LDS_ADDR uint8_t *smem_bytes =
       reinterpret_cast<TL_LDS_ADDR uint8_t *>(smem_ptr);
 
@@ -139,9 +144,10 @@ ds_read_format_tensor(TL_LDS_ADDR DataType *smem_ptr, TargetType *target,
     // delta(w, local) == offset(local) for this access pattern; origin is
     // folded only into the warp base pointer.
     constexpr auto immed_offset =
-        ::tl::mls::mls_storage_traits<DataType>::logical_offset_to_byte_offset(
-            Traits::LdsDesc.calculate_offset(::tl::make_multi_index(
-                mn_iter * DsFormatInst::kMN, k_iter * DsFormatInst::kK)));
+        ::tl::mls::mls_lds_physical_storage_traits<Traits::LdsPhysicalBits>::
+            logical_offset_to_byte_offset(
+                Traits::LdsDesc.calculate_offset(::tl::make_multi_index(
+                    mn_iter * DsFormatInst::kMN, k_iter * DsFormatInst::kK)));
 
     auto ret = DsFormatInst{}(reinterpret_cast<TL_LDS_ADDR DataType *>(
                                   smem_bytes + warp_lds_byte_offset),
@@ -174,7 +180,7 @@ ds_read_format_tensor(TL_LDS_ADDR DataType *smem_ptr, TargetType *target,
 #pragma unroll
 #endif
       for (::tl::index_t j = 0; j < Traits::VecSize; j++) {
-        target[target_offset + j] =
+        target_typed[target_offset + j] =
             static_cast<TargetType>(vec_value[vec_offset + j]);
       }
     });
@@ -194,9 +200,11 @@ ds_read_format_tensor(TL_LDS_ADDR DataType *smem_ptr, TargetType *target,
 template <typename LdsBlockSize, typename DsReadBlockSize, typename MlsTileA,
           ::tl::index_t WarpM, ::tl::index_t WarpK, typename DataType,
           ::tl::index_t Alt, bool Trans, ::tl::hcu_target_enum HcuArch,
-          typename TargetType = DataType>
+          typename TargetType = DataType,
+          ::tl::index_t LdsBits = mls_elem_bits_v<DataType>,
+          ::tl::index_t RegBits = mls_elem_bits_v<TargetType>>
 TL_DEVICE void ds_read_format_tensor_a(TL_LDS_ADDR DataType *smem_ptr,
-                                       TargetType *target,
+                                       void *target,
                                        ::tl::index_t warp_id_offset = 0,
                                        ::tl::index_t origin_mn = 0,
                                        ::tl::index_t origin_k = 0) {
@@ -205,8 +213,9 @@ TL_DEVICE void ds_read_format_tensor_a(TL_LDS_ADDR DataType *smem_ptr,
   const ::tl::index_t warp_m_idx = warp_id % WarpM;
   const ::tl::index_t warp_k_idx = 0;
   ds_read_format_tensor<LdsBlockSize, DsReadBlockSize, MlsTileA, WarpM, WarpK,
-                        DataType, Alt, Trans, HcuArch, TargetType>(
-      smem_ptr, target, warp_m_idx, warp_k_idx, origin_mn, origin_k);
+                        DataType, Alt, Trans, HcuArch, TargetType, LdsBits,
+                        RegBits>(smem_ptr, target, warp_m_idx, warp_k_idx,
+                                 origin_mn, origin_k);
 }
 
 /*
@@ -220,7 +229,9 @@ TL_DEVICE void ds_read_format_tensor_a(TL_LDS_ADDR DataType *smem_ptr,
 template <typename LdsBlockSize, typename DsReadBlockSize, typename MlsTileSize,
           ::tl::index_t WarpMN, ::tl::index_t WarpK, typename DataType,
           ::tl::index_t Alt, bool Trans, ::tl::hcu_target_enum HcuArch,
-          typename TargetType = DataType>
+          typename TargetType = DataType,
+          ::tl::index_t LdsBits = mls_elem_bits_v<DataType>,
+          ::tl::index_t RegBits = mls_elem_bits_v<TargetType>>
 TL_DEVICE void ds_read_format_tensor_common(TL_LDS_ADDR DataType *smem_ptr,
                                             TargetType *target,
                                             ::tl::index_t warp_id_offset = 0,
@@ -231,11 +242,10 @@ TL_DEVICE void ds_read_format_tensor_common(TL_LDS_ADDR DataType *smem_ptr,
   static constexpr ::tl::index_t Bits = mls_elem_bits_v<DataType>;
 
   using LdsTraits = mls_lds_desc_param_traits<LdsBlockSize, MlsTileSize, Bits,
-                                              Bits, Alt, Trans, HcuArch>;
+                                              LdsBits, Alt, Trans, HcuArch>;
   using MlsAtom = typename LdsTraits::MlsAtom;
   using DsFormatInst =
-      typename mls_ds_traits<MlsAtom, Bits, mls_elem_bits_v<TargetType>,
-                             Alt>::Type;
+      typename mls_ds_traits<MlsAtom, Bits, LdsBits, RegBits, Alt>::Type;
 
   static constexpr ::tl::index_t WarpMN_no_recompute =
       std::min(WarpMN, ReadBlockSizeMN / DsFormatInst::kMN);
@@ -249,8 +259,8 @@ TL_DEVICE void ds_read_format_tensor_common(TL_LDS_ADDR DataType *smem_ptr,
 
   ds_read_format_tensor<LdsBlockSize, DsReadBlockSize, MlsTileSize,
                         WarpMN_no_recompute, WarpK, DataType, Alt, Trans,
-                        HcuArch, TargetType>(smem_ptr, target, warp_mn_idx,
-                                             warp_k_idx, origin_mn, origin_k);
+                        HcuArch, TargetType, LdsBits, RegBits>(
+      smem_ptr, target, warp_mn_idx, warp_k_idx, origin_mn, origin_k);
 }
 
 /*
@@ -270,9 +280,11 @@ TL_DEVICE void ds_read_format_tensor_common(TL_LDS_ADDR DataType *smem_ptr,
 template <typename LdsBlockSize, typename DsReadBlockSize, typename MlsTileB,
           ::tl::index_t TotalWarp, ::tl::index_t WarpN, ::tl::index_t WarpK,
           typename DataType, ::tl::index_t Alt, bool Trans,
-          ::tl::hcu_target_enum HcuArch, typename TargetType = DataType>
+          ::tl::hcu_target_enum HcuArch, typename TargetType = DataType,
+          ::tl::index_t LdsBits = mls_elem_bits_v<DataType>,
+          ::tl::index_t RegBits = mls_elem_bits_v<TargetType>>
 TL_DEVICE void ds_read_format_tensor_b(TL_LDS_ADDR DataType *smem_ptr,
-                                       TargetType *target,
+                                       void *target,
                                        ::tl::index_t warp_id_offset = 0,
                                        ::tl::index_t origin_mn = 0,
                                        ::tl::index_t origin_k = 0) {
@@ -291,8 +303,8 @@ TL_DEVICE void ds_read_format_tensor_b(TL_LDS_ADDR DataType *smem_ptr,
   }
   ds_read_format_tensor<LdsBlockSize, DsReadBlockSize, MlsTileB,
                         WarpN_no_recompute, WarpK, DataType, Alt, Trans,
-                        HcuArch, TargetType>(smem_ptr, target, warp_n_idx,
-                                             warp_k_idx, origin_mn, origin_k);
+                        HcuArch, TargetType, LdsBits, RegBits>(
+      smem_ptr, target, warp_n_idx, warp_k_idx, origin_mn, origin_k);
 }
 
 } // namespace mls

@@ -63,6 +63,41 @@ template <typename Impl> struct DsreadmFormatAttribute {
   }
 };
 
+template <typename Impl> struct DsreadmPadByteAttribute {
+  using ImplType = ::tl::remove_cvref_t<Impl>;
+
+  static constexpr ::tl::index_t kMN = ImplType::kMN;
+  static constexpr ::tl::index_t kK = ImplType::kK;
+
+  static constexpr ::tl::index_t kMN0StorePerlane = ImplType::kMN0StorePerLane;
+  static constexpr ::tl::index_t kMNStoreLane = ImplType::kMNStoreLane;
+  static constexpr ::tl::index_t kMN1StorePerLane = ImplType::kMN1StorePerLane;
+  static constexpr ::tl::index_t kKStoreLane = ImplType::kKStoreLane;
+  static constexpr ::tl::index_t kKStorePerLane = ImplType::kKStorePerLane;
+  static constexpr ::tl::index_t kVectorLength = ImplType::kVectorLength;
+
+  using WarpStoreDstrEncoding = ::tl::tile_distribution_encoding<
+      ::tl::sequence<>,
+      ::tl::tuple<
+          ::tl::sequence<kMN0StorePerlane, kMNStoreLane, kMN1StorePerLane>,
+          ::tl::sequence<kKStoreLane, kKStorePerLane>>,
+      ::tl::tuple<::tl::sequence<2, 1>>, ::tl::tuple<::tl::sequence<0, 1>>,
+      ::tl::sequence<1, 1, 2>, ::tl::sequence<0, 2, 1>>;
+
+  template <typename T, ::tl::index_t offset>
+  TL_DEVICE auto operator()(TL_LDS_ADDR T *smem_ptr,
+                            ::tl::number<offset>) const {
+    using VectorType = ::tl::ext_vector_t<uint8_t, kVectorLength>;
+    using RetType = ::tl::thread_buffer<VectorType, 1>;
+
+    RetType ret;
+    Impl{}(smem_ptr, ret.template get_as<VectorType>()[::tl::number<0>{}],
+           ::tl::number<offset>{});
+
+    return ret;
+  }
+};
+
 // ========== Impl structs (builtin-based) ==========
 
 struct DsreadmFormatAttributeImpl_M32x16_B16 {
@@ -333,6 +368,60 @@ struct DsreadmFormatAttributeImpl_MT32x32_B8_ALT2 {
         __builtin_hcu_ds_read_matrix_trans_format_u8(
             ptr, offset, static_cast<char>(0x2), static_cast<char>(0x2),
             static_cast<char>(0x1)));
+  }
+};
+
+template <::tl::index_t Alt>
+struct DsreadmFormatAttributeImpl_M32x32_B4_PADBYTE {
+  static constexpr ::tl::index_t kMN = 32;
+  static constexpr ::tl::index_t kK = 32;
+
+  static constexpr ::tl::index_t kMNStoreLane = 16;
+  static constexpr ::tl::index_t kKStoreLane = 4;
+
+  static constexpr ::tl::index_t kMN0StorePerLane = 2;
+  static constexpr ::tl::index_t kMN1StorePerLane = 1;
+  static constexpr ::tl::index_t kKStorePerLane = 8;
+
+  static constexpr ::tl::index_t kMNInterleave = 1;
+  static constexpr ::tl::index_t kVectorLength =
+      kMN0StorePerLane * kMN1StorePerLane * kKStorePerLane;
+
+  template <typename T, ::tl::index_t offset>
+  TL_DEVICE void operator()(TL_LDS_ADDR T *smem,
+                            ::tl::ext_vector_t<uint8_t, kVectorLength> &ret,
+                            ::tl::number<offset>) const {
+    TL_LDS_ADDR int *ptr = reinterpret_cast<TL_LDS_ADDR int *>(smem);
+    ret = ::tl::bit_cast<::tl::ext_vector_t<uint8_t, kVectorLength>>(
+        __builtin_hcu_ds_read_matrix_padbyte_b4(ptr, offset,
+                                                static_cast<char>(Alt)));
+  }
+};
+
+template <::tl::index_t Alt>
+struct DsreadmFormatAttributeImpl_MT32x32_B4_PADBYTE {
+  static constexpr ::tl::index_t kMN = 32;
+  static constexpr ::tl::index_t kK = 32;
+
+  static constexpr ::tl::index_t kMNStoreLane = 16;
+  static constexpr ::tl::index_t kKStoreLane = 4;
+
+  static constexpr ::tl::index_t kMN0StorePerLane = 2;
+  static constexpr ::tl::index_t kMN1StorePerLane = 1;
+  static constexpr ::tl::index_t kKStorePerLane = 8;
+
+  static constexpr ::tl::index_t kMNInterleave = 1;
+  static constexpr ::tl::index_t kVectorLength =
+      kMN0StorePerLane * kMN1StorePerLane * kKStorePerLane;
+
+  template <typename T, ::tl::index_t offset>
+  TL_DEVICE void operator()(TL_LDS_ADDR T *smem,
+                            ::tl::ext_vector_t<uint8_t, kVectorLength> &ret,
+                            ::tl::number<offset>) const {
+    TL_LDS_ADDR int *ptr = reinterpret_cast<TL_LDS_ADDR int *>(smem);
+    ret = ::tl::bit_cast<::tl::ext_vector_t<uint8_t, kVectorLength>>(
+        __builtin_hcu_ds_read_matrix_trans_padbyte_b4(ptr, offset,
+                                                      static_cast<char>(Alt)));
   }
 };
 

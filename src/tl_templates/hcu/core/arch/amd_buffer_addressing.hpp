@@ -1329,7 +1329,11 @@ TL_DEVICE thread_buffer<T, N> amd_buffer_load_impl(int32x4_t src_wave_buffer_res
              (N == 1 || N == 2 || N == 4 || N == 8 || N == 16)) ||
             (std::is_same<T, fp8_t>::value && (N == 1 || N == 2 || N == 4 || N == 8 || N == 16)) ||
             (std::is_same<T, bf8_t>::value && (N == 1 || N == 2 || N == 4 || N == 8 || N == 16)) ||
-            (std::is_same<T, int8_t>::value && (N == 1 || N == 2 || N == 4 || N == 8 || N == 16)),
+            (std::is_same<T, int8_t>::value && (N == 1 || N == 2 || N == 4 || N == 8 || N == 16)) ||
+            (std::is_same<T, uint16_t>::value && (N == 1 || N == 2 || N == 4 || N == 8)) ||
+            (std::is_same<T, uint8x4_t>::value && (N == 1 || N == 2 || N == 4)) ||
+            (std::is_same<T, uint8x8_t>::value && (N == 1 || N == 2)) ||
+            (std::is_same<T, uint8x16_t>::value && N == 1),
         "wrong! not implemented");
 
     using rtn_type = thread_buffer<T, N>;
@@ -1967,7 +1971,10 @@ TL_DEVICE void amd_buffer_store_impl(const thread_buffer<T, N> src_thread_data,
             (std::is_same<T, int8_t>::value && (N == 1 || N == 2 || N == 4 || N == 8 || N == 16)) ||
             (std::is_same<T, uint16_t>::value &&
              (N == 1 || N == 2 || N == 4 || N == 8 || N == 16)) ||
-            (std::is_same<T, uint8_t>::value && (N == 1 || N == 2 || N == 4 || N == 8 || N == 16)),
+            (std::is_same<T, uint8_t>::value && (N == 1 || N == 2 || N == 4 || N == 8 || N == 16)) ||
+            (std::is_same<T, uint8x4_t>::value && (N == 1 || N == 2 || N == 4)) ||
+            (std::is_same<T, uint8x8_t>::value && (N == 1 || N == 2)) ||
+            (std::is_same<T, uint8x16_t>::value && N == 1),
         "wrong! not implemented");
 
     if constexpr(std::is_same<T, float>::value) // fp32

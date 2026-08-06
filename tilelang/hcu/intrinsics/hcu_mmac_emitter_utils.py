@@ -162,13 +162,23 @@ def build_ds_read_format_tensor_a_template(
     mls_trans: bool,
     dtype_str: str,
     target: Target,
+    target_dtype_str: str | None = None,
+    lds_bits: int | None = None,
+    reg_bits: int | None = None,
 ) -> str:
     arch = get_hcu_arch_string(target)
     trans = "true" if mls_trans else "false"
+    target_type = f", {target_dtype_str}" if target_dtype_str is not None else ""
+    if lds_bits is not None:
+        if target_dtype_str is None:
+            raise ValueError("lds_bits requires target_dtype_str")
+        if reg_bits is None:
+            raise ValueError("lds_bits requires reg_bits")
+        target_type += f", {int(lds_bits)}, {int(reg_bits)}"
     return (
         f"tl::mls::ds_read_format_tensor_a<tl::sequence<{lds_block_mn}, {lds_block_k}>, "
         f"tl::sequence<{ds_read_mn}, {ds_read_k}>, tl::sequence<{tile_mn}, {tile_k}>, "
-        f"{warp_m}, {warp_k}, {dtype_str}, 1, {trans}, tl::hcu_target_enum::{arch}>"
+        f"{warp_m}, {warp_k}, {dtype_str}, 1, {trans}, tl::hcu_target_enum::{arch}{target_type}>"
     )
 
 
@@ -186,14 +196,24 @@ def build_ds_read_format_tensor_b_template(
     mls_trans: bool,
     dtype_str: str,
     target: Target,
+    target_dtype_str: str | None = None,
+    lds_bits: int | None = None,
+    reg_bits: int | None = None,
 ) -> str:
     arch = get_hcu_arch_string(target)
     trans = "true" if mls_trans else "false"
+    target_type = f", {target_dtype_str}" if target_dtype_str is not None else ""
+    if lds_bits is not None:
+        if target_dtype_str is None:
+            raise ValueError("lds_bits requires target_dtype_str")
+        if reg_bits is None:
+            raise ValueError("lds_bits requires reg_bits")
+        target_type += f", {int(lds_bits)}, {int(reg_bits)}"
     return (
         f"tl::mls::ds_read_format_tensor_b<tl::sequence<{lds_block_mn}, {lds_block_k}>, "
         f"tl::sequence<{ds_read_mn}, {ds_read_k}>, tl::sequence<{tile_mn}, {tile_k}>, "
         f"{total_warp}, {warp_n}, {warp_k}, {dtype_str}, 1, {trans}, "
-        f"tl::hcu_target_enum::{arch}>"
+        f"tl::hcu_target_enum::{arch}{target_type}>"
     )
 
 
@@ -210,6 +230,29 @@ def block_col_warps_no_recompute(block_n: int, block_col_warps: int, min_n_per_w
 
 def elem_bits(dtype) -> int:
     return int(DataType(dtype).bits)
+
+
+def is_f8f6f4_operand_dtype(dtype) -> bool:
+    dtype_str = str(dtype)
+    return "float4_e2m1fn" in dtype_str or "float8_e4m3" in dtype_str or "float8_e5m2" in dtype_str
+
+
+def hcu_mls_lds_bits(dtype, *, mls_trans: bool, tile_mn: int, tile_k: int, target: Target) -> int:
+    """Physical LDS bits written by the selected MLS atom."""
+    from tilelang.hcu.target import get_hcu_arch_string
+
+    bits = elem_bits(dtype)
+    if bits != 4:
+        return bits
+    arch = get_hcu_arch_string(target)
+    # The 64x16_fp4 atom pads fp4 to b8 while writing LDS. Other fp4 MLS
+    # atoms keep LDS packed as b4; ds_read_matrix_padbyte may later expand
+    # the register view to b8 when RegBits=8.
+    if arch in ("gfx92a", "gfx946") and (
+        (not mls_trans and tile_mn == 64 and tile_k == 16) or (mls_trans and tile_mn == 16 and tile_k == 64)
+    ):
+        return 8
+    return bits
 
 
 def hcu_mmac_k_dim(target: Target, element_bits: int, *, use_tf32: bool = False) -> int:
@@ -234,3 +277,11 @@ def hcu_mmac_k_dim(target: Target, element_bits: int, *, use_tf32: bool = False)
                 return 4
         return 8
     raise ValueError(f"Unsupported element_bits for HCU MMAC: {element_bits}")
+
+
+def hcu_mmac_k_dim_for_operand(target: Target, dtype, *, operand_mode: str = "native", use_tf32: bool = False) -> int:
+    """Per-instruction MMAC K for a logical operand dtype under a selected operand mode."""
+    dtype = DataType(dtype)
+    if operand_mode == "f8f6f4" and is_f8f6f4_operand_dtype(dtype):
+        return 32
+    return hcu_mmac_k_dim(target, dtype.bits, use_tf32=use_tf32)

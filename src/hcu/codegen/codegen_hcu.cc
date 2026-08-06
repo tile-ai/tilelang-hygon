@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -33,6 +34,134 @@ namespace {
 
 bool IsValidCPAsyncTransferBytes(int64_t bytes) {
   return bytes == 4 || bytes == 8 || bytes == 16;
+}
+
+struct Fp4PackedVectorDesc {
+  int lanes;
+  std::string c_type;
+};
+
+Fp4PackedVectorDesc GetFp4PackedVectorDesc(int lanes) {
+  switch (lanes) {
+  case 2:
+    return {lanes, "uint8_t"};
+  case 4:
+    return {lanes, "int16_t"};
+  case 8:
+    return {lanes, "int"};
+  case 16:
+    return {lanes, "int2"};
+  case 32:
+    return {lanes, "tl::uint8x16_t"};
+  default:
+    LOG(FATAL) << "HCU fp4 packed vector load/store only supports lanes 2, "
+                  "4, 8, 16, or 32; got lanes="
+               << lanes;
+  }
+  return {};
+}
+
+bool CanProveMultiple(const PrimExpr &base, int multiple) {
+  arith::ModularSet me = arith::Analyzer().modular_set(base);
+  return me->coeff % multiple == 0 && me->base % multiple == 0;
+}
+
+bool IsFp4PackedVectorStore(DataType value_dtype, DataType element_dtype) {
+  return element_dtype.is_float4_e2m1fn() && element_dtype.is_scalar() &&
+         value_dtype.lanes() > 1 && value_dtype.element_of() == element_dtype;
+}
+
+bool CanStoreValueAsBufferVector(DataType value_dtype, DataType element_dtype) {
+  if (IsFp4PackedVectorStore(value_dtype, element_dtype)) {
+    return true;
+  }
+  return (element_dtype.lanes() == 1)
+             ? (value_dtype.element_of() == element_dtype.element_of())
+             : (value_dtype.lanes() == element_dtype.lanes());
+}
+
+enum RealABTypeId : unsigned {
+  FP8_FP8,
+  FP8_BF8,
+  FP8_FP6,
+  FP8_BF6,
+  FP8_FP4,
+  BF8_FP8,
+  BF8_BF8,
+  BF8_FP6,
+  BF8_BF6,
+  BF8_FP4,
+  FP6_FP8,
+  FP6_BF8,
+  FP6_FP6,
+  FP6_BF6,
+  FP6_FP4,
+  BF6_FP8,
+  BF6_BF8,
+  BF6_FP6,
+  BF6_BF6,
+  BF6_FP4,
+  FP4_FP8,
+  FP4_BF8,
+  FP4_FP6,
+  FP4_BF6,
+  FP4_FP4,
+};
+
+enum class RealABType : unsigned {
+  kFP8 = 0,
+  kBF8 = 1,
+  kFP6 = 2,
+  kBF6 = 3,
+  kFP4 = 4,
+};
+
+bool HasPrefix(const std::string &value, const std::string &prefix) {
+  return value.rfind(prefix, 0) == 0;
+}
+
+RealABType GetF8F6F4OperandType(const std::string &dtype) {
+  if (HasPrefix(dtype, "float8_e4m3")) {
+    return RealABType::kFP8;
+  }
+  if (HasPrefix(dtype, "float8_e5m2")) {
+    return RealABType::kBF8;
+  }
+  if (HasPrefix(dtype, "float6_e2m3fn")) {
+    return RealABType::kFP6;
+  }
+  if (HasPrefix(dtype, "float6_e3m2fn")) {
+    return RealABType::kBF6;
+  }
+  if (HasPrefix(dtype, "float4_e2m1fn") ||
+      HasPrefix(dtype, "float4_e2m1_unpacked") || dtype == "uint8" ||
+      HasPrefix(dtype, "uint8x")) {
+    return RealABType::kFP4;
+  }
+  LOG(FATAL) << "Unsupported f8f6f4 MMAC operand dtype: " << dtype;
+  return RealABType::kFP4;
+}
+
+int GetF8F6F4RealABTypeId(const std::string &a_dtype,
+                          const std::string &b_dtype) {
+  constexpr int kRealABTypeCount = 5;
+  int a_type = static_cast<int>(GetF8F6F4OperandType(a_dtype));
+  int b_type = static_cast<int>(GetF8F6F4OperandType(b_dtype));
+  return a_type * kRealABTypeCount + b_type;
+}
+
+std::optional<std::string>
+GetStringImmAnnotation(const ffi::Map<ffi::String, ObjectRef> &annotations,
+                       const char *key) {
+  auto it = annotations.find(key);
+  if (it == annotations.end()) {
+    return std::nullopt;
+  }
+  if (const auto *str = (*it).second.as<StringImmNode>()) {
+    return str->value;
+  }
+  LOG(FATAL) << "Annotation " << key << " must be a StringImm";
+  return std::nullopt;
 }
 
 std::optional<DataType> GetAccessPtrElementType(const PrimExpr &expr) {
@@ -99,6 +228,24 @@ int GetTileLangCPAsyncTransferBytes(const CallNode *op) {
 std::string HcuCkTemplateElemType(DataType dtype) {
   DataType elem_type = dtype.element_of();
   int elem_bits = elem_type.bits();
+  if (elem_type.is_float4_e2m1fn()) {
+    switch (dtype.lanes()) {
+    case 2:
+      return "uint8_t";
+    case 4:
+      return "uint16_t";
+    case 8:
+      return "tl::uint8x4_t";
+    case 16:
+      return "tl::uint8x8_t";
+    case 32:
+      return "tl::uint8x16_t";
+    default:
+      LOG(FATAL) << "HCU fp4 buffer ops only support lanes 2, 4, 8, 16, or "
+                    "32; got lanes="
+                 << dtype.lanes();
+    }
+  }
   if (elem_bits == 8) {
     if (elem_type.is_float8_e4m3fn() || elem_type.is_float8_e4m3fnuz() ||
         elem_type.is_float8_e4m3() ||
@@ -495,10 +642,7 @@ bool CodeGenTileLangHCU::StoreWillUseAmdBufferOpsWithPredicate(
   DataType element_dtype = op->buffer->dtype;
   PrimExpr index_expr = op->indices[0];
 
-  bool lanes_ok = (element_dtype.lanes() == 1)
-                      ? (value_dtype.element_of() == element_dtype.element_of())
-                      : (value_dtype.lanes() == element_dtype.lanes());
-  if (!lanes_ok)
+  if (!CanStoreValueAsBufferVector(value_dtype, element_dtype))
     return false;
   if (!CanUseVMBufferOps(op->buffer.get(), value_dtype.lanes()))
     return false;
@@ -953,80 +1097,32 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
   DataType value_dtype = op->value.dtype();
   DataType element_dtype = op->buffer->dtype;
   PrimExpr index_expr = op->indices[0];
-  Var buffer_var = op->buffer->data;
 
   if (TryToEmitLDSBufferOp(op))
     return;
 
-  if (element_dtype.is_float4_e2m1fn() && element_dtype.is_scalar()) {
-    auto emit_fp4_store = [&](const std::string &index,
-                              const std::string &value) {
-      PrintIndent();
-      std::string pred = GetCurrentPredicate();
-      if (pred != "true") {
-        stream << "if (" << pred << ") ";
-      }
-      stream << "tl::store_packed_fp4_lane(" << GetVarID(buffer_var.get())
-             << ", " << index << ", " << value << ");\n";
-    };
-
-    if (value_dtype.lanes() == 1) {
-      emit_fp4_store(PrintExpr(index_expr), PrintExpr(op->value));
-      return;
-    }
-
-    const RampNode *ramp_index = index_expr.as<RampNode>();
-    if (ramp_index) {
-      int vec_scope = BeginScope();
-      std::string value = SSAGetID(PrintExpr(op->value), value_dtype);
-      PrintIndent();
-      std::string pred = GetCurrentPredicate();
-      if (pred != "true") {
-        stream << "if (" << pred << ") ";
-      }
-      stream << "tl::store_packed_fp4_vector<" << value_dtype.lanes() << ">("
-             << GetVarID(buffer_var.get()) << ", "
-             << PrintExpr(ramp_index->base) << ", "
-             << PrintExpr(ramp_index->stride) << ", " << value << ");\n";
-      EndScope(vec_scope);
-      return;
-    }
-
-    int vec_scope = BeginScope();
-    std::string value = SSAGetID(PrintExpr(op->value), value_dtype);
-    for (int i = 0; i < value_dtype.lanes(); ++i) {
-      std::ostringstream lane_index;
-      std::string index = SSAGetID(PrintExpr(index_expr), index_expr.dtype());
-      PrintVecElemLoad(index, index_expr.dtype(), i, lane_index);
-      std::ostringstream lane_value;
-      PrintVecElemLoad(value, value_dtype, i, lane_value);
-      emit_fp4_store(lane_index.str(), lane_value.str());
-    }
-    EndScope(vec_scope);
-    return;
-  }
-
   // Only handle the common case where lanes match; otherwise, fall back to the
   // default CodeGenC implementation (which may invoke PrintVecStore to emit
   // buffer/vectorized store instructions).
-  if (value_dtype.lanes() == element_dtype.lanes()) {
+  if (value_dtype.lanes() == element_dtype.lanes() ||
+      IsFp4PackedVectorStore(value_dtype, element_dtype)) {
     BufferDesc desc = GetBufferDesc(value_dtype, op->buffer.get(), index_expr);
     if (CanUseVMBufferOps(op->buffer.get(), value_dtype.lanes())) {
       std::string value = PrintExpr(op->value);
 
       // Convert the value expression to a thread_buffer using bit_cast.
       // For lanes==1 this becomes thread_buffer<T,1>.
-      std::string src_thread_buffer = "tl::bit_cast<tl::thread_buffer<" +
-                                      HcuCkTemplateElemType(value_dtype) +
-                                      ", " + std::to_string(desc.num_elements) +
-                                      ">>(" + value + ")";
+      std::string data_type = HcuCkTemplateElemType(value_dtype);
+      std::string src_thread_buffer =
+          "tl::bit_cast<tl::thread_buffer<" + data_type + ", " +
+          std::to_string(desc.num_elements) + ">>(" + value + ")";
 
       std::string pred = GetCurrentPredicate();
       PrintIndent();
-      stream << "tl::amd_buffer_store<" << HcuCkTemplateElemType(value_dtype)
-             << ", " << desc.num_elements << ", "
-             << (pred == "true" ? "false" : "true") << ">(" << src_thread_buffer
-             << ", " << HcuCkBufferDstPtrExpr(value_dtype, desc.wave_ptr)
+      stream << "tl::amd_buffer_store<" << data_type << ", "
+             << desc.num_elements << ", " << (pred == "true" ? "false" : "true")
+             << ">(" << src_thread_buffer << ", reinterpret_cast<" << data_type
+             << "*>(" << desc.wave_ptr << ")"
              << ", " << desc.offset << ", " << pred << ", "
              << desc.element_space_size << ");\n";
 
@@ -1056,11 +1152,28 @@ void CodeGenTileLangHCU::VisitExpr_(const BufferLoadNode *op,
     CodeGenC::VisitExpr_(op, os);
     return;
   }
+  const int64_t *stride = as_const_int(ramp_index->stride);
+  ICHECK(stride && *stride == 1)
+      << "HCU fp4 vector load only supports logical stride 1, got "
+      << ramp_index->stride;
+  const int lanes = value_dtype.lanes();
+  const int64_t *ramp_lanes = as_const_int(ramp_index->lanes);
+  ICHECK(ramp_lanes && *ramp_lanes == lanes)
+      << "HCU fp4 vector load ramp lanes must match value lanes";
+
+  if (CanUseVMBufferOps(op->buffer.get(), lanes)) {
+    os << GetVecLoadWithPredicate(value_dtype, op->buffer.get(),
+                                  ramp_index->base, GetCurrentPredicate());
+    return;
+  }
 
   std::string vid = GetVarID(op->buffer->data.get());
-  os << "tl::load_packed_fp4_vector<" << value_dtype.lanes() << ">(" << vid
-     << ", " << PrintExpr(ramp_index->base) << ", "
-     << PrintExpr(ramp_index->stride) << ")";
+  Fp4PackedVectorDesc fp4_desc = GetFp4PackedVectorDesc(lanes);
+  ICHECK(CanProveMultiple(ramp_index->base, fp4_desc.lanes))
+      << "HCU fp4 vector load requires logical base aligned to "
+      << fp4_desc.lanes << " fp4 elements, got base=" << ramp_index->base;
+  os << "*((" << fp4_desc.c_type << "*)" << vid << " + (("
+     << PrintExpr(ramp_index->base) << ") / " << fp4_desc.lanes << "))";
 }
 
 void CodeGenTileLangHCU::BindThreadIndex(const IterVar &iv) {
@@ -1393,8 +1506,6 @@ CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer,
     total_size = total_size * dim;
   }
   std::string element_space_size = PrintExpr(total_size);
-  std::ostringstream stream;
-  PrintType(buffer->dtype.element_of(), stream);
 
   if (offset.as<RampNode>()) {
     arith::PVar<PrimExpr> base;
@@ -1403,13 +1514,33 @@ CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer,
     ICHECK(offset.defined()) << "Non-contiguous ramp offset is not supported.";
   }
 
+  std::string data_type = HcuCkTemplateElemType(t);
+  int num_elements = t.lanes();
+  if (t.element_of().is_float4_e2m1fn()) {
+    ICHECK_GT(t.lanes(), 1)
+        << "HCU fp4 scalar buffer ops are unsupported; use an aligned vector "
+           "access";
+    Fp4PackedVectorDesc fp4_desc = GetFp4PackedVectorDesc(t.lanes());
+    ICHECK(CanProveMultiple(offset, fp4_desc.lanes))
+        << "HCU fp4 buffer op requires logical base aligned to "
+        << fp4_desc.lanes << " fp4 elements, got base=" << offset;
+    // Keep each packed fp4 vector as one payload for amd_buffer_load/store.
+    // Using thread_buffer<T, N> with N > 1 can make the backend split/repack
+    // the value through extra register moves instead of a stable dword vector.
+    num_elements = 1;
+    offset = floordiv(offset, Integer(fp4_desc.lanes));
+    element_space_size = "((" + element_space_size + " + " +
+                         std::to_string(fp4_desc.lanes - 1) + ") / " +
+                         std::to_string(fp4_desc.lanes) + ")";
+  }
+
   BufferDesc desc;
   desc.wave_ptr = GetVarID(buffer_var);
   desc.offset = PrintExpr(offset);
   desc.element_space_size = element_space_size;
-  desc.data_type = stream.str();
+  desc.data_type = data_type;
   desc.scope = scope;
-  desc.num_elements = t.lanes();
+  desc.num_elements = num_elements;
 
   return std::move(desc);
 }
@@ -1426,13 +1557,15 @@ std::string CodeGenTileLangHCU::GetVecLoadWithPredicate(
     const std::string &pred) {
   if (CanUseVMBufferOps(buffer, t.lanes())) {
     auto desc = GetBufferDesc(t, buffer, base);
+    std::string data_type = HcuCkTemplateElemType(t);
     std::ostringstream os;
     os << "*(";
     PrintType(t, os);
-    os << "*)&(tl::amd_buffer_load<" << HcuCkTemplateElemType(t) << ", "
-       << desc.num_elements << ", " << (pred == "true" ? "false" : "true")
-       << ">(" << HcuCkBufferSrcPtrExpr(t, desc.wave_ptr) << ", " << desc.offset
-       << ", " << pred << ", " << desc.element_space_size << ").get())";
+    os << "*)&(tl::amd_buffer_load<" << data_type << ", " << desc.num_elements
+       << ", " << (pred == "true" ? "false" : "true")
+       << ">(reinterpret_cast<const " << data_type << "*>(" << desc.wave_ptr
+       << "), " << desc.offset << ", " << pred << ", "
+       << desc.element_space_size << ").get())";
 
     return os.str();
   }
@@ -1457,23 +1590,21 @@ void CodeGenTileLangHCU::PrintVecStoreWithPredicate(const BufferNode *buffer,
   }
 
   auto desc = GetBufferDesc(t, buffer, base);
-  // Convert value to thread_buffer and use buffer_store
-  // buffer_store signature:
-  //   buffer_store<type, num_elements>(src_thread_data, dst_ptr,
-  //   dst_offset,
-  //                                        is_valid, element_space_size)
-  // Convert the value expression to a thread_buffer using bit_cast
+  // Convert the value expression to the element shape required by
+  // amd_buffer_store.
+  std::string data_type = HcuCkTemplateElemType(t);
   std::string src_thread_buffer =
-      "tl::bit_cast<tl::thread_buffer<" + HcuCkTemplateElemType(t) + ", " +
+      "tl::bit_cast<tl::thread_buffer<" + data_type + ", " +
       std::to_string(desc.num_elements) + ">>(" + value + ")";
 
   this->PrintIndent();
-  this->stream << "tl::amd_buffer_store<" << HcuCkTemplateElemType(t) << ", "
+  this->stream << "tl::amd_buffer_store<" << data_type << ", "
                << desc.num_elements << ", "
                << (pred == "true" ? "false" : "true") << ">("
                << src_thread_buffer << ", "
-               << HcuCkBufferDstPtrExpr(t, desc.wave_ptr) << ", " << desc.offset
-               << ", " << pred << ", " << desc.element_space_size << ");\n";
+               << "reinterpret_cast<" << data_type << "*>(" << desc.wave_ptr
+               << "), " << desc.offset << ", " << pred << ", "
+               << desc.element_space_size << ");\n";
 }
 
 void CodeGenTileLangHCU::PrintVecElemLoad(const std::string &vec, DataType t,
@@ -2271,6 +2402,7 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
         {"int32", "int"},
         {"int8x4", "int32_t"},
         {"int8x8", "int32x2"},
+        {"uint8x8", "int32x2"},
         {"int32x2", "int32x2"},
         {"int32x4", "int32x4"},
         {"float16", "half"},
@@ -2313,6 +2445,17 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string lts = "";
     if (prefix.find("_lts") != std::string::npos) {
       lts = ", 0";
+    }
+    if (prefix.find("_f8f6f4") != std::string::npos) {
+      std::string real_a_dtype =
+          GetStringImmAnnotation(op->annotations, "tl.hcu_mmac_a_dtype")
+              .value_or(A_dtype);
+      std::string real_b_dtype =
+          GetStringImmAnnotation(op->annotations, "tl.hcu_mmac_b_dtype")
+              .value_or(B_dtype);
+      lit = ", " +
+            std::to_string(GetF8F6F4RealABTypeId(real_a_dtype, real_b_dtype));
+      lts = prefix.find("_lit_lts") != std::string::npos ? ", 1, 0" : "";
     }
 
     std::string call_mfma_code =
@@ -2576,6 +2719,12 @@ void CodeGenTileLangHCU::VisitStmt_(const AllocBufferNode *op) {
   DataType dtype = op->buffer->dtype;
 
   PrintStorageScope(scope, stream);
+  const bool align_local_fp4_array =
+      scope != "shared.dyn" && scope != "local.var" &&
+      dtype.is_float4_e2m1fn() && dtype.is_scalar();
+  if (align_local_fp4_array) {
+    stream << "__align__(16) ";
+  }
   PrintType(dtype, stream);
 
   if (scope == "shared.dyn") {

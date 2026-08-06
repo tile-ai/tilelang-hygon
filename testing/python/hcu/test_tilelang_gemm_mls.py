@@ -7,7 +7,13 @@ import tilelang as tl
 import tilelang.language as T
 import tilelang.testing
 import torch
-from hcu_test_utils import target_supports_mls, target_supports_mls_b4
+from hcu_test_utils import (
+    current_hcu_arch_string,
+    target_supports_fp8_mmac,
+    target_supports_mls,
+    target_supports_mls_b4,
+    target_supports_mls_fp4_pad,
+)
 
 
 pytestmark = [
@@ -236,6 +242,53 @@ def matmul_mls_ds_read_format(
                 T.ds_read_format(A_shared, A_fragment)
                 T.ds_read_format(B_shared, B_fragment)
                 T.gemm(A_fragment, B_fragment, C_local, trans_A, trans_B, k_pack=k_pack)
+            T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return main
+
+
+def matmul_mls_ds_read_format_mixed(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K,
+    trans_A,
+    trans_B,
+    a_dtype,
+    b_dtype,
+    out_dtype,
+    accum_dtype,
+    threads,
+):
+    """GEMM with mixed A/B dtypes: matrix_load -> T.gemm Python lowering."""
+    A_shape = (K, M) if trans_A else (M, K)
+    B_shape = (N, K) if trans_B else (K, N)
+    A_shared_shape = (block_K, block_M) if trans_A else (block_M, block_K)
+    B_shared_shape = (block_N, block_K) if trans_B else (block_K, block_N)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor(A_shape, a_dtype),
+        B: T.Tensor(B_shape, b_dtype),
+        C: T.Tensor((M, N), out_dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            A_shared = T.alloc_shared(A_shared_shape, a_dtype)
+            B_shared = T.alloc_shared(B_shared_shape, b_dtype)
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            T.clear(C_local)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=0):
+                if trans_A:
+                    T.matrix_load(A[k * block_K, by * block_M], A_shared)
+                else:
+                    T.matrix_load(A[by * block_M, k * block_K], A_shared)
+                if trans_B:
+                    T.matrix_load(B[bx * block_N, k * block_K], B_shared)
+                else:
+                    T.matrix_load(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_local, trans_A, trans_B)
             T.copy(C_local, C[by * block_M, bx * block_N])
 
     return main
@@ -1102,6 +1155,25 @@ def _pack_fp4_last_dim(logical: torch.Tensor) -> torch.Tensor:
     return (logical[..., 0::2] | (logical[..., 1::2] << 4)).contiguous().view(torch.int8)
 
 
+def _torch_dtype(dtype: str):
+    if dtype == "float8_e4m3fn":
+        return torch.float8_e4m3fn
+    if dtype == "float8_e5m2":
+        return torch.float8_e5m2
+    return getattr(torch, dtype)
+
+
+def _make_mixed_mls_input(shape, dtype: str, row_mul: int, col_mul: int):
+    rows = torch.arange(shape[0], device="cuda", dtype=torch.float32)[:, None]
+    cols = torch.arange(shape[1], device="cuda", dtype=torch.float32)[None, :]
+    value = ((rows * row_mul + cols * col_mul) % 13 - 6) / 8.0
+    if dtype == "float4_e2m1fn":
+        logical = ((rows.to(torch.uint8) * row_mul + cols.to(torch.uint8) * col_mul) & 0x0F).to(torch.uint8)
+        return _pack_fp4_last_dim(logical), _fp4_e2m1fn_decode(logical.cpu())
+    tensor = value.to(_torch_dtype(dtype))
+    return tensor, tensor.cpu().to(torch.float32)
+
+
 def run_gemm_mls_ds_read_format_b4(
     M=32,
     N=32,
@@ -1153,6 +1225,134 @@ def run_gemm_mls_ds_read_format_b4(
         B_ref = B_ref.T
     ref = A_ref @ B_ref
     torch.testing.assert_close(lib_out.cpu(), ref, rtol=1e-2, atol=1e-1)
+
+
+def run_gemm_mls_ds_read_format_b4_pad(
+    M=16,
+    N=16,
+    K=128,
+    trans_A=False,
+    trans_B=True,
+    block_M=16,
+    block_N=16,
+    block_K=128,
+    num_threads=64,
+):
+    program = matmul_mls_ds_read_format(
+        M,
+        N,
+        K,
+        block_M,
+        block_N,
+        block_K,
+        trans_A,
+        trans_B,
+        "float4_e2m1fn",
+        "float32",
+        "float32",
+        num_threads,
+    )
+    kernel = tl.compile(program, out_idx=[2])
+    source = kernel.get_kernel_source()
+    arch = current_hcu_arch_string()
+    expected_mls_tile = "tl::sequence<64, 16>" if trans_A and not trans_B else "tl::sequence<16, 64>"
+    assert expected_mls_tile in source
+    assert f"tl::hcu_target_enum::{arch}, 8>" in source
+    assert "ds_read_format_tensor_a" in source
+    assert "ds_read_format_tensor_b" in source
+    assert "uint8_t, 8, 8>" in source
+    if arch == "gfx946":
+        assert "__builtin_hcu_mmac_f32_16x16x32_f8f6f4_lit_lts" in source
+        assert ", 24, 1, 0)" in source
+        assert "__builtin_hcu_mmac_f32_16x16x64_fp4_lit_lts" not in source
+    else:
+        assert "__builtin_hcu_mmac_f32_16x16x32_f8f6f4(" in source
+        assert ", 24)" in source
+    profiler = kernel.get_profiler()
+
+    A_shape = (K, M) if trans_A else (M, K)
+    B_shape = (N, K) if trans_B else (K, N)
+    a_rows = torch.arange(A_shape[0], device="cuda", dtype=torch.uint8)[:, None]
+    a_cols = torch.arange(A_shape[1], device="cuda", dtype=torch.uint8)[None, :]
+    b_rows = torch.arange(B_shape[0], device="cuda", dtype=torch.uint8)[:, None]
+    b_cols = torch.arange(B_shape[1], device="cuda", dtype=torch.uint8)[None, :]
+    A_logical = (a_rows * 3 + a_cols * 5 + a_rows // 7 + a_cols // 11) & 0x0F
+    B_logical = (b_rows * 7 + b_cols * 2 + b_rows // 5 + b_cols // 13) & 0x0F
+    A = _pack_fp4_last_dim(A_logical)
+    B = _pack_fp4_last_dim(B_logical)
+
+    torch.cuda.synchronize()
+    lib_out = profiler.func(A, B)
+    torch.cuda.synchronize()
+
+    A_ref = _fp4_e2m1fn_decode(A_logical.cpu())
+    B_ref = _fp4_e2m1fn_decode(B_logical.cpu())
+    if trans_A:
+        A_ref = A_ref.T
+    if trans_B:
+        B_ref = B_ref.T
+    ref = A_ref @ B_ref
+    torch.testing.assert_close(lib_out.cpu(), ref, rtol=1e-2, atol=1e-1)
+
+
+def run_gemm_mls_mix_f4f6f8(
+    M=32,
+    N=32,
+    K=128,
+    trans_A=False,
+    trans_B=True,
+    block_M=32,
+    block_N=32,
+    block_K=128,
+    a_dtype="float8_e4m3fn",
+    b_dtype="float4_e2m1fn",
+    num_threads=64,
+):
+    program = matmul_mls_ds_read_format_mixed(
+        M,
+        N,
+        K,
+        block_M,
+        block_N,
+        block_K,
+        trans_A,
+        trans_B,
+        a_dtype,
+        b_dtype,
+        "float32",
+        "float32",
+        num_threads,
+    )
+    kernel = tl.compile(program, out_idx=[2])
+    source = kernel.get_kernel_source()
+    arch = current_hcu_arch_string()
+    assert "ds_read_format_tensor_a" in source
+    assert "ds_read_format_tensor_b" in source
+    assert "__builtin_hcu_mmac_f32_16x16x32_f8f6f4" in source
+    assert "__builtin_hcu_mmac_f32_16x16x64_fp4" not in source
+    if arch == "gfx946":
+        assert "uint8_t, 4, 8>" in source
+        assert "__builtin_hcu_mmac_f32_16x16x32_f8f6f4_lit_lts" in source
+    else:
+        assert "uint8_t, 8, 8>" in source
+        assert "__builtin_hcu_mmac_f32_16x16x32_f8f6f4(" in source
+
+    profiler = kernel.get_profiler()
+    A_shape = (K, M) if trans_A else (M, K)
+    B_shape = (N, K) if trans_B else (K, N)
+    A, A_ref = _make_mixed_mls_input(A_shape, a_dtype, 3, 5)
+    B, B_ref = _make_mixed_mls_input(B_shape, b_dtype, 7, 2)
+
+    torch.cuda.synchronize()
+    lib_out = profiler.func(A, B)
+    torch.cuda.synchronize()
+
+    if trans_A:
+        A_ref = A_ref.T
+    if trans_B:
+        B_ref = B_ref.T
+    ref = A_ref @ B_ref
+    torch.testing.assert_close(lib_out.cpu(), ref, rtol=2e-2, atol=2e-1)
 
 
 def matmul_mls_n_loop(
@@ -1257,8 +1457,8 @@ def test_mls_ds_read_format_copy_to_global(M, K, block_M, block_K, num_threads):
 
 
 @pytest.mark.skipif(
-    not target_supports_mls_b4(),
-    reason="b4 matrix_load is only supported on gfx946",
+    current_hcu_arch_string() != "gfx946",
+    reason="packed b4 ds_read_format copy-to-global no-pad test is only supported on gfx946",
 )
 @pytest.mark.parametrize(
     "M, K, block_M, block_K, num_threads",
@@ -1307,6 +1507,71 @@ def test_gemm_mls_b4_nopad(M, N, K, trans_A, trans_B, block_M, block_N, block_K,
         block_M=block_M,
         block_N=block_N,
         block_K=block_K,
+        num_threads=num_threads,
+    )
+
+
+@pytest.mark.skipif(
+    not target_supports_mls_fp4_pad(),
+    reason="fp4 b8-LDS MLS/MMAC path is only supported on gfx92a/gfx946",
+)
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads",
+    [
+        pytest.param(16, 16, 128, False, True, 16, 16, 128, 64, id="at_bn_m16_n16_k128_t64"),
+        pytest.param(16, 16, 128, False, True, 16, 16, 128, 128, id="at_bn_m16_n16_k128_t128"),
+        pytest.param(56, 64, 32, True, False, 64, 64, 32, 64, id="an_bt_m56_n64_k32_t64"),
+        pytest.param(64, 64, 64, True, False, 64, 64, 64, 64, id="an_bt_m64_n64_k64_t64"),
+    ],
+)
+def test_gemm_mls_b4_pad(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
+    """fp4 fallback path: matrix_load pads b4 to b8 LDS, ds_read outputs b8, MMAC uses f8f6f4."""
+    run_gemm_mls_ds_read_format_b4_pad(
+        M=M,
+        N=N,
+        K=K,
+        trans_A=trans_A,
+        trans_B=trans_B,
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+        num_threads=num_threads,
+    )
+
+
+@pytest.mark.skipif(
+    not (target_supports_fp8_mmac() and target_supports_mls_fp4_pad()),
+    reason="mixed f8/fp4 MLS f8f6f4 path requires fp8 MMAC and fp4 MLS support",
+)
+@pytest.mark.parametrize(
+    "a_dtype, b_dtype",
+    [
+        pytest.param("float8_e4m3fn", "float4_e2m1fn", id="fp8_fp4"),
+        pytest.param("float4_e2m1fn", "float8_e4m3fn", id="fp4_fp8"),
+    ],
+)
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads",
+    [
+        pytest.param(32, 32, 128, False, True, 32, 32, 128, 64, id="at_bn_m32_n32_k128_t64"),
+        pytest.param(64, 64, 256, False, True, 32, 32, 128, 64, id="at_bn_m64_n64_k256_t64"),
+        pytest.param(128, 128, 64, True, False, 128, 128, 64, 64, id="an_bt_m128_n128_k64_t64"),
+        pytest.param(256, 256, 128, True, False, 128, 128, 64, 128, id="an_bt_m256_n256_k128_t128"),
+    ],
+)
+def test_gemm_mls_mix_f4f6f8(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads, a_dtype, b_dtype):
+    """Mixed f8/fp4 MLS GEMM: fp4 operand is read as b8 for f8f6f4 MMAC."""
+    run_gemm_mls_mix_f4f6f8(
+        M=M,
+        N=N,
+        K=K,
+        trans_A=trans_A,
+        trans_B=trans_B,
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
         num_threads=num_threads,
     )
 

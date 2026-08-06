@@ -39,7 +39,8 @@ static int64_t DTypeStorageBits(DataType dtype) {
 
 Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
                                               int mls_tile_mn, int mls_tile_k,
-                                              bool trans, Target target) {
+                                              bool trans, Target target,
+                                              int lds_physical_bits) {
   const auto hcu_arch = TargetIsHCU(target) ? GetHcuArchString(target) : "";
   if (!TargetIsHCU(target) || (hcu_arch != "gfx946" && hcu_arch != "gfx92a") ||
       dst->shape.size() < 2) {
@@ -74,6 +75,8 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
   const int64_t logical_elements = block_mn * block_k;
   int64_t packed_elements = logical_elements;
   const int64_t bits_per_elem = DTypeStorageBits(dst->dtype);
+  const int64_t physical_bits_per_elem =
+      lds_physical_bits > 0 ? lds_physical_bits : bits_per_elem;
   int64_t packed_bytes = -1;
 
   auto bytes_to_elements = [&](int64_t bytes) {
@@ -83,7 +86,7 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
   };
 
   auto elements_to_bytes = [&](int64_t elements) {
-    return CeilDiv(elements * bits_per_elem, 8);
+    return CeilDiv(elements * physical_bits_per_elem, 8);
   };
 
   auto packed_bytes_for_4k_slots = [](int64_t contiguous_tiles,
@@ -100,8 +103,10 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
            kSlotStrideBytes + last_group_tiles * payload_bytes;
   };
 
-  if (dst->dtype.bits() == 16 && trans && mls_tile_mn == 16 &&
-      mls_tile_k == 64) {
+  if (dst->dtype.bits() == 4 && physical_bits_per_elem == 8) {
+    packed_bytes = elements_to_bytes(logical_elements);
+  } else if (dst->dtype.bits() == 16 && trans && mls_tile_mn == 16 &&
+             mls_tile_k == 64) {
     packed_bytes = packed_bytes_for_4k_slots(
         tile_issue_mn * tile_issue_k,
         elements_to_bytes(mls_tile_mn * (mls_tile_k / 2)));
@@ -142,17 +147,15 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
   return Integer(leading_count * packed_bytes);
 }
 
-Optional<PrimExpr> TryGetMlsPackedLeadingElemOffset(const Buffer &buffer,
-                                                    const Array<Range> &ranges,
-                                                    int mls_tile_mn,
-                                                    int mls_tile_k, bool trans,
-                                                    Target target) {
+Optional<PrimExpr> TryGetMlsPackedLeadingElemOffset(
+    const Buffer &buffer, const Array<Range> &ranges, int mls_tile_mn,
+    int mls_tile_k, bool trans, Target target, int lds_physical_bits) {
   if (ranges.size() <= 2 || buffer->shape.size() != ranges.size()) {
     return std::nullopt;
   }
 
   auto actual_size_bytes = TryGetMlsDstActualSizeBytes(
-      buffer, mls_tile_mn, mls_tile_k, trans, target);
+      buffer, mls_tile_mn, mls_tile_k, trans, target, lds_physical_bits);
   if (!actual_size_bytes) {
     return std::nullopt;
   }
@@ -302,6 +305,14 @@ constexpr MlsTileConfig kMlsTileConfigsB4NonTrans[] = {
     {128, 16, false},
 };
 
+constexpr MlsTileConfig kMlsTileConfigsFp4B8Trans[] = {
+    {16, 64, false},
+};
+
+constexpr MlsTileConfig kMlsTileConfigsFp4B8NonTrans[] = {
+    {64, 16, false},
+};
+
 constexpr MlsTileConfigSet kMlsTileConfigTable[] = {
     {4, kMlsTileConfigsB4Trans, ArraySize(kMlsTileConfigsB4Trans),
      kMlsTileConfigsB4NonTrans, ArraySize(kMlsTileConfigsB4NonTrans)},
@@ -325,7 +336,25 @@ const MlsTileConfigSet &GetMlsTileConfigSet(int elem_bits, Target target) {
   return kMlsTileConfigTable[0];
 }
 
+bool IsFp4B8LdsTile(bool trans, int mls_tile_mn, int mls_tile_k) {
+  return (!trans && mls_tile_mn == 64 && mls_tile_k == 16) ||
+         (trans && mls_tile_mn == 16 && mls_tile_k == 64);
+}
+
 } // namespace
+
+int GetMlsLdsPhysicalBits(DataType dtype, bool trans, int mls_tile_mn,
+                          int mls_tile_k, Target target) {
+  if (!TargetIsHCU(target) || !dtype.is_float4_e2m1fn()) {
+    return dtype.bits();
+  }
+  const std::string arch = GetHcuArchString(target);
+  if ((arch == "gfx92a" || arch == "gfx946") &&
+      IsFp4B8LdsTile(trans, mls_tile_mn, mls_tile_k)) {
+    return 8;
+  }
+  return dtype.bits();
+}
 
 std::pair<int64_t, int64_t> MlsBlockDims(const Buffer &buf, bool mls_trans) {
   ICHECK(buf->shape.size() >= 2);
@@ -366,15 +395,34 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
   int num_warps = block_size / TargetHcuGetWarpSize(target);
   ICHECK(num_warps >= 1) << "num_warps must be >= 1";
 
-  auto try_config = [&](int tile_mn, int tile_k,
-                        bool require_no_repeat) -> bool {
+  auto try_config = [&](const MlsTileConfig &config) -> bool {
+    int tile_mn = config.tile_mn;
+    int tile_k = config.tile_k;
+    auto min_block_mn = [&]() -> std::optional<int> {
+      if (elem_bits == 4 && trans && tile_mn == 16 && tile_k >= 128) {
+        return 32;
+      }
+      return std::nullopt;
+    }();
+    auto min_block_k = [&]() -> std::optional<int> {
+      if (elem_bits == 4 && !trans && tile_k == 16 && tile_mn > 64) {
+        return 32;
+      }
+      return std::nullopt;
+    }();
+    if (min_block_mn && block_mn < min_block_mn.value()) {
+      return false;
+    }
+    if (min_block_k && block_k < min_block_k.value()) {
+      return false;
+    }
     if (block_k % tile_k != 0 || block_mn % tile_mn != 0)
       return false;
     int wm = std::min(block_mn / tile_mn, num_warps);
     if (num_warps % wm != 0)
       return false;
     int wk = num_warps / wm;
-    if (require_no_repeat) {
+    if (config.require_no_repeat) {
       if (wm * tile_mn > block_mn || block_mn % (wm * tile_mn) != 0)
         return false;
       if (wk * tile_k > block_k || block_k % (wk * tile_k) != 0)
@@ -387,15 +435,45 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
     return true;
   };
 
-  const MlsTileConfigSet &config_set = GetMlsTileConfigSet(elem_bits, target);
-  const MlsTileConfig *configs =
-      trans ? config_set.trans : config_set.non_trans;
-  int config_count =
-      trans ? config_set.trans_count : config_set.non_trans_count;
-  for (int i = 0; i < config_count; ++i) {
-    const MlsTileConfig &config = configs[i];
-    if (try_config(config.tile_mn, config.tile_k, config.require_no_repeat))
+  auto try_configs = [&](const MlsTileConfig *configs, int config_count) {
+    for (int i = 0; i < config_count; ++i) {
+      if (try_config(configs[i]))
+        return true;
+    }
+    return false;
+  };
+
+  if (elem_bits == 4) {
+    const std::string arch = GetHcuArchString(target);
+    if (arch == "gfx946") {
+      const MlsTileConfig *b4_configs =
+          trans ? kMlsTileConfigsB4Trans : kMlsTileConfigsB4NonTrans;
+      int b4_config_count = trans ? ArraySize(kMlsTileConfigsB4Trans)
+                                  : ArraySize(kMlsTileConfigsB4NonTrans);
+      if (try_configs(b4_configs, b4_config_count)) {
+        return;
+      }
+    } else {
+      ICHECK_EQ(arch, "gfx92a")
+          << "b4 matrix_load is only supported on gfx946; fp4 b8 LDS "
+             "fallback is supported on gfx92a/gfx946";
+    }
+    const MlsTileConfig *fp4_b8_configs =
+        trans ? kMlsTileConfigsFp4B8Trans : kMlsTileConfigsFp4B8NonTrans;
+    int fp4_b8_config_count = trans ? ArraySize(kMlsTileConfigsFp4B8Trans)
+                                    : ArraySize(kMlsTileConfigsFp4B8NonTrans);
+    if (try_configs(fp4_b8_configs, fp4_b8_config_count)) {
       return;
+    }
+  } else {
+    const MlsTileConfigSet &config_set = GetMlsTileConfigSet(elem_bits, target);
+    const MlsTileConfig *configs =
+        trans ? config_set.trans : config_set.non_trans;
+    int config_count =
+        trans ? config_set.trans_count : config_set.non_trans_count;
+    if (try_configs(configs, config_count)) {
+      return;
+    }
   }
   ICHECK(false) << "No valid MLS tile config for "
                 << (trans ? "trans" : "non-trans") << ": block_mn=" << block_mn
@@ -451,6 +529,8 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   ComputeMlsWarpPartition(mls_trans, static_cast<int>(block_mn),
                           static_cast<int>(block_k), block_size, T.target,
                           src->dtype.bits(), warp_m, warp_k, tile_mn, tile_k);
+  const int lds_physical_bits =
+      GetMlsLdsPhysicalBits(src->dtype, mls_trans, tile_mn, tile_k, T.target);
 
   size_t nr = this->src_ranges.size();
   ICHECK(nr >= 2);
@@ -488,7 +568,7 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
      << ", " << warp_k << ", " << dtype_str << ", 1, "
      << (mls_trans ? "true" : "false")
      << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
-     << dst->dtype.bits() << ", " << (check_last_load ? "true" : "false")
+     << lds_physical_bits << ", " << (check_last_load ? "true" : "false")
      << ", " << (last_load ? "true" : "false") << ">";
 
   Buffer src_buf = T.buffer_remap.count(src) ? T.buffer_remap[src] : src;
@@ -526,7 +606,8 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
            "shape.size()="
         << dst_buf->shape.size() << " vs region rank=" << dr;
     if (auto packed_offset = TryGetMlsPackedLeadingElemOffset(
-            dst_buf, this->dst_ranges, tile_mn, tile_k, mls_trans, T.target)) {
+            dst_buf, this->dst_ranges, tile_mn, tile_k, mls_trans, T.target,
+            lds_physical_bits)) {
       dst_leading_elem_offset = packed_offset.value();
     } else {
       Array<PrimExpr> dst_idx_leading;
@@ -561,7 +642,7 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   Stmt stmt =
       Evaluate(Call(DataType::Handle(), builtin::call_extern(), call_args));
   if (auto actual_size_bytes = TryGetMlsDstActualSizeBytes(
-          dst_buf, tile_mn, tile_k, mls_trans, T.target)) {
+          dst_buf, tile_mn, tile_k, mls_trans, T.target, lds_physical_bits)) {
     Map<String, PrimExpr> actual_size_bytes_map;
     actual_size_bytes_map.Set(dst_buf->data->name_hint,
                               actual_size_bytes.value());

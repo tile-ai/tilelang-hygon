@@ -265,9 +265,8 @@ struct tilelang_mls_base {
                            HcuArch == ::tl::hcu_target_enum::gfx92a) {
         TL_LDS_ADDR uint8_t *smem_bytes =
             reinterpret_cast<TL_LDS_ADDR uint8_t *>(smem);
-        const auto lds_byte_offset =
-            ::tl::mls::mls_storage_traits<T>::logical_offset_to_byte_offset(
-                mls_lds_offset_[i]);
+        const auto lds_byte_offset = ::tl::mls::mls_lds_physical_storage_traits<
+            DstBits>::logical_offset_to_byte_offset(mls_lds_offset_[i]);
         MlsAtom::template load<moffset, true, bps>(
             reinterpret_cast<uintptr_t>(smem_bytes + lds_byte_offset),
             mls_res_[access_idx_mn], moffset, ::tl::bool_constant<true>{},
@@ -303,9 +302,8 @@ struct tilelang_mls_base {
                            HcuArch == ::tl::hcu_target_enum::gfx92a) {
         TL_LDS_ADDR uint8_t *smem_bytes =
             reinterpret_cast<TL_LDS_ADDR uint8_t *>(smem);
-        const auto lds_byte_offset =
-            ::tl::mls::mls_storage_traits<T>::logical_offset_to_byte_offset(
-                mls_lds_offset_[i]);
+        const auto lds_byte_offset = ::tl::mls::mls_lds_physical_storage_traits<
+            DstBits>::logical_offset_to_byte_offset(mls_lds_offset_[i]);
         MlsAtom::template load<moffset, true, bps>(
             reinterpret_cast<uintptr_t>(smem_bytes + lds_byte_offset),
             mls_res_[access_idx_mn], moffset, ::tl::bool_constant<true>{},
@@ -350,9 +348,8 @@ struct tilelang_mls_base {
                            HcuArch == ::tl::hcu_target_enum::gfx92a) {
         TL_LDS_ADDR uint8_t *smem_bytes =
             reinterpret_cast<TL_LDS_ADDR uint8_t *>(smem);
-        const auto lds_byte_offset =
-            ::tl::mls::mls_storage_traits<T>::logical_offset_to_byte_offset(
-                mls_lds_offset_[i]);
+        const auto lds_byte_offset = ::tl::mls::mls_lds_physical_storage_traits<
+            DstBits>::logical_offset_to_byte_offset(mls_lds_offset_[i]);
         MlsAtom::template load<moffset, true, bps>(
             reinterpret_cast<uintptr_t>(smem_bytes + lds_byte_offset),
             mls_res_[access_idx_mn], moffset, ::tl::bool_constant<true>{},

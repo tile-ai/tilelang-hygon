@@ -49,6 +49,16 @@ template <typename T> struct mls_storage_traits {
   }
 };
 
+template <::tl::index_t DstBits> struct mls_lds_physical_storage_traits {
+  static_assert(DstBits == 4 || DstBits == 8 || DstBits == 16,
+                "Unsupported MLS LDS physical bits");
+
+  TL_HOST_DEVICE static constexpr ::tl::index_t
+  logical_offset_to_byte_offset(::tl::index_t logical_offset) {
+    return logical_offset * DstBits / 8;
+  }
+};
+
 /*
  * mls_lds_desc_param_traits: LDS descriptor only, no WarpMN/WarpK.
  * Use when reading LDS with different warp layout than MLS write.

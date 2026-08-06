@@ -13,8 +13,8 @@ from tilelang.hcu.intrinsics.hcu_mmac_macro_generator import HCUMatrixCoreIntrin
 from tilelang.layout.swizzle import make_hcu_swizzled_layout
 from tilelang.transform.simplify import _Simplify
 from tilelang.utils.language import is_fragment, is_full_region, is_shared, is_shared_dynamic
-from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import hcu_mmac_k_dim
-from tilelang.hcu.target import target_has_mmac_lit_lts, target_is_hcu
+from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import hcu_mmac_k_dim_for_operand
+from tilelang.hcu.target import get_hcu_arch_string, target_has_mmac_lit_lts, target_is_hcu
 from tvm import DataType, tirx
 from tvm.ir import Range
 from tvm.target import Target
@@ -60,6 +60,65 @@ def _compute_mls_tiles(trans: bool, block_mn: int, block_k: int, block_size: int
     return int(tile_mn), int(tile_k)
 
 
+def _is_fp4_dtype(dtype) -> bool:
+    return "float4_e2m1fn" in str(dtype)
+
+
+def _is_f8f6f4_operand_dtype(dtype) -> bool:
+    dtype_str = str(dtype)
+    return _is_fp4_dtype(dtype_str) or "float8_e4m3" in dtype_str or "float8_e5m2" in dtype_str
+
+
+def _is_fp4_mixed_f8f6f4(gemm) -> bool:
+    return (
+        str(gemm.a_dtype) != str(gemm.b_dtype)
+        and _is_fp4_dtype(gemm.a_dtype) != _is_fp4_dtype(gemm.b_dtype)
+        and _is_f8f6f4_operand_dtype(gemm.a_dtype)
+        and _is_f8f6f4_operand_dtype(gemm.b_dtype)
+    )
+
+
+def _is_fp4_b8_lds_tile(trans: bool, tile_mn: int, tile_k: int) -> bool:
+    return (not trans and tile_mn == 64 and tile_k == 16) or (trans and tile_mn == 16 and tile_k == 64)
+
+
+def _resolve_fp4_mmac_mode(gemm, meta, target: Target) -> str:
+    if not (_is_fp4_dtype(gemm.a_dtype) or _is_fp4_dtype(gemm.b_dtype)):
+        return "native"
+    arch = get_hcu_arch_string(target)
+    if arch == "gfx92a":
+        return "f8f6f4"
+    if arch == "gfx946":
+        if _is_fp4_mixed_f8f6f4(gemm):
+            return "f8f6f4"
+        if (
+            _is_fp4_dtype(gemm.a_dtype)
+            and meta.a_from_mls
+            and _is_fp4_b8_lds_tile(bool(meta.a_mls_trans), int(meta.mls_tile_m), int(meta.mls_tile_ka))
+        ):
+            return "f8f6f4"
+        if (
+            _is_fp4_dtype(gemm.b_dtype)
+            and meta.b_from_mls
+            and _is_fp4_b8_lds_tile(bool(meta.b_mls_trans), int(meta.mls_tile_n), int(meta.mls_tile_kb))
+        ):
+            return "f8f6f4"
+    return "native"
+
+
+def _hcu_layout_bits_for_dtype(dtype, *, fp4_mmac_mode: str) -> int:
+    dtype = DataType(dtype)
+    if fp4_mmac_mode == "f8f6f4" and _is_f8f6f4_operand_dtype(dtype):
+        return 8
+    return int(dtype.bits)
+
+
+def _fp4_local_dtype(dtype, *, fp4_mmac_mode: str) -> str:
+    if fp4_mmac_mode == "f8f6f4" and _is_f8f6f4_operand_dtype(dtype):
+        return "uint8"
+    return str(DataType(dtype))
+
+
 def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
     """Read AnnotateMlsGemmDep flags from gemm.annotations and derive MLS tiles."""
     annotations = getattr(gemm_node, "annotations", None) or {}
@@ -90,8 +149,10 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
     )
 
 
-def _compute_hcu_warp_partition(gemm, thread_nums: int, target: Target, meta) -> tuple[int, int, int]:
+def _compute_hcu_warp_partition(gemm, thread_nums: int, target: Target, meta, fp4_mmac_mode: str = "native") -> tuple[int, int, int]:
     element_bits = DataType(gemm.a_dtype).bits
+    if fp4_mmac_mode == "f8f6f4" and _is_f8f6f4_operand_dtype(gemm.a_dtype):
+        element_bits = 8
     _ffi_api.GemmWarpPolicyComputeWarpPartitionHCU(
         gemm.policy,
         int(gemm.M),
@@ -125,9 +186,11 @@ def _make_hcu_emitter(
     target: Target,
     thread_var: tirx.Var,
     thread_bounds_min: int = 0,
+    fp4_mmac_mode: str = "native",
 ) -> HCUMatrixCoreIntrinEmitter:
-    element_bits = DataType(gemm.b_dtype).bits
-    min_n_per_warp = 32 if (meta.b_from_mls and (element_bits == 4 or not meta.b_mls_trans)) else 16
+    min_n_per_warp = 32 if (meta.b_from_mls and not meta.b_mls_trans) else 16
+    if fp4_mmac_mode == "f8f6f4" and _is_fp4_dtype(gemm.b_dtype) and not gemm.trans_B:
+        min_n_per_warp = 32
     return HCUMatrixCoreIntrinEmitter(
         a_dtype=gemm.a_dtype,
         b_dtype=gemm.b_dtype,
@@ -146,11 +209,16 @@ def _make_hcu_emitter(
         thread_bounds_min=thread_bounds_min,
         min_n_per_warp=min_n_per_warp,
         use_tf32=gemm.use_tf32,
+        fp4_mmac_mode=fp4_mmac_mode,
     )
 
 
 class GemmHCUMMAC(GemmBase):
     """HCU matrix core GEMM: layout and lowering via Python ``HCUMatrixCoreIntrinEmitter``."""
+
+    @property
+    def allow_f8f6f4_mixed_dtypes(self) -> bool:
+        return True
 
     def infer_layout(self, target: Target, thread_nums: int):
         if not target_is_hcu(target):
@@ -159,13 +227,16 @@ class GemmHCUMMAC(GemmBase):
         b_from_mls = int(meta.b_from_mls)
         b_mls_trans = bool(meta.b_mls_trans)
         block_size = int(thread_nums)
-        warp_m, warp_n, warp_k = _compute_hcu_warp_partition(self, block_size, target, meta)
+        fp4_mmac_mode = _resolve_fp4_mmac_mode(self, meta, target)
+        warp_m, warp_n, warp_k = _compute_hcu_warp_partition(self, block_size, target, meta, fp4_mmac_mode)
         min_n_per_warp = 32 if (b_from_mls and not b_mls_trans) else 16
+        if fp4_mmac_mode == "f8f6f4" and _is_fp4_dtype(self.B.dtype) and not self.trans_B:
+            min_n_per_warp = 32
         elem_bits_c = int(DataType(self.C.dtype).bits)
-        elem_bits_a = int(DataType(self.A.dtype).bits)
-        elem_bits_b = int(DataType(self.B.dtype).bits)
-        mmac_k_a = hcu_mmac_k_dim(target, elem_bits_a, use_tf32=self.use_tf32)
-        mmac_k_b = hcu_mmac_k_dim(target, elem_bits_b, use_tf32=self.use_tf32)
+        elem_bits_a = _hcu_layout_bits_for_dtype(self.A.dtype, fp4_mmac_mode=fp4_mmac_mode)
+        elem_bits_b = _hcu_layout_bits_for_dtype(self.B.dtype, fp4_mmac_mode=fp4_mmac_mode)
+        mmac_k_a = hcu_mmac_k_dim_for_operand(target, self.A.dtype, operand_mode=fp4_mmac_mode, use_tf32=self.use_tf32)
+        mmac_k_b = hcu_mmac_k_dim_for_operand(target, self.B.dtype, operand_mode=fp4_mmac_mode, use_tf32=self.use_tf32)
         frag_c = make_gemm_fragment_hcu(
             int(self.M),
             int(self.N),
@@ -231,12 +302,25 @@ class GemmHCUMMAC(GemmBase):
         meta = _resolve_hcu_mls_meta(self.gemm_node, self.A, self.B, thread_nums, target)
         a_from_mls = int(meta.a_from_mls)
         b_from_mls = int(meta.b_from_mls)
-        warp_m, warp_n, warp_k = _compute_hcu_warp_partition(self, thread_nums, target, meta)
-        emitter = _make_hcu_emitter(self, warp_m, warp_n, warp_k, meta, target, thread_var, _thread_bounds_min(thread_bounds))
+        fp4_mmac_mode = _resolve_fp4_mmac_mode(self, meta, target)
+        warp_m, warp_n, warp_k = _compute_hcu_warp_partition(self, thread_nums, target, meta, fp4_mmac_mode)
+        emitter = _make_hcu_emitter(
+            self,
+            warp_m,
+            warp_n,
+            warp_k,
+            meta,
+            target,
+            thread_var,
+            _thread_bounds_min(thread_bounds),
+            fp4_mmac_mode=fp4_mmac_mode,
+        )
 
         k_pack = emitter.k_pack
         a_dtype = self.a_dtype
         b_dtype = self.b_dtype
+        a_mls_local_dtype = _fp4_local_dtype(a_dtype, fp4_mmac_mode=fp4_mmac_mode)
+        b_mls_local_dtype = _fp4_local_dtype(b_dtype, fp4_mmac_mode=fp4_mmac_mode)
         inner_k = emitter.inner_k_per_warp()
         block_K = emitter.chunk
         micro_size_k = emitter.micro_size_k
@@ -270,8 +354,8 @@ class GemmHCUMMAC(GemmBase):
 
             @T.prim_func
             def _gemm_mls_mls() -> None:
-                A_local = T.alloc_local(emitter.local_elems_a(full_k=True), a_dtype)
-                B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_dtype)
+                A_local = T.alloc_local(emitter.local_elems_a(full_k=True), a_mls_local_dtype)
+                B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_mls_local_dtype)
                 if clear_accum:
                     T.clear(C_buf)
                 emitter.ldmatrix_mls_a(A_local, A_region)
@@ -290,7 +374,7 @@ class GemmHCUMMAC(GemmBase):
 
                 @T.prim_func
                 def _gemm_r_mls() -> None:
-                    B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_dtype)
+                    B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_mls_local_dtype)
                     if clear_accum:
                         T.clear(C_buf)
                     emitter.ldmatrix_mls_b(B_local, B_region)
@@ -304,7 +388,7 @@ class GemmHCUMMAC(GemmBase):
                 @T.prim_func
                 def _gemm_s_mls() -> None:
                     A_local = T.alloc_local(emitter.local_elems_a(), a_dtype)
-                    B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_dtype)
+                    B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_mls_local_dtype)
                     if clear_accum:
                         T.clear(C_buf)
                     emitter.ldmatrix_mls_b(B_local, B_region)

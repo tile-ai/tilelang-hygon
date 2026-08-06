@@ -854,6 +854,13 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_64x16_b8, Alt, BlockSizeMN,
 
 template <::tl::index_t Alt, ::tl::index_t BlockSizeMN,
           ::tl::index_t BlockSizeK>
+struct make_lds_desc_generic<tl::mls::gfx946_mls_64x16_fp4, Alt, BlockSizeMN,
+                             BlockSizeK, false>
+    : make_lds_desc_generic<tl::mls::gfx946_mls_64x16_b8, Alt, BlockSizeMN,
+                            BlockSizeK, false> {};
+
+template <::tl::index_t Alt, ::tl::index_t BlockSizeMN,
+          ::tl::index_t BlockSizeK>
 struct make_lds_desc_generic<tl::mls::gfx946_mls_16x64_trans_b8, Alt,
                              BlockSizeMN, BlockSizeK, true> {
   using MlsTraits = mls_traits<tl::mls::gfx946_mls_16x64_trans_b8, Alt>;
@@ -892,6 +899,13 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_16x64_trans_b8, Alt,
     }
   }
 };
+
+template <::tl::index_t Alt, ::tl::index_t BlockSizeMN,
+          ::tl::index_t BlockSizeK>
+struct make_lds_desc_generic<tl::mls::gfx946_mls_16x64_trans_fp4, Alt,
+                             BlockSizeMN, BlockSizeK, true>
+    : make_lds_desc_generic<tl::mls::gfx946_mls_16x64_trans_b8, Alt,
+                            BlockSizeMN, BlockSizeK, true> {};
 
 template <::tl::index_t Alt, ::tl::index_t BlockSizeMN,
           ::tl::index_t BlockSizeK>

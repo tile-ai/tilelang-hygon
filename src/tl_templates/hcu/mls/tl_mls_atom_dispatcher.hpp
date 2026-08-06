@@ -169,6 +169,16 @@ struct mls_atom_for_tile<16, 256, true, 4, 4, ::tl::hcu_target_enum::gfx946> {
 };
 
 template <>
+struct mls_atom_for_tile<64, 16, false, 4, 8, ::tl::hcu_target_enum::gfx946> {
+  using Type = tl::mls::gfx946_mls_64x16_fp4;
+};
+
+template <>
+struct mls_atom_for_tile<16, 64, true, 4, 8, ::tl::hcu_target_enum::gfx946> {
+  using Type = tl::mls::gfx946_mls_16x64_trans_fp4;
+};
+
+template <>
 struct mls_atom_for_tile<16, 64, true, 16, 16, ::tl::hcu_target_enum::gfx92a> {
   using Type = tl::mls::gfx946_mls_16x64_trans_b16;
 };
@@ -226,6 +236,16 @@ struct mls_atom_for_tile<128, 16, false, 8, 8, ::tl::hcu_target_enum::gfx92a> {
 template <>
 struct mls_atom_for_tile<16, 128, true, 8, 8, ::tl::hcu_target_enum::gfx92a> {
   using Type = tl::mls::gfx946_mls_16x128_trans_b8;
+};
+
+template <>
+struct mls_atom_for_tile<64, 16, false, 4, 8, ::tl::hcu_target_enum::gfx92a> {
+  using Type = tl::mls::gfx946_mls_64x16_fp4;
+};
+
+template <>
+struct mls_atom_for_tile<16, 64, true, 4, 8, ::tl::hcu_target_enum::gfx92a> {
+  using Type = tl::mls::gfx946_mls_16x64_trans_fp4;
 };
 #endif
 

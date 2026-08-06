@@ -21,6 +21,11 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
                              int &warp_mn, int &warp_k, int &mls_tile_mn,
                              int &mls_tile_k);
 
+/// Physical element bits written to LDS for an MLS tile. For fp4, this can
+/// differ from the logical/source bits when matrix_load expands b4 to b8.
+int GetMlsLdsPhysicalBits(DataType dtype, bool trans, int mls_tile_mn,
+                          int mls_tile_k, Target target);
+
 /// Logical warp index base for scoped MLS: thread_bounds.min / warp_size.
 int MlsScopedWarpIdOffset(const Range &thread_bounds, Target target);
 
@@ -29,13 +34,12 @@ std::pair<int64_t, int64_t> MlsBlockDims(const Buffer &buf, bool mls_trans);
 
 Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
                                               int mls_tile_mn, int mls_tile_k,
-                                              bool trans, Target target);
+                                              bool trans, Target target,
+                                              int lds_physical_bits = -1);
 
-Optional<PrimExpr> TryGetMlsPackedLeadingElemOffset(const Buffer &buffer,
-                                                    const Array<Range> &ranges,
-                                                    int mls_tile_mn,
-                                                    int mls_tile_k, bool trans,
-                                                    Target target);
+Optional<PrimExpr> TryGetMlsPackedLeadingElemOffset(
+    const Buffer &buffer, const Array<Range> &ranges, int mls_tile_mn,
+    int mls_tile_k, bool trans, Target target, int lds_physical_bits = -1);
 
 class MatrixLoadNode : public TileOperatorNode {
 public:

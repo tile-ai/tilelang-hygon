@@ -120,6 +120,28 @@ void ComputeDsReadFormatWarpPartition(bool trans, int block_mn, int block_k,
   warp_mn = num_warps / warp_k;
 }
 
+struct DsReadMlsPhysicalInfo {
+  int warp_mn;
+  int warp_k;
+  int tile_mn;
+  int tile_k;
+  int element_bits;
+};
+
+DsReadMlsPhysicalInfo InferDsReadMlsPhysicalInfo(const Buffer &src, bool trans,
+                                                 int block_size,
+                                                 Target target) {
+  auto [lds_mn, lds_k] = MlsBlockDims(src, trans);
+  DsReadMlsPhysicalInfo info{0, 0, 0, 0, src->dtype.bits()};
+  ComputeMlsWarpPartition(trans, static_cast<int>(lds_mn),
+                          static_cast<int>(lds_k), block_size, target,
+                          src->dtype.bits(), info.warp_mn, info.warp_k,
+                          info.tile_mn, info.tile_k);
+  info.element_bits = GetMlsLdsPhysicalBits(src->dtype, trans, info.tile_mn,
+                                            info.tile_k, target);
+  return info;
+}
+
 LayoutMap InferLayoutWithGemmDep(const DsReadFormatNode *self,
                                  const MlsGemmDepMetaNode *meta,
                                  const LayoutInferArgs &T) {
@@ -127,6 +149,11 @@ LayoutMap InferLayoutWithGemmDep(const DsReadFormatNode *self,
   GemmWarpPolicy policy(meta->gemm_policy);
   int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
   int element_bits = self->dst->dtype.bits();
+  if (self->src->dtype.is_float4_e2m1fn()) {
+    element_bits =
+        InferDsReadMlsPhysicalInfo(self->src, meta->trans, block_size, T.target)
+            .element_bits;
+  }
   const bool a_mls_trans = !meta->gemm_trans_a;
   const bool b_mls_trans = meta->gemm_trans_b;
   hcu::ComputeWarpPartitionHCU(*policy.get(), meta->gemm_m, meta->gemm_n,
@@ -149,13 +176,12 @@ LayoutMap InferLayoutWithGemmDep(const DsReadFormatNode *self,
   Fragment fragment =
       meta->feeds_slot == 0
           ? makeGemmFragmentAHCU(meta->gemm_m, meta->gemm_n, meta->gemm_k,
-                                 warp_m, warp_n, warp_k,
-                                 self->dst->dtype.bits(), meta->gemm_k_pack,
-                                 meta->gemm_trans_a)
+                                 warp_m, warp_n, warp_k, element_bits,
+                                 meta->gemm_k_pack, meta->gemm_trans_a)
           : makeGemmFragmentBHCU(meta->gemm_m, meta->gemm_n, meta->gemm_k,
-                                 warp_m, warp_n, warp_k,
-                                 self->dst->dtype.bits(), meta->gemm_k_pack,
-                                 meta->gemm_trans_b, min_n_per_warp);
+                                 warp_m, warp_n, warp_k, element_bits,
+                                 meta->gemm_k_pack, meta->gemm_trans_b,
+                                 min_n_per_warp);
   auto layout = fragment->BindThreadRange(T.thread_bounds);
   if (T.layout_map.count(self->dst)) {
     if (!StructuralEqual()(layout, T.layout_map[self->dst])) {
@@ -230,15 +256,12 @@ LayoutMap DsReadFormatNode::InferLayout(const LayoutInferArgs &T,
     int64_t block_mn = *as_const_int(dst->shape[0]);
     int64_t block_k = *as_const_int(dst->shape[1]);
     int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
-    int w_mn, w_k, t_mn, t_k;
-    ComputeMlsWarpPartition(trans, static_cast<int>(block_mn),
-                            static_cast<int>(block_k), block_size, T.target,
-                            src->dtype.bits(), w_mn, w_k, t_mn, t_k);
+    DsReadMlsPhysicalInfo info =
+        InferDsReadMlsPhysicalInfo(src, trans, block_size, T.target);
     const int alt = 1;
-    const int element_bits = src->dtype.bits();
     int read_tile_mn, read_tile_k;
-    GetReadTileFromMlsTile(trans, t_mn, t_k, alt, element_bits, read_tile_mn,
-                           read_tile_k);
+    GetReadTileFromMlsTile(trans, info.tile_mn, info.tile_k, alt,
+                           info.element_bits, read_tile_mn, read_tile_k);
     int warp_mn, warp_k;
     ComputeDsReadFormatWarpPartition(
         trans, static_cast<int>(block_mn), static_cast<int>(block_k),
@@ -328,11 +351,14 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   int w_mn = 0;
   int w_k = 0;
   // Mls tile / LdsDesc must follow the *full* LDS write shape.
-  {
-    int dummy_mn, dummy_k;
-    ComputeMlsWarpPartition(
-        ds_trans, static_cast<int>(lds_mn), static_cast<int>(lds_k), block_size,
-        T.target, src->dtype.bits(), dummy_mn, dummy_k, tile_mn, tile_k);
+  DsReadMlsPhysicalInfo info =
+      InferDsReadMlsPhysicalInfo(src, ds_trans, block_size, T.target);
+  tile_mn = info.tile_mn;
+  tile_k = info.tile_k;
+  const int lds_physical_bits = info.element_bits;
+  int reg_bits = dst->dtype.bits();
+  if (src->dtype.is_float4_e2m1fn() && lds_physical_bits == 8) {
+    reg_bits = 8;
   }
 
   const int64_t *origin_mn_c = as_const_int(origin_mn);
@@ -360,10 +386,10 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     GemmWarpPolicy policy(meta->gemm_policy);
     const bool a_mls_trans = !meta->gemm_trans_a;
     const bool b_mls_trans = meta->gemm_trans_b;
-    hcu::ComputeWarpPartitionHCU(
-        *policy.get(), meta->gemm_m, meta->gemm_n, meta->gemm_k,
-        meta->gemm_k_pack, dst->dtype.bits(), block_size, T.target,
-        meta->a_from_mls, meta->b_from_mls, a_mls_trans, b_mls_trans);
+    hcu::ComputeWarpPartitionHCU(*policy.get(), meta->gemm_m, meta->gemm_n,
+                                 meta->gemm_k, meta->gemm_k_pack, reg_bits,
+                                 block_size, T.target, meta->a_from_mls,
+                                 meta->b_from_mls, a_mls_trans, b_mls_trans);
     int warp_m = policy->m_warp;
     int warp_n = policy->n_warp;
     int warp_k_part = policy->k_warp;
@@ -371,7 +397,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     w_k = warp_k_part;
   } else {
     const int alt = 1;
-    const int element_bits = src->dtype.bits();
+    const int element_bits = lds_physical_bits;
     int read_tile_mn, read_tile_k;
     GetReadTileFromMlsTile(ds_trans, tile_mn, tile_k, alt, element_bits,
                            read_tile_mn, read_tile_k);
@@ -381,7 +407,9 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   }
 
   std::string dtype_str = DsReadFormatDTypeString(src->dtype);
-  std::string target_dtype_str = DsReadFormatDTypeString(dst->dtype);
+  std::string target_dtype_str = src->dtype.is_float4_e2m1fn() && reg_bits == 8
+                                     ? "uint8_t"
+                                     : DsReadFormatDTypeString(dst->dtype);
 
   std::stringstream ss;
   if (gemm_dep_.defined()) {
@@ -393,7 +421,8 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
          << ", " << w_k << ", " << dtype_str << ", 1, "
          << (ds_trans ? "true" : "false")
          << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
-         << target_dtype_str << ">";
+         << target_dtype_str << ", " << lds_physical_bits << ", " << reg_bits
+         << ">";
     } else {
       int total_warp = block_size / TargetHcuGetWarpSize(T.target);
       ss << "tl::mls::ds_read_format_tensor_b<tl::sequence<" << lds_mn << ", "
@@ -402,7 +431,8 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
          << total_warp << ", " << w_mn << ", " << w_k << ", " << dtype_str
          << ", 1, " << (ds_trans ? "true" : "false")
          << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
-         << target_dtype_str << ">";
+         << target_dtype_str << ", " << lds_physical_bits << ", " << reg_bits
+         << ">";
     }
   } else {
     ss << "tl::mls::ds_read_format_tensor_common<tl::sequence<" << lds_mn
@@ -411,7 +441,8 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
        << ", " << w_k << ", " << dtype_str << ", 1, "
        << (ds_trans ? "true" : "false")
        << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
-       << target_dtype_str << ">";
+       << target_dtype_str << ", " << lds_physical_bits << ", " << reg_bits
+       << ">";
   }
 
   Buffer src_buf = T.buffer_remap.count(src) ? T.buffer_remap[src] : src;
@@ -425,7 +456,8 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
            "shape.size()="
         << src_buf->shape.size() << " vs region rank=" << sr;
     if (auto packed_offset = TryGetMlsPackedLeadingElemOffset(
-            src_buf, this->src_ranges, tile_mn, tile_k, ds_trans, T.target)) {
+            src_buf, this->src_ranges, tile_mn, tile_k, ds_trans, T.target,
+            lds_physical_bits)) {
       src_leading_elem_offset = packed_offset.value();
     } else {
       Array<PrimExpr> src_idx_leading;

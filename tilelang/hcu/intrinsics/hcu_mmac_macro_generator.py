@@ -10,7 +10,10 @@ from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import (
     check_mls_slice_aligned_to_tile,
     compute_mls_tiles,
     elem_bits,
+    hcu_mls_lds_bits,
     hcu_mls_ds_read_dtype_str,
+    hcu_mmac_k_dim_for_operand,
+    is_f8f6f4_operand_dtype,
     min_n_per_warp_for_b,
     mls_block_mn_k_from_region,
     mls_full_and_read_mn_k,
@@ -18,7 +21,6 @@ from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import (
 )
 from tilelang.language.utils import get_buffer_region_from_load
 from tilelang.utils.language import is_fragment, retrieve_ptr
-from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import hcu_mmac_k_dim
 from tilelang.backend.target import determine_target
 from tilelang.hcu.target import target_has_mmac_lit_lts
 from tvm import DataType, tirx
@@ -46,6 +48,10 @@ def _normalize_dtype_str(dtype) -> str:
         if s.startswith("dtype(") and "'" in s:
             return s.split("'")[1]
         return s
+
+
+def _is_f8f6f4_operand_dtype(dtype) -> bool:
+    return is_f8f6f4_operand_dtype(_normalize_dtype_str(dtype))
 
 
 class HCUMatrixCoreIntrinEmitter:
@@ -109,6 +115,7 @@ class HCUMatrixCoreIntrinEmitter:
         thread_bounds_min: int = 0,
         min_n_per_warp: int | None = None,
         use_tf32: bool = False,
+        fp4_mmac_mode: str = "native",
     ):
         self.a_dtype = _normalize_dtype_str(a_dtype)
         self.b_dtype = _normalize_dtype_str(b_dtype)
@@ -122,6 +129,7 @@ class HCUMatrixCoreIntrinEmitter:
         self.thread_var = thread_var
         self.thread_bounds_min = int(thread_bounds_min)
         self.use_tf32 = bool(use_tf32)
+        self.fp4_mmac_mode = str(fp4_mmac_mode)
         if self.use_tf32:
             if a_dtype != "float32" or b_dtype != "float32":
                 raise ValueError("use_tf32=True requires float32 A and B dtypes")
@@ -163,9 +171,12 @@ class HCUMatrixCoreIntrinEmitter:
         self.warp_cols = self.block_n // (self.block_col_warps_no_recompute * self.micro_size_y)
 
     def _initialize_k_dim(self, a_dtype="float16"):
-        if isinstance(a_dtype, str):
-            a_dtype = DataType(a_dtype)
-        self.k_dim = hcu_mmac_k_dim(self.target, a_dtype.bits, use_tf32=self.use_tf32)
+        self.k_dim = hcu_mmac_k_dim_for_operand(
+            self.target,
+            a_dtype,
+            operand_mode=self.fp4_mmac_mode,
+            use_tf32=self.use_tf32,
+        )
 
     def _initialize_local_size(self, m_dim=16, n_dim=16, k_dim=16, warp_size=32):
         self.local_size_a = (m_dim * k_dim) // warp_size
@@ -182,6 +193,8 @@ class HCUMatrixCoreIntrinEmitter:
         if self.use_tf32:
             scalar_dtype = "int32"
         scalar_dtype = str(scalar_dtype)
+        if self.fp4_mmac_mode == "f8f6f4" and _is_f8f6f4_operand_dtype(scalar_dtype):
+            return (f"uint8x{local_size}" if local_size != 1 else "uint8"), local_size
         if local_size == 1:
             return scalar_dtype, 1
         return f"{scalar_dtype}x{local_size}", local_size
@@ -206,6 +219,17 @@ class HCUMatrixCoreIntrinEmitter:
             return
 
         out_dtype_abbrv = {"float16": "f16", "float32": "f32", "int8": "i8", "int32": "i32"}[out_dtype]
+
+        if self.fp4_mmac_mode == "f8f6f4":
+            if out_dtype_abbrv != "f32":
+                raise AssertionError("HCU f8f6f4 MMAC currently only supports float32 accum")
+            if not (_is_f8f6f4_operand_dtype(self.a_dtype) and _is_f8f6f4_operand_dtype(self.b_dtype)):
+                raise AssertionError("HCU f8f6f4 MMAC requires f8/f6/f4 operands")
+            suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_f8f6f4"
+            if has_lit:
+                suffix += "_lit_lts"
+            self.mmac_suffix = suffix
+            return
 
         in_dtype_abbrv = {
             "float16": "f16",
@@ -234,7 +258,10 @@ class HCUMatrixCoreIntrinEmitter:
             elif in_abbr == "fp4":
                 if out_dtype_abbrv != "f32":
                     raise AssertionError("HCU fp4 MMAC currently only supports float32 accum")
-                self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_fp4_lit_lts"
+                if self.fp4_mmac_mode == "f8f6f4":
+                    self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_f8f6f4_lit_lts"
+                else:
+                    self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_fp4_lit_lts"
             elif in_abbr == "i8":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_i8_lit_clamp_lts"
             elif in_abbr == "tf32":
@@ -253,7 +280,11 @@ class HCUMatrixCoreIntrinEmitter:
             elif in_abbr == "bf8":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_bf8_bf8"
             elif in_abbr == "fp4":
-                raise AssertionError("HCU fp4 MMAC requires lit/lts target support")
+                if out_dtype_abbrv != "f32":
+                    raise AssertionError("HCU fp4 MMAC currently only supports float32 accum")
+                if self.fp4_mmac_mode != "f8f6f4":
+                    raise AssertionError("HCU fp4 native MMAC requires lit/lts target support")
+                self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_f8f6f4"
             elif in_abbr == "i8":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_i8"
             elif in_abbr == "tf32":
@@ -343,7 +374,7 @@ class HCUMatrixCoreIntrinEmitter:
         self.min_n_per_warp = min_n_per_warp_for_b(
             b_mls=b_mls,
             b_mls_trans=self.b_transposed,
-            element_bits=DataType(self.b_dtype).bits,
+            element_bits=8 if self.fp4_mmac_mode == "f8f6f4" else DataType(self.b_dtype).bits,
         )
         self._initialize_block_warp_tiles(self.block_m, self.block_n)
 
@@ -631,7 +662,10 @@ class HCUMatrixCoreIntrinEmitter:
         mls_trans = not self.a_transposed
         lds_block_mn, lds_block_k, ds_read_mn, ds_read_k, origin_mn, origin_k = mls_full_and_read_mn_k(A_mls_src, mls_trans)
         # Mls tile / LdsDesc follow the full write shape.
-        tile_mn, tile_k = compute_mls_tiles(mls_trans, lds_block_mn, lds_block_k, self.threads, self.target, elem_bits(A_local_buf.dtype))
+        src_bits = elem_bits(self.a_dtype)
+        reg_bits = 8 if self.fp4_mmac_mode == "f8f6f4" else elem_bits(A_local_buf.dtype)
+        tile_mn, tile_k = compute_mls_tiles(mls_trans, lds_block_mn, lds_block_k, self.threads, self.target, src_bits)
+        lds_bits = hcu_mls_lds_bits(self.a_dtype, mls_trans=mls_trans, tile_mn=tile_mn, tile_k=tile_k, target=self.target)
         check_mls_slice_aligned_to_tile(
             origin_mn=origin_mn,
             origin_k=origin_k,
@@ -651,8 +685,11 @@ class HCUMatrixCoreIntrinEmitter:
             warp_m=self.block_row_warps,
             warp_k=self.block_k_warps,
             mls_trans=mls_trans,
-            dtype_str=hcu_mls_ds_read_dtype_str(A_local_buf.dtype),
+            dtype_str=hcu_mls_ds_read_dtype_str(self.a_dtype),
             target=self.target,
+            target_dtype_str="uint8_t" if self.fp4_mmac_mode == "f8f6f4" else None,
+            lds_bits=lds_bits if self.fp4_mmac_mode == "f8f6f4" else None,
+            reg_bits=reg_bits if self.fp4_mmac_mode == "f8f6f4" else None,
         )
         src_ptr = retrieve_mls_lds_base_ptr(A_mls_src, "r")
         dst_ptr = retrieve_ptr(A_local_buf, "rw")
@@ -682,7 +719,10 @@ class HCUMatrixCoreIntrinEmitter:
         self.configure_b_mls(b_mls=True)
         mls_trans = self.b_transposed
         lds_block_mn, lds_block_k, ds_read_mn, ds_read_k, origin_mn, origin_k = mls_full_and_read_mn_k(B_mls_src, mls_trans)
-        tile_mn, tile_k = compute_mls_tiles(mls_trans, lds_block_mn, lds_block_k, self.threads, self.target, elem_bits(B_local_buf.dtype))
+        src_bits = elem_bits(self.b_dtype)
+        reg_bits = 8 if self.fp4_mmac_mode == "f8f6f4" else elem_bits(B_local_buf.dtype)
+        tile_mn, tile_k = compute_mls_tiles(mls_trans, lds_block_mn, lds_block_k, self.threads, self.target, src_bits)
+        lds_bits = hcu_mls_lds_bits(self.b_dtype, mls_trans=mls_trans, tile_mn=tile_mn, tile_k=tile_k, target=self.target)
         check_mls_slice_aligned_to_tile(
             origin_mn=origin_mn,
             origin_k=origin_k,
@@ -704,8 +744,11 @@ class HCUMatrixCoreIntrinEmitter:
             warp_n=self.block_col_warps,
             warp_k=self.block_k_warps,
             mls_trans=mls_trans,
-            dtype_str=hcu_mls_ds_read_dtype_str(B_local_buf.dtype),
+            dtype_str=hcu_mls_ds_read_dtype_str(self.b_dtype),
             target=self.target,
+            target_dtype_str="uint8_t" if self.fp4_mmac_mode == "f8f6f4" else None,
+            lds_bits=lds_bits if self.fp4_mmac_mode == "f8f6f4" else None,
+            reg_bits=reg_bits if self.fp4_mmac_mode == "f8f6f4" else None,
         )
         src_ptr = retrieve_mls_lds_base_ptr(B_mls_src, "r")
         dst_ptr = retrieve_ptr(B_local_buf, "rw")
@@ -740,7 +783,13 @@ class HCUMatrixCoreIntrinEmitter:
         compute_a_dtype, a_index_div = self._mmac_ab_operand(self.a_dtype, local_size_a)
         compute_b_dtype, b_index_div = self._mmac_ab_operand(self.b_dtype, local_size_b)
         compute_out_dtype = out_dtype if local_size_out == 1 else f"{out_dtype}x{local_size_out}"
-        tf32_ann = {"tl.hcu_tf32_ab": 1} if self.use_tf32 else None
+        mmac_annotations = {}
+        if self.use_tf32:
+            mmac_annotations["tl.hcu_tf32_ab"] = 1
+        if "f8f6f4" in mmac_suffix:
+            mmac_annotations["tl.hcu_mmac_a_dtype"] = tirx.StringImm(str(self.a_dtype))
+            mmac_annotations["tl.hcu_mmac_b_dtype"] = tirx.StringImm(str(self.b_dtype))
+        mmac_annotations = mmac_annotations or None
         mmac_op = tirx.op.Op.get("tl.tvm_mfma")
 
         a_is_fragment = is_fragment(A_local_buf)
@@ -776,7 +825,7 @@ class HCUMatrixCoreIntrinEmitter:
                     (b_local_stride + (j * k_pack + kp) * local_size_b) // b_index_div,
                     C_local_buf.data,
                     (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
-                    annotations=tf32_ann,
+                    annotations=mmac_annotations,
                 )
 
         return _warp_mma(A_local_buf, B_local_buf, C_local_buf)
