@@ -1119,7 +1119,7 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
 
       std::string pred = GetCurrentPredicate();
       PrintIndent();
-      stream << "tl::amd_buffer_store<" << data_type << ", "
+      stream << "tl::hcu_buffer_store<" << data_type << ", "
              << desc.num_elements << ", " << (pred == "true" ? "false" : "true")
              << ">(" << src_thread_buffer << ", reinterpret_cast<" << data_type
              << "*>(" << desc.wave_ptr << ")"
@@ -1524,7 +1524,7 @@ CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer,
     ICHECK(CanProveMultiple(offset, fp4_desc.lanes))
         << "HCU fp4 buffer op requires logical base aligned to "
         << fp4_desc.lanes << " fp4 elements, got base=" << offset;
-    // Keep each packed fp4 vector as one payload for amd_buffer_load/store.
+    // Keep each packed fp4 vector as one payload for hcu_buffer_load/store.
     // Using thread_buffer<T, N> with N > 1 can make the backend split/repack
     // the value through extra register moves instead of a stable dword vector.
     num_elements = 1;
@@ -1561,7 +1561,7 @@ std::string CodeGenTileLangHCU::GetVecLoadWithPredicate(
     std::ostringstream os;
     os << "*(";
     PrintType(t, os);
-    os << "*)&(tl::amd_buffer_load<" << data_type << ", " << desc.num_elements
+    os << "*)&(tl::hcu_buffer_load<" << data_type << ", " << desc.num_elements
        << ", " << (pred == "true" ? "false" : "true")
        << ">(reinterpret_cast<const " << data_type << "*>(" << desc.wave_ptr
        << "), " << desc.offset << ", " << pred << ", "
@@ -1591,14 +1591,14 @@ void CodeGenTileLangHCU::PrintVecStoreWithPredicate(const BufferNode *buffer,
 
   auto desc = GetBufferDesc(t, buffer, base);
   // Convert the value expression to the element shape required by
-  // amd_buffer_store.
+  // hcu_buffer_store.
   std::string data_type = HcuCkTemplateElemType(t);
   std::string src_thread_buffer =
       "tl::bit_cast<tl::thread_buffer<" + data_type + ", " +
       std::to_string(desc.num_elements) + ">>(" + value + ")";
 
   this->PrintIndent();
-  this->stream << "tl::amd_buffer_store<" << data_type << ", "
+  this->stream << "tl::hcu_buffer_store<" << data_type << ", "
                << desc.num_elements << ", "
                << (pred == "true" ? "false" : "true") << ">("
                << src_thread_buffer << ", "

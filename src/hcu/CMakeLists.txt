@@ -25,7 +25,7 @@ if(NOT USE_ROCM)
 endif()
 
 set(CMAKE_HIP_STANDARD 17)
-add_compile_definitions(__HIP_PLATFORM_AMD__ __HIP_PLATFORM_HCC__=1)
+add_compile_definitions(__HIP_PLATFORM_HCC__=1)
 
 include(${TVM_SOURCE}/cmake/utils/FindROCM.cmake)
 find_rocm(${USE_ROCM})

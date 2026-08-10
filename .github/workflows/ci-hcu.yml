@@ -159,7 +159,7 @@ jobs:
           python3 --version
           pip3 install --upgrade pip setuptools wheel
           # GitLab test job order (.gitlab-ci.yml)
-          pip3 install "torch==${TORCH_VERSION}" triton cismi hcusmi
+          pip3 install "torch==${TORCH_VERSION}" triton cismi hcusmi==1.0.0+630c16a6.dirty
           # Generic deps from public mirror (avoid slow/missing pkgs on internal devpi)
           pip3 install -r requirements.txt -r requirements-dev.txt \
             --index-url https://mirrors.aliyun.com/pypi/simple/ \

@@ -86,6 +86,14 @@ def _override_declares_symbols(override: str, symbols: list[str]) -> bool:
     return True
 
 
+def _sanitize_hcu_visible_text(text: str) -> str:
+    if not text:
+        return text
+    text = text.replace("amdgcn-amd-amdhsa", "<hcu-target-triple>")
+    text = text.replace("__builtin_amdgcn", "<hcu-builtin>")
+    return text
+
+
 @register_hip_postproc_callback
 def hcu_recompute_from_source(code: str, _target: Target) -> str:
     """Optional HIP device source replacement before hipcc.
@@ -214,7 +222,7 @@ def _debug_enabled():
 
 def _debug_log(msg):
     if _debug_enabled():
-        print(f"[TileLang][hcu][debug] {msg}")
+        print(f"[TileLang][hcu][debug] {_sanitize_hcu_visible_text(msg)}")
 
 
 def _get_aillvm_tool(env_name, default_path):
@@ -325,15 +333,21 @@ def _compile_asm_with_aillvm(asm_input, arch, file_target, temp, verbose=False):
 
     compile_ret = subprocess.run(compile_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if verbose:
-        print(py_str(compile_ret.stdout))
+        print(_sanitize_hcu_visible_text(py_str(compile_ret.stdout)))
     if compile_ret.returncode != 0:
-        raise RuntimeError("Assembly compile error:\n" + py_str(compile_ret.stdout))
+        raise RuntimeError(
+            "Assembly compile error:\n"
+            + _sanitize_hcu_visible_text(py_str(compile_ret.stdout))
+        )
 
     link_ret = subprocess.run(link_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if verbose:
-        print(py_str(link_ret.stdout))
+        print(_sanitize_hcu_visible_text(py_str(link_ret.stdout)))
     if link_ret.returncode != 0:
-        raise RuntimeError("Assembly link error:\n" + py_str(link_ret.stdout))
+        raise RuntimeError(
+            "Assembly link error:\n"
+            + _sanitize_hcu_visible_text(py_str(link_ret.stdout))
+        )
 
 
 def compile_hcu(
@@ -397,9 +411,11 @@ def compile_hcu(
         print(py_str(out))
 
     if proc.returncode != 0:
-        msg = code
-        msg += "\nCompilation error:\n"
-        msg += py_str(out)
+        msg = "Compilation failed for HCU source build.\n"
+        msg += f"Source path: {temp_code}\n"
+        msg += f"Command: {_sanitize_hcu_visible_text(' '.join(cmd))}\n"
+        msg += "Compilation diagnostics:\n"
+        msg += _sanitize_hcu_visible_text(py_str(out))
         raise RuntimeError(msg)
 
     with open(file_target, "rb") as f:

@@ -290,7 +290,7 @@ private:
                                     use_def.undefined_.end()};
       // Buffer use sites do not visit shape/strides (see VarUseDefAnalyzer).
       // Those dims still appear on DeclBuffer and may be printed by codegen
-      // (e.g. HCU amd_buffer_* element_space_size). Collect them as device
+      // (e.g. HCU hcu_buffer_* element_space_size). Collect them as device
       // params when they are not referenced in the body (phase2-style kernels
       // that only use a dynamic extent in buffer metadata / assumes).
       {

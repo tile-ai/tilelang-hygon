@@ -1194,7 +1194,7 @@ TL_DEVICE void async_buffer_load_fence(index_t cnt = 0)
 // e.g. for
 // https://www.amd.com/system/files/TechDocs/instinct-mi200-cdna2-instruction-set-architecture.pdf,
 // page 67~68
-enum struct amd_buffer_coherence_enum
+enum struct hcu_buffer_coherence_enum
 {
     coherence_default = 0, // default value
     glc               = 1,
@@ -1203,9 +1203,9 @@ enum struct amd_buffer_coherence_enum
 };
 
 template <index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default>
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default>
 TL_DEVICE thread_buffer<int8_t, N>
-amd_buffer_load_impl_with_bytes(int32x4_t src_wave_buffer_resource,
+hcu_buffer_load_impl_with_bytes(int32x4_t src_wave_buffer_resource,
                                 index_t src_thread_addr_offset,
                                 index_t src_wave_addr_offset)
 {
@@ -1314,8 +1314,8 @@ amd_buffer_load_impl_with_bytes(int32x4_t src_wave_buffer_resource,
 
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default>
-TL_DEVICE thread_buffer<T, N> amd_buffer_load_impl(int32x4_t src_wave_buffer_resource,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default>
+TL_DEVICE thread_buffer<T, N> hcu_buffer_load_impl(int32x4_t src_wave_buffer_resource,
                                                         index_t src_thread_addr_offset,
                                                         index_t src_wave_addr_offset)
 {
@@ -1538,7 +1538,7 @@ TL_DEVICE thread_buffer<T, N> amd_buffer_load_impl(int32x4_t src_wave_buffer_res
     }
     else // other datatype
     {
-        auto raw_data = amd_buffer_load_impl_with_bytes<sizeof(T) * N, coherence>(
+        auto raw_data = hcu_buffer_load_impl_with_bytes<sizeof(T) * N, coherence>(
             src_wave_buffer_resource, src_thread_addr_offset, src_wave_addr_offset);
 
         return bit_cast<rtn_type>(raw_data);
@@ -1547,7 +1547,7 @@ TL_DEVICE thread_buffer<T, N> amd_buffer_load_impl(int32x4_t src_wave_buffer_res
 
 template <typename T, index_t N>
 TL_DEVICE thread_buffer<T, N>
-amd_buffer_load_impl_inline_asm(int32x4_t src_wave_buffer_resource,
+hcu_buffer_load_impl_inline_asm(int32x4_t src_wave_buffer_resource,
                                 index_t src_thread_addr_offset,
                                 index_t /* src_wave_addr_offset */)
 {
@@ -1606,7 +1606,7 @@ amd_buffer_load_impl_inline_asm(int32x4_t src_wave_buffer_resource,
 
 template <typename T, index_t N>
 TL_DEVICE thread_buffer<T, N>
-amd_buffer_load_impl_inline_asm(int32x4_t src_wave_buffer_resource, int32x2_t offset)
+hcu_buffer_load_impl_inline_asm(int32x4_t src_wave_buffer_resource, int32x2_t offset)
 {
     constexpr index_t bytes = sizeof(T) * N;
     static_assert(bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8 || bytes == 16,
@@ -1663,10 +1663,10 @@ amd_buffer_load_impl_inline_asm(int32x4_t src_wave_buffer_resource, int32x2_t of
 
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool oob_conditional_check          = true,
           bool pre_nop                        = false>
-TL_DEVICE void amd_buffer_load_raw_impl(thread_buffer<T, N>& dst,
+TL_DEVICE void hcu_buffer_load_raw_impl(thread_buffer<T, N>& dst,
                                              int32x4_t src_wave_buffer_resource,
                                              index_t src_thread_addr_offset,
                                              index_t src_wave_addr_offset,
@@ -1703,7 +1703,7 @@ TL_DEVICE void amd_buffer_load_raw_impl(thread_buffer<T, N>& dst,
 
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool pre_nop                        = false>
 TL_DEVICE void amd_async_buffer_load_impl(T* smem,
                                                int32x4_t src_wave_buffer_resource,
@@ -1725,7 +1725,7 @@ TL_DEVICE void amd_async_buffer_load_impl(T* smem,
 
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool oob_conditional_check          = true>
 TL_DEVICE void amd_async_buffer_load(TL_LDS_ADDR T* smem,
                                           int32x4_t src_wave_buffer_resource,
@@ -1757,7 +1757,7 @@ TL_DEVICE void amd_async_buffer_load(TL_LDS_ADDR T* smem,
 
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool oob_conditional_check          = true>
 TL_DEVICE void amd_async_buffer_load_inline_asm(TL_LDS_ADDR T* smem,
                                                      int32x4_t src_wave_buffer_resource,
@@ -1853,8 +1853,8 @@ TL_DEVICE void amd_async_buffer_load_inline_asm(TL_LDS_ADDR T* smem,
 }
 
 template <index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default>
-TL_DEVICE void amd_buffer_store_impl_with_bytes(const thread_buffer<int8_t, N> src_thread_data,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default>
+TL_DEVICE void hcu_buffer_store_impl_with_bytes(const thread_buffer<int8_t, N> src_thread_data,
                                                      int32x4_t dst_wave_buffer_resource,
                                                      index_t dst_thread_addr_offset,
                                                      index_t dst_wave_addr_offset)
@@ -1953,8 +1953,8 @@ TL_DEVICE void amd_buffer_store_impl_with_bytes(const thread_buffer<int8_t, N> s
 
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default>
-TL_DEVICE void amd_buffer_store_impl(const thread_buffer<T, N> src_thread_data,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default>
+TL_DEVICE void hcu_buffer_store_impl(const thread_buffer<T, N> src_thread_data,
                                           int32x4_t dst_wave_buffer_resource,
                                           index_t dst_thread_addr_offset,
                                           index_t dst_wave_addr_offset)
@@ -2160,7 +2160,7 @@ TL_DEVICE void amd_buffer_store_impl(const thread_buffer<T, N> src_thread_data,
     {
         using r_t = thread_buffer<int8_t, sizeof(T) * N>;
 
-        amd_buffer_store_impl_with_bytes<sizeof(T) * N, coherence>(bit_cast<r_t>(src_thread_data),
+        hcu_buffer_store_impl_with_bytes<sizeof(T) * N, coherence>(bit_cast<r_t>(src_thread_data),
                                                                    dst_wave_buffer_resource,
                                                                    dst_thread_addr_offset,
                                                                    dst_wave_addr_offset);
@@ -2169,9 +2169,9 @@ TL_DEVICE void amd_buffer_store_impl(const thread_buffer<T, N> src_thread_data,
 
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool oob_conditional_check          = true>
-TL_DEVICE void amd_buffer_store_raw_impl(const thread_buffer<T, N>& dst_thread_data,
+TL_DEVICE void hcu_buffer_store_raw_impl(const thread_buffer<T, N>& dst_thread_data,
                                               int32x4_t dst_wave_buffer_resource,
                                               index_t dst_thread_addr_offset,
                                               index_t dst_wave_addr_offset,
@@ -2203,7 +2203,7 @@ TL_DEVICE void amd_buffer_store_raw_impl(const thread_buffer<T, N>& dst_thread_d
 }
 
 template <typename T, index_t N>
-TL_DEVICE void amd_buffer_atomic_add_impl(const thread_buffer<T, N>& src_thread_data,
+TL_DEVICE void hcu_buffer_atomic_add_impl(const thread_buffer<T, N>& src_thread_data,
                                                int32x4_t dst_wave_buffer_resource,
                                                index_t dst_thread_addr_offset,
                                                index_t dst_wave_addr_offset)
@@ -2367,7 +2367,7 @@ TL_DEVICE void amd_buffer_atomic_add_impl(const thread_buffer<T, N>& src_thread_
 }
 
 template <typename T, index_t N>
-TL_DEVICE void amd_buffer_atomic_max_impl(const thread_buffer<T, N> src_thread_data,
+TL_DEVICE void hcu_buffer_atomic_max_impl(const thread_buffer<T, N> src_thread_data,
                                                int32x4_t dst_wave_buffer_resource,
                                                index_t dst_thread_addr_offset,
                                                index_t dst_wave_addr_offset)
@@ -2440,10 +2440,10 @@ TL_DEVICE void amd_buffer_atomic_max_impl(const thread_buffer<T, N> src_thread_d
 //   oob_conditional_check : dynamic check if out-of-bound
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool oob_conditional_check          = true>
 TL_DEVICE thread_buffer<T, N>
-amd_buffer_load_invalid_element_return_zero(const T* p_src_wave,
+hcu_buffer_load_invalid_element_return_zero(const T* p_src_wave,
                                             index_t src_thread_element_offset,
                                             bool src_thread_element_valid,
                                             index_t src_element_space_size)
@@ -2460,11 +2460,11 @@ amd_buffer_load_invalid_element_return_zero(const T* p_src_wave,
         else
             return 0;
     }();
-    return amd_buffer_load_impl<T, N, coherence>(
+    return hcu_buffer_load_impl<T, N, coherence>(
         src_wave_buffer_resource, src_addr_shift + src_thread_addr_offset, 0);
 #else
     thread_buffer<T, N> tmp =
-        amd_buffer_load_impl<T, N, coherence>(src_wave_buffer_resource, src_thread_addr_offset, 0);
+        hcu_buffer_load_impl<T, N, coherence>(src_wave_buffer_resource, src_thread_addr_offset, 0);
     if constexpr(oob_conditional_check)
         return src_thread_element_valid ? tmp : thread_buffer<T, N>{numeric<T>::zero()};
     else
@@ -2474,10 +2474,10 @@ amd_buffer_load_invalid_element_return_zero(const T* p_src_wave,
 
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool oob_conditional_check          = true>
 TL_DEVICE thread_buffer<T, N>
-amd_buffer_load_inline_asm_invalid_element_return_zero(const T* p_src_wave,
+hcu_buffer_load_inline_asm_invalid_element_return_zero(const T* p_src_wave,
                                                        index_t src_thread_element_offset,
                                                        bool src_thread_element_valid,
                                                        index_t src_element_space_size)
@@ -2491,24 +2491,24 @@ amd_buffer_load_inline_asm_invalid_element_return_zero(const T* p_src_wave,
                                              ? src_thread_element_offset * sizeof(T)
                                              : src_wave_buffer_resource[2];
 
-        return amd_buffer_load_impl_inline_asm<T, N>(
+        return hcu_buffer_load_impl_inline_asm<T, N>(
             src_wave_buffer_resource, src_thread_addr_offset, 0);
     }
     else
     {
         index_t src_thread_addr_offset = src_thread_element_offset * sizeof(T);
 
-        return amd_buffer_load_impl_inline_asm<T, N>(
+        return hcu_buffer_load_impl_inline_asm<T, N>(
             src_wave_buffer_resource, src_thread_addr_offset, 0);
     }
 }
 
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool oob_conditional_check          = true>
 TL_DEVICE thread_buffer<T, N>
-amd_buffer_load_inline_asm_invalid_element_return_zero(const T* p_src_wave,
+hcu_buffer_load_inline_asm_invalid_element_return_zero(const T* p_src_wave,
                                                        index_t src_thread_element_offset,
                                                        bool src_thread_element_valid,
                                                        index_t src_element_space_size,
@@ -2526,11 +2526,11 @@ amd_buffer_load_inline_asm_invalid_element_return_zero(const T* p_src_wave,
                                            voffset & (const_stride - 1)}
                                : int32x2_t{src_wave_buffer_resource[2], 0};
 
-        return amd_buffer_load_impl_inline_asm<T, N>(src_wave_buffer_resource, offset);
+        return hcu_buffer_load_impl_inline_asm<T, N>(src_wave_buffer_resource, offset);
     }
     else
     {
-        return amd_buffer_load_impl_inline_asm<T, N>(
+        return hcu_buffer_load_impl_inline_asm<T, N>(
             src_wave_buffer_resource,
             int32x2_t{voffset >> int(__builtin_log2f(const_stride)), voffset & (const_stride - 1)});
     }
@@ -2542,10 +2542,10 @@ amd_buffer_load_inline_asm_invalid_element_return_zero(const T* p_src_wave,
 // It is user's responsibility to make sure that is true.
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool oob_conditional_check          = true>
 TL_DEVICE thread_buffer<T, N>
-amd_buffer_load_invalid_element_return_customized_value(const T* p_src_wave,
+hcu_buffer_load_invalid_element_return_customized_value(const T* p_src_wave,
                                                         index_t src_thread_element_offset,
                                                         bool src_thread_element_valid,
                                                         index_t src_element_space_size,
@@ -2557,7 +2557,7 @@ amd_buffer_load_invalid_element_return_customized_value(const T* p_src_wave,
     index_t src_thread_addr_offset = src_thread_element_offset * sizeof(T);
 
     thread_buffer<T, N> tmp =
-        amd_buffer_load_impl<T, N, coherence>(src_wave_buffer_resource, src_thread_addr_offset, 0);
+        hcu_buffer_load_impl<T, N, coherence>(src_wave_buffer_resource, src_thread_addr_offset, 0);
 
     if constexpr(oob_conditional_check)
         return src_thread_element_valid ? tmp : thread_buffer<T, N>{customized_value};
@@ -2567,10 +2567,10 @@ amd_buffer_load_invalid_element_return_customized_value(const T* p_src_wave,
 
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool oob_conditional_check          = true,
           bool pre_nop                        = false>
-TL_DEVICE void amd_buffer_load_raw(thread_buffer<T, N>& dst,
+TL_DEVICE void hcu_buffer_load_raw(thread_buffer<T, N>& dst,
                                         const T* p_src_wave,
                                         index_t src_thread_element_offset,
                                         index_t src_linear_element_offset,
@@ -2584,7 +2584,7 @@ TL_DEVICE void amd_buffer_load_raw(thread_buffer<T, N>& dst,
     index_t src_thread_addr_offset = src_thread_element_offset * sizeof(T);
     index_t src_linear_addr_offset = src_linear_element_offset * sizeof(T);
 
-    amd_buffer_load_raw_impl<T, N, coherence, oob_conditional_check, pre_nop>(
+    hcu_buffer_load_raw_impl<T, N, coherence, oob_conditional_check, pre_nop>(
         dst,
         src_wave_buffer_resource,
         src_thread_addr_offset,
@@ -2597,10 +2597,10 @@ TL_DEVICE void amd_buffer_load_raw(thread_buffer<T, N>& dst,
 // This version support buffer resource as input arg
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool oob_conditional_check          = true,
           bool pre_nop                        = false>
-TL_DEVICE void amd_buffer_load_raw(thread_buffer<T, N>& dst,
+TL_DEVICE void hcu_buffer_load_raw(thread_buffer<T, N>& dst,
                                         const int32x4_t src_wave_buffer_resource,
                                         index_t src_thread_element_offset,
                                         index_t src_linear_element_offset,
@@ -2610,7 +2610,7 @@ TL_DEVICE void amd_buffer_load_raw(thread_buffer<T, N>& dst,
     index_t src_thread_addr_offset = src_thread_element_offset * sizeof(T);
     index_t src_linear_addr_offset = src_linear_element_offset * sizeof(T);
 
-    amd_buffer_load_raw_impl<T, N, coherence, oob_conditional_check, pre_nop>(
+    hcu_buffer_load_raw_impl<T, N, coherence, oob_conditional_check, pre_nop>(
         dst,
         src_wave_buffer_resource,
         src_thread_addr_offset,
@@ -2626,7 +2626,7 @@ TL_DEVICE void amd_buffer_load_raw(thread_buffer<T, N>& dst,
 // buffer_load OOB still working.
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool pre_nop                        = false>
 TL_DEVICE void amd_async_buffer_load_with_oob_raw(T* smem,
                                                        const T* p_src_wave,
@@ -2652,7 +2652,7 @@ TL_DEVICE void amd_async_buffer_load_with_oob_raw(T* smem,
 // This version support buffer resource as input arg
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool pre_nop                        = false>
 TL_DEVICE void amd_async_buffer_load_with_oob_raw(T* smem,
                                                        const int32x4_t src_wave_buffer_resource,
@@ -2674,7 +2674,7 @@ TL_DEVICE void amd_async_buffer_load_with_oob_raw(T* smem,
 // This version support buffer resource as input arg
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool oob_conditional_check          = false>
 TL_DEVICE void amd_async_buffer_load_with_oob(TL_LDS_ADDR T* smem,
                                                    const int32x4_t src_wave_buffer_resource,
@@ -2698,7 +2698,7 @@ TL_DEVICE void amd_async_buffer_load_with_oob(TL_LDS_ADDR T* smem,
 // This version support buffer resource as input arg
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool oob_conditional_check          = false>
 TL_DEVICE void
 amd_async_buffer_load_inline_asm_with_oob(TL_LDS_ADDR T* smem,
@@ -2726,13 +2726,14 @@ amd_async_buffer_load_inline_asm_with_oob(TL_LDS_ADDR T* smem,
 // It is user's responsibility to make sure that is true.
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool oob_conditional_check          = true>
-TL_DEVICE void amd_buffer_store(const thread_buffer<T, N>& src_thread_data,
-                                     T* p_dst_wave,
-                                     const index_t dst_thread_element_offset,
-                                     const bool dst_thread_element_valid,
-                                     const index_t dst_element_space_size)
+TL_DEVICE void hcu_buffer_store_invalid_element_guarded(
+    const thread_buffer<T, N>& src_thread_data,
+    T* p_dst_wave,
+    const index_t dst_thread_element_offset,
+    const bool dst_thread_element_valid,
+    const index_t dst_element_space_size)
 {
     const int32x4_t dst_wave_buffer_resource =
         make_wave_buffer_resource(p_dst_wave, dst_element_space_size * sizeof(T));
@@ -2746,20 +2747,20 @@ TL_DEVICE void amd_buffer_store(const thread_buffer<T, N>& src_thread_data,
         else
             return 0;
     }();
-    amd_buffer_store_impl<T, N, coherence>(
+    hcu_buffer_store_impl<T, N, coherence>(
         src_thread_data, dst_wave_buffer_resource, dst_addr_shift + dst_thread_addr_offset, 0);
 #else
     if constexpr(oob_conditional_check)
     {
         if(dst_thread_element_valid)
         {
-            amd_buffer_store_impl<T, N, coherence>(
+            hcu_buffer_store_impl<T, N, coherence>(
                 src_thread_data, dst_wave_buffer_resource, dst_thread_addr_offset, 0);
         }
     }
     else
     {
-        amd_buffer_store_impl<T, N, coherence>(
+        hcu_buffer_store_impl<T, N, coherence>(
             src_thread_data, dst_wave_buffer_resource, dst_thread_addr_offset, 0);
     }
 #endif
@@ -2767,9 +2768,9 @@ TL_DEVICE void amd_buffer_store(const thread_buffer<T, N>& src_thread_data,
 
 template <typename T,
           index_t N,
-          amd_buffer_coherence_enum coherence = amd_buffer_coherence_enum::coherence_default,
+          hcu_buffer_coherence_enum coherence = hcu_buffer_coherence_enum::coherence_default,
           bool oob_conditional_check          = true>
-TL_DEVICE void amd_buffer_store_raw(const thread_buffer<T, N>& src_thread_data,
+TL_DEVICE void hcu_buffer_store_raw(const thread_buffer<T, N>& src_thread_data,
                                          T* p_dst_wave,
                                          const index_t dst_thread_element_offset,
                                          const index_t dst_linear_element_offset,
@@ -2782,7 +2783,7 @@ TL_DEVICE void amd_buffer_store_raw(const thread_buffer<T, N>& src_thread_data,
     index_t dst_thread_addr_offset = dst_thread_element_offset * sizeof(T);
     index_t dst_linear_addr_offset = dst_linear_element_offset * sizeof(T);
 
-    amd_buffer_store_raw_impl<T, N, coherence, oob_conditional_check>(src_thread_data,
+    hcu_buffer_store_raw_impl<T, N, coherence, oob_conditional_check>(src_thread_data,
                                                                       dst_wave_buffer_resource,
                                                                       dst_thread_addr_offset,
                                                                       0,
@@ -2795,7 +2796,7 @@ TL_DEVICE void amd_buffer_store_raw(const thread_buffer<T, N>& src_thread_data,
 //   2) p_dst_wave must be a wavewise pointer.
 // It is user's responsibility to make sure that is true.
 template <typename T, index_t N>
-TL_DEVICE void amd_buffer_atomic_add(const thread_buffer<T, N>& src_thread_data,
+TL_DEVICE void hcu_buffer_atomic_add(const thread_buffer<T, N>& src_thread_data,
                                           T* p_dst_wave,
                                           const index_t dst_thread_element_offset,
                                           const bool dst_thread_element_valid,
@@ -2809,12 +2810,12 @@ TL_DEVICE void amd_buffer_atomic_add(const thread_buffer<T, N>& src_thread_data,
 #if TL_EXPERIMENTAL_USE_BUFFER_ATOMIC_ADD_OOB_CHECK_OFFSET_TRICK
     uint32_t dst_addr_shift = dst_thread_element_valid ? 0 : 0x80000000;
 
-    amd_buffer_atomic_add_impl<T, N>(
+    hcu_buffer_atomic_add_impl<T, N>(
         src_thread_data, dst_wave_buffer_resource, dst_addr_shift + dst_thread_addr_offset, 0);
 #else
     if(dst_thread_element_valid)
     {
-        amd_buffer_atomic_add_impl<T, N>(
+        hcu_buffer_atomic_add_impl<T, N>(
             src_thread_data, dst_wave_buffer_resource, dst_thread_addr_offset, 0);
     }
 #endif
@@ -2825,7 +2826,7 @@ TL_DEVICE void amd_buffer_atomic_add(const thread_buffer<T, N>& src_thread_data,
 //   2) p_dst_wave must be a wavewise pointer.
 // It is user's responsibility to make sure that is true.
 template <typename T, index_t N>
-TL_DEVICE void amd_buffer_atomic_max(const thread_buffer<T, N>& src_thread_data,
+TL_DEVICE void hcu_buffer_atomic_max(const thread_buffer<T, N>& src_thread_data,
                                           T* p_dst_wave,
                                           const index_t dst_thread_element_offset,
                                           const bool dst_thread_element_valid,
@@ -2839,12 +2840,12 @@ TL_DEVICE void amd_buffer_atomic_max(const thread_buffer<T, N>& src_thread_data,
 #if TL_EXPERIMENTAL_USE_BUFFER_ATOMIC_MAX_OOB_CHECK_OFFSET_TRICK
     uint32_t dst_addr_shift = dst_thread_element_valid ? 0 : 0x80000000;
 
-    amd_buffer_atomic_max_impl<T, N>(
+    hcu_buffer_atomic_max_impl<T, N>(
         src_thread_data, dst_wave_buffer_resource, dst_addr_shift + dst_thread_addr_offset, 0);
 #else
     if(dst_thread_element_valid)
     {
-        amd_buffer_atomic_max_impl<T, N>(
+        hcu_buffer_atomic_max_impl<T, N>(
             src_thread_data, dst_wave_buffer_resource, dst_thread_addr_offset, 0);
     }
 #endif

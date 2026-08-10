@@ -4,8 +4,6 @@
 #include <tvm/ir/cast.h>
 #endif
 
-#include <hip/hip_runtime.h>
-
 #include "codegen_hcu.h"
 #include "runtime/pack_args.h"
 #include "target/rocm/rocm_fallback_module.h"

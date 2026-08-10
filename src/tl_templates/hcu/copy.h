@@ -178,10 +178,9 @@ TL_DEVICE void cp_async_gs_conditional(void *lds_base_ptr,
                                                 cond);
 }
 
-// amd_buffer_load for tilelang
 template <typename T, tl::index_t N, bool oob_conditional_check = true>
 TL_DEVICE tl::thread_buffer<T, N>
-amd_buffer_load(const T *p_src_wave, tl::index_t src_thread_element_offset,
+hcu_buffer_load(const T *p_src_wave, tl::index_t src_thread_element_offset,
                 bool src_thread_element_valid,
                 tl::index_t src_element_space_size) {
   const int32x4_t src_wave_buffer_resource =
@@ -194,13 +193,12 @@ amd_buffer_load(const T *p_src_wave, tl::index_t src_thread_element_offset,
     else
       return src_thread_element_offset * sizeof(T);
   }();
-  return tl::amd_buffer_load_impl<T, N>(src_wave_buffer_resource,
+  return tl::hcu_buffer_load_impl<T, N>(src_wave_buffer_resource,
                                         src_thread_addr_offset, 0);
 }
 
-// amd_buffer_store for tilelang
 template <typename T, tl::index_t N, bool oob_conditional_check = true>
-TL_DEVICE void amd_buffer_store(const tl::thread_buffer<T, N> &src_thread_data,
+TL_DEVICE void hcu_buffer_store(const tl::thread_buffer<T, N> &src_thread_data,
                                 T *p_dst_wave,
                                 const tl::index_t dst_thread_element_offset,
                                 const bool dst_thread_element_valid,
@@ -215,7 +213,7 @@ TL_DEVICE void amd_buffer_store(const tl::thread_buffer<T, N> &src_thread_data,
     else
       return dst_thread_element_offset * sizeof(T);
   }();
-  tl::amd_buffer_store_impl<T, N>(src_thread_data, dst_wave_buffer_resource,
+  tl::hcu_buffer_store_impl<T, N>(src_thread_data, dst_wave_buffer_resource,
                                   dst_thread_addr_offset, 0);
 }
 
