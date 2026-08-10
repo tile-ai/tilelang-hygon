@@ -17,6 +17,8 @@ pytestmark = [
     ),
 ]
 
+_WAITCNT_RE = r"__builtin_[A-Za-z0-9_]+_s_waitcnt"
+
 
 def _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2):
     ins = profiler._get_inputs()
@@ -28,7 +30,7 @@ def _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2):
 
 
 def _waitcnt_imms(source: str) -> list[int]:
-    return [int(x) for x in re.findall(r"__builtin_amdgcn_s_waitcnt\((\d+)\)", source)]
+    return [int(x) for x in re.findall(rf"{_WAITCNT_RE}\((\d+)\)", source)]
 
 
 def _vmcnt_keep(imm: int) -> int:
@@ -39,7 +41,7 @@ def _assert_each_waitcnt_followed_by_sync(source: str) -> None:
     waits = _waitcnt_imms(source)
     sync_after_waits = len(
         re.findall(
-            r"__builtin_amdgcn_s_waitcnt\(\d+\);\s*\n\s*__syncthreads\(\);",
+            rf"{_WAITCNT_RE}\(\d+\);\s*\n\s*__syncthreads\(\);",
             source,
         )
     )
@@ -66,7 +68,7 @@ def _assert_mls_ds_stage1_waitcnt(source: str) -> None:
     _assert_each_waitcnt_followed_by_sync(source)
     ds_waits = len(
         re.findall(
-            r"__builtin_amdgcn_s_waitcnt\(\d+\);\s*\n\s*__syncthreads\(\);\s*\n\s*"
+            rf"{_WAITCNT_RE}\(\d+\);\s*\n\s*__syncthreads\(\);\s*\n\s*"
             r"tl::mls::ds_read_format",
             source,
         )
@@ -95,7 +97,7 @@ def _assert_mls_ds_stage2_waitcnt(source: str) -> None:
     _assert_each_waitcnt_followed_by_sync(source)
     ds_waits = len(
         re.findall(
-            r"__builtin_amdgcn_s_waitcnt\(\d+\);\s*\n\s*__syncthreads\(\);\s*\n\s*"
+            rf"{_WAITCNT_RE}\(\d+\);\s*\n\s*__syncthreads\(\);\s*\n\s*"
             r"tl::mls::ds_read_format",
             source,
         )
@@ -114,7 +116,7 @@ def _assert_mls_copy_a_mls_b_ds_stage1_waitcnt(source: str) -> None:
     _assert_each_waitcnt_followed_by_sync(source)
     ds_waits = len(
         re.findall(
-            r"__builtin_amdgcn_s_waitcnt\(\d+\);\s*\n\s*__syncthreads\(\);\s*\n\s*"
+            rf"{_WAITCNT_RE}\(\d+\);\s*\n\s*__syncthreads\(\);\s*\n\s*"
             r"tl::mls::ds_read_format_tensor_b",
             source,
         )
@@ -133,7 +135,7 @@ def _assert_mls_copy_a_mls_b_ds_stage2_waitcnt(source: str) -> None:
     _assert_each_waitcnt_followed_by_sync(source)
     ds_waits = len(
         re.findall(
-            r"__builtin_amdgcn_s_waitcnt\(\d+\);\s*\n\s*__syncthreads\(\);\s*\n\s*"
+            rf"{_WAITCNT_RE}\(\d+\);\s*\n\s*__syncthreads\(\);\s*\n\s*"
             r"tl::mls::ds_read_format_tensor_b",
             source,
         )

@@ -994,7 +994,7 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
 
       std::string pred = GetCurrentPredicate();
       PrintIndent();
-      stream << "tl::amd_buffer_store<" << HcuCkTemplateElemType(value_dtype)
+      stream << "tl::hcu_buffer_store<" << HcuCkTemplateElemType(value_dtype)
              << ", " << desc.num_elements << ", "
              << (pred == "true" ? "false" : "true") << ">(" << src_thread_buffer
              << ", " << HcuCkBufferDstPtrExpr(value_dtype, desc.wave_ptr)
@@ -1400,7 +1400,7 @@ std::string CodeGenTileLangHCU::GetVecLoadWithPredicate(
     std::ostringstream os;
     os << "*(";
     PrintType(t, os);
-    os << "*)&(tl::amd_buffer_load<" << HcuCkTemplateElemType(t) << ", "
+    os << "*)&(tl::hcu_buffer_load<" << HcuCkTemplateElemType(t) << ", "
        << desc.num_elements << ", " << (pred == "true" ? "false" : "true")
        << ">(" << HcuCkBufferSrcPtrExpr(t, desc.wave_ptr) << ", " << desc.offset
        << ", " << pred << ", " << desc.element_space_size << ").get())";
@@ -1428,18 +1428,13 @@ void CodeGenTileLangHCU::PrintVecStoreWithPredicate(const BufferNode *buffer,
   }
 
   auto desc = GetBufferDesc(t, buffer, base);
-  // Convert value to thread_buffer and use buffer_store
-  // buffer_store signature:
-  //   buffer_store<type, num_elements>(src_thread_data, dst_ptr,
-  //   dst_offset,
-  //                                        is_valid, element_space_size)
-  // Convert the value expression to a thread_buffer using bit_cast
+  // Convert the value expression to a thread_buffer using bit_cast.
   std::string src_thread_buffer =
       "tl::bit_cast<tl::thread_buffer<" + HcuCkTemplateElemType(t) + ", " +
       std::to_string(desc.num_elements) + ">>(" + value + ")";
 
   this->PrintIndent();
-  this->stream << "tl::amd_buffer_store<" << HcuCkTemplateElemType(t) << ", "
+  this->stream << "tl::hcu_buffer_store<" << HcuCkTemplateElemType(t) << ", "
                << desc.num_elements << ", "
                << (pred == "true" ? "false" : "true") << ">("
                << src_thread_buffer << ", "

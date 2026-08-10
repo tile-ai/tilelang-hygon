@@ -114,7 +114,7 @@ def annotate_direct_to_lds(buffers):
 
 
 def disable_buffer_ops(*buffers):
-    """Disable amd_buffer_load/amd_buffer_store for specified global buffers.
+    """Disable hcu_buffer_load/hcu_buffer_store for specified global buffers.
 
     Use when offset may exceed 2G (int32 limit). Applies to all accesses
     (T.copy, BufferLoad, BufferStore) in the entire kernel.

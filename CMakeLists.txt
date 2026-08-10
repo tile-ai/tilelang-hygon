@@ -168,6 +168,12 @@ foreach(BACKEND IN LISTS TILELANG_BACKENDS)
   set(${_backend_var} ${TILELANG_OPTION_${_backend_var}} CACHE STRING "${_doc}" FORCE)
   set(${_backend_var} ${TILELANG_OPTION_${_backend_var}})
 endforeach()
+if(USE_HCU AND TILELANG_USE_HIP_STUBS)
+  message(STATUS "HCU backend requires the DTK/ROCm runtime; disabling HIP stubs.")
+  set(TILELANG_USE_HIP_STUBS OFF CACHE BOOL
+      "Use POSIX dlopen-based HIP stub libraries (hip/hiprtc) for portable wheels"
+      FORCE)
+endif()
 # tvm tries to detect gtest by default, but may fail if its header is not installed.
 set(USE_GTEST OFF)
 
@@ -254,9 +260,13 @@ elseif(USE_ROCM)
   add_compile_definitions(__HIP_PLATFORM_AMD__ __HIP_PLATFORM_HCC__=1)
   if(USE_HCU)
     add_compile_definitions(USE_HCU=1)
+    if(NOT ROCM_FOUND)
+      message(FATAL_ERROR
+        "HCU build requires the DTK/ROCm runtime; HIP stubs are disabled for HCU.")
+    endif()
   endif()
 
-  if(TILELANG_USE_HIP_STUBS)
+  if(TILELANG_USE_HIP_STUBS AND NOT USE_HCU)
     if(WIN32 AND NOT CYGWIN)
       message(FATAL_ERROR "TILELANG_USE_HIP_STUBS=ON is not supported on Windows. "
                           "Please configure with -DTILELANG_USE_HIP_STUBS=OFF.")
@@ -550,7 +560,7 @@ if(USE_CUDA AND TILELANG_USE_CUDA_STUBS)
   list(APPEND TILELANG_OUTPUT_TARGETS cuda_stub cudart_stub nvrtc_stub)
 endif()
 
-if(USE_ROCM AND TILELANG_USE_HIP_STUBS)
+if(USE_ROCM AND TILELANG_USE_HIP_STUBS AND NOT USE_HCU)
   # Link against HIP stub library instead of libamdhip64.so
   # This enables lazy loading of libamdhip64.so at runtime, allowing
   # `import tilelang` to succeed on CPU-only machines.
