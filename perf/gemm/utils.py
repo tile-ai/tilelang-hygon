@@ -208,12 +208,13 @@ def get_persistent_group_size(
     n_blocks, gs]`` using truncdiv; **gs must divide** ``m_blocks`` or some
     output tiles are never scheduled.
 
-    Heuristic (gfx938 sweep, ``wgs_per_cu=1``):
+    Heuristic based on gfx938 sweeps with one workgroup per CU:
 
-    * ``tile_rounds <= 1``: ``gs=1`` (one tile per block, no cross-tile reuse).
-    * ``tile_rounds == 2``: prefer ``gs=4``, else ``m_blocks // 3``, ``m_blocks // 2``.
-    * ``tile_rounds in [3, 5]``: ``gs=1`` (e.g. 4096³).
-    * ``tile_rounds >= 6``: ``gs = m_blocks // 2`` when divisible (e.g. 5120³).
+    - One tile round uses group_size 1.
+    - Two rounds prefer group_size 4 when it divides the M tile count.
+    - Three to five rounds use group_size 1.
+    - Six or more rounds use half of the M tile grid.  On gfx938 FP16 square
+      GEMMs this selects 10 for 5120 and 16 for 8192.
     """
     m_blocks = _m_blocks(M, block_M)
     n_blocks = _n_blocks(N, block_N)
@@ -239,6 +240,34 @@ def get_persistent_group_size(
         if divides_m_blocks(gs):
             return gs
 
+    return 1
+
+
+def get_persistent_split_m_group_size(
+    M: int,
+    N: int,
+    block_M: int,
+    block_N: int,
+) -> int:
+    """Pick M-strip grouping for persistent split-M GEMM.
+
+    Split-M keeps a full N tile resident while grouping across M. Wide M
+    panels become counterproductive once the tile grid grows because their
+    working set reduces L2 locality. The thresholds below follow gfx938 FP16
+    sweeps with 256x256 output tiles: 4096 -> 1, 5120 -> 5, 8192 -> 1,
+    and 16384 -> 2.
+    """
+    m_blocks = _m_blocks(M, block_M)
+    n_blocks = _n_blocks(N, block_N)
+    if m_blocks >= 64:
+        return 2
+    if m_blocks >= 32 or n_blocks >= 32:
+        return 1
+    if m_blocks >= 20:
+        candidate = max(m_blocks // 4, 1)
+        while candidate > 1 and m_blocks % candidate != 0:
+            candidate -= 1
+        return candidate
     return 1
 
 
