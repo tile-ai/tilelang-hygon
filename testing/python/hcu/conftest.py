@@ -24,10 +24,7 @@ def _sanitize_longrepr(longrepr):
     if isinstance(longrepr, str):
         return _sanitize_hcu_visible_text(longrepr)
     if isinstance(longrepr, tuple):
-        return tuple(
-            _sanitize_hcu_visible_text(value) if isinstance(value, str) else value
-            for value in longrepr
-        )
+        return tuple(_sanitize_hcu_visible_text(value) if isinstance(value, str) else value for value in longrepr)
     return longrepr
 
 
@@ -39,10 +36,7 @@ def pytest_runtest_makereport(item, call):
     report.longrepr = _sanitize_longrepr(report.longrepr)
 
     if hasattr(report, "sections"):
-        report.sections = [
-            (name, _sanitize_hcu_visible_text(content))
-            for name, content in report.sections
-        ]
+        report.sections = [(name, _sanitize_hcu_visible_text(content)) for name, content in report.sections]
 
     if _precompile_only() and report.when == "call":
         report.outcome = "skipped"
