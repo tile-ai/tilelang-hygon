@@ -57,11 +57,6 @@ std::string GetHcuArchString(Target target) {
   ICHECK(TargetIsHCU(target)) << "GetHcuArchString requires HCU target";
   ICHECK(TargetHasMcpu(target)) << "HCU target must have mcpu attribute";
   std::string mcpu = GetMcpu(target);
-  static const std::set<std::string> kMlsSupported = {"gfx938", "gfx92a",
-                                                      "gfx946"};
-  ICHECK(kMlsSupported.count(mcpu))
-      << "HCU arch " << mcpu
-      << " not supported for MLS/GEMM_MLS; supported: gfx938, gfx92a, gfx946";
   return mcpu;
 }
 
