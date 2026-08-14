@@ -80,6 +80,7 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
     a_respect_layout_map = _int_annotation(annotations, "tl.hcu_a_respect_layout_map")
     b_respect_layout_map = _int_annotation(annotations, "tl.hcu_b_respect_layout_map")
     a_from_async_copy_linear = _int_annotation(annotations, "tl.hcu_a_from_async_copy_linear")
+    a_auto_lds_layout = _int_annotation(annotations, "tl.hcu_a_auto_lds_layout")
     b_from_async_copy_linear = _int_annotation(annotations, "tl.hcu_b_from_async_copy_linear")
     trans_c = _int_annotation(annotations, "trans_c")
     trans_a = bool(gemm_node.transA)
@@ -106,6 +107,7 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
         a_respect_layout_map=a_respect_layout_map,
         b_respect_layout_map=b_respect_layout_map,
         a_from_async_copy_linear=a_from_async_copy_linear,
+        a_auto_lds_layout=a_auto_lds_layout,
         b_from_async_copy_linear=b_from_async_copy_linear,
         trans_c=trans_c,
         a_mls_trans=int(a_mls_trans),
@@ -295,7 +297,9 @@ class GemmHCUMMAC(GemmBase):
         )
         out = {self.C: frag_c}
         if _is_shared_like(self.A):
-            if meta.a_respect_layout_map:
+            if meta.a_auto_lds_layout:
+                pass
+            elif meta.a_respect_layout_map:
                 logger.warning(
                     "HCU MMAC GEMM A uses custom annotate_layout; TileLang will not inject the default A shared swizzle. "
                     "The annotated layout must match GEMM-A matrix-core load semantics."

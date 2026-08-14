@@ -21,6 +21,9 @@ bool TargetHcuHasAsyncCopy(Target target);
 bool IsHCUEnableAutoAsyncCopyTarget(Target target);
 bool DefaultEnableAutoAsyncCopy(Target target);
 int TargetHcuGetWarpSize(Target target);
+int TargetHcuGetLdsBankCount(Target target);
+int TargetHcuGetLdsBankWidthBytes(Target target);
+int TargetHcuGetLdsWrapFieldBits(Target target);
 
 } // namespace tl
 } // namespace tvm

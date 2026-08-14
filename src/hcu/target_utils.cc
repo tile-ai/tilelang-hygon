@@ -108,6 +108,39 @@ int TargetHcuGetWarpSize(Target target) {
   return 64;
 }
 
+int TargetHcuGetLdsBankCount(Target target) {
+  ICHECK(TargetIsHCU(target))
+      << "TargetHcuGetLdsBankCount requires HCU target";
+  const std::string arch = GetHcuArchString(target);
+  if (arch == "gfx936" || arch == "gfx938" || arch == "gfx92a") {
+    return 32;
+  }
+  if (arch == "gfx946") {
+    return 64;
+  }
+  ICHECK(false) << "LDS bank count is not defined for HCU architecture: "
+                << arch;
+  return 0;
+}
+
+int TargetHcuGetLdsBankWidthBytes(Target target) {
+  ICHECK(TargetIsHCU(target))
+      << "TargetHcuGetLdsBankWidthBytes requires HCU target";
+  ICHECK(IsKnownHcuMcpu(GetHcuArchString(target)))
+      << "Unknown HCU architecture: " << GetHcuArchString(target);
+  return 4;
+}
+
+int TargetHcuGetLdsWrapFieldBits(Target target) {
+  ICHECK(TargetIsHCU(target))
+      << "TargetHcuGetLdsWrapFieldBits requires HCU target";
+  const std::string arch = GetHcuArchString(target);
+  if (arch == "gfx936" || arch == "gfx938") {
+    return 5;
+  }
+  return 0;
+}
+
 TVM_REGISTER_TARGET_KIND("hcu", kDLROCM)
     .add_attr_option<ffi::String>("mcpu")
     .add_attr_option<ffi::String>("mtriple")
@@ -143,7 +176,14 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def("tl.DefaultEnableAutoAsyncCopy",
            [](Target target) { return DefaultEnableAutoAsyncCopy(target); })
       .def("tl.TargetHcuGetWarpSize",
-           [](Target target) { return TargetHcuGetWarpSize(target); });
+           [](Target target) { return TargetHcuGetWarpSize(target); })
+      .def("tl.TargetHcuGetLdsBankCount",
+           [](Target target) { return TargetHcuGetLdsBankCount(target); })
+      .def("tl.TargetHcuGetLdsBankWidthBytes", [](Target target) {
+        return TargetHcuGetLdsBankWidthBytes(target);
+      })
+      .def("tl.TargetHcuGetLdsWrapFieldBits",
+           [](Target target) { return TargetHcuGetLdsWrapFieldBits(target); });
 }
 
 } // namespace tl

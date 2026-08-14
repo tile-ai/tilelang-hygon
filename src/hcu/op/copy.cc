@@ -10,6 +10,7 @@
 
 #include "hcu/target_utils.h"
 #include "hcu/transform/async_copy_injector.h"
+#include "hcu/utils/gemm_a_lds_strategy.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "transform/common/loop_fusion_utils.h"
@@ -50,6 +51,13 @@ bool GetNoImplicitAsyncCommitWait(const CopyNode &op) {
   return GetBoolAnnotation(op, attr::kAsyncCopyNoImplicitCommitWait);
 }
 
+Optional<HcuGemmALdsStrategy> GetGemmALdsStrategy(const CopyNode &op) {
+  if (auto value = op.annotations.Get(attr::kHcuGemmALdsStrategy)) {
+    return Downcast<HcuGemmALdsStrategy>(value.value());
+  }
+  return std::nullopt;
+}
+
 Map<String, ObjectRef> GetHCUAsyncCopyAnnotations(const CopyNode &op) {
   Map<String, ObjectRef> result;
   for (const char *key : {"use_idxen", "wrap_offset", "wrap_idx_mask"}) {
@@ -73,7 +81,14 @@ struct Copy {
                                InferLevel level) {
     SelectInst(op, layout_args.target, layout_args.layout_map,
                layout_args.analyzer);
-    return op.InferSIMTLayout(layout_args, level);
+    LayoutMap result = op.InferSIMTLayout(layout_args, level);
+    if (Optional<HcuGemmALdsStrategy> strategy = GetGemmALdsStrategy(op)) {
+      if (auto existing = layout_args.layout_map.Get(op.dst)) {
+        ValidateHcuGemmAStorageLayout(existing.value(), strategy.value());
+      }
+      result.Set(op.dst, strategy.value()->storage_layout);
+    }
+    return result;
   }
 
   static CopyInst SelectInst(const CopyNode &op, Target target,

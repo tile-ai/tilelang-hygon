@@ -7,6 +7,7 @@
 #include "hcu/op/ds_read_format.h"
 #include "hcu/op/mls.h"
 #include "hcu/target_utils.h"
+#include "hcu/utils/gemm_a_lds_strategy.h"
 #include "hcu/utils/mls_gemm_dep.h"
 #include "hcu/utils/propagation_tir_collector.h"
 #include "hcu/utils/propagation_util.h"
@@ -116,6 +117,75 @@ bool IsBLinearDirectGemmCandidate(const GemmNode *gemm) {
          (gemm->b_->dtype.is_float16() || gemm->b_->dtype.is_bfloat16());
 }
 
+class ThreadExtentCollector : public StmtExprVisitor {
+public:
+  static int Collect(const Stmt &body) {
+    ThreadExtentCollector collector;
+    collector(body);
+    if (collector.thread_x_extent_ <= 1 || collector.thread_y_extent_ != 1 ||
+        collector.thread_z_extent_ != 1) {
+      return -1;
+    }
+    return collector.thread_x_extent_;
+  }
+
+private:
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tirx::attr::thread_extent) {
+      if (const auto *iter_var = op->node.as<IterVarNode>()) {
+        if (const int64_t *extent = as_const_int(op->value)) {
+          if (iter_var->thread_tag == "threadIdx.x") {
+            thread_x_extent_ = static_cast<int>(*extent);
+          } else if (iter_var->thread_tag == "threadIdx.y") {
+            thread_y_extent_ = static_cast<int>(*extent);
+          } else if (iter_var->thread_tag == "threadIdx.z") {
+            thread_z_extent_ = static_cast<int>(*extent);
+          }
+        }
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  int thread_x_extent_{-1};
+  int thread_y_extent_{1};
+  int thread_z_extent_{1};
+};
+
+Optional<int> GetIntAnnotation(const Map<String, ObjectRef> &annotations,
+                               const char *key) {
+  if (auto value = annotations.Get(key)) {
+    if (const auto *imm = value.value().as<IntImmNode>()) {
+      return static_cast<int>(imm->value);
+    }
+    LOG(FATAL) << "Annotation `" << key << "` expects IntImm, got "
+               << value.value()->GetTypeKey();
+  }
+  return std::nullopt;
+}
+
+bool HaveSameGemmAStrategyParameters(const HcuGemmALdsStrategy &lhs,
+                                     const HcuGemmALdsStrategy &rhs) {
+  return lhs->strategy_version == rhs->strategy_version &&
+         lhs->block_m == rhs->block_m && lhs->block_k == rhs->block_k &&
+         lhs->block_threads == rhs->block_threads &&
+         lhs->warp_size == rhs->warp_size &&
+         lhs->warp_m_count == rhs->warp_m_count &&
+         lhs->bank_num == rhs->bank_num &&
+         lhs->bank_width_bytes == rhs->bank_width_bytes &&
+         lhs->element_bytes == rhs->element_bytes &&
+         lhs->copy_bytes_per_lane == rhs->copy_bytes_per_lane &&
+         lhs->read_bytes_per_lane == rhs->read_bytes_per_lane &&
+         lhs->row_period == rhs->row_period &&
+         lhs->row_bank_stride == rhs->row_bank_stride &&
+         lhs->segment_shift == rhs->segment_shift &&
+         lhs->rows_per_copy_wave == rhs->rows_per_copy_wave &&
+         lhs->row_slab_count == rhs->row_slab_count &&
+         lhs->warp_tile_m == rhs->warp_tile_m &&
+         lhs->wrap_offset == rhs->wrap_offset &&
+         lhs->wrap_idx_mask == rhs->wrap_idx_mask;
+}
+
 MlsGemmDepMeta BuildCopyToGemmBMeta(
     const GemmWithInput &consumer,
     const PropagationTirCollector *collector) {
@@ -140,8 +210,10 @@ MlsGemmDepMeta BuildCopyToGemmBMeta(
 
 class AnnotateMlsGemmDepMutator : public StmtExprMutator {
 public:
-  AnnotateMlsGemmDepMutator(PropagationTirCollector *collector, Target target)
-      : collector_(collector), target_(std::move(target)) {}
+  AnnotateMlsGemmDepMutator(PropagationTirCollector *collector, Target target,
+                            int block_threads)
+      : collector_(collector), target_(std::move(target)),
+        block_threads_(block_threads) {}
 
   static PrimFunc Substitute(PrimFunc f) {
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
@@ -154,7 +226,9 @@ public:
     Map<Var, Buffer> buffer_map = BuildBufferMap(f);
     PropagationTirCollector collector(buffer_map);
     collector.Collect(f->body);
-    AnnotateMlsGemmDepMutator mutator(&collector, target.value());
+    int block_threads = ThreadExtentCollector::Collect(f->body);
+    AnnotateMlsGemmDepMutator mutator(&collector, target.value(),
+                                      block_threads);
     PrimFuncNode *fn = f.CopyOnWrite();
     fn->body = mutator(f->body);
     return f;
@@ -195,6 +269,27 @@ private:
         return true;
     }
     return false;
+  }
+
+  void ValidateOrSetIntAnnotation(Map<String, ObjectRef> *annotations,
+                                  const char *key, int expected) const {
+    if (Optional<int> actual = GetIntAnnotation(*annotations, key)) {
+      ICHECK_EQ(actual.value(), expected)
+          << "HCU GEMM A auto LDS strategy requires `" << key << "`="
+          << expected << ", but got " << actual.value();
+      return;
+    }
+    annotations->Set(key, IntImm(DataType::Int(32), expected));
+  }
+
+  Optional<HcuGemmALdsStrategy>
+  TryDeriveGemmAStrategy(const CopyNode &copy,
+                         const GemmWithInput &consumer) const {
+    const GemmNode *gemm = consumer.gemm.get();
+    if (gemm == nullptr || !consumer.input.same_as(gemm->a_)) {
+      return std::nullopt;
+    }
+    return DeriveHcuGemmALdsStrategy(copy, *gemm, block_threads_, target_);
   }
 
   bool LookupSharedMlsTrans(const Buffer &dst, bool *out_trans) {
@@ -264,6 +359,37 @@ private:
         return Evaluate(Call(call->dtype, DsReadFormat::Get(), call->args,
                              annotations, call->span));
       }
+      if (IsAsyncCopyOp(tir_op) && consumer) {
+        Optional<HcuGemmALdsStrategy> strategy =
+            TryDeriveGemmAStrategy(*copy.get(), consumer.value());
+        if (strategy.defined()) {
+          auto annotations = call->annotations;
+          if (auto loop_layout = annotations.Get(attr::kParallelLoopLayout)) {
+            Fragment actual = Downcast<Fragment>(loop_layout.value());
+            ValidateHcuGemmACopyLayout(actual, strategy.value());
+          } else {
+            annotations.Set(attr::kParallelLoopLayout,
+                            strategy.value()->copy_loop_layout);
+          }
+          ValidateOrSetIntAnnotation(&annotations, "use_idxen", 1);
+          ValidateOrSetIntAnnotation(&annotations, "wrap_offset",
+                                     strategy.value()->wrap_offset);
+          ValidateOrSetIntAnnotation(&annotations, "wrap_idx_mask",
+                                     strategy.value()->wrap_idx_mask);
+          annotations.Set(attr::kHcuGemmALdsStrategy, strategy.value());
+          auto [it, inserted] =
+              auto_strategies_.emplace(copy->dst->data, strategy.value());
+          if (!inserted) {
+            const HcuGemmALdsStrategy &existing = it->second;
+            const HcuGemmALdsStrategy &current = strategy.value();
+            ICHECK(HaveSameGemmAStrategyParameters(existing, current))
+                << "Conflicting HCU GEMM A strategies for shared buffer "
+                << copy->dst->name;
+          }
+          return Evaluate(Call(call->dtype, call->op, call->args, annotations,
+                               call->span));
+        }
+      }
       if (IsAsyncCopyOp(tir_op) && IsSharedBuffer(copy->dst) &&
           !HasAnnotatedLayout(copy->dst)) {
         async_copy_linear_outputs_.insert(copy->dst->data);
@@ -278,7 +404,12 @@ private:
       if (copy_ds_read_b_outputs_.count(gemm->b_)) {
         annotations.Set(attr::kHcuBFromMls, IntImm(DataType::Int(32), 1));
       }
-      if (IsSharedBuffer(gemm->a_) && HasAnnotatedLayout(gemm->a_)) {
+      auto auto_strategy = auto_strategies_.find(gemm->a_->data);
+      if (IsSharedBuffer(gemm->a_) &&
+          auto_strategy != auto_strategies_.end()) {
+        annotations.Set(attr::kHcuAAutoLdsLayout,
+                        IntImm(DataType::Int(32), 1));
+      } else if (IsSharedBuffer(gemm->a_) && HasAnnotatedLayout(gemm->a_)) {
         annotations.Set(attr::kHcuARespectLayoutMap,
                         IntImm(DataType::Int(32), 1));
       } else if (IsSharedBuffer(gemm->a_) &&
@@ -304,6 +435,7 @@ private:
 
   PropagationTirCollector *collector_;
   Target target_;
+  int block_threads_{-1};
   std::unordered_map<Buffer, bool, ObjectPtrHash, ObjectPtrEqual>
       shared_mls_trans_;
   std::vector<std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>>
@@ -312,6 +444,8 @@ private:
       copy_ds_read_b_outputs_;
   std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>
       async_copy_linear_outputs_;
+  std::unordered_map<Var, HcuGemmALdsStrategy, ObjectPtrHash, ObjectPtrEqual>
+      auto_strategies_;
 };
 
 tvm::transform::Pass AnnotateMlsGemmDep() {
