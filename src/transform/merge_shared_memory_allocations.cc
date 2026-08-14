@@ -782,9 +782,8 @@ private:
                    op->args[4]});
     } else if (op->op.same_as(builtin::ptx_cp_async()) ||
                op->op.same_as(tl::ptx_cp_async())) {
-      ICHECK(op->args.size() == 3U || op->args.size() == 4U)
-          << "ptx_cp_async expects 3 or 4 arguments (dst_access_ptr, "
-             "src_access_ptr, count[, predicate])";
+      ICHECK(op->args.size() >= 3U && op->args.size() <= 6U)
+          << "ptx_cp_async expects 3 to 6 arguments";
 
       // Extract dst_access_ptr and check if it needs merging
       Call dst_access_ptr = Downcast<Call>(op->args[0]);
@@ -821,10 +820,13 @@ private:
 
       Array<PrimExpr> cp_async_args = {new_dst_access_ptr, op->args[1],
                                        op->args[2]};
-      if (op->args.size() == 4U) {
+      if (op->args.size() >= 4U) {
         cp_async_args.push_back(op->args[3]);
       }
-      return Call(dtype, op->op, cp_async_args);
+      for (size_t i = 4; i < op->args.size(); ++i) {
+        cp_async_args.push_back(op->args[i]);
+      }
+      return Call(dtype, op->op, cp_async_args, op->annotations, op->span);
     }
     return StmtExprMutator::VisitExpr_(op);
   }

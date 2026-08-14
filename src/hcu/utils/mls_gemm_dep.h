@@ -22,6 +22,16 @@ static constexpr const char *kMlsGemmDep = "tl.mls_gemm_dep";
 static constexpr const char *kMlsTrans = "tl.mls_trans";
 static constexpr const char *kHcuAFromMls = "tl.a_from_mls";
 static constexpr const char *kHcuBFromMls = "tl.b_from_mls";
+static constexpr const char *kHcuARespectLayoutMap =
+    "tl.hcu_a_respect_layout_map";
+static constexpr const char *kHcuBRespectLayoutMap =
+    "tl.hcu_b_respect_layout_map";
+static constexpr const char *kHcuAFromAsyncCopyLinear =
+    "tl.hcu_a_from_async_copy_linear";
+static constexpr const char *kHcuBFromAsyncCopyLinear =
+    "tl.hcu_b_from_async_copy_linear";
+static constexpr const char *kHcuBLinearDsRead = "tl.hcu_b_linear_ds_read";
+static constexpr const char *kHcuBLayoutDsRead = "tl.hcu_b_layout_ds_read";
 } // namespace attr
 
 /*!

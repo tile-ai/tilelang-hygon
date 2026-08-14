@@ -22,6 +22,8 @@ public:
   Array<Range> dst_ranges;
   /// Consumer GEMM facts from AnnotateMlsGemmDep (optional).
   Optional<MlsGemmDepMeta> gemm_dep_;
+  bool hcu_b_linear_ds_read_{false};
+  bool hcu_b_layout_ds_read_{false};
   mutable bool completed_ = false;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.DsReadFormat", DsReadFormatNode,

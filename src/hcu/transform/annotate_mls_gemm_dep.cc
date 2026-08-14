@@ -10,15 +10,21 @@
 #include "hcu/utils/mls_gemm_dep.h"
 #include "hcu/utils/propagation_tir_collector.h"
 #include "hcu/utils/propagation_util.h"
+#include "layout/layout.h"
 #include "op/builtin.h"
+#include "op/copy.h"
 #include "op/gemm.h"
 #include "op/operator.h"
+#include "op/utils.h"
 
 #include <tvm/ir/transform.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
 #include <unordered_map>
+#include <unordered_set>
+#include <optional>
+#include <vector>
 
 namespace tvm {
 namespace tl {
@@ -56,7 +62,10 @@ private:
     if (const auto *call = op->value.as<CallNode>()) {
       if (call->op.as<OpNode>()) {
         Op tir_op = Downcast<Op>(call->op);
-        if (tir_op == MatrixLoad::Get() || tir_op == DsReadFormat::Get()) {
+        static const Op &async_copy = Op::Get("tl.tileop.async_copy");
+        if (tir_op == MatrixLoad::Get() || tir_op == DsReadFormat::Get() ||
+            tir_op == Copy::Get() || tir_op == async_copy ||
+            tir_op == Gemm::Get()) {
           found_ = true;
           return;
         }
@@ -72,6 +81,59 @@ bool ContainsMlsTileOps(const Stmt &body) {
   MlsTileOpPresenceChecker checker;
   checker(body);
   return checker.found();
+}
+
+bool IsStaticMultipleOf(const PrimExpr &expr, int64_t value) {
+  const auto *imm = expr.as<IntImmNode>();
+  return imm && value != 0 && imm->value % value == 0;
+}
+
+bool IsBLinearDsReadCopyCandidate(const CopyNode *copy,
+                                  const GemmWithInput &consumer) {
+  if (!copy || !IsSharedBuffer(copy->src) ||
+      copy->dst.scope() != "local.fragment")
+    return false;
+  const GemmNode *gemm = consumer.gemm.get();
+  if (!gemm || !consumer.input.same_as(gemm->b_) || gemm->transB_ ||
+      gemm->k_ % 16 != 0 || gemm->kPack_ != 1)
+    return false;
+  if (!(copy->src->dtype.is_float16() || copy->src->dtype.is_bfloat16()) ||
+      copy->src->dtype != copy->dst->dtype)
+    return false;
+  if (copy->src_range.size() < 2 || copy->dst_range.size() < 2)
+    return false;
+  size_t sr = copy->src_range.size();
+  size_t dr = copy->dst_range.size();
+  return IsStaticMultipleOf(copy->src_range[sr - 2]->extent, 16) &&
+         IsStaticMultipleOf(copy->src_range[sr - 1]->extent, 32) &&
+         IsStaticMultipleOf(copy->dst_range[dr - 2]->extent, 16) &&
+         IsStaticMultipleOf(copy->dst_range[dr - 1]->extent, 32);
+}
+
+bool IsBLinearDirectGemmCandidate(const GemmNode *gemm) {
+  return gemm && !gemm->transB_ && gemm->k_ % 16 == 0 &&
+         gemm->kPack_ == 1 &&
+         (gemm->b_->dtype.is_float16() || gemm->b_->dtype.is_bfloat16());
+}
+
+MlsGemmDepMeta BuildCopyToGemmBMeta(
+    const GemmWithInput &consumer,
+    const PropagationTirCollector *collector) {
+  const GemmNode *gemm = consumer.gemm.get();
+  auto node = tvm::ffi::make_object<MlsGemmDepMetaNode>();
+  node->feeds_slot = 1;
+  node->trans = gemm->transB_;
+  node->gemm_m = gemm->m_;
+  node->gemm_n = gemm->n_;
+  node->gemm_k = gemm->k_;
+  node->gemm_k_pack = gemm->kPack_;
+  node->gemm_trans_a = gemm->transA_;
+  node->gemm_trans_b = gemm->transB_;
+  if (gemm->policy_.defined())
+    node->gemm_policy = gemm->policy_->policy_type;
+  node->a_from_mls = collector && IsFromMls(gemm->a_, collector);
+  node->b_from_mls = true;
+  return MlsGemmDepMeta(std::move(node));
 }
 
 } // namespace
@@ -99,6 +161,42 @@ public:
   }
 
 private:
+  bool IsCopyLikeOp(const Op &op) const {
+    static const Op &async_copy = Op::Get("tl.tileop.async_copy");
+    return op.same_as(Copy::Get()) || op.same_as(async_copy);
+  }
+
+  bool IsAsyncCopyOp(const Op &op) const {
+    static const Op &async_copy = Op::Get("tl.tileop.async_copy");
+    return op.same_as(async_copy);
+  }
+
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    bool pushed = false;
+    if (auto value = op->annotations.Get(attr::kLayoutMap)) {
+      if (auto layout_map = value.value().as<Map<Var, Layout>>()) {
+        std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> vars;
+        for (const auto &entry : layout_map.value())
+          vars.insert(entry.first);
+        annotated_layout_vars_stack_.push_back(std::move(vars));
+        pushed = true;
+      }
+    }
+    Stmt stmt = StmtExprMutator::VisitStmt_(op);
+    if (pushed)
+      annotated_layout_vars_stack_.pop_back();
+    return stmt;
+  }
+
+  bool HasAnnotatedLayout(const Buffer &buffer) const {
+    for (auto it = annotated_layout_vars_stack_.rbegin();
+         it != annotated_layout_vars_stack_.rend(); ++it) {
+      if (it->count(buffer->data))
+        return true;
+    }
+    return false;
+  }
+
   bool LookupSharedMlsTrans(const Buffer &dst, bool *out_trans) {
     auto it = shared_mls_trans_.find(dst);
     if (it != shared_mls_trans_.end()) {
@@ -147,10 +245,56 @@ private:
       return StmtExprMutator::VisitStmt_(op);
     }
 
+    if (IsCopyLikeOp(tir_op)) {
+      auto copy = Downcast<Copy>(ParseOperator(ffi::GetRef<Call>(call)));
+      auto consumer = PropagateToFindGemmConsumerOpWithInputAfterCall(
+          copy->dst, collector_, call);
+      if (consumer &&
+          IsBLinearDsReadCopyCandidate(copy.get(), consumer.value())) {
+        auto annotations = call->annotations;
+        annotations.Set(attr::kMlsGemmDep,
+                        BuildCopyToGemmBMeta(consumer.value(), collector_));
+        annotations.Set(attr::kHcuBLinearDsRead,
+                        IntImm(DataType::Int(32), 1));
+        if (HasAnnotatedLayout(copy->src)) {
+          annotations.Set(attr::kHcuBLayoutDsRead,
+                          IntImm(DataType::Int(32), 1));
+        }
+        copy_ds_read_b_outputs_.insert(copy->dst);
+        return Evaluate(Call(call->dtype, DsReadFormat::Get(), call->args,
+                             annotations, call->span));
+      }
+      if (IsAsyncCopyOp(tir_op) && IsSharedBuffer(copy->dst) &&
+          !HasAnnotatedLayout(copy->dst)) {
+        async_copy_linear_outputs_.insert(copy->dst->data);
+      }
+      return StmtExprMutator::VisitStmt_(op);
+    }
+
     if (tir_op.same_as(Gemm::Get())) {
       auto gemm = Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
       auto annotations =
           AnnotateGemmHcuMlsFlags(call->annotations, gemm.get(), collector_);
+      if (copy_ds_read_b_outputs_.count(gemm->b_)) {
+        annotations.Set(attr::kHcuBFromMls, IntImm(DataType::Int(32), 1));
+      }
+      if (IsSharedBuffer(gemm->a_) && HasAnnotatedLayout(gemm->a_)) {
+        annotations.Set(attr::kHcuARespectLayoutMap,
+                        IntImm(DataType::Int(32), 1));
+      } else if (IsSharedBuffer(gemm->a_) &&
+                 async_copy_linear_outputs_.count(gemm->a_->data)) {
+        annotations.Set(attr::kHcuAFromAsyncCopyLinear,
+                        IntImm(DataType::Int(32), 1));
+      }
+      if (IsSharedBuffer(gemm->b_) && HasAnnotatedLayout(gemm->b_)) {
+        annotations.Set(attr::kHcuBRespectLayoutMap,
+                        IntImm(DataType::Int(32), 1));
+      } else if (IsSharedBuffer(gemm->b_) &&
+                 async_copy_linear_outputs_.count(gemm->b_->data) &&
+                 IsBLinearDirectGemmCandidate(gemm.get())) {
+        annotations.Set(attr::kHcuBFromAsyncCopyLinear,
+                        IntImm(DataType::Int(32), 1));
+      }
       Call new_call(call->dtype, call->op, call->args, annotations, call->span);
       return Evaluate(new_call);
     }
@@ -162,6 +306,12 @@ private:
   Target target_;
   std::unordered_map<Buffer, bool, ObjectPtrHash, ObjectPtrEqual>
       shared_mls_trans_;
+  std::vector<std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>>
+      annotated_layout_vars_stack_;
+  std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
+      copy_ds_read_b_outputs_;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>
+      async_copy_linear_outputs_;
 };
 
 tvm::transform::Pass AnnotateMlsGemmDep() {

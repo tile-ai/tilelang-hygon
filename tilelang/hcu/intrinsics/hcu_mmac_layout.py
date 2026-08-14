@@ -85,6 +85,18 @@ def shared_16x16_to_local_64x4_layout_C_hcu_lit(i, j):
     return thread_id, local
 
 
+def shared_16x16_to_local_64x4_layout_C_hcu_lts(i, j):
+    thread_id = 16 * (i % 4) + j
+    local = i // 4
+    return thread_id, local
+
+
+def shared_16x16_to_local_64x4_layout_C_hcu_lit_lts(i, j):
+    thread_id = 16 * (i // 4) + j
+    local = i % 4
+    return thread_id, local
+
+
 def thread_id_shared_access_64x2_to_16x8_layout_A(thread_id, local_id):
     i = thread_id % 16
     j = (thread_id // 16) * 2 + local_id
@@ -322,8 +334,15 @@ def _micro_ab_fragment(element_bits: int, k_pack: int, *, spatial_leading: bool,
     return _fragment_from_layout_fn(layout_fn, micro_k, 16)
 
 
-def _micro_c_fragment(*, lit: bool) -> Fragment:
-    layout_fn = shared_16x16_to_local_64x4_layout_C_hcu_lit if lit else shared_16x16_to_local_64x4_layout_C_hcu
+def _micro_c_fragment(*, lit: bool, lts: bool = False) -> Fragment:
+    if lts:
+        layout_fn = (
+            shared_16x16_to_local_64x4_layout_C_hcu_lit_lts
+            if lit
+            else shared_16x16_to_local_64x4_layout_C_hcu_lts
+        )
+    else:
+        layout_fn = shared_16x16_to_local_64x4_layout_C_hcu_lit if lit else shared_16x16_to_local_64x4_layout_C_hcu
     return _fragment_from_layout_fn(layout_fn, 16, 16)
 
 
@@ -337,6 +356,7 @@ def make_gemm_fragment_hcu(
     min_n_per_warp: int,
     *,
     lit: bool = False,
+    lts: bool = False,
 ) -> Fragment:
     if element_bits == 64:
         raise ValueError("float64 C fragment is not supported for HCU MMAC")
@@ -353,7 +373,7 @@ def make_gemm_fragment_hcu(
     if warp_m % 16 != 0 or warp_n % 16 != 0:
         raise ValueError(f"warp_m and warp_n must be multiples of 16, got ({warp_m}, {warp_n})")
 
-    base = _micro_c_fragment(lit=lit).repeat([1, 1], repeat_on_thread=False)
+    base = _micro_c_fragment(lit=lit, lts=lts).repeat([1, 1], repeat_on_thread=False)
     warp_layout = base.repeat([warp_m // 16, warp_n // 16], repeat_on_thread=False, lower_dim_first=True)
     block_layout = warp_layout.repeat([block_m // warp_m, block_n // warp_n], repeat_on_thread=True, lower_dim_first=False)
     if n_recompute > 1 or num_warp_k > 1:

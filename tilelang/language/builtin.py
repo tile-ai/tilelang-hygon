@@ -1106,6 +1106,17 @@ def sync_warp(mask: int = None):
     return tirx.call_intrin("void", tirx.op.Op.get("tl.sync_warp"))
 
 
+def ds_read_vector(dst: tirx.Var, local_offset: tirx.Var, shared_source: tirx.PrimExpr):
+    """HCU ds_read_m32x16_b16 shared-memory load intrinsic."""
+    return tirx.call_intrin(
+        "handle",
+        tirx.op.Op.get("tl.ds_read_vector"),
+        dst,
+        local_offset,
+        shared_source,
+    )
+
+
 def shfl_sync(
     value: int | PrimExpr,
     srcLane: int | PrimExpr,

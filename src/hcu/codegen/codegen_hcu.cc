@@ -34,6 +34,20 @@ using namespace tirx;
 
 namespace {
 
+class InlineIfThenElseAsSelect : public StmtExprMutator {
+public:
+  PrimExpr Rewrite(PrimExpr expr) { return VisitExpr(expr); }
+
+private:
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    if (!op->op.same_as(builtin::if_then_else()))
+      return StmtExprMutator::VisitExpr_(op);
+    ICHECK_EQ(op->args.size(), 3U);
+    return Select(VisitExpr(op->args[0]), VisitExpr(op->args[1]),
+                  VisitExpr(op->args[2]));
+  }
+};
+
 bool IsValidCPAsyncTransferBytes(int64_t bytes) {
   return bytes == 4 || bytes == 8 || bytes == 16;
 }
@@ -190,10 +204,59 @@ std::optional<DataType> GetAccessPtrElementType(const PrimExpr &expr) {
   return std::nullopt;
 }
 
+PrimExpr GetBufferLoadLinearizedOffset(const BufferLoadNode *load) {
+  PrimExpr offset = make_zero(load->indices[0].dtype());
+  PrimExpr stride = make_const(load->indices[0].dtype(), 1);
+  for (int i = static_cast<int>(load->buffer->shape.size()) - 1; i >= 0; --i) {
+    PrimExpr index = load->indices[i];
+    if (const auto *ramp = index.as<RampNode>())
+      index = ramp->base;
+    offset = offset + index * stride;
+    stride = stride * load->buffer->shape[i];
+  }
+  return offset;
+}
+
+struct CPAsyncSourceInfo {
+  const VarNode *buffer_var{nullptr};
+  DataType elem_type;
+  PrimExpr element_offset;
+  std::optional<int> struct_bit;
+};
+
+std::optional<CPAsyncSourceInfo> GetCPAsyncSourceInfo(const PrimExpr &expr) {
+  const auto *ptr_call = expr.as<CallNode>();
+  if (!ptr_call)
+    return std::nullopt;
+  if (ptr_call->op.same_as(builtin::address_of())) {
+    const auto *load = ptr_call->args[0].as<BufferLoadNode>();
+    ICHECK(load);
+    return CPAsyncSourceInfo{load->buffer->data.get(),
+                             load->buffer->dtype.element_of(),
+                             GetBufferLoadLinearizedOffset(load)};
+  }
+  if (ptr_call->op.same_as(tl::access_ptr())) {
+    const auto *load = ptr_call->args[0].as<BufferLoadNode>();
+    ICHECK(load);
+    return CPAsyncSourceInfo{load->buffer->data.get(),
+                             load->buffer->dtype.element_of(),
+                             GetBufferLoadLinearizedOffset(load)};
+  }
+  if (ptr_call->op.same_as(builtin::tvm_access_ptr())) {
+    const auto *var = ptr_call->args[1].as<VarNode>();
+    ICHECK(var);
+    auto elem_type = GetAccessPtrElementType(expr);
+    ICHECK(elem_type.has_value());
+    return CPAsyncSourceInfo{var, elem_type.value().element_of(),
+                             ptr_call->args[2]};
+  }
+  return std::nullopt;
+}
+
 int GetTileLangCPAsyncTransferBytes(const CallNode *op) {
-  ICHECK(op->args.size() == 3 || op->args.size() == 4)
-      << "tl::ptx_cp_async expects 3 or 4 arguments (dst_access_ptr, "
-         "src_access_ptr, num_elems, [predicate])";
+  ICHECK(op->args.size() == 3 || op->args.size() == 4 ||
+         op->args.size() == 6)
+      << "HCU async copy expects 3, 4, or 6 arguments";
   const auto *num_elems_imm = op->args[2].as<IntImmNode>();
   ICHECK(num_elems_imm) << "tl::ptx_cp_async num_elems must be IntImm, but got "
                         << op->args[2];
@@ -498,6 +561,67 @@ std::string CodeGenTileLangHCU::Finish() {
   }
   decl_stream << "\n";
   return CodeGenC::Finish();
+}
+
+void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
+  cp_async_resource_var_names_.clear();
+  cp_async_idxen_resource_var_names_.clear();
+  std::vector<CPAsyncSourceInfo> normal_sources;
+  std::vector<CPAsyncSourceInfo> idxen_sources;
+
+  PostOrderVisit(func->body, [&](const ObjectRef &object) {
+    const auto *call = object.as<CallNode>();
+    if (!call || (!call->op.same_as(tl::ptx_cp_async()) &&
+                  !call->op.same_as(tl::hcu_cp_async_idxen())))
+      return;
+    auto source = GetCPAsyncSourceInfo(call->args[1]);
+    ICHECK(source.has_value()) << "Unable to identify HCU async-copy source";
+    if (call->op.same_as(tl::hcu_cp_async_idxen())) {
+      ICHECK_EQ(call->args.size(), 6U);
+      const auto *struct_bit = call->args[5].as<IntImmNode>();
+      ICHECK(struct_bit);
+      if (cp_async_idxen_resource_var_names_.count(source->buffer_var))
+        return;
+      source->struct_bit = static_cast<int>(struct_bit->value);
+      cp_async_idxen_resource_var_names_[source->buffer_var] =
+          name_supply_->FreshName(GetVarID(source->buffer_var) +
+                                  "_cp_async_idxen_resource");
+      idxen_sources.push_back(*source);
+      return;
+    }
+    if (cp_async_resource_var_names_.count(source->buffer_var))
+      return;
+    cp_async_resource_var_names_[source->buffer_var] =
+        name_supply_->FreshName(GetVarID(source->buffer_var) +
+                                "_cp_async_resource");
+    normal_sources.push_back(*source);
+  });
+
+  for (const auto &source : normal_sources) {
+    PrintIndent();
+    stream << "const int32x4_t "
+           << cp_async_resource_var_names_.at(source.buffer_var)
+           << " = tl::make_wave_buffer_resource("
+           << "reinterpret_cast<const void *>(" << GetVarID(source.buffer_var)
+           << "), 0xfffffffcu);\n";
+  }
+  for (const auto &source : idxen_sources) {
+    PrintIndent();
+    stream << "const int32x4_t "
+           << cp_async_idxen_resource_var_names_.at(source.buffer_var)
+           << " = tl::make_wave_buffer_resource<" << source.struct_bit.value()
+           << ">(reinterpret_cast<const void *>("
+           << GetVarID(source.buffer_var) << "), 0xfffffffcu);\n";
+  }
+}
+
+int GetWrapAnnotation(const CallNode *call, const char *key) {
+  auto value = call->annotations.Get(key);
+  if (!value)
+    return 0;
+  const auto *imm = value.value().as<IntImmNode>();
+  ICHECK(imm) << key << " must be IntImm";
+  return static_cast<int>(imm->value);
 }
 
 namespace {
@@ -2144,20 +2268,80 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
                    << ", " << src << ", " << condition << ");\n";
     }
-  } else if (op->op.same_as(tl::ptx_cp_async())) {
+  } else if (op->op.same_as(tl::ptx_cp_async()) ||
+             op->op.same_as(tl::hcu_cp_async_idxen())) {
     int total_bytes = GetTileLangCPAsyncTransferBytes(op);
     std::string dst = this->PrintExpr(op->args[0]);
     std::string src = this->PrintExpr(op->args[1]);
     std::string size = std::to_string(total_bytes);
-    this->PrintIndent();
-    if (op->args.size() == 3) {
-      this->stream << "tl::cp_async_gs<" << size << ">(" << dst << ", " << src
-                   << ");\n";
+    bool use_idxen = op->op.same_as(tl::hcu_cp_async_idxen());
+    if (use_idxen) {
+      ICHECK_EQ(op->args.size(), 6U);
+      ICHECK_EQ(total_bytes, 16);
     } else {
-      std::string condition = this->PrintExpr(op->args[3]);
-      this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
-                   << ", " << src << ", " << condition << ");\n";
+      ICHECK(op->args.size() == 3U || op->args.size() == 4U);
     }
+
+    int wrap_offset = GetWrapAnnotation(op, "wrap_offset");
+    int wrap_idx_mask = GetWrapAnnotation(op, "wrap_idx_mask");
+    ICHECK_EQ(wrap_offset != 0, wrap_idx_mask != 0)
+        << "wrap_offset and wrap_idx_mask must be enabled together";
+    if (wrap_offset != 0) {
+      // gfx936/gfx938 encode the wrap field in LDS address bits [20:16].
+      dst = "reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(" + dst +
+            ") | static_cast<uint64_t>((((((int)threadIdx.x) >> 6) & " +
+            std::to_string(wrap_idx_mask) + ") * " +
+            std::to_string(wrap_offset) + ") << 16))";
+    }
+
+    auto source = GetCPAsyncSourceInfo(op->args[1]);
+    ICHECK(source.has_value()) << "Unable to identify HCU async-copy source";
+    std::string source_offset_bytes =
+        "(" + PrintExpr(source->element_offset) + ") * sizeof(" +
+        HcuCkTemplateElemType(source->elem_type) + ")";
+    this->PrintIndent();
+    if (use_idxen) {
+      auto resource =
+          cp_async_idxen_resource_var_names_.find(source->buffer_var);
+      ICHECK(resource != cp_async_idxen_resource_var_names_.end());
+      std::string idxen = PrintExpr(op->args[4]);
+      std::string condition = PrintExpr(op->args[3]);
+      this->stream << "tl::cp_async_gs_idxen_conditional<" << size << ">(" << dst
+                   << ", " << resource->second << ", " << source_offset_bytes
+                   << ", " << idxen << ", " << condition << ");\n";
+    } else {
+      auto resource = cp_async_resource_var_names_.find(source->buffer_var);
+      ICHECK(resource != cp_async_resource_var_names_.end());
+      if (op->args.size() == 3U) {
+        this->stream << "tl::cp_async_gs<" << size << ">(" << dst << ", " << src
+                     << ", " << resource->second << ", "
+                     << source_offset_bytes << ");\n";
+      } else {
+        std::string condition = this->PrintExpr(op->args[3]);
+        this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
+                     << ", " << src << ", " << resource->second << ", "
+                     << source_offset_bytes << ", " << condition << ");\n";
+      }
+    }
+  } else if (op->op.same_as(tl::ds_read_vector())) {
+    ICHECK_EQ(op->args.size(), 3U);
+    std::string dst = PrintExpr(op->args[0]);
+    std::string local_offset = PrintExpr(op->args[1]);
+    std::string shared_byte_offset;
+    DataType shared_dtype = DataType::Float(16);
+    if (const auto *load = op->args[2].as<BufferLoadNode>()) {
+      shared_dtype = load->buffer->dtype.element_of();
+      std::ostringstream load_expr;
+      PrintExpr(op->args[2], load_expr);
+      shared_byte_offset = "reinterpret_cast<uintptr_t>(&(" + load_expr.str() + "))";
+    } else {
+      PrimExpr shared_offset = InlineIfThenElseAsSelect().Rewrite(op->args[2]);
+      shared_byte_offset = "(" + PrintExpr(shared_offset) + ") * sizeof(" +
+                           HcuCkTemplateElemType(shared_dtype) + ")";
+    }
+    PrintIndent();
+    stream << "tl::ds_read_vector(*(float32x4 *)(" << dst << " + ("
+           << local_offset << ")), " << shared_byte_offset << ");\n";
   } else if (op->op.same_as(builtin::ptx_commit_group())) {
     print_extern_call_stmt("tl::cp_async_commit");
   } else if (op->op.same_as(builtin::ptx_wait_group())) {
@@ -2537,7 +2721,13 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     std::string lts = "";
     if (prefix.find("_lts") != std::string::npos) {
-      lts = ", 0";
+      bool use_lts = false;
+      auto lts_hint = op->annotations.find("tl.hcu_use_lts");
+      if (lts_hint != op->annotations.end()) {
+        const auto *imm = (*lts_hint).second.as<IntImmNode>();
+        use_lts = imm && imm->value != 0;
+      }
+      lts = use_lts ? ", 1" : ", 0";
     }
     if (prefix.find("_f8f6f4") != std::string::npos) {
       auto real_a_dtype =
@@ -2550,7 +2740,17 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
              "types; packed uint8 register types are ambiguous";
       lit = ", " +
             std::to_string(GetF8F6F4RealABTypeId(*real_a_dtype, *real_b_dtype));
-      lts = prefix.find("_lit_lts") != std::string::npos ? ", 1, 0" : "";
+      if (prefix.find("_lit_lts") != std::string::npos) {
+        bool use_lts = false;
+        auto lts_hint = op->annotations.find("tl.hcu_use_lts");
+        if (lts_hint != op->annotations.end()) {
+          const auto *imm = (*lts_hint).second.as<IntImmNode>();
+          use_lts = imm && imm->value != 0;
+        }
+        lts = use_lts ? ", 1, 1" : ", 1, 0";
+      } else {
+        lts = "";
+      }
     }
 
     std::string call_mfma_code =
@@ -3213,6 +3413,8 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   // reserve keywords
   ReserveKeywordsAsUnique();
   buffer_ops_disable_param_names_.clear();
+  cp_async_resource_var_names_.clear();
+  cp_async_idxen_resource_var_names_.clear();
   mls_resource_object_counter_ = 0;
   wdra_init_emitted_ = false;
 
@@ -3270,6 +3472,7 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   }
   stream << ") {\n";
   int func_scope = this->BeginScope();
+  EmitHoistedCPAsyncResources(f);
   this->PreFunctionBody(f);
   this->PrintStmt(f->body);
   this->EndScope(func_scope);

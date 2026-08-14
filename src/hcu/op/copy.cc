@@ -50,6 +50,16 @@ bool GetNoImplicitAsyncCommitWait(const CopyNode &op) {
   return GetBoolAnnotation(op, attr::kAsyncCopyNoImplicitCommitWait);
 }
 
+Map<String, ObjectRef> GetHCUAsyncCopyAnnotations(const CopyNode &op) {
+  Map<String, ObjectRef> result;
+  for (const char *key : {"use_idxen", "wrap_offset", "wrap_idx_mask"}) {
+    if (auto value = op.annotations.Get(key)) {
+      result.Set(key, value.value());
+    }
+  }
+  return result;
+}
+
 } // namespace
 
 enum class CopyInst : uint8_t {
@@ -137,7 +147,8 @@ private:
 
     auto inject_result =
         InjectHCUAsyncCopy(lowered_loop, /*async_without_async_commit_wait=*/
-                           no_implicit_commit_wait || GetIsAsyncCopy(op));
+                           no_implicit_commit_wait || GetIsAsyncCopy(op),
+                           GetHCUAsyncCopyAnnotations(op));
     Stmt async_copy_loop = inject_result.stmt;
     if (!inject_result.injected_hcu_async_copy) {
       DLOG(WARNING) << "HCU async-copy rewrite miss for copy src="

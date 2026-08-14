@@ -235,6 +235,16 @@ DsReadFormat::DsReadFormat(Array<PrimExpr> args,
                           kAccessWrite};
   node->SetAccessRegions({src_access, dst_access});
   node->gemm_dep_ = GetMlsGemmDepFromAnnotations(annotations);
+  if (auto value = annotations.Get(attr::kHcuBLinearDsRead)) {
+    const auto *imm = value.value().as<IntImmNode>();
+    ICHECK(imm) << attr::kHcuBLinearDsRead << " must be IntImm";
+    node->hcu_b_linear_ds_read_ = imm->value != 0;
+  }
+  if (auto value = annotations.Get(attr::kHcuBLayoutDsRead)) {
+    const auto *imm = value.value().as<IntImmNode>();
+    ICHECK(imm) << attr::kHcuBLayoutDsRead << " must be IntImm";
+    node->hcu_b_layout_ds_read_ = imm->value != 0;
+  }
   data_ = std::move(node);
 }
 
@@ -345,6 +355,134 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   ICHECK(read_mn > 0 && read_k > 0);
   ICHECK_LE(read_mn, lds_mn);
   ICHECK_LE(read_k, lds_k);
+
+  if (hcu_b_linear_ds_read_) {
+    ICHECK(gemm_dep_.defined() && gemm_dep_.get()->feeds_slot == 1)
+        << "linear ds_read is only valid for GEMM B";
+    ICHECK(!ds_trans && !gemm_dep_.get()->gemm_trans_b)
+        << "linear ds_read only supports non-transposed GEMM B";
+    ICHECK(src->dtype.is_float16() || src->dtype.is_bfloat16());
+    ICHECK_EQ(read_k % 16, 0);
+    ICHECK_EQ(read_mn % 32, 0);
+
+    const auto *meta = gemm_dep_.get();
+    GemmWarpPolicy policy(meta->gemm_policy);
+    hcu::ComputeWarpPartitionHCU(
+        *policy.get(), meta->gemm_m, meta->gemm_n, meta->gemm_k,
+        meta->gemm_k_pack, dst->dtype.bits(), block_size, T.target,
+        meta->a_from_mls, true, !meta->gemm_trans_a, false,
+        meta->min_m_per_warp, std::max(meta->min_n_per_warp, 32));
+    int warp_n = policy->n_warp;
+    int warp_k = policy->k_warp;
+    ICHECK_EQ(warp_k, 1) << "linear B ds_read requires WarpK == 1";
+
+    Buffer src_buf = T.buffer_remap.count(src) ? T.buffer_remap[src] : src;
+    Buffer dst_buf = T.buffer_remap.count(dst) ? T.buffer_remap[dst] : dst;
+    size_t sr = src_ranges.size();
+    size_t dr = dst_ranges.size();
+    ICHECK_GE(sr, 2U);
+    ICHECK_GE(dr, 2U);
+    PrimExpr src_leading_offset = IntImm(DataType::Int(32), 0);
+    if (sr > 2) {
+      Array<PrimExpr> indices;
+      for (size_t i = 0; i + 2 < sr; ++i)
+        indices.push_back(src_ranges[i]->min);
+      indices.push_back(make_zero(src_buf->DefaultIndexType()));
+      indices.push_back(make_zero(src_buf->DefaultIndexType()));
+      src_leading_offset = src_buf.OffsetOf(indices)[0];
+    }
+    PrimExpr dst_leading_offset = IntImm(DataType::Int(32), 0);
+    if (dr > 2) {
+      Array<PrimExpr> indices;
+      for (size_t i = 0; i + 2 < dr; ++i)
+        indices.push_back(dst_ranges[i]->min);
+      indices.push_back(make_zero(dst_buf->DefaultIndexType()));
+      indices.push_back(make_zero(dst_buf->DefaultIndexType()));
+      dst_leading_offset = dst_buf.OffsetOf(indices)[0];
+    }
+
+    if (hcu_b_layout_ds_read_) {
+      ICHECK_EQ(sr, 2U)
+          << "layout-aware B ds_read currently requires rank-2 B[K,N]";
+      ICHECK(T.layout_map.count(src))
+          << "layout-aware B ds_read requires annotate_layout";
+      Layout layout = T.layout_map.at(src);
+      ICHECK_EQ(layout->InputDim(), 2U);
+      ICHECK_EQ(layout->OutputDim(), 2U);
+
+      int warp_size = TargetHcuGetWarpSize(T.target);
+      int total_warp = block_size / warp_size;
+      ICHECK_EQ(total_warp % warp_n, 0);
+      int warp_m = total_warp / warp_n;
+      int warp_n_no_recompute =
+          std::min(warp_n, static_cast<int>(read_mn / 32));
+      ICHECK_GT(warp_n_no_recompute, 0);
+      ICHECK_EQ(read_mn % warp_n_no_recompute, 0);
+      int per_warp_n = read_mn / warp_n_no_recompute;
+      ICHECK_EQ(per_warp_n % 32, 0);
+
+      PrimExpr scoped_thread = analyzer->Simplify(
+          T.thread_var - Cast(T.thread_var.dtype(), T.thread_bounds->min));
+      PrimExpr lane = FloorMod(scoped_thread,
+                               make_const(scoped_thread.dtype(), warp_size));
+      PrimExpr warp_id = FloorDiv(scoped_thread,
+                                  make_const(scoped_thread.dtype(), warp_size));
+      PrimExpr warp_n_idx =
+          FloorDiv(warp_id, make_const(warp_id.dtype(), warp_m));
+      if (warp_n_no_recompute != warp_n) {
+        warp_n_idx = FloorMod(
+            warp_n_idx,
+            make_const(warp_n_idx.dtype(), warp_n_no_recompute));
+      }
+
+      Array<Stmt> reads;
+      for (int n_panel = 0; n_panel < per_warp_n / 32; ++n_panel) {
+        for (int k_tile = 0; k_tile < read_k / 16; ++k_tile) {
+          PrimExpr panel = analyzer->Simplify(
+              warp_n_idx * make_const(warp_n_idx.dtype(), per_warp_n / 32) +
+              make_const(warp_n_idx.dtype(), n_panel));
+          PrimExpr logical_k = analyzer->Simplify(
+              origin_dim0 + make_const(lane.dtype(), k_tile * 16) +
+              FloorDiv(lane, make_const(lane.dtype(), 4)));
+          PrimExpr logical_n = analyzer->Simplify(
+              origin_dim1 + panel * make_const(panel.dtype(), 32) +
+              FloorMod(lane, make_const(lane.dtype(), 4)) *
+                  make_const(lane.dtype(), 8));
+          Array<PrimExpr> physical =
+              layout->Forward({logical_k, logical_n});
+          Array<PrimExpr> physical_last = layout->Forward(
+              {logical_k, logical_n + make_const(logical_n.dtype(), 7)});
+          ICHECK(analyzer->CanProveEqual(physical[0], physical_last[0]) &&
+                 analyzer->CanProveEqual(physical[1] + 7,
+                                         physical_last[1]))
+              << "each B ds_read 8-half segment must remain contiguous";
+          PrimExpr local_offset = analyzer->Simplify(
+              dst_leading_offset +
+              make_const(dst_leading_offset.dtype(),
+                         (k_tile * per_warp_n / 16 + n_panel * 2) * 4));
+          reads.push_back(Evaluate(Call(
+              DataType::Handle(), tl::ds_read_vector(),
+              {dst_buf->data, local_offset, BufferLoad(src_buf, physical)})));
+        }
+      }
+      ICHECK(!reads.empty());
+      return reads.size() == 1 ? reads[0] : SeqStmt(reads);
+    }
+
+    std::string dtype_str = DsReadFormatDTypeString(src->dtype);
+    int total_warp = block_size / TargetHcuGetWarpSize(T.target);
+    std::stringstream ss;
+    ss << "tl::mls::ds_read_format_tensor_b_linear<tl::sequence<"
+       << read_mn << ", " << read_k << ">, " << total_warp << ", "
+       << warp_n << ", " << dtype_str << ">";
+    auto src_ptr = src_buf.access_ptr(1, DataType::Handle(), 1,
+                                      src_leading_offset);
+    auto dst_ptr = dst_buf.access_ptr(2, DataType::Handle(), 1,
+                                      dst_leading_offset);
+    return Evaluate(Call(DataType::Handle(), builtin::call_extern(),
+                         {StringImm(ss.str()), src_ptr, dst_ptr,
+                          IntImm(DataType::Int(32), warp_id_offset)}));
+  }
 
   int tile_mn = 0;
   int tile_k = 0;

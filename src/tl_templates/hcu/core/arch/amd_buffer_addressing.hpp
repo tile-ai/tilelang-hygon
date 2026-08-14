@@ -46,6 +46,22 @@ TL_DEVICE int32x4_t make_wave_buffer_resource(const void* ptr, uint32_t size = 0
     return r;
 }
 
+template <index_t StructBit>
+TL_DEVICE int32x4_t make_wave_buffer_resource(const void *ptr,
+                                              uint32_t size = 0xffffffff) {
+  int32x4_t resource = make_wave_buffer_resource(ptr, size);
+  if constexpr (StructBit != 0) {
+    static_assert(StructBit <= 15,
+                  "StructBit must fit in the structured-buffer field");
+    constexpr uint32_t kIsStructured = 0x40000000u;
+    constexpr uint32_t kStructScale = 1u << (17 + StructBit);
+    uint32_t addr_hi = static_cast<uint32_t>(resource.y) & 0x0000ffffu;
+    resource.y = __builtin_amdgcn_readfirstlane(
+        static_cast<int32_t>(addr_hi | kIsStructured | kStructScale));
+  }
+  return resource;
+}
+
 TL_DEVICE int32x4_t make_wave_buffer_resource(const void* ptr,
                                                    uint32_t size, // in bytes
                                                    uint32_t const_stride)

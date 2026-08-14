@@ -30,8 +30,11 @@ using namespace ffi;
 
 class HCUAsyncCopyInjector : public StmtMutator {
 public:
-  explicit HCUAsyncCopyInjector(bool async_without_async_commit_wait)
-      : async_without_async_commit_wait_(async_without_async_commit_wait) {}
+  explicit HCUAsyncCopyInjector(
+      bool async_without_async_commit_wait,
+      Map<String, ObjectRef> call_annotations = {})
+      : async_without_async_commit_wait_(async_without_async_commit_wait),
+        call_annotations_(std::move(call_annotations)) {}
 
   bool InjectedHCUAsyncCopy() const { return injected_hcu_async_copy_; }
 
@@ -469,7 +472,7 @@ private:
                  IntImm(DataType::Int(32), rw_mask)});
   }
 
-  static Optional<Stmt>
+  Optional<Stmt>
   MakeCPAsyncStmtFromLoads(const BufferStoreNode *store,
                            const BufferLoad &dst_base_load,
                            const BufferLoad &src_base_load, int num_elems,
@@ -486,8 +489,8 @@ private:
     } else {
       cp_async_args = {dst_access_ptr, src_access_ptr, PrimExpr(num_elems)};
     }
-    return Evaluate(
-        Call(store->buffer->dtype, tvm::tl::ptx_cp_async(), cp_async_args));
+    return Evaluate(Call(store->buffer->dtype, tvm::tl::ptx_cp_async(),
+                         cp_async_args, call_annotations_));
   }
 
   static Stmt MakeCommitGroupStmt() {
@@ -671,6 +674,7 @@ private:
   // `SummarizeAsyncIntrinsics` helpers to avoid redundant traversals.
 
   bool async_without_async_commit_wait_{false};
+  Map<String, ObjectRef> call_annotations_;
   int current_vectorized_lanes_{1};
   std::vector<ActiveVectorizedLoop> active_vectorized_loops_;
   arith::Analyzer analyzer_;
@@ -680,8 +684,10 @@ private:
 };
 
 HCUAsyncCopyInjectResult
-InjectHCUAsyncCopy(const Stmt &body, bool async_without_async_commit_wait) {
-  HCUAsyncCopyInjector injector(async_without_async_commit_wait);
+InjectHCUAsyncCopy(const Stmt &body, bool async_without_async_commit_wait,
+                   Map<String, ObjectRef> call_annotations) {
+  HCUAsyncCopyInjector injector(async_without_async_commit_wait,
+                                std::move(call_annotations));
   Stmt injected = injector(body);
   return {injector.Finalize(injected), injector.InjectedHCUAsyncCopy()};
 }

@@ -6,6 +6,7 @@ from tilelang import tvm as tvm
 from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import (
     block_col_warps_no_recompute,
     build_ds_read_format_tensor_a_template,
+    build_ds_read_format_tensor_b_linear_template,
     build_ds_read_format_tensor_b_template,
     check_mls_slice_aligned_to_tile,
     compute_mls_tiles,
@@ -122,6 +123,7 @@ class HCUMatrixCoreIntrinEmitter:
         scale_format_b: int | None = None,
         use_tf32: bool = False,
         fp4_mmac_mode: str = "native",
+        use_lts: bool = False,
     ):
         self.a_dtype = _normalize_dtype_str(a_dtype)
         self.b_dtype = _normalize_dtype_str(b_dtype)
@@ -136,6 +138,7 @@ class HCUMatrixCoreIntrinEmitter:
         self.thread_bounds_min = int(thread_bounds_min)
         self.use_tf32 = bool(use_tf32)
         self.fp4_mmac_mode = str(fp4_mmac_mode)
+        self.use_lts = bool(use_lts)
         if self.use_tf32:
             if a_dtype != "float32" or b_dtype != "float32":
                 raise ValueError("use_tf32=True requires float32 A and B dtypes")
@@ -497,8 +500,10 @@ class HCUMatrixCoreIntrinEmitter:
 
         return index_map, reverse_index_map
 
-    def get_store_index_map(self):
+    def get_store_index_map(self, trans_c: bool = False):
         from .hcu_mmac_layout import (
+            thread_id_shared_access_64x4_to_16x16_layout_C_lit_lts,
+            thread_id_shared_access_64x4_to_16x16_layout_C_lts,
             thread_id_shared_access_64x4_to_16x16_layout_C_m_n,
             thread_id_shared_access_64x4_to_16x16_layout_C_m_n_lit,
         )
@@ -507,9 +512,17 @@ class HCUMatrixCoreIntrinEmitter:
         target = self.target
         # check if target has mmac lit lts
         if target is not None and target_has_mmac_lit_lts(target):
-            return thread_id_shared_access_64x4_to_16x16_layout_C_m_n_lit
+            return (
+                thread_id_shared_access_64x4_to_16x16_layout_C_lit_lts
+                if trans_c
+                else thread_id_shared_access_64x4_to_16x16_layout_C_m_n_lit
+            )
         else:
-            return thread_id_shared_access_64x4_to_16x16_layout_C_m_n
+            return (
+                thread_id_shared_access_64x4_to_16x16_layout_C_lts
+                if trans_c
+                else thread_id_shared_access_64x4_to_16x16_layout_C_m_n
+            )
 
     def extract_thread_binding(self, thread_id, is_m_first=None) -> tuple[PrimExpr, PrimExpr, PrimExpr]:
         """Decode ``thread_id`` into ``(lane_id, warp_n, warp_m)``.
@@ -855,7 +868,56 @@ class HCUMatrixCoreIntrinEmitter:
 
         return _warp_ldmatrix_mls_b(B_local_buf, B_mls_src)
 
-    def mmac(self, A_local_buf, B_local_buf, C_local_buf, k_inner: PrimExpr | int = 0):
+    def ldmatrix_b_linear(self, B_local_buf, B_src: Buffer | BufferLoad | BufferRegion):
+        """Load linear LDS B[K, N] directly into the full-K MMAC B fragment."""
+        if self.block_k_warps != 1:
+            raise ValueError("ldmatrix_b_linear requires block_k_warps == 1")
+        if self.b_transposed:
+            raise ValueError("ldmatrix_b_linear only supports non-transposed GEMM B")
+        B_region = self._legalize_to_buffer_region(B_src)
+        ext_k = B_region.region[-2].extent
+        ext_n = B_region.region[-1].extent
+        if not isinstance(ext_k, tirx.IntImm) or not isinstance(ext_n, tirx.IntImm):
+            raise ValueError(f"ldmatrix_b_linear requires static B[K, N] region extents, got {ext_k}, {ext_n}")
+        block_k = int(ext_k.value)
+        block_n = int(ext_n.value)
+        if block_k % 16 != 0 or block_n % 32 != 0:
+            raise ValueError("ldmatrix_b_linear requires K multiple of 16 and N multiple of 32")
+        total_warp = self.threads // self.WARP_SIZE
+        template = build_ds_read_format_tensor_b_linear_template(
+            block_n=block_n,
+            block_k=block_k,
+            total_warp=total_warp,
+            warp_n=self.block_col_warps,
+            dtype_str=hcu_mls_ds_read_dtype_str(B_local_buf.dtype),
+        )
+        src_ptr = retrieve_ptr(B_src, "r")
+        dst_ptr = retrieve_ptr(B_local_buf, "rw")
+        warp_id_offset = self.scoped_warp_id_offset()
+        self._b_full_k = True
+
+        @T.macro
+        def _warp_ldmatrix_b_linear(B_local_buf, B_src):
+            T.evaluate(
+                tirx.call_extern(
+                    "handle",
+                    template,
+                    src_ptr,
+                    dst_ptr,
+                    warp_id_offset,
+                )
+            )
+
+        return _warp_ldmatrix_b_linear(B_local_buf, B_src)
+
+    def mmac(
+        self,
+        A_local_buf,
+        B_local_buf,
+        C_local_buf,
+        k_inner: PrimExpr | int = 0,
+        trans_c: bool = False,
+    ):
         warp_rows = self.warp_rows
         warp_cols = self.warp_cols
         local_size_a = self.local_size_a
@@ -870,6 +932,8 @@ class HCUMatrixCoreIntrinEmitter:
         mmac_annotations = {}
         if self.use_tf32:
             mmac_annotations["tl.hcu_tf32_ab"] = 1
+        if self.use_lts:
+            mmac_annotations["tl.hcu_use_lts"] = 1
         if "f8f6f4" in mmac_suffix:
             mmac_annotations["tl.hcu_mmac_a_dtype"] = tirx.StringImm(str(self.a_dtype))
             mmac_annotations["tl.hcu_mmac_b_dtype"] = tirx.StringImm(str(self.b_dtype))
@@ -882,6 +946,7 @@ class HCUMatrixCoreIntrinEmitter:
         b_full_k = self._b_full_k or b_is_fragment
         a_local_stride: PrimExpr = k_inner * warp_rows * k_pack * local_size_a if a_full_k else 0
         b_local_stride: PrimExpr = k_inner * warp_cols * k_pack * local_size_b if b_full_k else 0
+        swap_operands_for_trans_c = trans_c and not self.use_lts
 
         # tirx.Call args must be PrimExpr; wrap dtype/layout strings as StringImm
         # (same pattern as tl.infinity). Return dtype stays a plain str for Call(dtype, ...).
@@ -894,23 +959,30 @@ class HCUMatrixCoreIntrinEmitter:
         @T.macro
         def _warp_mma(A_local_buf, B_local_buf, C_local_buf):
             for kp, i, j in T.grid(k_pack, warp_rows, warp_cols):
-                T.call_intrin(
-                    str(compute_out_dtype),
-                    mmac_op,
-                    mmac_suffix_imm,
-                    layout_imm,
-                    layout_imm,
-                    compute_a_dtype_imm,
-                    compute_b_dtype_imm,
-                    compute_out_dtype_imm,
-                    A_local_buf.data,
-                    (a_local_stride + (i * k_pack + kp) * local_size_a) // a_index_div,
-                    B_local_buf.data,
-                    (b_local_stride + (j * k_pack + kp) * local_size_b) // b_index_div,
-                    C_local_buf.data,
-                    (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
-                    annotations=mmac_annotations,
-                )
+                if swap_operands_for_trans_c:
+                    T.call_intrin(
+                        str(compute_out_dtype), mmac_op, mmac_suffix_imm, layout_imm, layout_imm,
+                        compute_b_dtype_imm, compute_a_dtype_imm, compute_out_dtype_imm,
+                        B_local_buf.data,
+                        (b_local_stride + (j * k_pack + kp) * local_size_b) // b_index_div,
+                        A_local_buf.data,
+                        (a_local_stride + (i * k_pack + kp) * local_size_a) // a_index_div,
+                        C_local_buf.data,
+                        (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
+                        annotations=mmac_annotations,
+                    )
+                else:
+                    T.call_intrin(
+                        str(compute_out_dtype), mmac_op, mmac_suffix_imm, layout_imm, layout_imm,
+                        compute_a_dtype_imm, compute_b_dtype_imm, compute_out_dtype_imm,
+                        A_local_buf.data,
+                        (a_local_stride + (i * k_pack + kp) * local_size_a) // a_index_div,
+                        B_local_buf.data,
+                        (b_local_stride + (j * k_pack + kp) * local_size_b) // b_index_div,
+                        C_local_buf.data,
+                        (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
+                        annotations=mmac_annotations,
+                    )
 
         return _warp_mma(A_local_buf, B_local_buf, C_local_buf)
 
@@ -969,7 +1041,7 @@ class HCUMatrixCoreIntrinEmitter:
 
         return _warp_mmac_scale(A_local_buf, B_local_buf, C_local_buf, m0_wave_base)
 
-    def stmatrix(self, C_local_buf, C_buf, pid_m=None, pid_n=None):
+    def stmatrix(self, C_local_buf, C_buf, pid_m=None, pid_n=None, trans_c: bool = False):
         block_row_warps = self.block_row_warps
         block_col_warps = self.block_col_warps
         warp_rows = self.warp_rows
@@ -982,7 +1054,7 @@ class HCUMatrixCoreIntrinEmitter:
         M_DIM, N_DIM = self.M_DIM, self.N_DIM
         C_buf_dims = len(C_buf.shape)
         assert C_buf_dims in {2, 4}, "C_buf should be 2D or 4D"
-        mmac_store_index_map = self.get_store_index_map()
+        mmac_store_index_map = self.get_store_index_map(trans_c=trans_c)
 
         # STS
         # MMA Store must be in simulated instead of TVM Intrins
@@ -1047,6 +1119,7 @@ class HCUMatrixCorePreshuffleIntrinEmitter(HCUMatrixCoreIntrinEmitter):
         b_mls_trans: bool | None = None,
         scale_format_b: int | None = None,
         use_tf32: bool = False,
+        use_lts: bool = False,
     ):
         super().__init__(
             a_dtype=a_dtype,
@@ -1072,6 +1145,7 @@ class HCUMatrixCorePreshuffleIntrinEmitter(HCUMatrixCoreIntrinEmitter):
             b_mls_trans=b_mls_trans,
             scale_format_b=scale_format_b,
             use_tf32=use_tf32,
+            use_lts=use_lts,
         )
         self._initialize_preshuffle(a_preshuffle, b_preshuffle)
 
