@@ -36,6 +36,15 @@ def target_supports_mls_b4() -> bool:
         return False
 
 
+def target_supports_mls_b32() -> bool:
+    """Return whether the target supports b32 as an MLS source."""
+    try:
+        target = tvm.target.Target(determine_target("auto"))
+        return target_is_hcu(target) and get_hcu_arch_string(target) in ("gfx92a", "gfx946")
+    except Exception:
+        return False
+
+
 def target_supports_mls_fp4_pad() -> bool:
     """Return whether the active target supports fp4 MLS b8-LDS fallback tests."""
     try:

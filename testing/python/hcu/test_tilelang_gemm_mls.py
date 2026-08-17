@@ -12,6 +12,7 @@ from hcu_test_utils import (
     target_supports_fp8_mmac,
     target_supports_mls,
     target_supports_mls_b4,
+    target_supports_mls_b32,
     target_supports_mls_fp4_pad,
 )
 
@@ -945,6 +946,10 @@ def _assert_mls_b32_tf32_source(source: str) -> None:
         pytest.param(64, 64, 32, True, False, 64, 64, 16, 256, id="an_bt_m64_n64_k32_t256"),
     ],
 )
+@pytest.mark.skipif(
+    not target_supports_mls_b32(),
+    reason="b32 MLS matrix_load + ds_read_format is only supported on gfx92a/gfx946",
+)
 def test_gemm_mls_b32_tf32(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
     """Float32 matrix_load_16x16_b32 -> TF32 ds_read_format -> TF32 GEMM coverage."""
     run_gemm_mls(
@@ -1501,29 +1506,45 @@ def run_gemm_mls_n_loop(
 
 
 @pytest.mark.parametrize(
-    "M, K, block_M, block_K, in_dtype, out_dtype, num_threads",
+    "M, K, block_M, block_K, num_threads",
     [
-        pytest.param(16, 64, 16, 64, "float16", "float16", 128, id="16x32_B1_W2K_b16"),
-        pytest.param(16, 64, 16, 64, "float16", "float16", 64, id="16x64_B1_W1_b16"),
-        pytest.param(64, 64, 64, 64, "float16", "float16", 128, id="16x64_B1_W4M_b16"),
-        pytest.param(16, 128, 16, 128, "float16", "float16", 64, id="16x64_B1_W1_4KB_b16"),
-        pytest.param(16, 128, 16, 128, "float16", "float16", 128, id="16x64_B1_W2_4KB_b16"),
-        pytest.param(32, 128, 32, 128, "float16", "float16", 128, id="16x64_B1_W2_8KB_b16"),
-        pytest.param(32, 128, 32, 128, "float16", "float16", 256, id="16x64_B1_W4_8KB_b16"),
-        pytest.param(32, 32, 32, 32, "float16", "float16", 64, id="32x32"),
-        pytest.param(16, 16, 16, 16, "float32", "float32", 64, id="16x16_b32"),
+        pytest.param(16, 64, 16, 64, 128, id="16x32_B1_W2K_b16"),
+        pytest.param(16, 64, 16, 64, 64, id="16x64_B1_W1_b16"),
+        pytest.param(64, 64, 64, 64, 128, id="16x64_B1_W4M_b16"),
+        pytest.param(16, 128, 16, 128, 64, id="16x64_B1_W1_4KB_b16"),
+        pytest.param(16, 128, 16, 128, 128, id="16x64_B1_W2_4KB_b16"),
+        pytest.param(32, 128, 32, 128, 128, id="16x64_B1_W2_8KB_b16"),
+        pytest.param(32, 128, 32, 128, 256, id="16x64_B1_W4_8KB_b16"),
+        pytest.param(32, 32, 32, 32, 64, id="32x32"),
     ],
 )
-def test_mls_ds_read_format_copy_to_global(M, K, block_M, block_K, in_dtype, out_dtype, num_threads):
+def test_mls_ds_read_format_copy_to_global(M, K, block_M, block_K, num_threads):
     """matrix_load -> ds_read_format -> copy(fragment to global). No gemm."""
     run_mls_ds_read_format_copy_to_global(
         M=M,
         K=K,
         block_M=block_M,
         block_K=block_K,
-        in_dtype=in_dtype,
-        out_dtype=out_dtype,
+        in_dtype="float16",
+        out_dtype="float16",
         num_threads=num_threads,
+    )
+
+
+@pytest.mark.skipif(
+    not target_supports_mls_b32(),
+    reason="b32 MLS matrix_load + ds_read_format is only supported on gfx92a/gfx946",
+)
+def test_mls_ds_read_format_b32_copy_to_global():
+    """b32 matrix_load -> ds_read_format -> copy(fragment to global). No gemm."""
+    run_mls_ds_read_format_copy_to_global(
+        M=16,
+        K=16,
+        block_M=16,
+        block_K=16,
+        in_dtype="float32",
+        out_dtype="float32",
+        num_threads=64,
     )
 
 
