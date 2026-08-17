@@ -10,6 +10,7 @@
 
 #include "hcu/target_utils.h"
 #include "hcu/transform/async_copy_injector.h"
+#include "hcu/utils/gemm_a_lds_strategy.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "transform/common/loop_fusion_utils.h"
@@ -52,7 +53,8 @@ bool GetNoImplicitAsyncCommitWait(const CopyNode &op) {
 
 Map<String, ObjectRef> GetHCUAsyncCopyAnnotations(const CopyNode &op) {
   Map<String, ObjectRef> result;
-  for (const char *key : {"use_idxen", "wrap_offset", "wrap_idx_mask"}) {
+  for (const char *key : {"use_idxen", "wrap_offset", "wrap_idx_mask",
+                          attr::kHcuGemmALdsStrategy}) {
     if (auto value = op.annotations.Get(key)) {
       result.Set(key, value.value());
     }
@@ -148,7 +150,8 @@ private:
     auto inject_result =
         InjectHCUAsyncCopy(lowered_loop, /*async_without_async_commit_wait=*/
                            no_implicit_commit_wait || GetIsAsyncCopy(op),
-                           GetHCUAsyncCopyAnnotations(op));
+                           GetHCUAsyncCopyAnnotations(op),
+                           lower_args.thread_var, lower_args.buffer_remap);
     Stmt async_copy_loop = inject_result.stmt;
     if (!inject_result.injected_hcu_async_copy) {
       DLOG(WARNING) << "HCU async-copy rewrite miss for copy src="

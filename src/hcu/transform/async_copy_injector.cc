@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "hcu/transform/async_copy_injector.h"
+#include "hcu/utils/gemm_a_lds_strategy.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "tir/ir/buffer_common.h"
@@ -32,9 +33,16 @@ class HCUAsyncCopyInjector : public StmtMutator {
 public:
   explicit HCUAsyncCopyInjector(
       bool async_without_async_commit_wait,
-      Map<String, ObjectRef> call_annotations = {})
+      Map<String, ObjectRef> call_annotations, Var thread_var,
+      Map<Buffer, Buffer> buffer_remap)
       : async_without_async_commit_wait_(async_without_async_commit_wait),
-        call_annotations_(std::move(call_annotations)) {}
+        call_annotations_(std::move(call_annotations)),
+        thread_var_(std::move(thread_var)),
+        buffer_remap_(std::move(buffer_remap)) {
+    if (auto value = call_annotations_.Get(attr::kHcuGemmALdsStrategy)) {
+      gemm_a_strategy_ = Downcast<HcuGemmALdsStrategy>(value.value());
+    }
+  }
 
   bool InjectedHCUAsyncCopy() const { return injected_hcu_async_copy_; }
 
@@ -472,13 +480,50 @@ private:
                  IntImm(DataType::Int(32), rw_mask)});
   }
 
+  PrimExpr MakeGemmACommandDstAccessPtr(const Buffer &buffer,
+                                        int num_elems) {
+    ICHECK(gemm_a_strategy_.defined());
+    ICHECK(thread_var_.defined());
+    const HcuGemmALdsStrategy &strategy = gemm_a_strategy_.value();
+    const int element_bits = buffer->dtype.bits() * buffer->dtype.lanes();
+    ICHECK_GT(element_bits, 0);
+    ICHECK_EQ((strategy->copy_bytes_per_lane * 8) % element_bits, 0);
+    const int copy_elements_per_lane =
+        strategy->copy_bytes_per_lane * 8 / element_bits;
+    ICHECK_EQ(num_elems * current_vectorized_lanes_, copy_elements_per_lane)
+        << "HCU GEMM A strategy expects " << copy_elements_per_lane
+        << " elements per thread, but async-copy lowering produced "
+        << num_elems * current_vectorized_lanes_;
+
+    PrimExpr local_offset = make_const(thread_var_->dtype, 0);
+    for (const ActiveVectorizedLoop &loop : active_vectorized_loops_) {
+      local_offset = local_offset * loop.extent + loop.loop_var;
+    }
+    PrimExpr physical_offset = analyzer_.Simplify(
+        thread_var_ * copy_elements_per_lane + local_offset * num_elems);
+    Array<PrimExpr> physical_indices = {
+        floordiv(physical_offset, Integer(strategy->block_k)),
+        floormod(physical_offset, Integer(strategy->block_k))};
+    // Address the remapped buffer directly so the enclosing layout lowering
+    // does not apply the final LDS storage layout to this pre-wrap address.
+    Optional<Buffer> physical_buffer = buffer_remap_.Get(buffer);
+    ICHECK(physical_buffer.defined())
+        << "HCU GEMM A strategy requires a remapped physical LDS buffer for "
+        << buffer->name;
+    return MakeAccessPtrFromLoad(
+        BufferLoad(physical_buffer.value(), physical_indices), num_elems,
+        /*rw_mask=*/2);
+  }
+
   Optional<Stmt>
   MakeCPAsyncStmtFromLoads(const BufferStoreNode *store,
                            const BufferLoad &dst_base_load,
                            const BufferLoad &src_base_load, int num_elems,
                            bool predicated, const PrimExpr &predicate_value) {
     PrimExpr dst_access_ptr =
-        MakeAccessPtrFromLoad(dst_base_load, num_elems, /*rw_mask=*/2);
+        gemm_a_strategy_.defined()
+            ? MakeGemmACommandDstAccessPtr(store->buffer, num_elems)
+            : MakeAccessPtrFromLoad(dst_base_load, num_elems, /*rw_mask=*/2);
     PrimExpr src_access_ptr =
         MakeAccessPtrFromLoad(src_base_load, num_elems, /*rw_mask=*/1);
 
@@ -675,6 +720,9 @@ private:
 
   bool async_without_async_commit_wait_{false};
   Map<String, ObjectRef> call_annotations_;
+  Optional<HcuGemmALdsStrategy> gemm_a_strategy_;
+  Var thread_var_;
+  Map<Buffer, Buffer> buffer_remap_;
   int current_vectorized_lanes_{1};
   std::vector<ActiveVectorizedLoop> active_vectorized_loops_;
   arith::Analyzer analyzer_;
@@ -685,9 +733,11 @@ private:
 
 HCUAsyncCopyInjectResult
 InjectHCUAsyncCopy(const Stmt &body, bool async_without_async_commit_wait,
-                   Map<String, ObjectRef> call_annotations) {
+                   Map<String, ObjectRef> call_annotations, Var thread_var,
+                   Map<Buffer, Buffer> buffer_remap) {
   HCUAsyncCopyInjector injector(async_without_async_commit_wait,
-                                std::move(call_annotations));
+                                std::move(call_annotations),
+                                std::move(thread_var), std::move(buffer_remap));
   Stmt injected = injector(body);
   return {injector.Finalize(injected), injector.InjectedHCUAsyncCopy()};
 }

@@ -16,7 +16,10 @@ HCUAsyncCopyInjectResult
 InjectHCUAsyncCopy(const tvm::tirx::Stmt &body,
                    bool async_without_async_commit_wait = false,
                    tvm::ffi::Map<tvm::ffi::String, tvm::ffi::ObjectRef>
-                       call_annotations = {});
+                       call_annotations = {},
+                   tvm::tirx::Var thread_var = tvm::tirx::Var(),
+                   tvm::ffi::Map<tvm::tirx::Buffer, tvm::tirx::Buffer>
+                       buffer_remap = {});
 
 } // namespace tl
 } // namespace tvm
