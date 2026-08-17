@@ -761,7 +761,9 @@ class HCUMatrixCoreIntrinEmitter:
             mls_trans=mls_trans,
             dtype_str=hcu_mls_ds_read_dtype_str(self.a_dtype),
             target=self.target,
-            target_dtype_str="uint8_t" if self.fp4_mmac_mode == "f8f6f4" else None,
+            target_dtype_str=(
+                "uint8_t" if self.fp4_mmac_mode == "f8f6f4" else hcu_mls_ds_read_dtype_str(A_local_buf.dtype) if self.use_tf32 else None
+            ),
             lds_bits=lds_bits if self.fp4_mmac_mode == "f8f6f4" else None,
             reg_bits=reg_bits if self.fp4_mmac_mode == "f8f6f4" else None,
         )
@@ -825,7 +827,9 @@ class HCUMatrixCoreIntrinEmitter:
             mls_trans=mls_trans,
             dtype_str=hcu_mls_ds_read_dtype_str(self.b_dtype),
             target=self.target,
-            target_dtype_str="uint8_t" if self.fp4_mmac_mode == "f8f6f4" else None,
+            target_dtype_str=(
+                "uint8_t" if self.fp4_mmac_mode == "f8f6f4" else hcu_mls_ds_read_dtype_str(B_local_buf.dtype) if self.use_tf32 else None
+            ),
             lds_bits=lds_bits if self.fp4_mmac_mode == "f8f6f4" else None,
             reg_bits=reg_bits if self.fp4_mmac_mode == "f8f6f4" else None,
             min_n_per_warp=self.min_n_per_warp,

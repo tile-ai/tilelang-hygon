@@ -593,6 +593,11 @@ Fragment makeDsReadFormatFragmentHCU(const int block_mn, const int block_k,
                                                                  false)
                    : makeGemmFragmentAB16x16CDNATransposed(k_pack)->Repeat(
                          {1, 1}, false, false))
+      : fragment_bits == 32
+          ? (trans ? makeGemmFragmentAB16x8CDNA(k_pack)->Repeat({1, 1}, false,
+                                                                false)
+                   : makeGemmFragmentAB16x8CDNATransposed(k_pack)->Repeat(
+                         {1, 1}, false, false))
           : (trans ? (fragment_bits == 4 ? makeGemmFragmentAB16x64CDNA(k_pack)
                                          : makeGemmFragmentAB16x32CDNA(k_pack))
                          ->Repeat({1, 1}, false, false)

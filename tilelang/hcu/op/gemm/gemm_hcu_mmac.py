@@ -61,10 +61,13 @@ def _hcu_layout_bits_for_dtype(dtype, *, fp4_mmac_mode: str) -> int:
     return int(dtype.bits)
 
 
-def _fp4_local_dtype(dtype, *, fp4_mmac_mode: str) -> str:
+def _mls_local_dtype(dtype, *, fp4_mmac_mode: str, use_tf32: bool = False) -> str:
+    dtype = DataType(dtype)
+    if use_tf32 and str(dtype) == "float32":
+        return "int32"
     if fp4_mmac_mode == "f8f6f4" and _is_f8f6f4_operand_dtype(dtype):
         return "uint8"
-    return str(DataType(dtype))
+    return str(dtype)
 
 
 def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
@@ -393,8 +396,8 @@ class GemmHCUMMAC(GemmBase):
         clear_accum = self.clear_accum
         a_dtype = self.a_dtype
         b_dtype = self.b_dtype
-        a_local_dtype = _fp4_local_dtype(a_dtype, fp4_mmac_mode=fp4_mmac_mode)
-        b_local_dtype = _fp4_local_dtype(b_dtype, fp4_mmac_mode=fp4_mmac_mode)
+        a_local_dtype = _mls_local_dtype(a_dtype, fp4_mmac_mode=fp4_mmac_mode)
+        b_local_dtype = _mls_local_dtype(b_dtype, fp4_mmac_mode=fp4_mmac_mode)
         assert is_full_region(C_region), "Fragment output C must be a full region"
 
         thread_binding = thread_var
@@ -695,8 +698,8 @@ class GemmHCUMMAC(GemmBase):
         k_pack = emitter.k_pack
         a_dtype = self.a_dtype
         b_dtype = self.b_dtype
-        a_mls_local_dtype = _fp4_local_dtype(a_dtype, fp4_mmac_mode=fp4_mmac_mode)
-        b_mls_local_dtype = _fp4_local_dtype(b_dtype, fp4_mmac_mode=fp4_mmac_mode)
+        a_mls_local_dtype = _mls_local_dtype(a_dtype, fp4_mmac_mode=fp4_mmac_mode, use_tf32=self.use_tf32)
+        b_mls_local_dtype = _mls_local_dtype(b_dtype, fp4_mmac_mode=fp4_mmac_mode, use_tf32=self.use_tf32)
         inner_k = emitter.inner_k_per_warp()
         block_K = emitter.chunk
         micro_size_k = emitter.micro_size_k
@@ -723,8 +726,6 @@ class GemmHCUMMAC(GemmBase):
                 raise ValueError("gemm_mls does not support kPack > 1")
             if warp_k != 1:
                 raise ValueError("gemm_mls does not support warp on K")
-            if self.use_tf32:
-                raise ValueError("HCU gemm: use_tf32=True is not supported for gemm_mls (MLS) path")
 
         if use_gemm_mls and a_from_mls and b_from_mls:
 

@@ -24,6 +24,10 @@ struct DsreadmFormatDispatcher;
 template <::tl::index_t Row, ::tl::index_t Col, ::tl::index_t Alt, bool Trans>
 struct DsreadmPadByteDispatcher;
 
+template <bool IsTf32, ::tl::index_t Row, ::tl::index_t Col, ::tl::index_t Alt,
+          bool Trans>
+struct DsreadmFormatDispatcherB32;
+
 // M32x16 B16 non-trans Alt1
 template <> struct DsreadmFormatDispatcher<2, 32, 16, 1, false> {
   using Type = DsreadmFormatAttribute<DsreadmFormatAttributeImpl_M32x16_B16>;
@@ -44,6 +48,30 @@ template <> struct DsreadmFormatDispatcher<2, 32, 16, 1, true> {
 template <> struct DsreadmFormatDispatcher<2, 16, 32, 2, true> {
   using Type =
       DsreadmFormatAttribute<DsreadmFormatAttributeImpl_MT16x32_B16_ALT2>;
+};
+
+// ---------------------------
+// DS_READ_MATRIX_FORMAT_B32
+// ---------------------------
+
+template <> struct DsreadmFormatDispatcherB32<false, 16, 16, 1, false> {
+  using Type =
+      DsreadmFormatAttribute<DsreadmFormatAttributeImpl_M16x16_B32_F32>;
+};
+
+template <> struct DsreadmFormatDispatcherB32<false, 16, 16, 1, true> {
+  using Type =
+      DsreadmFormatAttribute<DsreadmFormatAttributeImpl_MT16x16_B32_F32>;
+};
+
+template <> struct DsreadmFormatDispatcherB32<true, 16, 16, 1, false> {
+  using Type =
+      DsreadmFormatAttribute<DsreadmFormatAttributeImpl_M16x16_B32_TF32>;
+};
+
+template <> struct DsreadmFormatDispatcherB32<true, 16, 16, 1, true> {
+  using Type =
+      DsreadmFormatAttribute<DsreadmFormatAttributeImpl_MT16x16_B32_TF32>;
 };
 
 // ---------------------------
@@ -125,6 +153,12 @@ using DsreadmFormatDispatcher =
 template <::tl::index_t Row, ::tl::index_t Col, ::tl::index_t Alt, bool Trans>
 using DsreadmPadByteDispatcher =
     typename impl::DsreadmPadByteDispatcher<Row, Col, Alt, Trans>::Type;
+
+template <bool IsTf32, ::tl::index_t Row, ::tl::index_t Col, ::tl::index_t Alt,
+          bool Trans>
+using DsreadmFormatDispatcherB32 =
+    typename impl::DsreadmFormatDispatcherB32<IsTf32, Row, Col, Alt,
+                                              Trans>::Type;
 
 } // namespace mls
 } // namespace tl

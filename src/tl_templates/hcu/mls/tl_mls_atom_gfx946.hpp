@@ -99,6 +99,34 @@ struct gfx946_mls_16x64_trans_b16 {
   }
 };
 
+struct gfx946_mls_16x16_b32 {
+  static constexpr auto TileShape = ::tl::sequence<16, 16>{};
+
+  template <::tl::index_t moffset, bool r, bool bps = false>
+  TL_DEVICE static void load(const uintptr_t lds_addr,
+                             const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
+                             ::tl::bool_constant<r>,
+                             ::tl::bool_constant<bps> = {}) {
+    __builtin_hcu_matrix_load_16X16_b32(rsrc,
+                                        reinterpret_cast<uint32_t *>(lds_addr),
+                                        moffset, false, r, false, false, bps);
+  }
+};
+
+struct gfx946_mls_16x16_trans_b32 {
+  static constexpr auto TileShape = ::tl::sequence<16, 16>{};
+
+  template <::tl::index_t moffset, bool r, bool bps = false>
+  TL_DEVICE static void load(const uintptr_t lds_addr,
+                             const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
+                             ::tl::bool_constant<r>,
+                             ::tl::bool_constant<bps> = {}) {
+    __builtin_hcu_matrix_load_16X16_b32(rsrc,
+                                        reinterpret_cast<uint32_t *>(lds_addr),
+                                        moffset, true, r, false, false, bps);
+  }
+};
+
 struct gfx946_mls_64x16_b8 {
   static constexpr auto TileShape = ::tl::sequence<64, 16>{};
 

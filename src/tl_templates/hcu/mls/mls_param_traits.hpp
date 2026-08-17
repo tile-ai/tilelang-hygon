@@ -50,7 +50,7 @@ template <typename T> struct mls_storage_traits {
 };
 
 template <::tl::index_t DstBits> struct mls_lds_physical_storage_traits {
-  static_assert(DstBits == 4 || DstBits == 8 || DstBits == 16,
+  static_assert(DstBits == 4 || DstBits == 8 || DstBits == 16 || DstBits == 32,
                 "Unsupported MLS LDS physical bits");
 
   TL_HOST_DEVICE static constexpr ::tl::index_t

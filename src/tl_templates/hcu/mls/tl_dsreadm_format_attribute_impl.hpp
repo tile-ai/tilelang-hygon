@@ -219,6 +219,118 @@ struct DsreadmFormatAttributeImpl_MT16x32_B16_ALT2 {
   }
 };
 
+struct DsreadmFormatAttributeImpl_M16x16_B32_F32 {
+  static constexpr ::tl::index_t kMN = 16;
+  static constexpr ::tl::index_t kK = 16;
+
+  static constexpr ::tl::index_t kMNStoreLane = 16;
+  static constexpr ::tl::index_t kKStoreLane = 4;
+
+  static constexpr ::tl::index_t kMN0StorePerLane = 1;
+  static constexpr ::tl::index_t kMN1StorePerLane = 1;
+  static constexpr ::tl::index_t kKStorePerLane = 4;
+
+  static constexpr ::tl::index_t kMNInterleave = 1;
+  static constexpr ::tl::index_t kVectorLength =
+      kMN0StorePerLane * kMN1StorePerLane * kKStorePerLane;
+
+  template <typename T, ::tl::index_t offset>
+  TL_DEVICE void operator()(TL_LDS_ADDR T *smem,
+                            ::tl::ext_vector_t<T, kVectorLength> &ret,
+                            ::tl::number<offset>) const {
+    // element:0x4, row:0x1, col:0x1, alt:0x0
+    TL_LDS_ADDR float *ptr = reinterpret_cast<TL_LDS_ADDR float *>(smem);
+    ret = ::tl::bit_cast<::tl::ext_vector_t<T, kVectorLength>>(
+        __builtin_hcu_ds_read_matrix_format_f32(
+            ptr, offset, static_cast<char>(0x1), static_cast<char>(0x1),
+            static_cast<char>(0x0)));
+  }
+};
+
+struct DsreadmFormatAttributeImpl_MT16x16_B32_F32 {
+  static constexpr ::tl::index_t kMN = 16;
+  static constexpr ::tl::index_t kK = 16;
+
+  static constexpr ::tl::index_t kMNStoreLane = 16;
+  static constexpr ::tl::index_t kKStoreLane = 4;
+
+  static constexpr ::tl::index_t kMN0StorePerLane = 1;
+  static constexpr ::tl::index_t kMN1StorePerLane = 1;
+  static constexpr ::tl::index_t kKStorePerLane = 4;
+
+  static constexpr ::tl::index_t kMNInterleave = 1;
+  static constexpr ::tl::index_t kVectorLength =
+      kMN0StorePerLane * kMN1StorePerLane * kKStorePerLane;
+
+  template <typename T, ::tl::index_t offset>
+  TL_DEVICE void operator()(TL_LDS_ADDR T *smem,
+                            ::tl::ext_vector_t<T, kVectorLength> &ret,
+                            ::tl::number<offset>) const {
+    // element:0x4, row:0x1, col:0x1, alt:0x0
+    TL_LDS_ADDR float *ptr = reinterpret_cast<TL_LDS_ADDR float *>(smem);
+    ret = ::tl::bit_cast<::tl::ext_vector_t<T, kVectorLength>>(
+        __builtin_hcu_ds_read_matrix_trans_format_f32(
+            ptr, offset, static_cast<char>(0x1), static_cast<char>(0x1),
+            static_cast<char>(0x0)));
+  }
+};
+
+struct DsreadmFormatAttributeImpl_M16x16_B32_TF32 {
+  static constexpr ::tl::index_t kMN = 16;
+  static constexpr ::tl::index_t kK = 16;
+
+  static constexpr ::tl::index_t kMNStoreLane = 16;
+  static constexpr ::tl::index_t kKStoreLane = 4;
+
+  static constexpr ::tl::index_t kMN0StorePerLane = 1;
+  static constexpr ::tl::index_t kMN1StorePerLane = 1;
+  static constexpr ::tl::index_t kKStorePerLane = 4;
+
+  static constexpr ::tl::index_t kMNInterleave = 1;
+  static constexpr ::tl::index_t kVectorLength =
+      kMN0StorePerLane * kMN1StorePerLane * kKStorePerLane;
+
+  template <typename T, ::tl::index_t offset>
+  TL_DEVICE void operator()(TL_LDS_ADDR T *smem,
+                            ::tl::ext_vector_t<T, kVectorLength> &ret,
+                            ::tl::number<offset>) const {
+    // element:0x4, row:0x1, col:0x1, alt:0x0
+    TL_LDS_ADDR int *ptr = reinterpret_cast<TL_LDS_ADDR int *>(smem);
+    ret = ::tl::bit_cast<::tl::ext_vector_t<T, kVectorLength>>(
+        __builtin_hcu_ds_read_matrix_format_tf32(
+            ptr, offset, static_cast<char>(0x1), static_cast<char>(0x1),
+            static_cast<char>(0x0)));
+  }
+};
+
+struct DsreadmFormatAttributeImpl_MT16x16_B32_TF32 {
+  static constexpr ::tl::index_t kMN = 16;
+  static constexpr ::tl::index_t kK = 16;
+
+  static constexpr ::tl::index_t kMNStoreLane = 16;
+  static constexpr ::tl::index_t kKStoreLane = 4;
+
+  static constexpr ::tl::index_t kMN0StorePerLane = 1;
+  static constexpr ::tl::index_t kMN1StorePerLane = 1;
+  static constexpr ::tl::index_t kKStorePerLane = 4;
+
+  static constexpr ::tl::index_t kMNInterleave = 1;
+  static constexpr ::tl::index_t kVectorLength =
+      kMN0StorePerLane * kMN1StorePerLane * kKStorePerLane;
+
+  template <typename T, ::tl::index_t offset>
+  TL_DEVICE void operator()(TL_LDS_ADDR T *smem,
+                            ::tl::ext_vector_t<T, kVectorLength> &ret,
+                            ::tl::number<offset>) const {
+    // element:0x4, row:0x1, col:0x1, alt:0x0
+    TL_LDS_ADDR int *ptr = reinterpret_cast<TL_LDS_ADDR int *>(smem);
+    ret = ::tl::bit_cast<::tl::ext_vector_t<T, kVectorLength>>(
+        __builtin_hcu_ds_read_matrix_trans_format_tf32(
+            ptr, offset, static_cast<char>(0x1), static_cast<char>(0x1),
+            static_cast<char>(0x0)));
+  }
+};
+
 // b8 related
 
 // DS_S_READ_M32X32_B8

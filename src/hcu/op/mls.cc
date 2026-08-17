@@ -313,6 +313,14 @@ constexpr MlsTileConfig kMlsTileConfigsFp4B8NonTrans[] = {
     {64, 16, false},
 };
 
+constexpr MlsTileConfig kMlsTileConfigsB32Trans[] = {
+    {16, 16, false},
+};
+
+constexpr MlsTileConfig kMlsTileConfigsB32NonTrans[] = {
+    {16, 16, false},
+};
+
 constexpr MlsTileConfigSet kMlsTileConfigTable[] = {
     {4, kMlsTileConfigsB4Trans, ArraySize(kMlsTileConfigsB4Trans),
      kMlsTileConfigsB4NonTrans, ArraySize(kMlsTileConfigsB4NonTrans)},
@@ -320,6 +328,8 @@ constexpr MlsTileConfigSet kMlsTileConfigTable[] = {
      kMlsTileConfigsB8NonTrans, ArraySize(kMlsTileConfigsB8NonTrans)},
     {16, kMlsTileConfigsB16Trans, ArraySize(kMlsTileConfigsB16Trans),
      kMlsTileConfigsB16NonTrans, ArraySize(kMlsTileConfigsB16NonTrans)},
+    {32, kMlsTileConfigsB32Trans, ArraySize(kMlsTileConfigsB32Trans),
+     kMlsTileConfigsB32NonTrans, ArraySize(kMlsTileConfigsB32NonTrans)},
 };
 
 const MlsTileConfigSet &GetMlsTileConfigSet(int elem_bits, Target target) {
@@ -560,6 +570,10 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
     dtype_str = "tl::bf8_t";
   } else if (src->dtype.is_float4_e2m1fn()) {
     dtype_str = "tl::pk_fp4_t";
+  } else if (src->dtype.is_tfloat32()) {
+    dtype_str = "int";
+  } else if (src->dtype.is_float() && src->dtype.bits() == 32) {
+    dtype_str = "float";
   } else {
     LOG(FATAL) << "matrix_load unsupported dtype: " << src->dtype;
   }
