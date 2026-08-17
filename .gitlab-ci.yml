@@ -54,7 +54,7 @@ test:
     - pip install -r requirements.txt -r requirements-dev.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     - NO_TOOLCHAIN_VERSION=1 NO_GIT_VERSION=1 bash das-build.sh
     - pip install dist/*.whl
-    - pip install numpy==1.24.3 allure-pytest pytest-xdist
+    - pip install "numpy>=1.26,<2" allure-pytest pytest-xdist
     # 回归测试
     - test -n "${HCU_TILEKERNELS_GIT_URL}" || (echo "HCU_TILEKERNELS_GIT_URL is not set" && exit 1)
     - git clone -b ${TILEKERNELS_REF} http://gitlab-ci-token:${CI_JOB_TOKEN}@${HCU_TILEKERNELS_GIT_URL} ${TILEKERNELS_DIR}
