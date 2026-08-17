@@ -22,9 +22,9 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
-#include <optional>
 #include <vector>
 
 namespace tvm {
@@ -231,6 +231,7 @@ public:
                                       block_threads);
     PrimFuncNode *fn = f.CopyOnWrite();
     fn->body = mutator(f->body);
+    mutator.ValidateAutoLayoutsAttached();
     return f;
   }
 
@@ -246,29 +247,65 @@ private:
   }
 
   Stmt VisitStmt_(const SBlockNode *op) final {
-    bool pushed = false;
+    Map<Var, Layout> block_layout_map;
     if (auto value = op->annotations.Get(attr::kLayoutMap)) {
       if (auto layout_map = value.value().as<Map<Var, Layout>>()) {
-        std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> vars;
-        for (const auto &entry : layout_map.value())
-          vars.insert(entry.first);
-        annotated_layout_vars_stack_.push_back(std::move(vars));
-        pushed = true;
+        block_layout_map = layout_map.value();
       }
     }
-    Stmt stmt = StmtExprMutator::VisitStmt_(op);
-    if (pushed)
-      annotated_layout_vars_stack_.pop_back();
-    return stmt;
+    annotated_layout_maps_stack_.push_back(block_layout_map);
+
+    SBlock block = Downcast<SBlock>(StmtExprMutator::VisitStmt_(op));
+    bool layout_map_changed = false;
+    // Materialize auto layouts at the shared buffer's allocation scope, just
+    // like an explicit T.annotate_layout entry.
+    for (const Buffer &buffer : block->alloc_buffers) {
+      auto strategy = auto_strategies_.find(buffer->data);
+      if (strategy == auto_strategies_.end()) {
+        continue;
+      }
+
+      if (Optional<Layout> existing = FindAnnotatedLayout(buffer)) {
+        ValidateHcuGemmAStorageLayout(existing.value(), strategy->second);
+      } else {
+        const Layout &storage_layout = strategy->second->storage_layout;
+        block_layout_map.Set(buffer->data, storage_layout);
+        annotated_layout_maps_stack_.back().Set(buffer->data, storage_layout);
+        layout_map_changed = true;
+      }
+      auto_layout_attached_vars_.insert(buffer->data);
+    }
+
+    if (layout_map_changed) {
+      SBlockNode *block_ptr = block.CopyOnWrite();
+      block_ptr->annotations.Set(attr::kLayoutMap, block_layout_map);
+    }
+    annotated_layout_maps_stack_.pop_back();
+    return block;
   }
 
   bool HasAnnotatedLayout(const Buffer &buffer) const {
-    for (auto it = annotated_layout_vars_stack_.rbegin();
-         it != annotated_layout_vars_stack_.rend(); ++it) {
-      if (it->count(buffer->data))
-        return true;
+    return FindAnnotatedLayout(buffer).defined();
+  }
+
+  Optional<Layout> FindAnnotatedLayout(const Buffer &buffer) const {
+    for (auto it = annotated_layout_maps_stack_.rbegin();
+         it != annotated_layout_maps_stack_.rend(); ++it) {
+      if (Optional<Layout> layout = it->Get(buffer->data)) {
+        return layout;
+      }
     }
-    return false;
+    return std::nullopt;
+  }
+
+  void ValidateAutoLayoutsAttached() const {
+    for (const auto &[var, strategy] : auto_strategies_) {
+      (void)strategy;
+      ICHECK(auto_layout_attached_vars_.count(var))
+          << "Cannot attach compiler-derived HCU GEMM A LDS layout to the "
+             "SBlock that allocates buffer `"
+          << var->name_hint << "`";
+    }
   }
 
   void ValidateOrSetIntAnnotation(Map<String, ObjectRef> *annotations,
@@ -437,14 +474,15 @@ private:
   int block_threads_{-1};
   std::unordered_map<Buffer, bool, ObjectPtrHash, ObjectPtrEqual>
       shared_mls_trans_;
-  std::vector<std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>>
-      annotated_layout_vars_stack_;
+  std::vector<Map<Var, Layout>> annotated_layout_maps_stack_;
   std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
       copy_ds_read_b_outputs_;
   std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>
       async_copy_linear_outputs_;
   std::unordered_map<Var, HcuGemmALdsStrategy, ObjectPtrHash, ObjectPtrEqual>
       auto_strategies_;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>
+      auto_layout_attached_vars_;
 };
 
 tvm::transform::Pass AnnotateMlsGemmDep() {
