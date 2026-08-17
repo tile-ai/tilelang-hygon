@@ -18,8 +18,6 @@ namespace tl {
 namespace attr {
 static constexpr const char *kHcuGemmALdsStrategy =
     "tl.hcu_gemm_a_lds_strategy";
-static constexpr const char *kHcuAAutoLdsLayout =
-    "tl.hcu_a_auto_lds_layout";
 } // namespace attr
 
 class HcuGemmALdsStrategyNode : public Object {

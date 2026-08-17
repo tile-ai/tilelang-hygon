@@ -407,8 +407,7 @@ private:
       auto auto_strategy = auto_strategies_.find(gemm->a_->data);
       if (IsSharedBuffer(gemm->a_) &&
           auto_strategy != auto_strategies_.end()) {
-        annotations.Set(attr::kHcuAAutoLdsLayout,
-                        IntImm(DataType::Int(32), 1));
+        annotations.Set(attr::kHcuGemmALdsStrategy, auto_strategy->second);
       } else if (IsSharedBuffer(gemm->a_) && HasAnnotatedLayout(gemm->a_)) {
         annotations.Set(attr::kHcuARespectLayoutMap,
                         IntImm(DataType::Int(32), 1));
