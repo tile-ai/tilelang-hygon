@@ -79,8 +79,14 @@ public:
     // int4/fp4/int2/int1 remain representable here.
     int previous_vectorized_lanes = current_vectorized_lanes_;
     bool pushed_vectorized_loop = false;
+    const auto *extent_imm = op->extent.as<IntImmNode>();
+    bool pushed_active_loop = false;
+    if (extent_imm && extent_imm->value > 1) {
+      active_loops_.push_back(
+          {op->loop_var, static_cast<int>(extent_imm->value)});
+      pushed_active_loop = true;
+    }
     if (op->kind == ForKind::kVectorized) {
-      const auto *extent_imm = op->extent.as<IntImmNode>();
       ICHECK(extent_imm)
           << "Vectorized loops must have constant extent, but got "
           << op->extent;
@@ -95,6 +101,9 @@ public:
     Stmt stmt = StmtMutator::VisitStmt_(op);
     if (pushed_vectorized_loop) {
       active_vectorized_loops_.pop_back();
+    }
+    if (pushed_active_loop) {
+      active_loops_.pop_back();
     }
     current_vectorized_lanes_ = previous_vectorized_lanes;
     return stmt;
@@ -309,6 +318,11 @@ private:
     int extent;
   };
 
+  struct ActiveLoop {
+    Var loop_var;
+    int extent;
+  };
+
   // ---- Copy candidate analysis helpers ----
   static bool IsZeroValue(const PrimExpr &expr) {
     if (const auto *broadcast = expr.as<BroadcastNode>()) {
@@ -484,27 +498,55 @@ private:
                  IntImm(DataType::Int(32), rw_mask)});
   }
 
-  PrimExpr MakeGemmCommandDstAccessPtr(const Buffer &buffer, int num_elems,
-                                       int copy_bytes_per_lane, int inner_extent,
-                                       const char *operand) {
+  PrimExpr MakeGemmCommandDstAccessPtr(
+      const Buffer &buffer, int num_elems, int copy_bytes_per_lane,
+      int copy_transaction_bytes, int block_threads, int inner_extent,
+      const char *operand) {
     ICHECK(thread_var_.defined());
     const int element_bits = buffer->dtype.bits() * buffer->dtype.lanes();
     ICHECK_GT(element_bits, 0);
     ICHECK_EQ((copy_bytes_per_lane * 8) % element_bits, 0);
     const int copy_elements_per_lane =
         copy_bytes_per_lane * 8 / element_bits;
-    ICHECK_EQ(num_elems * current_vectorized_lanes_, copy_elements_per_lane)
+    ICHECK_EQ((copy_transaction_bytes * 8) % element_bits, 0);
+    const int transaction_elements =
+        copy_transaction_bytes * 8 / element_bits;
+    ICHECK_EQ(copy_elements_per_lane % transaction_elements, 0);
+    ICHECK_EQ(transaction_elements % num_elems, 0);
+
+    const int local_iterations = copy_elements_per_lane / num_elems;
+    int covered_iterations = 1;
+    size_t first_local_loop = active_loops_.size();
+    while (first_local_loop > 0 && covered_iterations < local_iterations) {
+      const ActiveLoop &loop = active_loops_[first_local_loop - 1];
+      ICHECK_EQ(local_iterations % (covered_iterations * loop.extent), 0)
+          << "HCU GEMM " << operand
+          << " async-copy loop structure does not match the compiler-derived "
+             "transaction layout";
+      covered_iterations *= loop.extent;
+      --first_local_loop;
+    }
+    ICHECK_EQ(covered_iterations, local_iterations)
         << "HCU GEMM " << operand << " strategy expects "
         << copy_elements_per_lane
-        << " elements per thread, but async-copy lowering produced "
-        << num_elems * current_vectorized_lanes_;
+        << " elements per thread, but the innermost async-copy loops cover "
+        << covered_iterations * num_elems;
 
-    PrimExpr local_offset = make_const(thread_var_->dtype, 0);
-    for (const ActiveVectorizedLoop &loop : active_vectorized_loops_) {
-      local_offset = local_offset * loop.extent + loop.loop_var;
+    PrimExpr local_iteration = make_const(thread_var_->dtype, 0);
+    for (size_t i = first_local_loop; i < active_loops_.size(); ++i) {
+      const ActiveLoop &loop = active_loops_[i];
+      local_iteration = local_iteration * loop.extent + loop.loop_var;
     }
+    PrimExpr local_element = local_iteration * num_elems;
+    PrimExpr transaction =
+        floordiv(local_element, Integer(transaction_elements));
+    PrimExpr intra_transaction =
+        floormod(local_element, Integer(transaction_elements));
+    // Each issued transaction is contiguous across lanes. Multiple
+    // transactions owned by one thread are placed transaction-major.
     PrimExpr physical_offset = analyzer_.Simplify(
-        thread_var_ * copy_elements_per_lane + local_offset * num_elems);
+        (transaction * block_threads + thread_var_) * transaction_elements +
+        intra_transaction);
     Array<PrimExpr> physical_indices = {
         floordiv(physical_offset, Integer(inner_extent)),
         floormod(physical_offset, Integer(inner_extent))};
@@ -530,11 +572,13 @@ private:
       const HcuGemmALdsStrategy &strategy = gemm_a_strategy_.value();
       dst_access_ptr = MakeGemmCommandDstAccessPtr(
           store->buffer, num_elems, strategy->copy_bytes_per_lane,
+          strategy->copy_transaction_bytes, strategy->block_threads,
           strategy->block_k, "A");
     } else if (gemm_b_strategy_.defined()) {
       const HcuGemmBLdsStrategy &strategy = gemm_b_strategy_.value();
       dst_access_ptr = MakeGemmCommandDstAccessPtr(
           store->buffer, num_elems, strategy->copy_bytes_per_lane,
+          strategy->copy_bytes_per_lane, strategy->block_threads,
           strategy->block_n, "B");
     } else {
       dst_access_ptr =
@@ -742,6 +786,7 @@ private:
   Map<Buffer, Buffer> buffer_remap_;
   int current_vectorized_lanes_{1};
   std::vector<ActiveVectorizedLoop> active_vectorized_loops_;
+  std::vector<ActiveLoop> active_loops_;
   arith::Analyzer analyzer_;
   bool injected_hcu_async_copy_{false};
   bool pending_sync_copies_{false};

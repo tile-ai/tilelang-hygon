@@ -32,6 +32,8 @@ public:
   int bank_width_bytes{4};
   int element_bytes{0};
   int copy_bytes_per_lane{0};
+  int copy_transaction_bytes{0};
+  int copy_transactions_per_lane{0};
   int read_bytes_per_lane{0};
   int row_period{0};
   int row_bank_stride{0};

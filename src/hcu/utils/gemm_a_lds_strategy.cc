@@ -24,10 +24,10 @@ using namespace tirx;
 
 namespace {
 
-constexpr int kStrategyVersion = 1;
+constexpr int kStrategyVersion = 2;
 // These are instruction semantics, not kernel tile parameters.
 constexpr int kMmacMAtom = 16;
-constexpr int kAsyncCopyBytesPerLane = 16;
+constexpr int kAsyncCopyTransactionBytes = 16;
 constexpr int kReadBytesPerLane = 8;
 
 struct GemmAStrategyParams {
@@ -40,6 +40,8 @@ struct GemmAStrategyParams {
   int bank_width_bytes{0};
   int element_bytes{0};
   int copy_bytes_per_lane{0};
+  int copy_transaction_bytes{0};
+  int copy_transactions_per_lane{0};
   int read_bytes_per_lane{0};
   int row_bank_stride{0};
   int row_period{0};
@@ -85,7 +87,7 @@ int SelectWrapOffset(const GemmAStrategyParams &params,
   const int banks_per_read =
       params.read_bytes_per_lane / params.bank_width_bytes;
   const int banks_per_copy =
-      params.copy_bytes_per_lane / params.bank_width_bytes;
+      params.copy_transaction_bytes / params.bank_width_bytes;
   std::vector<bool> base_banks(params.bank_num, false);
   for (int row = 0; row < params.row_period; ++row) {
     const int start = (row * params.row_bank_stride) % params.bank_num;
@@ -125,32 +127,29 @@ PrimExpr MatrixARowPermute(const PrimExpr &row,
 Layout MakeStorageLayout(const GemmAStrategyParams &params) {
   PrimExpr row = InputPlaceholder(0);
   PrimExpr col = InputPlaceholder(1);
-  PrimExpr layout_physical_row = MatrixARowPermute(row, params);
-  PrimExpr warp_m = floordiv(row, Integer(params.warp_tile_m));
+  PrimExpr mapped_row = MatrixARowPermute(row, params);
+  PrimExpr segment = mapped_row * params.copy_segments_per_row +
+                     floordiv(col, Integer(params.copy_elements_per_lane));
+  PrimExpr transaction = floordiv(segment, Integer(params.block_threads));
+  PrimExpr thread = floormod(segment, Integer(params.block_threads));
+  PrimExpr copy_warp = floordiv(thread, Integer(params.warp_size));
+  PrimExpr lane = floormod(thread, Integer(params.warp_size));
+  // Reproduce the hardware wrap on each issued copy transaction so the
+  // annotation and the physical LDS writes share the same mapping.
   PrimExpr wrap_offset_cur =
-      floormod(warp_m, Integer(params.warp_m_count)) * params.wrap_offset;
-
-  PrimExpr quad = floordiv(floormod(row, Integer(kMmacMAtom)),
-                           Integer(params.row_period));
-  PrimExpr segment_base =
-      floordiv(col, Integer(params.read_elements_per_lane));
-  PrimExpr segment_mix = quad * params.segment_shift + segment_base;
-  PrimExpr wrapped_segment =
-      floormod(segment_mix, Integer(params.read_segments_per_row));
-  PrimExpr segment_carry =
-      floordiv(segment_mix, Integer(params.read_segments_per_row));
-
-  PrimExpr row_slab_base = floordiv(
-      layout_physical_row, Integer(params.rows_per_copy_wave)) *
-      params.rows_per_copy_wave;
-  PrimExpr row_in_slab = floormod(
-      floormod(layout_physical_row, Integer(params.rows_per_copy_wave)) -
-          warp_m * params.rows_per_wrap_phase +
-          wrap_offset_cur * params.rows_per_wrap_phase + segment_carry,
-      Integer(params.rows_per_copy_wave));
-  PrimExpr physical_row = row_slab_base + row_in_slab;
-  PrimExpr physical_col = wrapped_segment * params.read_elements_per_lane +
-                          floormod(col, Integer(params.read_elements_per_lane));
+      floormod(copy_warp, Integer(params.wrap_idx_mask + 1)) *
+      params.wrap_offset;
+  PrimExpr physical_lane =
+      floormod(lane + wrap_offset_cur, Integer(params.warp_size));
+  PrimExpr physical_segment = transaction * params.block_threads +
+                              copy_warp * params.warp_size + physical_lane;
+  PrimExpr physical_linear =
+      physical_segment * params.copy_elements_per_lane +
+      floormod(col, Integer(params.copy_elements_per_lane));
+  PrimExpr physical_row =
+      floordiv(physical_linear, Integer(params.block_k));
+  PrimExpr physical_col =
+      floormod(physical_linear, Integer(params.block_k));
   Array<PrimExpr> input_shape = {Integer(params.block_m),
                                  Integer(params.block_k)};
   Array<PrimExpr> forward_index = {physical_row, physical_col};
@@ -161,11 +160,17 @@ Fragment MakeCopyLoopLayout(const GemmAStrategyParams &params) {
   PrimExpr row = InputPlaceholder(0);
   PrimExpr col = InputPlaceholder(1);
   PrimExpr mapped_row = MatrixARowPermute(row, params);
-  PrimExpr thread = mapped_row * params.copy_segments_per_row +
-                    floordiv(col, Integer(params.copy_elements_per_lane));
-  PrimExpr local = floormod(col, Integer(params.copy_elements_per_lane));
-  return Fragment({Integer(params.block_m), Integer(params.block_k)}, {local},
-                  thread, Integer(1), std::nullopt);
+  PrimExpr segment = mapped_row * params.copy_segments_per_row +
+                     floordiv(col, Integer(params.copy_elements_per_lane));
+  PrimExpr thread = floormod(segment, Integer(params.block_threads));
+  PrimExpr transaction = floordiv(segment, Integer(params.block_threads));
+  PrimExpr intra = floormod(col, Integer(params.copy_elements_per_lane));
+  if (params.copy_transactions_per_lane == 1) {
+    return Fragment({Integer(params.block_m), Integer(params.block_k)},
+                    {intra}, thread, Integer(1), std::nullopt);
+  }
+  return Fragment({Integer(params.block_m), Integer(params.block_k)},
+                  {transaction, intra}, thread, Integer(1), std::nullopt);
 }
 
 void ValidateSameLayout(const Layout &actual, const Layout &expected,
@@ -218,6 +223,10 @@ void HcuGemmALdsStrategyNode::RegisterReflection() {
       .def_ro("element_bytes", &HcuGemmALdsStrategyNode::element_bytes)
       .def_ro("copy_bytes_per_lane",
               &HcuGemmALdsStrategyNode::copy_bytes_per_lane)
+      .def_ro("copy_transaction_bytes",
+              &HcuGemmALdsStrategyNode::copy_transaction_bytes)
+      .def_ro("copy_transactions_per_lane",
+              &HcuGemmALdsStrategyNode::copy_transactions_per_lane)
       .def_ro("read_bytes_per_lane",
               &HcuGemmALdsStrategyNode::read_bytes_per_lane)
       .def_ro("row_period", &HcuGemmALdsStrategyNode::row_period)
@@ -305,18 +314,22 @@ DeriveHcuGemmALdsStrategy(const CopyNode &copy, const GemmNode &gemm,
     return std::nullopt;
   }
   params.copy_bytes_per_lane = static_cast<int>(tile_bytes / block_threads);
+  params.copy_transaction_bytes = kAsyncCopyTransactionBytes;
   params.read_bytes_per_lane = kReadBytesPerLane;
-  if (params.copy_bytes_per_lane != kAsyncCopyBytesPerLane ||
+  if (params.copy_bytes_per_lane < params.copy_transaction_bytes ||
+      params.copy_bytes_per_lane % params.copy_transaction_bytes != 0 ||
       params.copy_bytes_per_lane % params.element_bytes != 0 ||
       params.read_bytes_per_lane % params.element_bytes != 0 ||
-      params.copy_bytes_per_lane % params.read_bytes_per_lane != 0) {
+      params.copy_transaction_bytes % params.read_bytes_per_lane != 0) {
     return std::nullopt;
   }
+  params.copy_transactions_per_lane =
+      params.copy_bytes_per_lane / params.copy_transaction_bytes;
 
   // MMAC A VGPR layout: each lane reads 4 half values, i.e. one b64.
   const int row_bytes = block_k * params.element_bytes;
   if (row_bytes % params.bank_width_bytes != 0 ||
-      row_bytes % params.copy_bytes_per_lane != 0 ||
+      row_bytes % params.copy_transaction_bytes != 0 ||
       row_bytes % params.read_bytes_per_lane != 0) {
     return std::nullopt;
   }
@@ -326,13 +339,20 @@ DeriveHcuGemmALdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   params.row_period =
       params.bank_num / std::gcd(params.bank_num, params.row_bank_stride);
   params.copy_elements_per_lane =
-      params.copy_bytes_per_lane / params.element_bytes;
-  params.copy_segments_per_row = row_bytes / params.copy_bytes_per_lane;
+      params.copy_transaction_bytes / params.element_bytes;
+  params.copy_segments_per_row = row_bytes / params.copy_transaction_bytes;
   params.read_elements_per_lane =
       params.read_bytes_per_lane / params.element_bytes;
   params.read_segments_per_row = row_bytes / params.read_bytes_per_lane;
   params.segment_shift =
-      params.copy_bytes_per_lane / params.read_bytes_per_lane;
+      params.copy_transaction_bytes / params.read_bytes_per_lane;
+  const int64_t copy_segment_count =
+      static_cast<int64_t>(block_m) * params.copy_segments_per_row;
+  if (copy_segment_count % block_threads != 0 ||
+      copy_segment_count / block_threads !=
+          params.copy_transactions_per_lane) {
+    return std::nullopt;
+  }
   if (warp_size % params.copy_segments_per_row != 0) {
     return std::nullopt;
   }
@@ -370,6 +390,8 @@ DeriveHcuGemmALdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   node->bank_width_bytes = params.bank_width_bytes;
   node->element_bytes = params.element_bytes;
   node->copy_bytes_per_lane = params.copy_bytes_per_lane;
+  node->copy_transaction_bytes = params.copy_transaction_bytes;
+  node->copy_transactions_per_lane = params.copy_transactions_per_lane;
   node->read_bytes_per_lane = params.read_bytes_per_lane;
   node->row_bank_stride = params.row_bank_stride;
   node->row_period = params.row_period;

@@ -176,6 +176,9 @@ bool HaveSameGemmAStrategyParameters(const HcuGemmALdsStrategy &lhs,
          lhs->bank_width_bytes == rhs->bank_width_bytes &&
          lhs->element_bytes == rhs->element_bytes &&
          lhs->copy_bytes_per_lane == rhs->copy_bytes_per_lane &&
+         lhs->copy_transaction_bytes == rhs->copy_transaction_bytes &&
+         lhs->copy_transactions_per_lane ==
+             rhs->copy_transactions_per_lane &&
          lhs->read_bytes_per_lane == rhs->read_bytes_per_lane &&
          lhs->row_period == rhs->row_period &&
          lhs->row_bank_stride == rhs->row_bank_stride &&
