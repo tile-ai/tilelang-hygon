@@ -10,8 +10,11 @@
 
 #include <tvm/arith/analyzer.h>
 
+#include <algorithm>
 #include <array>
+#include <limits>
 #include <optional>
+#include <tuple>
 #include <vector>
 
 namespace tvm {
@@ -21,7 +24,7 @@ using namespace tirx;
 
 namespace {
 
-constexpr int kStrategyVersion = 1;
+constexpr int kStrategyVersion = 2;
 constexpr int kDsReadTileK = 16;
 constexpr int kDsReadPanelN = 32;
 constexpr int kDsReadPhaseBytes = 128;
@@ -51,6 +54,8 @@ struct GemmBStrategyParams {
   int bank_width_bytes{0};
   int element_bytes{0};
   int copy_bytes_per_lane{0};
+  int copy_transaction_bytes{0};
+  int copy_transactions_per_lane{0};
   int read_bytes_per_lane{0};
   int phase_bytes{0};
   int panel_n{0};
@@ -58,6 +63,15 @@ struct GemmBStrategyParams {
   int copy_segments_per_row{0};
   int wrap_offset{0};
   int wrap_idx_mask{0};
+};
+
+struct BankConflictScore {
+  int max_bank_uses{0};
+  int total_conflicts{0};
+  int first_panel{-1};
+  int first_phase{-1};
+  int first_lane{-1};
+  int first_bank{-1};
 };
 
 std::optional<int64_t> StaticExtent(const Array<Range> &ranges, size_t dim) {
@@ -69,6 +83,10 @@ std::optional<int64_t> StaticExtent(const Array<Range> &ranges, size_t dim) {
     return std::nullopt;
   }
   return *extent;
+}
+
+bool IsPowerOfTwo(int value) {
+  return value > 0 && (value & (value - 1)) == 0;
 }
 
 int64_t RequireConst(const PrimExpr &expr, arith::Analyzer *analyzer,
@@ -84,15 +102,33 @@ int64_t RequireConst(const PrimExpr &expr, arith::Analyzer *analyzer,
 Fragment MakeCopyLoopLayout(const GemmBStrategyParams &params) {
   PrimExpr k = InputPlaceholder(0);
   PrimExpr n = InputPlaceholder(1);
-  PrimExpr segment = floordiv(n, Integer(params.copy_elements_per_lane));
-  PrimExpr copy_warp = floordiv(k, Integer(4)) * 2 + floormod(k, Integer(2));
-  PrimExpr copy_lane = floordiv(floormod(k, Integer(4)), Integer(2)) *
-                           params.copy_segments_per_row +
-                       segment;
-  PrimExpr thread = copy_warp * params.warp_size + copy_lane;
-  PrimExpr local = floormod(n, Integer(params.copy_elements_per_lane));
-  return Fragment({Integer(params.block_k), Integer(params.block_n)}, {local},
-                  thread, Integer(1), std::nullopt);
+  PrimExpr k_tile = floordiv(k, Integer(kDsReadTileK));
+  PrimExpr k_inner = floormod(k, Integer(kDsReadTileK));
+  PrimExpr n_segment =
+      floordiv(n, Integer(params.copy_elements_per_lane));
+  // Follow the ds_read_m32x16 phase row order within each K16 tile:
+  //   0, 2, 1, 3, 4, 6, 5, 7, ...
+  // Flattening this row order with the N segments reproduces the established
+  // K16xN256/512-thread mapping and remains compact for other legal shapes.
+  PrimExpr permuted_k_inner =
+      floordiv(k_inner, Integer(4)) * 4 +
+      floormod(k_inner, Integer(2)) * 2 +
+      floordiv(floormod(k_inner, Integer(4)), Integer(2));
+  PrimExpr canonical_segment =
+      (k_tile * kDsReadTileK + permuted_k_inner) *
+          params.copy_segments_per_row +
+      n_segment;
+  PrimExpr transaction =
+      floordiv(canonical_segment, Integer(params.block_threads));
+  PrimExpr thread =
+      floormod(canonical_segment, Integer(params.block_threads));
+  PrimExpr intra = floormod(n, Integer(params.copy_elements_per_lane));
+  if (params.copy_transactions_per_lane == 1) {
+    return Fragment({Integer(params.block_k), Integer(params.block_n)},
+                    {intra}, thread, Integer(1), std::nullopt);
+  }
+  return Fragment({Integer(params.block_k), Integer(params.block_n)},
+                  {transaction, intra}, thread, Integer(1), std::nullopt);
 }
 
 Layout MakeStorageLayout(const GemmBStrategyParams &params,
@@ -102,7 +138,10 @@ Layout MakeStorageLayout(const GemmBStrategyParams &params,
   Array<PrimExpr> logical = {k, n};
   PrimExpr thread = copy_layout->ForwardThread(logical, std::nullopt);
   Array<PrimExpr> local = copy_layout->Forward(logical);
-  ICHECK_EQ(local.size(), 1U);
+  ICHECK(local.size() == 1U || local.size() == 2U);
+  PrimExpr transaction =
+      local.size() == 2U ? local[0] : make_const(thread->dtype, 0);
+  PrimExpr intra = local[local.size() - 1];
 
   PrimExpr copy_warp = floordiv(thread, Integer(params.warp_size));
   PrimExpr copy_lane = floormod(thread, Integer(params.warp_size));
@@ -111,9 +150,10 @@ Layout MakeStorageLayout(const GemmBStrategyParams &params,
   PrimExpr physical_lane =
       floormod(copy_lane + wrap, Integer(params.warp_size));
   PrimExpr physical_offset =
-      (copy_warp * params.warp_size + physical_lane) *
+      (transaction * params.block_threads + copy_warp * params.warp_size +
+       physical_lane) *
           params.copy_elements_per_lane +
-      local[0];
+      intra;
   Array<PrimExpr> physical = {
       floordiv(physical_offset, Integer(params.block_n)),
       floormod(physical_offset, Integer(params.block_n))};
@@ -153,7 +193,7 @@ void ValidateSameLayout(const Layout &actual, const Layout &expected, int block_
 
 void ValidateCopyStorageConsistency(const HcuGemmBLdsStrategy &strategy) {
   const int copy_elements =
-      strategy->copy_bytes_per_lane / strategy->element_bytes;
+      strategy->copy_transaction_bytes / strategy->element_bytes;
   arith::Analyzer analyzer;
   for (int k = 0; k < strategy->block_k; ++k) {
     for (int n = 0; n < strategy->block_n; ++n) {
@@ -162,12 +202,18 @@ void ValidateCopyStorageConsistency(const HcuGemmBLdsStrategy &strategy) {
           strategy->copy_loop_layout->ForwardThread(logical, std::nullopt),
           &analyzer, "copy thread", k, n);
       Array<PrimExpr> local = strategy->copy_loop_layout->Forward(logical);
-      ICHECK_EQ(local.size(), 1U)
-          << "HCU GEMM B copy layout must have one local index";
-      int64_t local_index =
-          RequireConst(local[0], &analyzer, "copy local", k, n);
+      ICHECK(local.size() == 1U || local.size() == 2U)
+          << "HCU GEMM B copy layout must have transaction/intra indices";
+      int64_t transaction =
+          local.size() == 2U
+              ? RequireConst(local[0], &analyzer, "copy transaction", k, n)
+              : 0;
+      int64_t local_index = RequireConst(
+          local[local.size() - 1], &analyzer, "copy local", k, n);
       ICHECK_GE(thread, 0);
       ICHECK_LT(thread, strategy->block_threads);
+      ICHECK_GE(transaction, 0);
+      ICHECK_LT(transaction, strategy->copy_transactions_per_lane);
       ICHECK_GE(local_index, 0);
       ICHECK_LT(local_index, copy_elements);
 
@@ -177,7 +223,9 @@ void ValidateCopyStorageConsistency(const HcuGemmBLdsStrategy &strategy) {
                      strategy->wrap_offset;
       int64_t physical_lane = (copy_lane + wrap) % strategy->warp_size;
       int64_t expected_offset =
-          (copy_warp * strategy->warp_size + physical_lane) * copy_elements +
+          (transaction * strategy->block_threads +
+           copy_warp * strategy->warp_size + physical_lane) *
+              copy_elements +
           local_index;
 
       Array<PrimExpr> physical = strategy->storage_layout->Forward(logical);
@@ -195,41 +243,108 @@ void ValidateCopyStorageConsistency(const HcuGemmBLdsStrategy &strategy) {
   }
 }
 
-void ValidateDsReadBankConflicts(const HcuGemmBLdsStrategy &strategy) {
-  ICHECK_EQ(strategy->read_bytes_per_lane % strategy->bank_width_bytes, 0);
+BankConflictScore EvaluateDsReadBankConflicts(
+    const Layout &storage_layout, const GemmBStrategyParams &params) {
+  ICHECK_EQ(params.read_bytes_per_lane % params.bank_width_bytes, 0);
   const int banks_per_read =
-      strategy->read_bytes_per_lane / strategy->bank_width_bytes;
+      params.read_bytes_per_lane / params.bank_width_bytes;
+  BankConflictScore score;
   arith::Analyzer analyzer;
-  for (int panel = 0; panel < strategy->block_n / strategy->panel_n; ++panel) {
-    for (int phase = 0; phase < kDsReadPhaseCount; ++phase) {
-      std::vector<int> bank_uses(strategy->bank_num, 0);
-      for (int lane : kDsReadPhaseLanes[phase]) {
-        int k = lane >> 2;
-        int n = panel * strategy->panel_n + (lane & 3) * 8;
-        Array<PrimExpr> physical =
-            strategy->storage_layout->Forward({Integer(k), Integer(n)});
-        ICHECK_EQ(physical.size(), 2U);
-        int64_t physical_k =
-            RequireConst(physical[0], &analyzer, "ds-read row", k, n);
-        int64_t physical_n =
-            RequireConst(physical[1], &analyzer, "ds-read column", k, n);
-        int64_t byte_offset =
-            (physical_k * strategy->block_n + physical_n) *
-            strategy->element_bytes;
-        ICHECK_EQ(byte_offset % strategy->bank_width_bytes, 0)
-            << "HCU GEMM B ds-read address must be bank aligned";
-        int start_bank = static_cast<int>(
-            (byte_offset / strategy->bank_width_bytes) % strategy->bank_num);
-        for (int bank = 0; bank < banks_per_read; ++bank) {
-          int current = (start_bank + bank) % strategy->bank_num;
-          ICHECK_EQ(bank_uses[current]++, 0)
-              << "HCU GEMM B ds_read_m32x16_b16 bank conflict at panel "
-              << panel << ", phase " << phase << ", lane T" << lane
-              << ", bank " << current;
+  for (int k_tile = 0; k_tile < params.block_k / kDsReadTileK; ++k_tile) {
+    for (int panel = 0; panel < params.block_n / params.panel_n; ++panel) {
+      for (int phase = 0; phase < kDsReadPhaseCount; ++phase) {
+        std::vector<int> bank_uses(params.bank_num, 0);
+        for (int lane : kDsReadPhaseLanes[phase]) {
+          int k = k_tile * kDsReadTileK + (lane >> 2);
+          int n = panel * params.panel_n + (lane & 3) * 8;
+          Array<PrimExpr> physical =
+              storage_layout->Forward({Integer(k), Integer(n)});
+          ICHECK_EQ(physical.size(), 2U);
+          int64_t physical_k =
+              RequireConst(physical[0], &analyzer, "ds-read row", k, n);
+          int64_t physical_n =
+              RequireConst(physical[1], &analyzer, "ds-read column", k, n);
+          int64_t byte_offset =
+              (physical_k * params.block_n + physical_n) * params.element_bytes;
+          ICHECK_EQ(byte_offset % params.bank_width_bytes, 0)
+              << "HCU GEMM B ds-read address must be bank aligned";
+          int start_bank = static_cast<int>(
+              (byte_offset / params.bank_width_bytes) % params.bank_num);
+          for (int bank = 0; bank < banks_per_read; ++bank) {
+            int current = (start_bank + bank) % params.bank_num;
+            int uses = ++bank_uses[current];
+            score.max_bank_uses = std::max(score.max_bank_uses, uses);
+            if (uses > 1) {
+              ++score.total_conflicts;
+              if (score.first_panel < 0) {
+                score.first_panel = panel;
+                score.first_phase = phase;
+                score.first_lane = lane;
+                score.first_bank = current;
+              }
+            }
+          }
         }
       }
     }
   }
+  return score;
+}
+
+bool SelectWrapStrategy(GemmBStrategyParams *params, const Fragment &copy_layout,
+                        Target target) {
+  if (params->block_threads % params->warp_size != 0) {
+    return false;
+  }
+  params->wrap_offset = 0;
+  params->wrap_idx_mask = 0;
+  Layout linear_storage = MakeStorageLayout(*params, copy_layout);
+  BankConflictScore linear_score =
+      EvaluateDsReadBankConflicts(linear_storage, *params);
+  if (linear_score.max_bank_uses <= 1) {
+    return true;
+  }
+
+  const int max_wrap_offset = TargetHcuGetLdsWrapMaxOffset(
+      target, params->copy_transaction_bytes);
+  if (max_wrap_offset <= 0) {
+    return false;
+  }
+  const int copy_warps = params->block_threads / params->warp_size;
+  std::tuple<int, int, int> best_key = {
+      std::numeric_limits<int>::max(), std::numeric_limits<int>::max(),
+      std::numeric_limits<int>::max()};
+  bool found = false;
+
+  // wrap_idx_mask is restricted to 2^n-1 so `(warp & mask)` forms a
+  // repeatable swizzle period. The physical warp count must contain a whole
+  // number of those periods; otherwise transaction folding changes the
+  // swizzle assignment.
+  for (int period = 2; period <= copy_warps; period *= 2) {
+    if (copy_warps % period != 0) {
+      continue;
+    }
+    const int mask = period - 1;
+    for (int offset = 1; offset * mask <= max_wrap_offset; ++offset) {
+      GemmBStrategyParams candidate = *params;
+      candidate.wrap_offset = offset;
+      candidate.wrap_idx_mask = mask;
+      Layout storage_layout = MakeStorageLayout(candidate, copy_layout);
+      BankConflictScore score =
+          EvaluateDsReadBankConflicts(storage_layout, candidate);
+      if (score.max_bank_uses > 1) {
+        continue;
+      }
+      std::tuple<int, int, int> key = {offset * mask, offset, mask};
+      if (!found || key < best_key) {
+        found = true;
+        best_key = key;
+        params->wrap_offset = offset;
+        params->wrap_idx_mask = mask;
+      }
+    }
+  }
+  return found;
 }
 
 } // namespace
@@ -247,6 +362,10 @@ void HcuGemmBLdsStrategyNode::RegisterReflection() {
       .def_ro("element_bytes", &HcuGemmBLdsStrategyNode::element_bytes)
       .def_ro("copy_bytes_per_lane",
               &HcuGemmBLdsStrategyNode::copy_bytes_per_lane)
+      .def_ro("copy_transaction_bytes",
+              &HcuGemmBLdsStrategyNode::copy_transaction_bytes)
+      .def_ro("copy_transactions_per_lane",
+              &HcuGemmBLdsStrategyNode::copy_transactions_per_lane)
       .def_ro("read_bytes_per_lane",
               &HcuGemmBLdsStrategyNode::read_bytes_per_lane)
       .def_ro("phase_bytes", &HcuGemmBLdsStrategyNode::phase_bytes)
@@ -276,8 +395,11 @@ DeriveHcuGemmBLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   std::optional<int64_t> dst_k = StaticExtent(copy.dst_range, dst_rank - 2);
   std::optional<int64_t> dst_n = StaticExtent(copy.dst_range, dst_rank - 1);
   if (!src_k || !src_n || !dst_k || !dst_n || *src_k != *dst_k ||
-      *src_n != *dst_n || *dst_k != kDsReadTileK || *dst_n != 256 ||
-      gemm.k_ != *dst_k || gemm.n_ != *dst_n) {
+      *src_n != *dst_n || *dst_k <= 0 || *dst_n <= 0 ||
+      *dst_k % kDsReadTileK != 0 || *dst_n % kDsReadPanelN != 0 ||
+      !IsPowerOfTwo(static_cast<int>(*dst_k)) ||
+      !IsPowerOfTwo(static_cast<int>(*dst_n)) || gemm.k_ != *dst_k ||
+      gemm.n_ != *dst_n) {
     return std::nullopt;
   }
 
@@ -292,41 +414,39 @@ DeriveHcuGemmBLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   params.read_bytes_per_lane = kDsReadBytesPerLane;
   params.phase_bytes = kDsReadPhaseBytes;
   params.panel_n = kDsReadPanelN;
-  if (params.warp_size != 64 || params.block_threads != 512 ||
+  if (params.warp_size != 64 ||
+      params.block_threads % params.warp_size != 0 ||
       copy.dst->dtype.bits() != 16 ||
       params.phase_bytes % params.read_bytes_per_lane != 0 ||
       params.block_n % params.panel_n != 0) {
     return std::nullopt;
   }
 
+  params.copy_transaction_bytes = kAsyncCopyBytesPerLane;
   int64_t tile_bytes = static_cast<int64_t>(params.block_k) * params.block_n *
                        params.element_bytes;
-  if (tile_bytes % params.block_threads != 0) {
+  if (tile_bytes % params.copy_transaction_bytes != 0) {
     return std::nullopt;
   }
+  const int64_t total_transactions =
+      tile_bytes / params.copy_transaction_bytes;
+  params.copy_transactions_per_lane = static_cast<int>(
+      (total_transactions + params.block_threads - 1) / params.block_threads);
   params.copy_bytes_per_lane =
-      static_cast<int>(tile_bytes / params.block_threads);
-  if (params.copy_bytes_per_lane != kAsyncCopyBytesPerLane ||
-      params.copy_bytes_per_lane % params.element_bytes != 0) {
+      params.copy_transactions_per_lane * params.copy_transaction_bytes;
+  if (params.copy_transactions_per_lane <= 0 ||
+      params.copy_transaction_bytes % params.element_bytes != 0) {
     return std::nullopt;
   }
   params.copy_elements_per_lane =
-      params.copy_bytes_per_lane / params.element_bytes;
+      params.copy_transaction_bytes / params.element_bytes;
   params.copy_segments_per_row =
       params.block_n / params.copy_elements_per_lane;
 
-  // Each phase has two four-request row-parity groups.  Moving the second
-  // group by four 16-byte copy segments separates their bank footprints.
-  params.wrap_offset =
-      params.phase_bytes / params.read_bytes_per_lane / 2;
-  params.wrap_idx_mask = 1;
-  const int wrap_field_bits = TargetHcuGetLdsWrapFieldBits(target);
-  if (wrap_field_bits <= 0 ||
-      params.wrap_offset * params.wrap_idx_mask >= (1 << wrap_field_bits)) {
+  Fragment copy_layout = MakeCopyLoopLayout(params);
+  if (!SelectWrapStrategy(&params, copy_layout, target)) {
     return std::nullopt;
   }
-
-  Fragment copy_layout = MakeCopyLoopLayout(params);
   Layout storage_layout = MakeStorageLayout(params, copy_layout);
   auto node = ffi::make_object<HcuGemmBLdsStrategyNode>();
   node->strategy_version = kStrategyVersion;
@@ -338,6 +458,8 @@ DeriveHcuGemmBLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   node->bank_width_bytes = params.bank_width_bytes;
   node->element_bytes = params.element_bytes;
   node->copy_bytes_per_lane = params.copy_bytes_per_lane;
+  node->copy_transaction_bytes = params.copy_transaction_bytes;
+  node->copy_transactions_per_lane = params.copy_transactions_per_lane;
   node->read_bytes_per_lane = params.read_bytes_per_lane;
   node->phase_bytes = params.phase_bytes;
   node->panel_n = params.panel_n;
@@ -347,7 +469,12 @@ DeriveHcuGemmBLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   node->copy_loop_layout = copy_layout;
   HcuGemmBLdsStrategy strategy(std::move(node));
   ValidateCopyStorageConsistency(strategy);
-  ValidateDsReadBankConflicts(strategy);
+  BankConflictScore score =
+      EvaluateDsReadBankConflicts(strategy->storage_layout, params);
+  ICHECK_LE(score.max_bank_uses, 1)
+      << "HCU GEMM B ds_read_m32x16_b16 bank conflict at panel "
+      << score.first_panel << ", phase " << score.first_phase << ", lane T"
+      << score.first_lane << ", bank " << score.first_bank;
   return strategy;
 }
 

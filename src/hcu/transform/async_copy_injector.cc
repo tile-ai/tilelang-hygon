@@ -578,7 +578,7 @@ private:
       const HcuGemmBLdsStrategy &strategy = gemm_b_strategy_.value();
       dst_access_ptr = MakeGemmCommandDstAccessPtr(
           store->buffer, num_elems, strategy->copy_bytes_per_lane,
-          strategy->copy_bytes_per_lane, strategy->block_threads,
+          strategy->copy_transaction_bytes, strategy->block_threads,
           strategy->block_n, "B");
     } else {
       dst_access_ptr =
@@ -641,11 +641,59 @@ private:
     return stride == 1;
   }
 
+  int GetGemmStrategyBlockThreads() const {
+    if (gemm_a_strategy_.defined()) {
+      return gemm_a_strategy_.value()->block_threads;
+    }
+    if (gemm_b_strategy_.defined()) {
+      return gemm_b_strategy_.value()->block_threads;
+    }
+    return 0;
+  }
+
+  bool HasUnitStrideForEveryThread(const PrimExpr &expr,
+                                   const ActiveVectorizedLoop &loop,
+                                   int block_threads) {
+    ICHECK(thread_var_.defined());
+    for (int thread = 0; thread < block_threads; ++thread) {
+      PrimExpr prev = analyzer_.Simplify(Substitute(
+          expr, {{thread_var_, IntImm(thread_var_->dtype, thread)},
+                 {loop.loop_var, IntImm(loop.loop_var->dtype, 0)}}));
+      for (int value = 1; value < loop.extent; ++value) {
+        PrimExpr curr = analyzer_.Simplify(Substitute(
+            expr, {{thread_var_, IntImm(thread_var_->dtype, thread)},
+                   {loop.loop_var, IntImm(loop.loop_var->dtype, value)}}));
+        int64_t delta = 0;
+        if (!TryGetConstInt64(analyzer_.Simplify(curr - prev), &delta) ||
+            delta != 1) {
+          return false;
+        }
+        prev = curr;
+      }
+    }
+    return true;
+  }
+
   bool HasContiguousVectorizedOffsets(const PrimExpr &src_index,
                                       const PrimExpr &dst_index) {
+    const int strategy_block_threads = GetGemmStrategyBlockThreads();
     for (const auto &loop : active_vectorized_loops_) {
-      if (!HasUnitStrideForVectorizedLoop(src_index, loop) ||
-          !HasUnitStrideForVectorizedLoop(dst_index, loop)) {
+      bool src_contiguous = HasUnitStrideForVectorizedLoop(src_index, loop);
+      bool dst_contiguous = HasUnitStrideForVectorizedLoop(dst_index, loop);
+      // Strategy-generated layouts can retain floor/mod expressions that are
+      // contiguous for every concrete lane but not simplifiable with symbolic
+      // threadIdx.x. Prove the same property over the finite thread domain.
+      if (strategy_block_threads > 0) {
+        if (!src_contiguous) {
+          src_contiguous = HasUnitStrideForEveryThread(
+              src_index, loop, strategy_block_threads);
+        }
+        if (!dst_contiguous) {
+          dst_contiguous = HasUnitStrideForEveryThread(
+              dst_index, loop, strategy_block_threads);
+        }
+      }
+      if (!src_contiguous || !dst_contiguous) {
         return false;
       }
     }

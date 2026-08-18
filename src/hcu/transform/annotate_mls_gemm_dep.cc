@@ -200,6 +200,9 @@ bool HaveSameGemmBStrategyParameters(const HcuGemmBLdsStrategy &lhs,
          lhs->bank_width_bytes == rhs->bank_width_bytes &&
          lhs->element_bytes == rhs->element_bytes &&
          lhs->copy_bytes_per_lane == rhs->copy_bytes_per_lane &&
+         lhs->copy_transaction_bytes == rhs->copy_transaction_bytes &&
+         lhs->copy_transactions_per_lane ==
+             rhs->copy_transactions_per_lane &&
          lhs->read_bytes_per_lane == rhs->read_bytes_per_lane &&
          lhs->phase_bytes == rhs->phase_bytes &&
          lhs->panel_n == rhs->panel_n &&

@@ -69,21 +69,14 @@ std::optional<int64_t> StaticExtent(const Array<Range> &ranges, size_t dim) {
   return *extent;
 }
 
-bool IsSupportedArch(Target target) {
-  const std::string arch = GetHcuArchString(target);
-  return arch == "gfx936" || arch == "gfx938";
-}
-
 bool IsPowerOfTwo(int value) {
   return value > 0 && (value & (value - 1)) == 0;
 }
 
-int SelectWrapOffset(const GemmAStrategyParams &params,
-                     int wrap_field_bits) {
-  if (wrap_field_bits <= 0) {
+int SelectWrapOffset(const GemmAStrategyParams &params, int max_wrap_offset) {
+  if (max_wrap_offset <= 0) {
     return 0;
   }
-  const int max_wrap_value = (1 << wrap_field_bits) - 1;
   const int banks_per_read =
       params.read_bytes_per_lane / params.bank_width_bytes;
   const int banks_per_copy =
@@ -96,7 +89,7 @@ int SelectWrapOffset(const GemmAStrategyParams &params,
     }
   }
   for (int offset = 1;
-       offset * params.wrap_idx_mask <= max_wrap_value; ++offset) {
+       offset * params.wrap_idx_mask <= max_wrap_offset; ++offset) {
     const int bank_shift = (offset * banks_per_copy) % params.bank_num;
     bool overlaps = false;
     for (int bank = 0; bank < params.bank_num; ++bank) {
@@ -246,7 +239,7 @@ Optional<HcuGemmALdsStrategy>
 DeriveHcuGemmALdsStrategy(const CopyNode &copy, const GemmNode &gemm,
                           int block_threads, Target target) {
   if (!TargetIsHCU(target) || !TargetHcuHasAsyncCopy(target) ||
-      !IsSupportedArch(target) || block_threads <= 0) {
+      block_threads <= 0) {
     return std::nullopt;
   }
   if (!IsGlobalBuffer(copy.src) || !IsSharedBuffer(copy.dst) ||
@@ -374,7 +367,8 @@ DeriveHcuGemmALdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   // In the current case, shifting one 16-byte segment moves exactly 4 banks,
   // so wrap_offset=1.
   params.wrap_offset =
-      SelectWrapOffset(params, TargetHcuGetLdsWrapFieldBits(target));
+      SelectWrapOffset(params, TargetHcuGetLdsWrapMaxOffset(
+                                   target, params.copy_transaction_bytes));
   if (params.wrap_offset == 0) {
     return std::nullopt;
   }

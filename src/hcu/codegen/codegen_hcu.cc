@@ -2287,11 +2287,42 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     ICHECK_EQ(wrap_offset != 0, wrap_idx_mask != 0)
         << "wrap_offset and wrap_idx_mask must be enabled together";
     if (wrap_offset != 0) {
-      // gfx936/gfx938 encode the wrap field in LDS address bits [20:16].
+      const tl::HcuLdsWrapConfig wrap_config =
+          tl::TargetHcuGetLdsWrapConfig(target_);
+      ICHECK(wrap_config.encoding != tl::HcuLdsWrapEncoding::kNone)
+          << "LDS wrap encoding is not defined for "
+          << tl::GetHcuArchString(target_);
+      ICHECK_EQ(total_bytes % 4, 0)
+          << "LDS wrap requires a dword-aligned async-copy transaction";
+      const int dwords_per_offset = total_bytes / 4;
+      std::string wrap_index = "((((int)threadIdx.x) >> 6) & " +
+                               std::to_string(wrap_idx_mask) + ")";
+      std::string dword_offset = "(" + wrap_index + " * " +
+                                 std::to_string(wrap_offset *
+                                                dwords_per_offset) +
+                                 ")";
+      std::string encoded_field;
+      switch (wrap_config.encoding) {
+      case tl::HcuLdsWrapEncoding::kFourDword:
+        ICHECK_EQ(dwords_per_offset % 4, 0)
+            << "BMZ LDS wrap requires a 4-dword-aligned offset unit";
+        encoded_field =
+            "(" + wrap_index + " * " +
+            std::to_string(wrap_offset * dwords_per_offset / 4) + ")";
+        break;
+      case tl::HcuLdsWrapEncoding::kHybridFourAndOneDword:
+        encoded_field = "((" + dword_offset + " / 4) | ((" + dword_offset +
+                        " % 4) << 3))";
+        break;
+      case tl::HcuLdsWrapEncoding::kOneDword:
+        encoded_field = dword_offset;
+        break;
+      case tl::HcuLdsWrapEncoding::kNone:
+        ICHECK(false) << "Unreachable LDS wrap encoding";
+      }
       dst = "reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(" + dst +
-            ") | static_cast<uint64_t>((((((int)threadIdx.x) >> 6) & " +
-            std::to_string(wrap_idx_mask) + ") * " +
-            std::to_string(wrap_offset) + ") << 16))";
+            ") | static_cast<uint64_t>((" + encoded_field + ") << " +
+            std::to_string(wrap_config.field_shift) + "))";
     }
 
     auto source = GetCPAsyncSourceInfo(op->args[1]);

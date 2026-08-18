@@ -148,7 +148,6 @@ private:
         lower_args.layout_map, par_op->GetPredicate(lower_args.thread_var),
         /*parallel_loop=*/true,
         /*should_vectorize=*/true, par_op->LoopLayoutRequiresPaddingGuard());
-
     auto inject_result =
         InjectHCUAsyncCopy(lowered_loop, /*async_without_async_commit_wait=*/
                            no_implicit_commit_wait || GetIsAsyncCopy(op),

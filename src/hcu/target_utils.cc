@@ -131,14 +131,53 @@ int TargetHcuGetLdsBankWidthBytes(Target target) {
   return 4;
 }
 
-int TargetHcuGetLdsWrapFieldBits(Target target) {
+HcuLdsWrapConfig TargetHcuGetLdsWrapConfig(Target target) {
   ICHECK(TargetIsHCU(target))
-      << "TargetHcuGetLdsWrapFieldBits requires HCU target";
+      << "TargetHcuGetLdsWrapConfig requires HCU target";
   const std::string arch = GetHcuArchString(target);
-  if (arch == "gfx936" || arch == "gfx938") {
-    return 5;
+  if (arch == "gfx936") {
+    return {/*field_bits=*/5, /*field_shift=*/16,
+            /*lds_offset_bits=*/16, HcuLdsWrapEncoding::kFourDword};
   }
-  return 0;
+  if (arch == "gfx938" || arch == "gfx92a") {
+    return {/*field_bits=*/5, /*field_shift=*/16,
+            /*lds_offset_bits=*/16,
+            HcuLdsWrapEncoding::kHybridFourAndOneDword};
+  }
+  if (arch == "gfx946") {
+    return {/*field_bits=*/6, /*field_shift=*/24,
+            /*lds_offset_bits=*/17, HcuLdsWrapEncoding::kOneDword};
+  }
+  return {};
+}
+
+int TargetHcuGetLdsWrapFieldBits(Target target) {
+  return TargetHcuGetLdsWrapConfig(target).field_bits;
+}
+
+int TargetHcuGetLdsWrapMaxOffset(Target target, int offset_unit_bytes) {
+  ICHECK_GT(offset_unit_bytes, 0);
+  ICHECK_EQ(offset_unit_bytes % 4, 0)
+      << "LDS wrap offset units must be dword aligned";
+  HcuLdsWrapConfig config = TargetHcuGetLdsWrapConfig(target);
+  if (config.encoding == HcuLdsWrapEncoding::kNone) {
+    return 0;
+  }
+
+  const int max_field_value = (1 << config.field_bits) - 1;
+  int max_dword_offset = 0;
+  switch (config.encoding) {
+  case HcuLdsWrapEncoding::kFourDword:
+    max_dword_offset = max_field_value * 4;
+    break;
+  case HcuLdsWrapEncoding::kHybridFourAndOneDword:
+  case HcuLdsWrapEncoding::kOneDword:
+    max_dword_offset = max_field_value;
+    break;
+  case HcuLdsWrapEncoding::kNone:
+    return 0;
+  }
+  return max_dword_offset / (offset_unit_bytes / 4);
 }
 
 TVM_REGISTER_TARGET_KIND("hcu", kDLROCM)
