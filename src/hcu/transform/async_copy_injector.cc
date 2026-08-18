@@ -19,6 +19,7 @@
 
 #include "hcu/transform/async_copy_injector.h"
 #include "hcu/utils/gemm_a_lds_strategy.h"
+#include "hcu/utils/gemm_b_lds_strategy.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "tir/ir/buffer_common.h"
@@ -41,6 +42,9 @@ public:
         buffer_remap_(std::move(buffer_remap)) {
     if (auto value = call_annotations_.Get(attr::kHcuGemmALdsStrategy)) {
       gemm_a_strategy_ = Downcast<HcuGemmALdsStrategy>(value.value());
+    }
+    if (auto value = call_annotations_.Get(attr::kHcuGemmBLdsStrategy)) {
+      gemm_b_strategy_ = Downcast<HcuGemmBLdsStrategy>(value.value());
     }
   }
 
@@ -480,18 +484,18 @@ private:
                  IntImm(DataType::Int(32), rw_mask)});
   }
 
-  PrimExpr MakeGemmACommandDstAccessPtr(const Buffer &buffer,
-                                        int num_elems) {
-    ICHECK(gemm_a_strategy_.defined());
+  PrimExpr MakeGemmCommandDstAccessPtr(const Buffer &buffer, int num_elems,
+                                       int copy_bytes_per_lane, int inner_extent,
+                                       const char *operand) {
     ICHECK(thread_var_.defined());
-    const HcuGemmALdsStrategy &strategy = gemm_a_strategy_.value();
     const int element_bits = buffer->dtype.bits() * buffer->dtype.lanes();
     ICHECK_GT(element_bits, 0);
-    ICHECK_EQ((strategy->copy_bytes_per_lane * 8) % element_bits, 0);
+    ICHECK_EQ((copy_bytes_per_lane * 8) % element_bits, 0);
     const int copy_elements_per_lane =
-        strategy->copy_bytes_per_lane * 8 / element_bits;
+        copy_bytes_per_lane * 8 / element_bits;
     ICHECK_EQ(num_elems * current_vectorized_lanes_, copy_elements_per_lane)
-        << "HCU GEMM A strategy expects " << copy_elements_per_lane
+        << "HCU GEMM " << operand << " strategy expects "
+        << copy_elements_per_lane
         << " elements per thread, but async-copy lowering produced "
         << num_elems * current_vectorized_lanes_;
 
@@ -502,13 +506,14 @@ private:
     PrimExpr physical_offset = analyzer_.Simplify(
         thread_var_ * copy_elements_per_lane + local_offset * num_elems);
     Array<PrimExpr> physical_indices = {
-        floordiv(physical_offset, Integer(strategy->block_k)),
-        floormod(physical_offset, Integer(strategy->block_k))};
+        floordiv(physical_offset, Integer(inner_extent)),
+        floormod(physical_offset, Integer(inner_extent))};
     // Address the remapped buffer directly so the enclosing layout lowering
     // does not apply the final LDS storage layout to this pre-wrap address.
     Optional<Buffer> physical_buffer = buffer_remap_.Get(buffer);
     ICHECK(physical_buffer.defined())
-        << "HCU GEMM A strategy requires a remapped physical LDS buffer for "
+        << "HCU GEMM " << operand
+        << " strategy requires a remapped physical LDS buffer for "
         << buffer->name;
     return MakeAccessPtrFromLoad(
         BufferLoad(physical_buffer.value(), physical_indices), num_elems,
@@ -520,10 +525,21 @@ private:
                            const BufferLoad &dst_base_load,
                            const BufferLoad &src_base_load, int num_elems,
                            bool predicated, const PrimExpr &predicate_value) {
-    PrimExpr dst_access_ptr =
-        gemm_a_strategy_.defined()
-            ? MakeGemmACommandDstAccessPtr(store->buffer, num_elems)
-            : MakeAccessPtrFromLoad(dst_base_load, num_elems, /*rw_mask=*/2);
+    PrimExpr dst_access_ptr;
+    if (gemm_a_strategy_.defined()) {
+      const HcuGemmALdsStrategy &strategy = gemm_a_strategy_.value();
+      dst_access_ptr = MakeGemmCommandDstAccessPtr(
+          store->buffer, num_elems, strategy->copy_bytes_per_lane,
+          strategy->block_k, "A");
+    } else if (gemm_b_strategy_.defined()) {
+      const HcuGemmBLdsStrategy &strategy = gemm_b_strategy_.value();
+      dst_access_ptr = MakeGemmCommandDstAccessPtr(
+          store->buffer, num_elems, strategy->copy_bytes_per_lane,
+          strategy->block_n, "B");
+    } else {
+      dst_access_ptr =
+          MakeAccessPtrFromLoad(dst_base_load, num_elems, /*rw_mask=*/2);
+    }
     PrimExpr src_access_ptr =
         MakeAccessPtrFromLoad(src_base_load, num_elems, /*rw_mask=*/1);
 
@@ -721,6 +737,7 @@ private:
   bool async_without_async_commit_wait_{false};
   Map<String, ObjectRef> call_annotations_;
   Optional<HcuGemmALdsStrategy> gemm_a_strategy_;
+  Optional<HcuGemmBLdsStrategy> gemm_b_strategy_;
   Var thread_var_;
   Map<Buffer, Buffer> buffer_remap_;
   int current_vectorized_lanes_{1};
