@@ -106,6 +106,16 @@ TL_DEVICE bfloat16_t hcu_habs(bfloat16_t a) {
   return static_cast<bfloat16_t>(v >= 0.0f ? v : -v);
 }
 
+TL_DEVICE half_t hexp(half_t x) {
+  __half hx = static_cast<__half>(x);
+  return static_cast<half_t>(::hexp(hx));
+}
+
+TL_DEVICE bfloat16_t hexp(bfloat16_t x) {
+  __hip_bfloat16 bx = static_cast<__hip_bfloat16>(static_cast<float>(x));
+  return static_cast<bfloat16_t>(static_cast<float>(::hexp(bx)));
+}
+
 // __shfl overload for _Float16/half_t
 // There is no half_t version of __shfl in HIP, so we implement it ourselves
 // here.
