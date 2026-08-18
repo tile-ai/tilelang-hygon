@@ -18,8 +18,8 @@
 #include <vector>
 
 #include "hcu/transform/async_copy_injector.h"
-#include "hcu/utils/gemm_a_lds_strategy.h"
-#include "hcu/utils/gemm_b_lds_strategy.h"
+#include "hcu/utils/gemm_at_bn_lds_strategy.h"
+#include "hcu/utils/gemm_an_bt_lds_strategy.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "tir/ir/buffer_common.h"
@@ -40,11 +40,11 @@ public:
         call_annotations_(std::move(call_annotations)),
         thread_var_(std::move(thread_var)),
         buffer_remap_(std::move(buffer_remap)) {
-    if (auto value = call_annotations_.Get(attr::kHcuGemmALdsStrategy)) {
-      gemm_a_strategy_ = Downcast<HcuGemmALdsStrategy>(value.value());
+    if (auto value = call_annotations_.Get(attr::kHcuGemmAtBnLdsStrategy)) {
+      at_bn_strategy_ = Downcast<HcuGemmAtBnLdsStrategy>(value.value());
     }
-    if (auto value = call_annotations_.Get(attr::kHcuGemmBLdsStrategy)) {
-      gemm_b_strategy_ = Downcast<HcuGemmBLdsStrategy>(value.value());
+    if (auto value = call_annotations_.Get(attr::kHcuGemmAnBtLdsStrategy)) {
+      an_bt_strategy_ = Downcast<HcuGemmAnBtLdsStrategy>(value.value());
     }
   }
 
@@ -568,18 +568,18 @@ private:
                            const BufferLoad &src_base_load, int num_elems,
                            bool predicated, const PrimExpr &predicate_value) {
     PrimExpr dst_access_ptr;
-    if (gemm_a_strategy_.defined()) {
-      const HcuGemmALdsStrategy &strategy = gemm_a_strategy_.value();
+    if (at_bn_strategy_.defined()) {
+      const HcuGemmAtBnLdsStrategy &strategy = at_bn_strategy_.value();
       dst_access_ptr = MakeGemmCommandDstAccessPtr(
           store->buffer, num_elems, strategy->copy_bytes_per_lane,
           strategy->copy_transaction_bytes, strategy->block_threads,
-          strategy->block_k, "A");
-    } else if (gemm_b_strategy_.defined()) {
-      const HcuGemmBLdsStrategy &strategy = gemm_b_strategy_.value();
+          strategy->block_k, "AT/BN");
+    } else if (an_bt_strategy_.defined()) {
+      const HcuGemmAnBtLdsStrategy &strategy = an_bt_strategy_.value();
       dst_access_ptr = MakeGemmCommandDstAccessPtr(
           store->buffer, num_elems, strategy->copy_bytes_per_lane,
           strategy->copy_transaction_bytes, strategy->block_threads,
-          strategy->block_n, "B");
+          strategy->block_mn, "AN/BT");
     } else {
       dst_access_ptr =
           MakeAccessPtrFromLoad(dst_base_load, num_elems, /*rw_mask=*/2);
@@ -642,11 +642,11 @@ private:
   }
 
   int GetGemmStrategyBlockThreads() const {
-    if (gemm_a_strategy_.defined()) {
-      return gemm_a_strategy_.value()->block_threads;
+    if (at_bn_strategy_.defined()) {
+      return at_bn_strategy_.value()->block_threads;
     }
-    if (gemm_b_strategy_.defined()) {
-      return gemm_b_strategy_.value()->block_threads;
+    if (an_bt_strategy_.defined()) {
+      return an_bt_strategy_.value()->block_threads;
     }
     return 0;
   }
@@ -828,8 +828,8 @@ private:
 
   bool async_without_async_commit_wait_{false};
   Map<String, ObjectRef> call_annotations_;
-  Optional<HcuGemmALdsStrategy> gemm_a_strategy_;
-  Optional<HcuGemmBLdsStrategy> gemm_b_strategy_;
+  Optional<HcuGemmAtBnLdsStrategy> at_bn_strategy_;
+  Optional<HcuGemmAnBtLdsStrategy> an_bt_strategy_;
   Var thread_var_;
   Map<Buffer, Buffer> buffer_remap_;
   int current_vectorized_lanes_{1};

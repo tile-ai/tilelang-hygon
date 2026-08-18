@@ -12,8 +12,8 @@
 #include <optional>
 #include <vector>
 
-#include "hcu/utils/gemm_a_lds_strategy.h"
-#include "hcu/utils/gemm_b_lds_strategy.h"
+#include "hcu/utils/gemm_at_bn_lds_strategy.h"
+#include "hcu/utils/gemm_an_bt_lds_strategy.h"
 #include "layout/layout.h"
 #include "op/builtin.h"
 
@@ -153,8 +153,8 @@ private:
     bool has_wrap = wrap_offset_imm && wrap_offset_imm->value > 0 &&
                     wrap_idx_mask_imm && wrap_idx_mask_imm->value > 0;
     bool has_gemm_lds_strategy =
-        call->annotations.Get(attr::kHcuGemmALdsStrategy).has_value() ||
-        call->annotations.Get(attr::kHcuGemmBLdsStrategy).has_value();
+        call->annotations.Get(attr::kHcuGemmAtBnLdsStrategy).has_value() ||
+        call->annotations.Get(attr::kHcuGemmAnBtLdsStrategy).has_value();
     ICHECK_EQ(wrap_offset_imm != nullptr, wrap_idx_mask_imm != nullptr)
         << "wrap_offset and wrap_idx_mask must be specified together";
     if (!use_idxen && !has_wrap)

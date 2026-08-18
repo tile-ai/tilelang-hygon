@@ -90,7 +90,9 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
     a_respect_layout_map = _int_annotation(annotations, "tl.hcu_a_respect_layout_map")
     b_respect_layout_map = _int_annotation(annotations, "tl.hcu_b_respect_layout_map")
     a_from_async_copy_linear = _int_annotation(annotations, "tl.hcu_a_from_async_copy_linear")
-    a_auto_lds_strategy = _has_annotation(annotations, "tl.hcu_gemm_a_lds_strategy")
+    a_at_bn_auto_lds_strategy = _has_annotation(
+        annotations, "tl.hcu_gemm_at_bn_lds_strategy"
+    )
     b_from_async_copy_linear = _int_annotation(annotations, "tl.hcu_b_from_async_copy_linear")
     trans_c = _int_annotation(annotations, "trans_c")
     trans_a = bool(gemm_node.transA)
@@ -117,7 +119,7 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
         a_respect_layout_map=a_respect_layout_map,
         b_respect_layout_map=b_respect_layout_map,
         a_from_async_copy_linear=a_from_async_copy_linear,
-        a_auto_lds_strategy=a_auto_lds_strategy,
+        a_at_bn_auto_lds_strategy=a_at_bn_auto_lds_strategy,
         b_from_async_copy_linear=b_from_async_copy_linear,
         trans_c=trans_c,
         a_mls_trans=int(a_mls_trans),
@@ -307,7 +309,7 @@ class GemmHCUMMAC(GemmBase):
         )
         out = {self.C: frag_c}
         if _is_shared_like(self.A):
-            if meta.a_auto_lds_strategy:
+            if meta.a_at_bn_auto_lds_strategy:
                 pass
             elif meta.a_respect_layout_map:
                 logger.warning(

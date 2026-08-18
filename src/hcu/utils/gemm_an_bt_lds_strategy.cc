@@ -1,11 +1,12 @@
 /*!
- * \file gemm_b_lds_strategy.cc
- * \brief Compiler-derived LDS strategy for HCU GEMM B ds-read copies.
+ * \file gemm_an_bt_lds_strategy.cc
+ * \brief Compiler-derived LDS strategy for HCU GEMM AN/BT ds-read copies.
  */
 
-#include "gemm_b_lds_strategy.h"
+#include "gemm_an_bt_lds_strategy.h"
 
 #include "hcu/target_utils.h"
+#include "hcu/utils/gemm_lds_access.h"
 #include "op/utils.h"
 
 #include <tvm/arith/analyzer.h>
@@ -45,9 +46,9 @@ constexpr std::array<std::array<int, kDsReadRequestsPerPhase>,
                           {10, 14, 11, 15, 24, 28, 25, 29},
                           {34, 38, 35, 39, 48, 52, 49, 53}}};
 
-struct GemmBStrategyParams {
+struct AnBtStrategyParams {
   int block_k{0};
-  int block_n{0};
+  int block_mn{0};
   int block_threads{0};
   int warp_size{0};
   int bank_num{0};
@@ -58,7 +59,7 @@ struct GemmBStrategyParams {
   int copy_transactions_per_lane{0};
   int read_bytes_per_lane{0};
   int phase_bytes{0};
-  int panel_n{0};
+  int panel_mn{0};
   int copy_elements_per_lane{0};
   int copy_segments_per_row{0};
   int wrap_offset{0};
@@ -93,13 +94,13 @@ int64_t RequireConst(const PrimExpr &expr, arith::Analyzer *analyzer,
                      const char *kind, int k, int n) {
   PrimExpr simplified = analyzer->Simplify(expr);
   const int64_t *value = as_const_int(simplified);
-  ICHECK(value) << "HCU GEMM B " << kind
+  ICHECK(value) << "HCU GEMM AN/BT " << kind
                 << " mapping must be constant at logical coordinate (" << k
                 << ", " << n << "), got " << simplified;
   return *value;
 }
 
-Fragment MakeCopyLoopLayout(const GemmBStrategyParams &params) {
+Fragment MakeCopyLoopLayout(const AnBtStrategyParams &params) {
   PrimExpr k = InputPlaceholder(0);
   PrimExpr n = InputPlaceholder(1);
   PrimExpr k_tile = floordiv(k, Integer(kDsReadTileK));
@@ -124,14 +125,14 @@ Fragment MakeCopyLoopLayout(const GemmBStrategyParams &params) {
       floormod(canonical_segment, Integer(params.block_threads));
   PrimExpr intra = floormod(n, Integer(params.copy_elements_per_lane));
   if (params.copy_transactions_per_lane == 1) {
-    return Fragment({Integer(params.block_k), Integer(params.block_n)},
+    return Fragment({Integer(params.block_k), Integer(params.block_mn)},
                     {intra}, thread, Integer(1), std::nullopt);
   }
-  return Fragment({Integer(params.block_k), Integer(params.block_n)},
+  return Fragment({Integer(params.block_k), Integer(params.block_mn)},
                   {transaction, intra}, thread, Integer(1), std::nullopt);
 }
 
-Layout MakeStorageLayout(const GemmBStrategyParams &params,
+Layout MakeStorageLayout(const AnBtStrategyParams &params,
                          const Fragment &copy_layout) {
   PrimExpr k = InputPlaceholder(0);
   PrimExpr n = InputPlaceholder(1);
@@ -155,15 +156,15 @@ Layout MakeStorageLayout(const GemmBStrategyParams &params,
           params.copy_elements_per_lane +
       intra;
   Array<PrimExpr> physical = {
-      floordiv(physical_offset, Integer(params.block_n)),
-      floormod(physical_offset, Integer(params.block_n))};
+      floordiv(physical_offset, Integer(params.block_mn)),
+      floormod(physical_offset, Integer(params.block_mn))};
   Array<PrimExpr> input_shape = {Integer(params.block_k),
-                                 Integer(params.block_n)};
+                                 Integer(params.block_mn)};
   return Layout(input_shape, physical);
 }
 
 void ValidateSameLayout(const Layout &actual, const Layout &expected, int block_k,
-                        int block_n, const char *kind) {
+                        int block_mn, const char *kind) {
   ICHECK(actual.defined()) << kind << " layout is undefined";
   ICHECK(expected.defined()) << "Expected " << kind << " layout is undefined";
   ICHECK_EQ(actual->InputDim(), expected->InputDim())
@@ -172,7 +173,7 @@ void ValidateSameLayout(const Layout &actual, const Layout &expected, int block_
 
   arith::Analyzer analyzer;
   for (int k = 0; k < block_k; ++k) {
-    for (int n = 0; n < block_n; ++n) {
+    for (int n = 0; n < block_mn; ++n) {
       Array<PrimExpr> logical = {Integer(k), Integer(n)};
       Array<PrimExpr> actual_index = actual->Forward(logical);
       Array<PrimExpr> expected_index = expected->Forward(logical);
@@ -180,7 +181,7 @@ void ValidateSameLayout(const Layout &actual, const Layout &expected, int block_
       for (size_t dim = 0; dim < actual_index.size(); ++dim) {
         if (!is_zero(
                 analyzer.Simplify(actual_index[dim] - expected_index[dim]))) {
-          LOG(FATAL) << "HCU GEMM B " << kind
+          LOG(FATAL) << "HCU GEMM AN/BT " << kind
                      << " layout mismatch at logical coordinate (" << k << ", "
                      << n << "), dimension " << dim
                      << ": actual=" << actual_index[dim]
@@ -191,19 +192,19 @@ void ValidateSameLayout(const Layout &actual, const Layout &expected, int block_
   }
 }
 
-void ValidateCopyStorageConsistency(const HcuGemmBLdsStrategy &strategy) {
+void ValidateCopyStorageConsistency(const HcuGemmAnBtLdsStrategy &strategy) {
   const int copy_elements =
       strategy->copy_transaction_bytes / strategy->element_bytes;
   arith::Analyzer analyzer;
   for (int k = 0; k < strategy->block_k; ++k) {
-    for (int n = 0; n < strategy->block_n; ++n) {
+    for (int n = 0; n < strategy->block_mn; ++n) {
       Array<PrimExpr> logical = {Integer(k), Integer(n)};
       int64_t thread = RequireConst(
           strategy->copy_loop_layout->ForwardThread(logical, std::nullopt),
           &analyzer, "copy thread", k, n);
       Array<PrimExpr> local = strategy->copy_loop_layout->Forward(logical);
       ICHECK(local.size() == 1U || local.size() == 2U)
-          << "HCU GEMM B copy layout must have transaction/intra indices";
+          << "HCU GEMM AN/BT copy layout must have transaction/intra indices";
       int64_t transaction =
           local.size() == 2U
               ? RequireConst(local[0], &analyzer, "copy transaction", k, n)
@@ -234,9 +235,10 @@ void ValidateCopyStorageConsistency(const HcuGemmBLdsStrategy &strategy) {
           RequireConst(physical[0], &analyzer, "storage row", k, n);
       int64_t actual_n =
           RequireConst(physical[1], &analyzer, "storage column", k, n);
-      int64_t actual_offset = actual_k * strategy->block_n + actual_n;
+      int64_t actual_offset = actual_k * strategy->block_mn + actual_n;
       ICHECK_EQ(actual_offset, expected_offset)
-          << "HCU GEMM B copy/layout/wrap mismatch at logical coordinate (" << k
+          << "HCU GEMM AN/BT copy/layout/wrap mismatch at logical coordinate ("
+          << k
           << ", " << n << "): actual physical offset=" << actual_offset
           << ", expected=" << expected_offset;
     }
@@ -244,19 +246,19 @@ void ValidateCopyStorageConsistency(const HcuGemmBLdsStrategy &strategy) {
 }
 
 BankConflictScore EvaluateDsReadBankConflicts(
-    const Layout &storage_layout, const GemmBStrategyParams &params) {
+    const Layout &storage_layout, const AnBtStrategyParams &params) {
   ICHECK_EQ(params.read_bytes_per_lane % params.bank_width_bytes, 0);
   const int banks_per_read =
       params.read_bytes_per_lane / params.bank_width_bytes;
   BankConflictScore score;
   arith::Analyzer analyzer;
   for (int k_tile = 0; k_tile < params.block_k / kDsReadTileK; ++k_tile) {
-    for (int panel = 0; panel < params.block_n / params.panel_n; ++panel) {
+    for (int panel = 0; panel < params.block_mn / params.panel_mn; ++panel) {
       for (int phase = 0; phase < kDsReadPhaseCount; ++phase) {
         std::vector<int> bank_uses(params.bank_num, 0);
         for (int lane : kDsReadPhaseLanes[phase]) {
           int k = k_tile * kDsReadTileK + (lane >> 2);
-          int n = panel * params.panel_n + (lane & 3) * 8;
+          int n = panel * params.panel_mn + (lane & 3) * 8;
           Array<PrimExpr> physical =
               storage_layout->Forward({Integer(k), Integer(n)});
           ICHECK_EQ(physical.size(), 2U);
@@ -265,9 +267,9 @@ BankConflictScore EvaluateDsReadBankConflicts(
           int64_t physical_n =
               RequireConst(physical[1], &analyzer, "ds-read column", k, n);
           int64_t byte_offset =
-              (physical_k * params.block_n + physical_n) * params.element_bytes;
+              (physical_k * params.block_mn + physical_n) * params.element_bytes;
           ICHECK_EQ(byte_offset % params.bank_width_bytes, 0)
-              << "HCU GEMM B ds-read address must be bank aligned";
+              << "HCU GEMM AN/BT ds-read address must be bank aligned";
           int start_bank = static_cast<int>(
               (byte_offset / params.bank_width_bytes) % params.bank_num);
           for (int bank = 0; bank < banks_per_read; ++bank) {
@@ -291,7 +293,7 @@ BankConflictScore EvaluateDsReadBankConflicts(
   return score;
 }
 
-bool SelectWrapStrategy(GemmBStrategyParams *params, const Fragment &copy_layout,
+bool SelectWrapStrategy(AnBtStrategyParams *params, const Fragment &copy_layout,
                         Target target) {
   if (params->block_threads % params->warp_size != 0) {
     return false;
@@ -326,7 +328,7 @@ bool SelectWrapStrategy(GemmBStrategyParams *params, const Fragment &copy_layout
     }
     const int mask = period - 1;
     for (int offset = 1; offset * mask <= max_wrap_offset; ++offset) {
-      GemmBStrategyParams candidate = *params;
+      AnBtStrategyParams candidate = *params;
       candidate.wrap_offset = offset;
       candidate.wrap_idx_mask = mask;
       Layout storage_layout = MakeStorageLayout(candidate, copy_layout);
@@ -349,42 +351,51 @@ bool SelectWrapStrategy(GemmBStrategyParams *params, const Fragment &copy_layout
 
 } // namespace
 
-void HcuGemmBLdsStrategyNode::RegisterReflection() {
+void HcuGemmAnBtLdsStrategyNode::RegisterReflection() {
   namespace refl = ffi::reflection;
-  refl::ObjectDef<HcuGemmBLdsStrategyNode>()
-      .def_ro("strategy_version", &HcuGemmBLdsStrategyNode::strategy_version)
-      .def_ro("block_k", &HcuGemmBLdsStrategyNode::block_k)
-      .def_ro("block_n", &HcuGemmBLdsStrategyNode::block_n)
-      .def_ro("block_threads", &HcuGemmBLdsStrategyNode::block_threads)
-      .def_ro("warp_size", &HcuGemmBLdsStrategyNode::warp_size)
-      .def_ro("bank_num", &HcuGemmBLdsStrategyNode::bank_num)
-      .def_ro("bank_width_bytes", &HcuGemmBLdsStrategyNode::bank_width_bytes)
-      .def_ro("element_bytes", &HcuGemmBLdsStrategyNode::element_bytes)
+  refl::ObjectDef<HcuGemmAnBtLdsStrategyNode>()
+      .def_ro("strategy_version", &HcuGemmAnBtLdsStrategyNode::strategy_version)
+      .def_ro("block_k", &HcuGemmAnBtLdsStrategyNode::block_k)
+      .def_ro("block_mn", &HcuGemmAnBtLdsStrategyNode::block_mn)
+      .def_ro("block_threads", &HcuGemmAnBtLdsStrategyNode::block_threads)
+      .def_ro("warp_size", &HcuGemmAnBtLdsStrategyNode::warp_size)
+      .def_ro("bank_num", &HcuGemmAnBtLdsStrategyNode::bank_num)
+      .def_ro("bank_width_bytes", &HcuGemmAnBtLdsStrategyNode::bank_width_bytes)
+      .def_ro("element_bytes", &HcuGemmAnBtLdsStrategyNode::element_bytes)
       .def_ro("copy_bytes_per_lane",
-              &HcuGemmBLdsStrategyNode::copy_bytes_per_lane)
+              &HcuGemmAnBtLdsStrategyNode::copy_bytes_per_lane)
       .def_ro("copy_transaction_bytes",
-              &HcuGemmBLdsStrategyNode::copy_transaction_bytes)
+              &HcuGemmAnBtLdsStrategyNode::copy_transaction_bytes)
       .def_ro("copy_transactions_per_lane",
-              &HcuGemmBLdsStrategyNode::copy_transactions_per_lane)
+              &HcuGemmAnBtLdsStrategyNode::copy_transactions_per_lane)
       .def_ro("read_bytes_per_lane",
-              &HcuGemmBLdsStrategyNode::read_bytes_per_lane)
-      .def_ro("phase_bytes", &HcuGemmBLdsStrategyNode::phase_bytes)
-      .def_ro("panel_n", &HcuGemmBLdsStrategyNode::panel_n)
-      .def_ro("wrap_offset", &HcuGemmBLdsStrategyNode::wrap_offset)
-      .def_ro("wrap_idx_mask", &HcuGemmBLdsStrategyNode::wrap_idx_mask)
-      .def_ro("storage_layout", &HcuGemmBLdsStrategyNode::storage_layout)
-      .def_ro("copy_loop_layout", &HcuGemmBLdsStrategyNode::copy_loop_layout);
+              &HcuGemmAnBtLdsStrategyNode::read_bytes_per_lane)
+      .def_ro("phase_bytes", &HcuGemmAnBtLdsStrategyNode::phase_bytes)
+      .def_ro("panel_mn", &HcuGemmAnBtLdsStrategyNode::panel_mn)
+      .def_ro("wrap_offset", &HcuGemmAnBtLdsStrategyNode::wrap_offset)
+      .def_ro("wrap_idx_mask", &HcuGemmAnBtLdsStrategyNode::wrap_idx_mask)
+      .def_ro("storage_layout", &HcuGemmAnBtLdsStrategyNode::storage_layout)
+      .def_ro("copy_loop_layout", &HcuGemmAnBtLdsStrategyNode::copy_loop_layout);
 }
 
-Optional<HcuGemmBLdsStrategy>
-DeriveHcuGemmBLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
-                          int block_threads, Target target) {
+Optional<HcuGemmAnBtLdsStrategy>
+DeriveHcuGemmAnBtLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
+                          bool feeds_a, int block_threads, Target target) {
   if (!TargetIsHCU(target) || !TargetHcuHasAsyncCopy(target) ||
       block_threads <= 0 || !IsGlobalBuffer(copy.src) ||
       !IsSharedBuffer(copy.dst) || copy.src->dtype != copy.dst->dtype ||
       !(copy.dst->dtype.is_float16() || copy.dst->dtype.is_bfloat16()) ||
-      copy.src_range.size() < 2 || copy.dst_range.size() < 2 || gemm.transB_ ||
+      copy.src_range.size() < 2 || copy.dst_range.size() < 2 ||
       gemm.kPack_ != 1) {
+    return std::nullopt;
+  }
+
+  // AN (A, transA=true) and BT (B, transB=false) share the same
+  // K-leading MMAC fragment layout. Their physical LDS shape is [K, MN].
+  const bool has_an_bt_access =
+      GetHcuGemmLdsAccessKind(gemm, feeds_a) ==
+      HcuGemmLdsAccessKind::kAnBt;
+  if (!has_an_bt_access) {
     return std::nullopt;
   }
 
@@ -399,13 +410,14 @@ DeriveHcuGemmBLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
       *dst_k % kDsReadTileK != 0 || *dst_n % kDsReadPanelN != 0 ||
       !IsPowerOfTwo(static_cast<int>(*dst_k)) ||
       !IsPowerOfTwo(static_cast<int>(*dst_n)) || gemm.k_ != *dst_k ||
-      gemm.n_ != *dst_n) {
+      GetHcuGemmLdsMnExtent(gemm, feeds_a) != *dst_n ||
+      GetHcuGemmOperandDType(gemm, feeds_a) != copy.dst->dtype) {
     return std::nullopt;
   }
 
-  GemmBStrategyParams params;
+  AnBtStrategyParams params;
   params.block_k = static_cast<int>(*dst_k);
-  params.block_n = static_cast<int>(*dst_n);
+  params.block_mn = static_cast<int>(*dst_n);
   params.block_threads = block_threads;
   params.warp_size = TargetHcuGetWarpSize(target);
   params.bank_num = TargetHcuGetLdsBankCount(target);
@@ -413,17 +425,17 @@ DeriveHcuGemmBLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   params.element_bytes = copy.dst->dtype.bits() / 8;
   params.read_bytes_per_lane = kDsReadBytesPerLane;
   params.phase_bytes = kDsReadPhaseBytes;
-  params.panel_n = kDsReadPanelN;
+  params.panel_mn = kDsReadPanelN;
   if (params.warp_size != 64 ||
       params.block_threads % params.warp_size != 0 ||
       copy.dst->dtype.bits() != 16 ||
       params.phase_bytes % params.read_bytes_per_lane != 0 ||
-      params.block_n % params.panel_n != 0) {
+      params.block_mn % params.panel_mn != 0) {
     return std::nullopt;
   }
 
   params.copy_transaction_bytes = kAsyncCopyBytesPerLane;
-  int64_t tile_bytes = static_cast<int64_t>(params.block_k) * params.block_n *
+  int64_t tile_bytes = static_cast<int64_t>(params.block_k) * params.block_mn *
                        params.element_bytes;
   if (tile_bytes % params.copy_transaction_bytes != 0) {
     return std::nullopt;
@@ -441,17 +453,17 @@ DeriveHcuGemmBLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   params.copy_elements_per_lane =
       params.copy_transaction_bytes / params.element_bytes;
   params.copy_segments_per_row =
-      params.block_n / params.copy_elements_per_lane;
+      params.block_mn / params.copy_elements_per_lane;
 
   Fragment copy_layout = MakeCopyLoopLayout(params);
   if (!SelectWrapStrategy(&params, copy_layout, target)) {
     return std::nullopt;
   }
   Layout storage_layout = MakeStorageLayout(params, copy_layout);
-  auto node = ffi::make_object<HcuGemmBLdsStrategyNode>();
+  auto node = ffi::make_object<HcuGemmAnBtLdsStrategyNode>();
   node->strategy_version = kStrategyVersion;
   node->block_k = params.block_k;
-  node->block_n = params.block_n;
+  node->block_mn = params.block_mn;
   node->block_threads = params.block_threads;
   node->warp_size = params.warp_size;
   node->bank_num = params.bank_num;
@@ -462,42 +474,43 @@ DeriveHcuGemmBLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   node->copy_transactions_per_lane = params.copy_transactions_per_lane;
   node->read_bytes_per_lane = params.read_bytes_per_lane;
   node->phase_bytes = params.phase_bytes;
-  node->panel_n = params.panel_n;
+  node->panel_mn = params.panel_mn;
   node->wrap_offset = params.wrap_offset;
   node->wrap_idx_mask = params.wrap_idx_mask;
   node->storage_layout = storage_layout;
   node->copy_loop_layout = copy_layout;
-  HcuGemmBLdsStrategy strategy(std::move(node));
+  HcuGemmAnBtLdsStrategy strategy(std::move(node));
   ValidateCopyStorageConsistency(strategy);
   BankConflictScore score =
       EvaluateDsReadBankConflicts(strategy->storage_layout, params);
   ICHECK_LE(score.max_bank_uses, 1)
-      << "HCU GEMM B ds_read_m32x16_b16 bank conflict at panel "
+      << "HCU GEMM AN/BT ds_read_m32x16_b16 bank conflict at panel "
       << score.first_panel << ", phase " << score.first_phase << ", lane T"
       << score.first_lane << ", bank " << score.first_bank;
   return strategy;
 }
 
-void ValidateHcuGemmBStorageLayout(const Layout &actual,
-                                   const HcuGemmBLdsStrategy &strategy) {
+void ValidateHcuGemmAnBtStorageLayout(const Layout &actual,
+                                   const HcuGemmAnBtLdsStrategy &strategy) {
   ValidateSameLayout(actual, strategy->storage_layout, strategy->block_k,
-                     strategy->block_n, "storage");
+                     strategy->block_mn, "storage");
 }
 
-void ValidateHcuGemmBCopyLayout(const Fragment &actual,
-                                const HcuGemmBLdsStrategy &strategy) {
+void ValidateHcuGemmAnBtCopyLayout(const Fragment &actual,
+                                const HcuGemmAnBtLdsStrategy &strategy) {
   ValidateSameLayout(actual, strategy->copy_loop_layout, strategy->block_k,
-                     strategy->block_n, "copy-loop local");
+                     strategy->block_mn, "copy-loop local");
   arith::Analyzer analyzer;
   for (int k = 0; k < strategy->block_k; ++k) {
-    for (int n = 0; n < strategy->block_n; ++n) {
+    for (int n = 0; n < strategy->block_mn; ++n) {
       Array<PrimExpr> logical = {Integer(k), Integer(n)};
       PrimExpr actual_thread =
           actual->ForwardThread(logical, Optional<PrimExpr>());
       PrimExpr expected_thread = strategy->copy_loop_layout->ForwardThread(
           logical, Optional<PrimExpr>());
       if (!is_zero(analyzer.Simplify(actual_thread - expected_thread))) {
-        LOG(FATAL) << "HCU GEMM B copy-loop layout thread mapping mismatch at "
+        LOG(FATAL)
+            << "HCU GEMM AN/BT copy-loop layout thread mapping mismatch at "
                    << "logical coordinate (" << k << ", " << n
                    << "): actual=" << actual_thread
                    << ", expected=" << expected_thread;
@@ -507,7 +520,7 @@ void ValidateHcuGemmBCopyLayout(const Fragment &actual,
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
-  HcuGemmBLdsStrategyNode::RegisterReflection();
+  HcuGemmAnBtLdsStrategyNode::RegisterReflection();
 }
 
 } // namespace tl

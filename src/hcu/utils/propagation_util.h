@@ -65,6 +65,12 @@ std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInputAfterCall(
     Buffer buffer, const PropagationTirCollector *tir_collector,
     const CallNode *after_site_call);
 
+/*! \brief Collect all downstream Gemm consumers after a specific call site. */
+std::vector<GemmWithInput>
+PropagateToFindAllGemmConsumersAfterCall(
+    Buffer buffer, const PropagationTirCollector *tir_collector,
+    const CallNode *after_site_call);
+
 /*!
  * \brief Tile-op consumers that read `buffer`, in program order.
  * Prefer this over GetConsumerOpsFromTir when stmt_order pairing matters.
