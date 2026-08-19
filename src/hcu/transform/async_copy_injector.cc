@@ -3,6 +3,7 @@
  * \file hcu/transform/async_copy_injector.cc
  */
 #include "support/check.h"
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
@@ -42,10 +43,17 @@ public:
         buffer_remap_(std::move(buffer_remap)) {
     if (auto value = call_annotations_.Get(attr::kHcuGemmAtBnLdsStrategy)) {
       at_bn_strategy_ = Downcast<HcuGemmAtBnLdsStrategy>(value.value());
+      SetCompilerDerivedWrapAnnotations(at_bn_strategy_.value()->wrap_offset,
+                                        at_bn_strategy_.value()->wrap_idx_mask);
     }
     if (auto value = call_annotations_.Get(attr::kHcuGemmAnBtLdsStrategy)) {
       an_bt_strategy_ = Downcast<HcuGemmAnBtLdsStrategy>(value.value());
+      SetCompilerDerivedWrapAnnotations(an_bt_strategy_.value()->wrap_offset,
+                                        an_bt_strategy_.value()->wrap_idx_mask);
     }
+    ICHECK(!(at_bn_strategy_.defined() && an_bt_strategy_.defined()))
+        << "An async copy cannot use both HCU GEMM AT/BN and AN/BT LDS "
+           "strategies";
   }
 
   bool InjectedHCUAsyncCopy() const { return injected_hcu_async_copy_; }
@@ -295,6 +303,21 @@ public:
   }
 
 private:
+  void SetCompilerDerivedWrapAnnotations(int wrap_offset, int wrap_idx_mask) {
+    ICHECK_EQ(wrap_offset != 0, wrap_idx_mask != 0)
+        << "Compiler-derived HCU LDS wrap offset and mask must be enabled "
+           "together";
+    if (wrap_offset == 0) {
+      return;
+    }
+    // These scalar annotations are an internal codegen protocol. Public Copy
+    // annotations are intentionally not forwarded here.
+    call_annotations_.Set("wrap_offset",
+                          IntImm(DataType::Int(32), wrap_offset));
+    call_annotations_.Set("wrap_idx_mask",
+                          IntImm(DataType::Int(32), wrap_idx_mask));
+  }
+
   bool UseExplicitAsyncSemantics() const {
     return async_without_async_commit_wait_;
   }
@@ -851,6 +874,176 @@ InjectHCUAsyncCopy(const Stmt &body, bool async_without_async_commit_wait,
   Stmt injected = injector(body);
   return {injector.Finalize(injected), injector.InjectedHCUAsyncCopy()};
 }
+
+namespace {
+
+int64_t LargestPow2LessThanOrEqual(int64_t value) {
+  if (value <= 1) {
+    return 1;
+  }
+  int64_t result = 1;
+  while ((result << 1) <= value) {
+    result <<= 1;
+  }
+  return result;
+}
+
+int64_t TileWidthFromK(int64_t k_dim) {
+  return std::min<int64_t>(LargestPow2LessThanOrEqual(k_dim), 4096);
+}
+
+int StructBitFromTileWidth(int64_t tile_width) {
+  int bit = 0;
+  while ((int64_t{1} << bit) < tile_width) {
+    ++bit;
+  }
+  return bit;
+}
+
+Optional<PrimExpr> ExtractRowExpr(const PrimExpr &expr, int64_t k_dim) {
+  if (const auto *mul = expr.as<MulNode>()) {
+    if (const auto *imm = mul->b.as<IntImmNode>()) {
+      if (imm->value == k_dim) {
+        return mul->a;
+      }
+    }
+    if (const auto *imm = mul->a.as<IntImmNode>()) {
+      if (imm->value == k_dim) {
+        return mul->b;
+      }
+    }
+  }
+  if (const auto *add = expr.as<AddNode>()) {
+    if (Optional<PrimExpr> lhs = ExtractRowExpr(add->a, k_dim)) {
+      return lhs;
+    }
+    if (Optional<PrimExpr> rhs = ExtractRowExpr(add->b, k_dim)) {
+      return rhs;
+    }
+  }
+  if (const auto *sub = expr.as<SubNode>()) {
+    if (Optional<PrimExpr> lhs = ExtractRowExpr(sub->a, k_dim)) {
+      return lhs;
+    }
+    if (Optional<PrimExpr> rhs = ExtractRowExpr(sub->b, k_dim)) {
+      return rhs;
+    }
+  }
+  return Optional<PrimExpr>();
+}
+
+class HcuGemmIdxenRewriter : public StmtExprMutator {
+public:
+  explicit HcuGemmIdxenRewriter(const PrimFunc &func) {
+    for (const auto &[var, buffer] : func->buffer_map) {
+      buffer_data_to_buffer_.Set(buffer->data, buffer);
+    }
+  }
+
+private:
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    for (const Buffer &buffer : op->alloc_buffers) {
+      buffer_data_to_buffer_.Set(buffer->data, buffer);
+    }
+    for (const MatchBufferRegion &match_buffer : op->match_buffers) {
+      buffer_data_to_buffer_.Set(match_buffer->buffer->data,
+                                 match_buffer->buffer);
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    if (!call->op.same_as(tl::ptx_cp_async()) ||
+        !call->annotations.Get(attr::kHcuGemmAtBnLdsStrategy)) {
+      return call;
+    }
+
+    if (call->args.size() != 3U && call->args.size() != 4U) {
+      return call;
+    }
+    const auto *src_call = call->args[1].as<CallNode>();
+    if (!src_call || !src_call->op.same_as(builtin::tvm_access_ptr())) {
+      return call;
+    }
+    Optional<Buffer> src_buffer = LookupBuffer(src_call->args[1]);
+    if (!src_buffer.defined() || src_buffer.value()->shape.size() != 2) {
+      return call;
+    }
+    const auto *k_imm = src_buffer.value()->shape[1].as<IntImmNode>();
+    if (!k_imm) {
+      return call;
+    }
+
+    const int64_t k_dim = k_imm->value;
+    const int64_t tile_width = TileWidthFromK(k_dim);
+    PrimExpr old_offset = src_call->args[2];
+    Optional<PrimExpr> row_expr = ExtractRowExpr(old_offset, k_dim);
+    if (!row_expr.defined()) {
+      return call;
+    }
+    PrimExpr idxen = analyzer_.Simplify(row_expr.value());
+    PrimExpr new_offset = analyzer_.Simplify(
+        old_offset - idxen * make_const(old_offset.dtype(), tile_width));
+    Array<PrimExpr> src_args = src_call->args;
+    src_args.Set(2, new_offset);
+    PrimExpr new_src = Call(call->args[1].dtype(), builtin::tvm_access_ptr(),
+                            src_args, src_call->annotations, src_call->span);
+    PrimExpr predicate =
+        call->args.size() == 4U ? call->args[3] : const_true();
+    return Call(call->dtype, tl::hcu_cp_async_idxen(),
+                {call->args[0], new_src, call->args[2], predicate, idxen,
+                 IntImm(DataType::Int(32),
+                        StructBitFromTileWidth(tile_width))},
+                call->annotations, call->span);
+  }
+
+  Optional<Buffer> LookupBuffer(const PrimExpr &expr) const {
+    if (const auto *var = expr.as<VarNode>()) {
+      auto it = buffer_data_to_buffer_.find(ffi::GetRef<Var>(var));
+      if (it != buffer_data_to_buffer_.end()) {
+        return (*it).second;
+      }
+    }
+    return Optional<Buffer>();
+  }
+
+  Map<Var, Buffer> buffer_data_to_buffer_;
+  arith::Analyzer analyzer_;
+};
+
+PrimFunc InjectHcuCopyIdxenPrimFunc(PrimFunc func) {
+  if (!func.defined() || !func->body.defined()) {
+    return func;
+  }
+  PrimFuncNode *node = func.CopyOnWrite();
+  HcuGemmIdxenRewriter rewriter(func);
+  node->body = rewriter(std::move(node->body));
+  return func;
+}
+
+} // namespace
+
+namespace transform {
+
+tvm::transform::Pass InjectHcuCopyIdxen() {
+  auto pass_func = [](PrimFunc func, const IRModule &mod,
+                      const tvm::transform::PassContext &ctx) {
+    (void)mod;
+    (void)ctx;
+    return InjectHcuCopyIdxenPrimFunc(std::move(func));
+  };
+  return tirx::transform::CreatePrimFuncPass(pass_func, 0,
+                                             "tl.InjectHcuCopyIdxen", {});
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.InjectHcuCopyIdxen",
+                        InjectHcuCopyIdxen);
+}
+
+} // namespace transform
 
 } // namespace tl
 } // namespace tvm

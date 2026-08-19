@@ -54,8 +54,7 @@ bool GetNoImplicitAsyncCommitWait(const CopyNode &op) {
 
 Map<String, ObjectRef> GetHCUAsyncCopyAnnotations(const CopyNode &op) {
   Map<String, ObjectRef> result;
-  for (const char *key : {"use_idxen", "wrap_offset", "wrap_idx_mask",
-                          attr::kHcuGemmAtBnLdsStrategy,
+  for (const char *key : {attr::kHcuGemmAtBnLdsStrategy,
                           attr::kHcuGemmAnBtLdsStrategy}) {
     if (auto value = op.annotations.Get(key)) {
       result.Set(key, value.value());

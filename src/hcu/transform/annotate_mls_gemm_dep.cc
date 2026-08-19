@@ -157,18 +157,6 @@ private:
   int thread_z_extent_{1};
 };
 
-Optional<int> GetIntAnnotation(const Map<String, ObjectRef> &annotations,
-                               const char *key) {
-  if (auto value = annotations.Get(key)) {
-    if (const auto *imm = value.value().as<IntImmNode>()) {
-      return static_cast<int>(imm->value);
-    }
-    LOG(FATAL) << "Annotation `" << key << "` expects IntImm, got "
-               << value.value()->GetTypeKey();
-  }
-  return std::nullopt;
-}
-
 bool HaveSameAtBnStrategyParameters(const HcuGemmAtBnLdsStrategy &lhs,
                                      const HcuGemmAtBnLdsStrategy &rhs) {
   return lhs->strategy_version == rhs->strategy_version &&
@@ -368,19 +356,6 @@ private:
     }
   }
 
-  void ValidateOrSetIntAnnotation(Map<String, ObjectRef> *annotations,
-                                  const char *operand, const char *key,
-                                  int expected) const {
-    if (Optional<int> actual = GetIntAnnotation(*annotations, key)) {
-      ICHECK_EQ(actual.value(), expected)
-          << "HCU GEMM " << operand << " auto LDS strategy requires `" << key
-          << "`="
-          << expected << ", but got " << actual.value();
-      return;
-    }
-    annotations->Set(key, IntImm(DataType::Int(32), expected));
-  }
-
   Optional<HcuGemmAtBnLdsStrategy>
   TryDeriveAtBnStrategy(const CopyNode &copy,
                          const GemmWithInput &consumer) const {
@@ -578,11 +553,6 @@ private:
             annotations.Set(attr::kParallelLoopLayout,
                             at_bn_strategy.value()->copy_loop_layout);
           }
-          ValidateOrSetIntAnnotation(&annotations, "AT/BN", "use_idxen", 1);
-          ValidateOrSetIntAnnotation(&annotations, "AT/BN", "wrap_offset",
-                                     at_bn_strategy.value()->wrap_offset);
-          ValidateOrSetIntAnnotation(&annotations, "AT/BN", "wrap_idx_mask",
-                                     at_bn_strategy.value()->wrap_idx_mask);
           annotations.Set(attr::kHcuGemmAtBnLdsStrategy,
                           at_bn_strategy.value());
           auto [it, inserted] = auto_at_bn_strategies_.emplace(
@@ -611,10 +581,6 @@ private:
             annotations.Set(attr::kParallelLoopLayout,
                             an_bt_strategy.value()->copy_loop_layout);
           }
-          ValidateOrSetIntAnnotation(&annotations, "AN/BT", "wrap_offset",
-                                     an_bt_strategy.value()->wrap_offset);
-          ValidateOrSetIntAnnotation(&annotations, "AN/BT", "wrap_idx_mask",
-                                     an_bt_strategy.value()->wrap_idx_mask);
           annotations.Set(attr::kHcuGemmAnBtLdsStrategy,
                           an_bt_strategy.value());
           auto [it, inserted] = auto_an_bt_strategies_.emplace(
