@@ -152,6 +152,18 @@ def thread_id_shared_access_64x4_to_16x16_layout_C_n_m_lit(thread_id, local_id):
     return i, j
 
 
+def thread_id_shared_access_64x4_to_16x16_layout_C_lts(thread_id, local_id):
+    i = local_id * 4 + thread_id // 16
+    j = thread_id % 16
+    return i, j
+
+
+def thread_id_shared_access_64x4_to_16x16_layout_C_lit_lts(thread_id, local_id):
+    i = (thread_id // 16) * 4 + local_id
+    j = thread_id % 16
+    return i, j
+
+
 def thread_id_shared_access_64x8_to_16x32_layout_A(thread_id, local_id):
     i = thread_id % 16
     j = (thread_id // 16) * 8 + local_id
