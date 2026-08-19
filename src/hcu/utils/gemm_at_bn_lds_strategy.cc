@@ -279,7 +279,8 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
       /*b_is_fragment=*/false, /*is_blockscaled=*/false, block_k,
       ScaleLdsFormat::kIdentity, ScaleLdsFormat::kIdentity, target);
   if (element_bits <= 0 || element_bits % 8 != 0 ||
-      mmac_mode.element_bits != element_bits || block_k != mmac_mode.mmac_k) {
+      mmac_mode.element_bits != element_bits || mmac_mode.mmac_k <= 0 ||
+      block_k % mmac_mode.mmac_k != 0) {
     return std::nullopt;
   }
 
