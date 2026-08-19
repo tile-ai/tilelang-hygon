@@ -65,9 +65,7 @@ private:
     if (const auto *call = op->value.as<CallNode>()) {
       if (call->op.as<OpNode>()) {
         Op tir_op = Downcast<Op>(call->op);
-        static const Op &async_copy = Op::Get("tl.tileop.async_copy");
         if (tir_op == MatrixLoad::Get() || tir_op == DsReadFormat::Get() ||
-            tir_op == Copy::Get() || tir_op == async_copy ||
             tir_op == Gemm::Get()) {
           found_ = true;
           return;
