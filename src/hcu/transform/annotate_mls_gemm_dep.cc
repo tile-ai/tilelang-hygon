@@ -9,6 +9,7 @@
 #include "hcu/target_utils.h"
 #include "hcu/utils/gemm_at_bn_lds_strategy.h"
 #include "hcu/utils/gemm_an_bt_lds_strategy.h"
+#include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "hcu/utils/gemm_lds_access.h"
 #include "hcu/utils/mls_gemm_dep.h"
 #include "hcu/utils/propagation_tir_collector.h"
@@ -200,6 +201,20 @@ bool HaveSameAnBtStrategyParameters(const HcuGemmAnBtLdsStrategy &lhs,
          lhs->wrap_idx_mask == rhs->wrap_idx_mask;
 }
 
+bool HaveSameCopyStrategyParameters(const HcuGemmLdsCopyStrategy &lhs,
+                                    const HcuGemmLdsCopyStrategy &rhs) {
+  return lhs->strategy_version == rhs->strategy_version &&
+         lhs->use_idxen == rhs->use_idxen &&
+         lhs->copy_bytes_per_lane == rhs->copy_bytes_per_lane &&
+         lhs->copy_transaction_bytes == rhs->copy_transaction_bytes &&
+         lhs->block_threads == rhs->block_threads &&
+         lhs->inner_extent == rhs->inner_extent &&
+         lhs->wrap_offset == rhs->wrap_offset &&
+         lhs->wrap_idx_mask == rhs->wrap_idx_mask &&
+         lhs->storage_layout->IsEqual(rhs->storage_layout.get()) &&
+         lhs->copy_loop_layout->IsEqual(rhs->copy_loop_layout.get());
+}
+
 MlsGemmDepMeta BuildCopyToGemmLinearMeta(
     const GemmWithInput &consumer, bool a_from_mls, bool b_from_mls) {
   const GemmNode *gemm = consumer.gemm.get();
@@ -284,30 +299,26 @@ private:
     // Materialize auto layouts at the shared buffer's allocation scope, just
     // like an explicit T.annotate_layout entry.
     for (const Buffer &buffer : block->alloc_buffers) {
-      auto at_bn_strategy = auto_at_bn_strategies_.find(buffer->data);
-      auto an_bt_strategy = auto_an_bt_strategies_.find(buffer->data);
-      ICHECK(at_bn_strategy == auto_at_bn_strategies_.end() ||
-             an_bt_strategy == auto_an_bt_strategies_.end())
-          << "Shared buffer `" << buffer->name
-          << "` cannot use both HCU GEMM AT/BN and AN/BT LDS strategies";
-      if (at_bn_strategy == auto_at_bn_strategies_.end() &&
-          an_bt_strategy == auto_an_bt_strategies_.end()) {
+      auto copy_strategy = auto_copy_strategies_.find(buffer->data);
+      if (copy_strategy == auto_copy_strategies_.end()) {
         continue;
       }
+      auto at_bn_strategy = auto_at_bn_strategies_.find(buffer->data);
+      auto an_bt_strategy = auto_an_bt_strategies_.find(buffer->data);
 
       if (Optional<Layout> existing = FindAnnotatedLayout(buffer)) {
-        if (at_bn_strategy != auto_at_bn_strategies_.end()) {
-          ValidateHcuGemmAtBnStorageLayout(existing.value(),
-                                           at_bn_strategy->second);
-        } else {
+        if (an_bt_strategy != auto_an_bt_strategies_.end() &&
+            copy_strategy->second->storage_layout.same_as(
+                an_bt_strategy->second->storage_layout)) {
           ValidateHcuGemmAnBtStorageLayout(existing.value(),
                                            an_bt_strategy->second);
+        } else {
+          ICHECK(at_bn_strategy != auto_at_bn_strategies_.end());
+          ValidateHcuGemmAtBnStorageLayout(existing.value(),
+                                           at_bn_strategy->second);
         }
       } else {
-        const Layout &storage_layout =
-            at_bn_strategy != auto_at_bn_strategies_.end()
-                ? at_bn_strategy->second->storage_layout
-                : an_bt_strategy->second->storage_layout;
+        const Layout &storage_layout = copy_strategy->second->storage_layout;
         block_layout_map.Set(buffer->data, storage_layout);
         annotated_layout_maps_stack_.back().Set(buffer->data, storage_layout);
         layout_map_changed = true;
@@ -338,17 +349,10 @@ private:
   }
 
   void ValidateAutoLayoutsAttached() const {
-    for (const auto &[var, strategy] : auto_at_bn_strategies_) {
+    for (const auto &[var, strategy] : auto_copy_strategies_) {
       (void)strategy;
       ICHECK(auto_layout_attached_vars_.count(var))
-          << "Cannot attach compiler-derived HCU GEMM AT/BN LDS layout to the "
-             "SBlock that allocates buffer `"
-          << var->name_hint << "`";
-    }
-    for (const auto &[var, strategy] : auto_an_bt_strategies_) {
-      (void)strategy;
-      ICHECK(auto_layout_attached_vars_.count(var))
-          << "Cannot attach compiler-derived HCU GEMM AN/BT LDS layout to the "
+          << "Cannot attach compiler-derived HCU GEMM LDS layout to the "
              "SBlock that allocates buffer `"
           << var->name_hint << "`";
     }
@@ -387,17 +391,7 @@ private:
       const std::vector<GemmWithInput> &consumers) const {
     Optional<HcuGemmAtBnLdsStrategy> at_bn_strategy;
     Optional<HcuGemmAnBtLdsStrategy> an_bt_strategy;
-    std::optional<bool> requires_at_bn;
     for (const GemmWithInput &consumer : consumers) {
-      const bool current_requires_at_bn = IsAtBnAccess(consumer);
-      if (requires_at_bn.has_value()) {
-        ICHECK_EQ(requires_at_bn.value(), current_requires_at_bn)
-            << "Conflicting HCU GEMM LDS access classes for shared buffer `"
-            << copy.dst->name << "`: one consumer requires AT/BN access and "
-            << "another requires AN/BT access";
-      } else {
-        requires_at_bn = current_requires_at_bn;
-      }
       Optional<HcuGemmAtBnLdsStrategy> current_at_bn =
           TryDeriveAtBnStrategy(copy, consumer);
       Optional<HcuGemmAnBtLdsStrategy> current_an_bt =
@@ -427,6 +421,43 @@ private:
       }
     }
     return {at_bn_strategy, an_bt_strategy};
+  }
+
+  HcuGemmLdsCopyStrategy SelectCopyStrategy(
+      const CopyNode &copy,
+      const Optional<HcuGemmAtBnLdsStrategy> &at_bn_strategy,
+      const Optional<HcuGemmAnBtLdsStrategy> &an_bt_strategy) const {
+    ICHECK(at_bn_strategy.defined() || an_bt_strategy.defined());
+    if (an_bt_strategy.defined()) {
+      const HcuGemmAnBtLdsStrategy &an_bt = an_bt_strategy.value();
+      if (at_bn_strategy.defined()) {
+        const HcuGemmAtBnLdsStrategy &at_bn = at_bn_strategy.value();
+        ICHECK_EQ(at_bn->block_mn, an_bt->block_k);
+        ICHECK_EQ(at_bn->block_k, an_bt->block_mn);
+        ICHECK_EQ(at_bn->block_threads, an_bt->block_threads);
+        ICHECK_EQ(at_bn->copy_bytes_per_lane, an_bt->copy_bytes_per_lane);
+        ICHECK_EQ(at_bn->copy_transaction_bytes,
+                  an_bt->copy_transaction_bytes)
+            << "Mixed HCU GEMM consumers of shared buffer `" << copy.dst->name
+            << "` require incompatible async-copy transactions";
+        DLOG(WARNING)
+            << "Shared buffer `" << copy.dst->name
+            << "` has both AT/BN and AN/BT GEMM consumers; selecting the "
+               "AN/BT-safe common LDS strategy";
+      }
+      return MakeHcuGemmLdsCopyStrategy(
+          /*use_idxen=*/false, an_bt->copy_bytes_per_lane,
+          an_bt->copy_transaction_bytes, an_bt->block_threads,
+          an_bt->block_mn, an_bt->wrap_offset, an_bt->wrap_idx_mask,
+          an_bt->storage_layout, an_bt->copy_loop_layout);
+    }
+
+    const HcuGemmAtBnLdsStrategy &at_bn = at_bn_strategy.value();
+    return MakeHcuGemmLdsCopyStrategy(
+        /*use_idxen=*/true, at_bn->copy_bytes_per_lane,
+        at_bn->copy_transaction_bytes, at_bn->block_threads, at_bn->block_k,
+        at_bn->wrap_offset, at_bn->wrap_idx_mask, at_bn->storage_layout,
+        at_bn->copy_loop_layout);
   }
 
   bool IsLinearDsReadGemmInput(const Gemm &gemm,
@@ -542,52 +573,54 @@ private:
                                                      call);
         auto [at_bn_strategy, an_bt_strategy] =
             SelectAutoStrategy(*copy.get(), consumers);
-        if (at_bn_strategy.defined()) {
+        if (at_bn_strategy.defined() || an_bt_strategy.defined()) {
           auto annotations = call->annotations;
+          HcuGemmLdsCopyStrategy copy_strategy =
+              SelectCopyStrategy(*copy.get(), at_bn_strategy, an_bt_strategy);
           if (auto loop_layout = annotations.Get(attr::kParallelLoopLayout)) {
             Fragment actual = Downcast<Fragment>(loop_layout.value());
-            ValidateHcuGemmAtBnCopyLayout(actual, at_bn_strategy.value());
-          } else {
-            annotations.Set(attr::kParallelLoopLayout,
-                            at_bn_strategy.value()->copy_loop_layout);
-          }
-          annotations.Set(attr::kHcuGemmAtBnLdsStrategy,
-                          at_bn_strategy.value());
-          auto [it, inserted] = auto_at_bn_strategies_.emplace(
-              copy->dst->data, at_bn_strategy.value());
-          if (!inserted) {
-            const HcuGemmAtBnLdsStrategy &existing = it->second;
-            const HcuGemmAtBnLdsStrategy &current = at_bn_strategy.value();
-            ICHECK(HaveSameAtBnStrategyParameters(existing, current))
-                << "Conflicting HCU GEMM AT/BN strategies for shared buffer "
-                << copy->dst->name;
-          }
-          return Evaluate(Call(call->dtype, call->op, call->args, annotations,
-                               call->span));
-        }
-        if (an_bt_strategy.defined()) {
-          auto annotations = call->annotations;
-          if (auto loop_layout = annotations.Get(attr::kParallelLoopLayout)) {
-            Fragment actual = Downcast<Fragment>(loop_layout.value());
-            auto validated = validated_an_bt_copy_layouts_.find(copy->dst->data);
-            if (validated == validated_an_bt_copy_layouts_.end() ||
-                !validated->second.same_as(actual)) {
+            if (an_bt_strategy.defined() &&
+                copy_strategy->copy_loop_layout.same_as(
+                    an_bt_strategy.value()->copy_loop_layout)) {
               ValidateHcuGemmAnBtCopyLayout(actual, an_bt_strategy.value());
-              validated_an_bt_copy_layouts_[copy->dst->data] = actual;
+            } else {
+              ValidateHcuGemmAtBnCopyLayout(actual, at_bn_strategy.value());
             }
           } else {
             annotations.Set(attr::kParallelLoopLayout,
-                            an_bt_strategy.value()->copy_loop_layout);
+                            copy_strategy->copy_loop_layout);
           }
-          annotations.Set(attr::kHcuGemmAnBtLdsStrategy,
-                          an_bt_strategy.value());
-          auto [it, inserted] = auto_an_bt_strategies_.emplace(
-              copy->dst->data, an_bt_strategy.value());
-          if (!inserted) {
-            const HcuGemmAnBtLdsStrategy &existing = it->second;
-            const HcuGemmAnBtLdsStrategy &current = an_bt_strategy.value();
-            ICHECK(HaveSameAnBtStrategyParameters(existing, current))
-                << "Conflicting HCU GEMM AN/BT strategies for shared buffer "
+          if (at_bn_strategy.defined()) {
+            annotations.Set(attr::kHcuGemmAtBnLdsStrategy,
+                            at_bn_strategy.value());
+            auto [it, inserted] = auto_at_bn_strategies_.emplace(
+                copy->dst->data, at_bn_strategy.value());
+            if (!inserted) {
+              ICHECK(HaveSameAtBnStrategyParameters(it->second,
+                                                    at_bn_strategy.value()))
+                  << "Conflicting HCU GEMM AT/BN strategies for shared buffer "
+                  << copy->dst->name;
+            }
+          }
+          if (an_bt_strategy.defined()) {
+            annotations.Set(attr::kHcuGemmAnBtLdsStrategy,
+                            an_bt_strategy.value());
+            auto [it, inserted] = auto_an_bt_strategies_.emplace(
+                copy->dst->data, an_bt_strategy.value());
+            if (!inserted) {
+              ICHECK(HaveSameAnBtStrategyParameters(it->second,
+                                                    an_bt_strategy.value()))
+                  << "Conflicting HCU GEMM AN/BT strategies for shared buffer "
+                  << copy->dst->name;
+            }
+          }
+          annotations.Set(attr::kHcuGemmLdsCopyStrategy, copy_strategy);
+          auto [copy_it, copy_inserted] = auto_copy_strategies_.emplace(
+              copy->dst->data, copy_strategy);
+          if (!copy_inserted) {
+            ICHECK(HaveSameCopyStrategyParameters(copy_it->second,
+                                                  copy_strategy))
+                << "Conflicting HCU GEMM copy strategies for shared buffer "
                 << copy->dst->name;
           }
           return Evaluate(Call(call->dtype, call->op, call->args, annotations,
@@ -613,11 +646,14 @@ private:
       }
       auto a_at_bn_strategy = auto_at_bn_strategies_.find(gemm->a_->data);
       auto a_an_bt_strategy = auto_an_bt_strategies_.find(gemm->a_->data);
+      const bool a_uses_at_bn = IsAtBnAccess({gemm, gemm->a_});
       if (IsSharedBuffer(gemm->a_) &&
+          a_uses_at_bn &&
           a_at_bn_strategy != auto_at_bn_strategies_.end()) {
         annotations.Set(attr::kHcuGemmAtBnLdsStrategy,
                         a_at_bn_strategy->second);
       } else if (IsSharedBuffer(gemm->a_) &&
+                 !a_uses_at_bn &&
                  a_an_bt_strategy != auto_an_bt_strategies_.end()) {
         annotations.Set(attr::kHcuARespectLayoutMap,
                         IntImm(DataType::Int(32), 1));
@@ -631,13 +667,16 @@ private:
       }
       auto b_an_bt_strategy = auto_an_bt_strategies_.find(gemm->b_->data);
       auto b_at_bn_strategy = auto_at_bn_strategies_.find(gemm->b_->data);
+      const bool b_uses_at_bn = IsAtBnAccess({gemm, gemm->b_});
       if (IsSharedBuffer(gemm->b_) &&
+          !b_uses_at_bn &&
           b_an_bt_strategy != auto_an_bt_strategies_.end()) {
         annotations.Set(attr::kHcuGemmAnBtLdsStrategy,
                         b_an_bt_strategy->second);
         annotations.Set(attr::kHcuBRespectLayoutMap,
                         IntImm(DataType::Int(32), 1));
       } else if (IsSharedBuffer(gemm->b_) &&
+                 b_uses_at_bn &&
                  b_at_bn_strategy != auto_at_bn_strategies_.end()) {
         annotations.Set(attr::kHcuBRespectLayoutMap,
                         IntImm(DataType::Int(32), 1));
@@ -671,8 +710,8 @@ private:
       auto_at_bn_strategies_;
   std::unordered_map<Var, HcuGemmAnBtLdsStrategy, ObjectPtrHash, ObjectPtrEqual>
       auto_an_bt_strategies_;
-  std::unordered_map<Var, Fragment, ObjectPtrHash, ObjectPtrEqual>
-      validated_an_bt_copy_layouts_;
+  std::unordered_map<Var, HcuGemmLdsCopyStrategy, ObjectPtrHash, ObjectPtrEqual>
+      auto_copy_strategies_;
   std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>
       auto_layout_attached_vars_;
 };

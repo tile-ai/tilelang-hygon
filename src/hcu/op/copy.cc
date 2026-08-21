@@ -10,8 +10,7 @@
 
 #include "hcu/target_utils.h"
 #include "hcu/transform/async_copy_injector.h"
-#include "hcu/utils/gemm_at_bn_lds_strategy.h"
-#include "hcu/utils/gemm_an_bt_lds_strategy.h"
+#include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "transform/common/loop_fusion_utils.h"
@@ -54,11 +53,8 @@ bool GetNoImplicitAsyncCommitWait(const CopyNode &op) {
 
 Map<String, ObjectRef> GetHCUAsyncCopyAnnotations(const CopyNode &op) {
   Map<String, ObjectRef> result;
-  for (const char *key : {attr::kHcuGemmAtBnLdsStrategy,
-                          attr::kHcuGemmAnBtLdsStrategy}) {
-    if (auto value = op.annotations.Get(key)) {
-      result.Set(key, value.value());
-    }
+  if (auto value = op.annotations.Get(attr::kHcuGemmLdsCopyStrategy)) {
+    result.Set(attr::kHcuGemmLdsCopyStrategy, value.value());
   }
   return result;
 }

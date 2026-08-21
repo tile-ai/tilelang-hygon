@@ -7,15 +7,14 @@
 
 #include "hcu/target_utils.h"
 #include "hcu/utils/gemm_lds_access.h"
+#include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "op/utils.h"
 
 #include <tvm/arith/analyzer.h>
 
 #include <algorithm>
 #include <array>
-#include <limits>
 #include <optional>
-#include <tuple>
 #include <vector>
 
 namespace tvm {
@@ -25,7 +24,7 @@ using namespace tirx;
 
 namespace {
 
-constexpr int kStrategyVersion = 3;
+constexpr int kStrategyVersion = 4;
 constexpr int kDsReadTileK = 16;
 constexpr int kDsReadPanelN = 32;
 constexpr int kDsReadPhaseBytes = 128;
@@ -33,6 +32,8 @@ constexpr int kDsReadPhaseCount = 8;
 constexpr int kDsReadRequestsPerPhase = 8;
 constexpr int kAsyncCopyBytesPerLane = 16;
 constexpr int kDsReadBytesPerLane = 16;
+constexpr int kDsReadWrapStepBytes = 64;
+constexpr int kDsReadWrapCount = 2;
 
 // ds_read_m32x16_b16 issues these eight lane addresses in each 128-byte phase.
 constexpr std::array<std::array<int, kDsReadRequestsPerPhase>,
@@ -101,7 +102,7 @@ int64_t RequireConst(const PrimExpr &expr, arith::Analyzer *analyzer,
 }
 
 Fragment MakeCopyLoopLayout(const AnBtStrategyParams &params,
-                            bool permute_rows) {
+                            bool permute_rows, int rows_per_copy_wave = 0) {
   PrimExpr k = InputPlaceholder(0);
   PrimExpr n = InputPlaceholder(1);
   PrimExpr k_tile = floordiv(k, Integer(kDsReadTileK));
@@ -110,11 +111,17 @@ Fragment MakeCopyLoopLayout(const AnBtStrategyParams &params,
       floordiv(n, Integer(params.copy_elements_per_lane));
   PrimExpr mapped_k_inner = k_inner;
   if (permute_rows) {
-    // Assign repeated-bank K rows to different copy waves before applying
-    // wrap. Conflict-free linear layouts must retain the identity row order.
-    mapped_k_inner = floordiv(k_inner, Integer(4)) * 4 +
-                     floormod(k_inner, Integer(2)) * 2 +
-                     floordiv(floormod(k_inner, Integer(4)), Integer(2));
+    ICHECK_GT(rows_per_copy_wave, 0);
+    ICHECK_LE(rows_per_copy_wave * kDsReadWrapCount, kDsReadTileK);
+    PrimExpr row_pair = floordiv(k_inner, Integer(kDsReadWrapCount));
+    PrimExpr wrap_class = floormod(k_inner, Integer(kDsReadWrapCount));
+    // Group adjacent K rows into the two hardware wrap classes.  For
+    // rows_per_copy_wave=2 this reduces to the original 0,2,1,3 ordering.
+    mapped_k_inner =
+        floordiv(row_pair, Integer(rows_per_copy_wave)) *
+            (kDsReadWrapCount * rows_per_copy_wave) +
+        wrap_class * rows_per_copy_wave +
+        floormod(row_pair, Integer(rows_per_copy_wave));
   }
   PrimExpr canonical_segment =
       (k_tile * kDsReadTileK + mapped_k_inner) *
@@ -296,7 +303,12 @@ BankConflictScore EvaluateDsReadBankConflicts(
 
 bool SelectWrapStrategy(AnBtStrategyParams *params, Fragment *copy_layout,
                         Target target) {
-  if (params->block_threads % params->warp_size != 0) {
+  const int bytes_per_row = params->block_mn * params->element_bytes;
+  std::optional<HcuGemmLdsCopyGeometry> geometry =
+      DeriveHcuGemmLdsCopyGeometry(bytes_per_row,
+                                   params->copy_transaction_bytes,
+                                   params->block_threads, target);
+  if (!geometry.has_value() || geometry->warp_size != params->warp_size) {
     return false;
   }
   params->wrap_offset = 0;
@@ -305,60 +317,39 @@ bool SelectWrapStrategy(AnBtStrategyParams *params, Fragment *copy_layout,
   Layout linear_storage = MakeStorageLayout(*params, *copy_layout);
   BankConflictScore linear_score =
       EvaluateDsReadBankConflicts(linear_storage, *params);
-  if (linear_score.max_bank_uses <= 1) {
+  const bool linear_has_conflict =
+      bytes_per_row >= geometry->bank_ring_bytes;
+  if (!linear_has_conflict) {
+    ICHECK_LE(linear_score.max_bank_uses, 1)
+        << "HCU GEMM AN/BT closed-form strategy predicted conflict-free "
+           "linear LDS access, but phase validation found a conflict";
     return true;
   }
+  ICHECK_GT(linear_score.max_bank_uses, 1)
+      << "HCU GEMM AN/BT closed-form strategy predicted a linear LDS bank "
+         "conflict, but phase validation did not find one";
 
   // Row permutation is part of the conflict-resolution strategy, not a
   // baseline requirement of ds_read_m32x16_b16.
-  *copy_layout = MakeCopyLoopLayout(*params, /*permute_rows=*/true);
-  Layout permuted_storage = MakeStorageLayout(*params, *copy_layout);
-  BankConflictScore permuted_score =
-      EvaluateDsReadBankConflicts(permuted_storage, *params);
-  if (permuted_score.max_bank_uses <= 1) {
-    return true;
-  }
-
-  const int max_wrap_offset = TargetHcuGetLdsWrapMaxOffset(
-      target, params->copy_transaction_bytes);
-  if (max_wrap_offset <= 0) {
+  *copy_layout = MakeCopyLoopLayout(*params, /*permute_rows=*/true,
+                                    geometry->rows_per_group);
+  if (!IsLegalHcuGemmLdsWrap(*geometry, kDsReadWrapStepBytes,
+                             kDsReadWrapCount)) {
     return false;
   }
-  const int copy_warps = params->block_threads / params->warp_size;
-  std::tuple<int, int, int> best_key = {
-      std::numeric_limits<int>::max(), std::numeric_limits<int>::max(),
-      std::numeric_limits<int>::max()};
-  bool found = false;
-
-  // wrap_idx_mask is restricted to 2^n-1 so `(warp & mask)` forms a
-  // repeatable swizzle period. The physical warp count must contain a whole
-  // number of those periods; otherwise transaction folding changes the
-  // swizzle assignment.
-  for (int period = 2; period <= copy_warps; period *= 2) {
-    if (copy_warps % period != 0) {
-      continue;
-    }
-    const int mask = period - 1;
-    for (int offset = 1; offset * mask <= max_wrap_offset; ++offset) {
-      AnBtStrategyParams candidate = *params;
-      candidate.wrap_offset = offset;
-      candidate.wrap_idx_mask = mask;
-      Layout storage_layout = MakeStorageLayout(candidate, *copy_layout);
-      BankConflictScore score =
-          EvaluateDsReadBankConflicts(storage_layout, candidate);
-      if (score.max_bank_uses > 1) {
-        continue;
-      }
-      std::tuple<int, int, int> key = {offset * mask, offset, mask};
-      if (!found || key < best_key) {
-        found = true;
-        best_key = key;
-        params->wrap_offset = offset;
-        params->wrap_idx_mask = mask;
-      }
-    }
-  }
-  return found;
+  params->wrap_offset =
+      GetHcuGemmLdsWrapOffset(*geometry, kDsReadWrapStepBytes);
+  params->wrap_idx_mask = kDsReadWrapCount - 1;
+  Layout wrapped_storage = MakeStorageLayout(*params, *copy_layout);
+  BankConflictScore wrapped_score =
+      EvaluateDsReadBankConflicts(wrapped_storage, *params);
+  ICHECK_LE(wrapped_score.max_bank_uses, 1)
+      << "HCU GEMM AN/BT 64-byte wrap strategy still has a bank conflict at "
+         "panel "
+      << wrapped_score.first_panel << ", phase " << wrapped_score.first_phase
+      << ", lane T" << wrapped_score.first_lane << ", bank "
+      << wrapped_score.first_bank;
+  return true;
 }
 
 } // namespace

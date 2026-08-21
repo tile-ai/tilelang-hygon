@@ -8,6 +8,7 @@
 #include "hcu/op/gemm_partition.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/gemm_lds_access.h"
+#include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "op/utils.h"
 #include "support/check.h"
 
@@ -25,7 +26,7 @@ using namespace tirx;
 
 namespace {
 
-constexpr int kStrategyVersion = 2;
+constexpr int kStrategyVersion = 3;
 // These are instruction semantics, not kernel tile parameters.
 constexpr int kMmacMAtom = 16;
 constexpr int kAsyncCopyTransactionBytes = 16;
@@ -307,8 +308,6 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   params.block_threads = block_threads;
   params.warp_size = warp_size;
   params.warp_mn_count = warp_mn_count;
-  params.bank_num = TargetHcuGetLdsBankCount(target);
-  params.bank_width_bytes = TargetHcuGetLdsBankWidthBytes(target);
   params.element_bytes = element_bits / 8;
 
   const int64_t tile_bytes =
@@ -331,9 +330,21 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
 
   // MMAC A VGPR layout: each lane reads 4 half values, i.e. one b64.
   const int row_bytes = block_k * params.element_bytes;
-  if (row_bytes % params.bank_width_bytes != 0 ||
-      row_bytes % params.copy_transaction_bytes != 0 ||
+  if (row_bytes % params.copy_transaction_bytes != 0 ||
       row_bytes % params.read_bytes_per_lane != 0) {
+    return std::nullopt;
+  }
+  std::optional<HcuGemmLdsCopyGeometry> geometry =
+      DeriveHcuGemmLdsCopyGeometry(row_bytes,
+                                   params.copy_transaction_bytes,
+                                   params.block_threads, target);
+  if (!geometry.has_value() || geometry->warp_size != params.warp_size ||
+      geometry->waves_per_group != 1) {
+    return std::nullopt;
+  }
+  params.bank_num = geometry->bank_count;
+  params.bank_width_bytes = geometry->bank_width_bytes;
+  if (row_bytes % params.bank_width_bytes != 0) {
     return std::nullopt;
   }
   params.row_bank_stride = row_bytes / params.bank_width_bytes;
@@ -356,10 +367,7 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
           params.copy_transactions_per_lane) {
     return std::nullopt;
   }
-  if (warp_size % params.copy_segments_per_row != 0) {
-    return std::nullopt;
-  }
-  params.rows_per_copy_wave = warp_size / params.copy_segments_per_row;
+  params.rows_per_copy_wave = geometry->rows_per_group;
   if (block_mn % params.rows_per_copy_wave != 0 ||
       params.rows_per_copy_wave % params.row_period != 0 ||
       block_mn % params.warp_mn_count != 0 ||
@@ -377,9 +385,12 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   // In the current case, shifting one 16-byte segment moves exactly 4 banks,
   // so wrap_offset=1.
   params.wrap_offset =
-      SelectWrapOffset(params, TargetHcuGetLdsWrapMaxOffset(
-                                   target, params.copy_transaction_bytes));
-  if (params.wrap_offset == 0) {
+      SelectWrapOffset(params, geometry->max_wrap_offset);
+  const int wrap_count = params.wrap_idx_mask + 1;
+  const int wrap_step_bytes =
+      params.wrap_offset * params.copy_transaction_bytes;
+  if (params.wrap_offset == 0 ||
+      !IsLegalHcuGemmLdsWrap(*geometry, wrap_step_bytes, wrap_count)) {
     return std::nullopt;
   }
 

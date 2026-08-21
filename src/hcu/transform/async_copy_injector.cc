@@ -19,8 +19,7 @@
 #include <vector>
 
 #include "hcu/transform/async_copy_injector.h"
-#include "hcu/utils/gemm_at_bn_lds_strategy.h"
-#include "hcu/utils/gemm_an_bt_lds_strategy.h"
+#include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "tir/ir/buffer_common.h"
@@ -41,19 +40,11 @@ public:
         call_annotations_(std::move(call_annotations)),
         thread_var_(std::move(thread_var)),
         buffer_remap_(std::move(buffer_remap)) {
-    if (auto value = call_annotations_.Get(attr::kHcuGemmAtBnLdsStrategy)) {
-      at_bn_strategy_ = Downcast<HcuGemmAtBnLdsStrategy>(value.value());
-      SetCompilerDerivedWrapAnnotations(at_bn_strategy_.value()->wrap_offset,
-                                        at_bn_strategy_.value()->wrap_idx_mask);
+    if (auto value = call_annotations_.Get(attr::kHcuGemmLdsCopyStrategy)) {
+      copy_strategy_ = Downcast<HcuGemmLdsCopyStrategy>(value.value());
+      SetCompilerDerivedWrapAnnotations(copy_strategy_.value()->wrap_offset,
+                                        copy_strategy_.value()->wrap_idx_mask);
     }
-    if (auto value = call_annotations_.Get(attr::kHcuGemmAnBtLdsStrategy)) {
-      an_bt_strategy_ = Downcast<HcuGemmAnBtLdsStrategy>(value.value());
-      SetCompilerDerivedWrapAnnotations(an_bt_strategy_.value()->wrap_offset,
-                                        an_bt_strategy_.value()->wrap_idx_mask);
-    }
-    ICHECK(!(at_bn_strategy_.defined() && an_bt_strategy_.defined()))
-        << "An async copy cannot use both HCU GEMM AT/BN and AN/BT LDS "
-           "strategies";
   }
 
   bool InjectedHCUAsyncCopy() const { return injected_hcu_async_copy_; }
@@ -591,18 +582,12 @@ private:
                            const BufferLoad &src_base_load, int num_elems,
                            bool predicated, const PrimExpr &predicate_value) {
     PrimExpr dst_access_ptr;
-    if (at_bn_strategy_.defined()) {
-      const HcuGemmAtBnLdsStrategy &strategy = at_bn_strategy_.value();
+    if (copy_strategy_.defined()) {
+      const HcuGemmLdsCopyStrategy &strategy = copy_strategy_.value();
       dst_access_ptr = MakeGemmCommandDstAccessPtr(
           store->buffer, num_elems, strategy->copy_bytes_per_lane,
           strategy->copy_transaction_bytes, strategy->block_threads,
-          strategy->block_k, "AT/BN");
-    } else if (an_bt_strategy_.defined()) {
-      const HcuGemmAnBtLdsStrategy &strategy = an_bt_strategy_.value();
-      dst_access_ptr = MakeGemmCommandDstAccessPtr(
-          store->buffer, num_elems, strategy->copy_bytes_per_lane,
-          strategy->copy_transaction_bytes, strategy->block_threads,
-          strategy->block_mn, "AN/BT");
+          strategy->inner_extent, "GEMM");
     } else {
       dst_access_ptr =
           MakeAccessPtrFromLoad(dst_base_load, num_elems, /*rw_mask=*/2);
@@ -665,13 +650,7 @@ private:
   }
 
   int GetGemmStrategyBlockThreads() const {
-    if (at_bn_strategy_.defined()) {
-      return at_bn_strategy_.value()->block_threads;
-    }
-    if (an_bt_strategy_.defined()) {
-      return an_bt_strategy_.value()->block_threads;
-    }
-    return 0;
+    return copy_strategy_.defined() ? copy_strategy_.value()->block_threads : 0;
   }
 
   bool HasUnitStrideForEveryThread(const PrimExpr &expr,
@@ -851,8 +830,7 @@ private:
 
   bool async_without_async_commit_wait_{false};
   Map<String, ObjectRef> call_annotations_;
-  Optional<HcuGemmAtBnLdsStrategy> at_bn_strategy_;
-  Optional<HcuGemmAnBtLdsStrategy> an_bt_strategy_;
+  Optional<HcuGemmLdsCopyStrategy> copy_strategy_;
   Var thread_var_;
   Map<Buffer, Buffer> buffer_remap_;
   int current_vectorized_lanes_{1};
@@ -954,8 +932,13 @@ private:
 
   PrimExpr VisitExpr_(const CallNode *op) final {
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
-    if (!call->op.same_as(tl::ptx_cp_async()) ||
-        !call->annotations.Get(attr::kHcuGemmAtBnLdsStrategy)) {
+    if (!call->op.same_as(tl::ptx_cp_async())) {
+      return call;
+    }
+    Optional<ObjectRef> strategy_value =
+        call->annotations.Get(attr::kHcuGemmLdsCopyStrategy);
+    if (!strategy_value.defined() ||
+        !Downcast<HcuGemmLdsCopyStrategy>(strategy_value.value())->use_idxen) {
       return call;
     }
 
