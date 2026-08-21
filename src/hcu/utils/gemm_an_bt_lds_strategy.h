@@ -60,6 +60,11 @@ Optional<HcuGemmAnBtLdsStrategy>
 DeriveHcuGemmAnBtLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
                              bool feeds_a, int block_threads, Target target);
 
+Optional<HcuGemmAnBtLdsStrategy>
+DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
+    const CopyNode &copy, const GemmNode &gemm, bool feeds_a, int block_threads,
+    Target target, int wrap_count);
+
 void ValidateHcuGemmAnBtStorageLayout(
     const Layout &actual, const HcuGemmAnBtLdsStrategy &strategy);
 

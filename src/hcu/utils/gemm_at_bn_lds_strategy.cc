@@ -202,6 +202,82 @@ void ValidateSameLayout(const Layout &actual, const Layout &expected,
   }
 }
 
+int64_t RequireConst(const PrimExpr &expr, arith::Analyzer *analyzer,
+                     const char *kind, int row, int col) {
+  PrimExpr simplified = analyzer->Simplify(expr);
+  const int64_t *value = as_const_int(simplified);
+  ICHECK(value) << "HCU GEMM AT/BN " << kind
+                << " must be constant at logical coordinate (" << row << ", "
+                << col << "), got " << simplified;
+  return *value;
+}
+
+bool EvaluateAtBnBankConflict(
+    const Layout &storage_layout,
+    const HcuGemmAtBnLdsStrategy &strategy) {
+  constexpr int kIssueGroupLanes = 8;
+  const int banks_per_read =
+      strategy->read_bytes_per_lane / strategy->bank_width_bytes;
+  const int elements_per_read =
+      strategy->read_bytes_per_lane / strategy->element_bytes;
+  ICHECK_EQ(strategy->warp_size % kIssueGroupLanes, 0);
+  ICHECK_EQ(strategy->read_bytes_per_lane % strategy->bank_width_bytes, 0);
+  ICHECK_EQ(strategy->read_bytes_per_lane % strategy->element_bytes, 0);
+  ICHECK_EQ(strategy->warp_tile_mn % kMmacMAtom, 0);
+  ICHECK_EQ(strategy->block_k % kMmacMAtom, 0);
+
+  arith::Analyzer analyzer;
+  for (int warp_m = 0; warp_m < strategy->warp_mn_count; ++warp_m) {
+    for (int row_tile = 0; row_tile < strategy->warp_tile_mn / kMmacMAtom;
+         ++row_tile) {
+      for (int k_tile = 0; k_tile < strategy->block_k / kMmacMAtom;
+           ++k_tile) {
+        for (int lane_base = 0; lane_base < strategy->warp_size;
+             lane_base += kIssueGroupLanes) {
+          std::vector<bool> bank_uses(strategy->bank_num, false);
+          for (int lane = lane_base; lane < lane_base + kIssueGroupLanes;
+               ++lane) {
+            int row = warp_m * strategy->warp_tile_mn +
+                      row_tile * kMmacMAtom + lane % kMmacMAtom;
+            int col = k_tile * kMmacMAtom +
+                      (lane / kMmacMAtom) * elements_per_read;
+            int64_t first_offset = -1;
+            for (int elem = 0; elem < elements_per_read; ++elem) {
+              Array<PrimExpr> physical =
+                  storage_layout->Forward({Integer(row), Integer(col + elem)});
+              ICHECK_EQ(physical.size(), 2U);
+              int64_t physical_row = RequireConst(
+                  physical[0], &analyzer, "physical row", row, col + elem);
+              int64_t physical_col = RequireConst(
+                  physical[1], &analyzer, "physical column", row, col + elem);
+              int64_t offset = physical_row * strategy->block_k + physical_col;
+              if (elem == 0) {
+                first_offset = offset;
+              } else {
+                ICHECK_EQ(offset, first_offset + elem)
+                    << "HCU GEMM AT/BN b64 elements must remain contiguous";
+              }
+            }
+            int64_t byte_offset = first_offset * strategy->element_bytes;
+            ICHECK_EQ(byte_offset % strategy->bank_width_bytes, 0);
+            int start_bank = static_cast<int>(
+                (byte_offset / strategy->bank_width_bytes) %
+                strategy->bank_num);
+            for (int bank = 0; bank < banks_per_read; ++bank) {
+              int current = (start_bank + bank) % strategy->bank_num;
+              if (bank_uses[current]) {
+                return true;
+              }
+              bank_uses[current] = true;
+            }
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
 } // namespace
 
 void HcuGemmAtBnLdsStrategyNode::RegisterReflection() {
@@ -449,6 +525,12 @@ void ValidateHcuGemmAtBnCopyLayout(const Fragment &actual,
       }
     }
   }
+}
+
+bool HcuGemmAtBnLayoutHasBankConflict(
+    const Layout &storage_layout,
+    const HcuGemmAtBnLdsStrategy &strategy) {
+  return EvaluateAtBnBankConflict(storage_layout, strategy);
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

@@ -71,6 +71,9 @@ void ValidateHcuGemmAtBnStorageLayout(
 void ValidateHcuGemmAtBnCopyLayout(
     const Fragment &actual, const HcuGemmAtBnLdsStrategy &strategy);
 
+bool HcuGemmAtBnLayoutHasBankConflict(
+    const Layout &storage_layout, const HcuGemmAtBnLdsStrategy &strategy);
+
 } // namespace tl
 } // namespace tvm
 

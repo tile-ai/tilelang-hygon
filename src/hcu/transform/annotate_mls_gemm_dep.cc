@@ -384,6 +384,20 @@ private:
                                      target_);
   }
 
+  Optional<HcuGemmAnBtLdsStrategy>
+  TryDeriveAnBtCommonWrapStrategy(const CopyNode &copy,
+                                  const GemmWithInput &consumer,
+                                  int wrap_count) const {
+    const GemmNode *gemm = consumer.gemm.get();
+    if (gemm == nullptr) {
+      return std::nullopt;
+    }
+    const bool feeds_a = consumer.input.same_as(gemm->a_);
+    ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
+    return DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
+        copy, *gemm, feeds_a, block_threads_, target_, wrap_count);
+  }
+
   std::pair<Optional<HcuGemmAtBnLdsStrategy>,
             Optional<HcuGemmAnBtLdsStrategy>>
   SelectAutoStrategy(
@@ -391,6 +405,7 @@ private:
       const std::vector<GemmWithInput> &consumers) const {
     Optional<HcuGemmAtBnLdsStrategy> at_bn_strategy;
     Optional<HcuGemmAnBtLdsStrategy> an_bt_strategy;
+    std::optional<GemmWithInput> an_bt_consumer;
     for (const GemmWithInput &consumer : consumers) {
       Optional<HcuGemmAtBnLdsStrategy> current_at_bn =
           TryDeriveAtBnStrategy(copy, consumer);
@@ -418,6 +433,31 @@ private:
             << copy.dst->name << "` across GEMM consumers";
       } else {
         an_bt_strategy = current_an_bt;
+        an_bt_consumer = consumer;
+      }
+    }
+
+    if (at_bn_strategy.defined() && an_bt_strategy.defined() &&
+        an_bt_strategy.value()->wrap_offset == 0 &&
+        an_bt_strategy.value()->wrap_idx_mask == 0 &&
+        HcuGemmAtBnLayoutHasBankConflict(
+            an_bt_strategy.value()->storage_layout,
+            at_bn_strategy.value())) {
+      const int bank_ring_bytes = an_bt_strategy.value()->bank_num *
+                                  an_bt_strategy.value()->bank_width_bytes;
+      constexpr int kCommonWrapStepBytes = 64;
+      const int common_wrap_count_limit =
+          bank_ring_bytes / (2 * kCommonWrapStepBytes);
+      if (common_wrap_count_limit >= 2 && an_bt_consumer.has_value()) {
+        Optional<HcuGemmAnBtLdsStrategy> common_strategy =
+            TryDeriveAnBtCommonWrapStrategy(copy, *an_bt_consumer,
+                                            /*wrap_count=*/2);
+        if (common_strategy.defined() &&
+            !HcuGemmAtBnLayoutHasBankConflict(
+                common_strategy.value()->storage_layout,
+                at_bn_strategy.value())) {
+          an_bt_strategy = common_strategy;
+        }
       }
     }
     return {at_bn_strategy, an_bt_strategy};
