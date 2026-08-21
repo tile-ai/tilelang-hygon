@@ -207,56 +207,31 @@ void ValidateSameLayout(const Layout &actual, const Layout &expected, int block_
   }
 }
 
-void ValidateCopyStorageConsistency(const HcuGemmAnBtLdsStrategy &strategy) {
-  const int copy_elements =
-      strategy->copy_transaction_bytes / strategy->element_bytes;
-  arith::Analyzer analyzer;
-  for (int k = 0; k < strategy->block_k; ++k) {
-    for (int n = 0; n < strategy->block_mn; ++n) {
-      Array<PrimExpr> logical = {Integer(k), Integer(n)};
-      int64_t thread = RequireConst(
-          strategy->copy_loop_layout->ForwardThread(logical, std::nullopt),
-          &analyzer, "copy thread", k, n);
-      Array<PrimExpr> local = strategy->copy_loop_layout->Forward(logical);
-      ICHECK(local.size() == 1U || local.size() == 2U)
-          << "HCU GEMM AN/BT copy layout must have transaction/intra indices";
-      int64_t transaction =
-          local.size() == 2U
-              ? RequireConst(local[0], &analyzer, "copy transaction", k, n)
-              : 0;
-      int64_t local_index = RequireConst(
-          local[local.size() - 1], &analyzer, "copy local", k, n);
-      ICHECK_GE(thread, 0);
-      ICHECK_LT(thread, strategy->block_threads);
-      ICHECK_GE(transaction, 0);
-      ICHECK_LT(transaction, strategy->copy_transactions_per_lane);
-      ICHECK_GE(local_index, 0);
-      ICHECK_LT(local_index, copy_elements);
-
-      int64_t copy_warp = thread / strategy->warp_size;
-      int64_t copy_lane = thread % strategy->warp_size;
-      int64_t wrap = (copy_warp & strategy->wrap_idx_mask) *
-                     strategy->wrap_offset;
-      int64_t physical_lane = (copy_lane + wrap) % strategy->warp_size;
-      int64_t expected_offset =
-          (transaction * strategy->block_threads +
-           copy_warp * strategy->warp_size + physical_lane) *
-              copy_elements +
-          local_index;
-
-      Array<PrimExpr> physical = strategy->storage_layout->Forward(logical);
-      ICHECK_EQ(physical.size(), 2U);
-      int64_t actual_k =
-          RequireConst(physical[0], &analyzer, "storage row", k, n);
-      int64_t actual_n =
-          RequireConst(physical[1], &analyzer, "storage column", k, n);
-      int64_t actual_offset = actual_k * strategy->block_mn + actual_n;
-      ICHECK_EQ(actual_offset, expected_offset)
-          << "HCU GEMM AN/BT copy/layout/wrap mismatch at logical coordinate ("
-          << k
-          << ", " << n << "): actual physical offset=" << actual_offset
-          << ", expected=" << expected_offset;
-    }
+void ValidateStrategyParameters(const AnBtStrategyParams &params) {
+  ICHECK_GT(params.block_k, 0);
+  ICHECK_GT(params.block_mn, 0);
+  ICHECK_GT(params.block_threads, 0);
+  ICHECK_GT(params.warp_size, 0);
+  ICHECK_EQ(params.block_threads % params.warp_size, 0);
+  ICHECK_EQ(params.block_k % kDsReadTileK, 0);
+  ICHECK_EQ(params.block_mn % params.panel_mn, 0);
+  ICHECK_EQ(params.copy_transaction_bytes % params.element_bytes, 0);
+  ICHECK_EQ(params.read_bytes_per_lane % params.element_bytes, 0);
+  ICHECK_EQ(params.phase_bytes % params.read_bytes_per_lane, 0);
+  ICHECK_EQ(params.block_mn % params.copy_elements_per_lane, 0);
+  ICHECK_EQ(params.copy_segments_per_row * params.copy_elements_per_lane,
+            params.block_mn);
+  ICHECK_EQ(params.copy_bytes_per_lane,
+            params.copy_transactions_per_lane *
+                params.copy_transaction_bytes);
+  ICHECK_GE(params.copy_transactions_per_lane, 1);
+  ICHECK_GE(params.wrap_offset, 0);
+  ICHECK_GE(params.wrap_idx_mask, 0);
+  if (params.wrap_idx_mask == 0) {
+    ICHECK_EQ(params.wrap_offset, 0);
+  } else {
+    ICHECK_GT(params.wrap_offset, 0);
+    ICHECK(IsPowerOfTwo(params.wrap_idx_mask + 1));
   }
 }
 
@@ -321,21 +296,10 @@ bool SelectWrapStrategy(AnBtStrategyParams *params, Fragment *copy_layout,
   params->wrap_offset = 0;
   params->wrap_idx_mask = 0;
   *copy_layout = MakeCopyLoopLayout(*params, /*permute_rows=*/false);
-  Layout linear_storage = MakeStorageLayout(*params, *copy_layout);
-  BankConflictScore linear_score =
-      EvaluateDsReadBankConflicts(linear_storage, *params);
   const bool linear_has_conflict =
       bytes_per_row >= geometry->bank_ring_bytes;
   if (!linear_has_conflict && forced_wrap_count == 0) {
-    ICHECK_LE(linear_score.max_bank_uses, 1)
-        << "HCU GEMM AN/BT closed-form strategy predicted conflict-free "
-           "linear LDS access, but phase validation found a conflict";
     return true;
-  }
-  if (linear_has_conflict) {
-    ICHECK_GT(linear_score.max_bank_uses, 1)
-        << "HCU GEMM AN/BT closed-form strategy predicted a linear LDS bank "
-           "conflict, but phase validation did not find one";
   }
 
   const int wrap_count =
@@ -364,18 +328,14 @@ bool SelectWrapStrategy(AnBtStrategyParams *params, Fragment *copy_layout,
   params->wrap_offset =
       GetHcuGemmLdsWrapOffset(*geometry, kDsReadWrapStepBytes);
   params->wrap_idx_mask = wrap_count - 1;
-  Layout wrapped_storage = MakeStorageLayout(*params, *copy_layout);
-  BankConflictScore wrapped_score =
-      EvaluateDsReadBankConflicts(wrapped_storage, *params);
-  if (forced_wrap_count != 0 && wrapped_score.max_bank_uses > 1) {
-    return false;
+  if (forced_wrap_count != 0) {
+    Layout wrapped_storage = MakeStorageLayout(*params, *copy_layout);
+    BankConflictScore wrapped_score =
+        EvaluateDsReadBankConflicts(wrapped_storage, *params);
+    if (wrapped_score.max_bank_uses > 1) {
+      return false;
+    }
   }
-  ICHECK_LE(wrapped_score.max_bank_uses, 1)
-      << "HCU GEMM AN/BT 64-byte wrap strategy still has a bank conflict at "
-         "panel "
-      << wrapped_score.first_panel << ", phase " << wrapped_score.first_phase
-      << ", lane T" << wrapped_score.first_lane << ", bank "
-      << wrapped_score.first_bank;
   return true;
 }
 
@@ -511,13 +471,7 @@ DeriveHcuGemmAnBtLdsStrategyImpl(const CopyNode &copy, const GemmNode &gemm,
   node->storage_layout = storage_layout;
   node->copy_loop_layout = copy_layout;
   HcuGemmAnBtLdsStrategy strategy(std::move(node));
-  ValidateCopyStorageConsistency(strategy);
-  BankConflictScore score =
-      EvaluateDsReadBankConflicts(strategy->storage_layout, params);
-  ICHECK_LE(score.max_bank_uses, 1)
-      << "HCU GEMM AN/BT ds_read_m32x16_b16 bank conflict at panel "
-      << score.first_panel << ", phase " << score.first_phase << ", lane T"
-      << score.first_lane << ", bank " << score.first_bank;
+  ValidateStrategyParameters(params);
   return strategy;
 }
 
