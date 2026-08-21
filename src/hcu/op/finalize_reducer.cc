@@ -6,6 +6,7 @@
 #include "backend/common/op/finalize_reducer.h"
 
 #include "hcu/target_utils.h"
+#include "hcu/utils/auto_ebarrier.h"
 
 #include <sstream>
 
@@ -21,23 +22,34 @@ struct FinalizeReducer : backend::FinalizeReducerLowerer<FinalizeReducer> {
 
   static std::string MakeBatchAllReduce(std::string reducer,
                                         int reducing_threads, int scale,
-                                        PrimExpr thread_offset, PrimExpr,
-                                        int batch, int workspace_stride,
-                                        Target) {
+                                        PrimExpr thread_offset,
+                                        PrimExpr all_threads, int batch,
+                                        int workspace_stride, Target target) {
     std::stringstream ss;
     ss << "tl::AllReduce<" << reducer << ", " << reducing_threads << ", "
-       << scale << ", " << thread_offset << ", " << batch << ", "
-       << workspace_stride << ">::run_batch";
+       << scale << ", " << thread_offset;
+    if (reducing_threads > TargetHcuGetWarpSize(target) &&
+        TargetSupportsHcuEBarrier(target)) {
+      ss << ", " << kAutoEBarrierPolicyMarker;
+    } else {
+      ss << ", tl::SyncThreadsBarrier";
+    }
+    ss << ", " << batch << ", " << workspace_stride << ">::run_batch";
     return ss.str();
   }
 
   static std::string MakeScalarAllReduce(std::string reducer,
                                          int reducing_threads, int scale,
-                                         PrimExpr thread_offset, PrimExpr,
-                                         Target) {
+                                         PrimExpr thread_offset,
+                                         PrimExpr all_threads, Target target) {
     std::stringstream ss;
     ss << "tl::AllReduce<" << reducer << ", " << reducing_threads << ", "
-       << scale << ", " << thread_offset << ">::run";
+       << scale << ", " << thread_offset;
+    if (reducing_threads > TargetHcuGetWarpSize(target) &&
+        TargetSupportsHcuEBarrier(target)) {
+      ss << ", " << kAutoEBarrierPolicyMarker;
+    }
+    ss << ">::run";
     return ss.str();
   }
 };

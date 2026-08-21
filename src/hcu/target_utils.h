@@ -13,6 +13,8 @@ namespace tl {
 
 bool TargetIsHCU(Target target);
 bool TargetSupportsHcuWdra(Target target);
+bool TargetSupportsHcuEBarrier(Target target);
+bool TargetSupportsHcuABarrier(Target target);
 bool TargetHasMmacLitLts(Target target);
 std::string GetHcuArchString(Target target);
 bool TargetHcuHasAsyncCopy(Target target);

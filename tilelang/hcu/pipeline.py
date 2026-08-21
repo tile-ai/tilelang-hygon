@@ -85,6 +85,7 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.HoistMlsResource()(mod)
     mod = tilelang.transform.ThreadSync("shared")(mod)
     mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
+    mod = tilelang.transform.ResolveHcuEBarrier()(mod)
     mod = tilelang.transform.MergeIfStmt()(mod)
     mod = tilelang.transform.LowerAndValidateHcuWdra()(mod)
     mod = tilelang.transform.MakePackedAPI()(mod)

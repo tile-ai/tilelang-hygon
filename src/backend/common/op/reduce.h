@@ -600,18 +600,27 @@ template <typename Impl> struct ReduceLowerer {
           std::string reducer =
               reduce::MakeCodegenReducer(op, can_batch_pack ? vsize : 1)
                   .value();
+          auto all_threads = as_const_int(lower_args.thread_bounds->extent);
+          ICHECK(all_threads != nullptr)
+              << "Batch AllReduce requires a constant participating-thread "
+                 "extent";
+          int workspace_stride = static_cast<int>(*all_threads);
           std::string allreduce = Impl::MakeBatchAllReduce(
               reducer, reducing_threads, *scale, thread_offset,
-              lower_args.thread_bounds->extent, eff_batch, reducing_threads,
+              lower_args.thread_bounds->extent, eff_batch, workspace_stride,
               lower_args.target);
 
           DataType ws_dtype = can_batch_pack
                                   ? clear_buffer->dtype.with_lanes(vsize)
                                   : clear_buffer->dtype;
           PrimExpr workspace;
-          bool need_workspace = reducing_threads > 32;
+          int warp_size =
+              lower_args.target->GetAttr<Integer>("thread_warp_size", 32)
+                  .value()
+                  .IntValue();
+          bool need_workspace = reducing_threads > warp_size;
           if (need_workspace) {
-            int ws_size = reducing_threads * eff_batch;
+            int ws_size = workspace_stride * eff_batch;
             workspace = lower_args.add_workspace(ws_size, ws_dtype);
           }
 
@@ -790,7 +799,11 @@ template <typename Impl> struct ReduceLowerer {
               lower_args.target);
           Array<PrimExpr> thread_reduce_args = {
               StringImm(allreduce), BufferLoad(clear_buffer, red_indices)};
-          if (reducing_threads > 32) {
+          int warp_size =
+              lower_args.target->GetAttr<Integer>("thread_warp_size", 32)
+                  .value()
+                  .IntValue();
+          if (reducing_threads > warp_size) {
             int workspace_size = static_cast<int>(
                 *as_const_int(lower_args.thread_bounds->extent));
             PrimExpr workspace =

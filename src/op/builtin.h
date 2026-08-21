@@ -1455,7 +1455,7 @@ TVM_DLL const Op &ptx_cluster_store();
 TVM_DLL const Op &tma_store_cluster();
 
 /*!
- * \brief Hygon gfx946 ABarrier / EBarrier intrinsics (hardware slot id).
+ * \brief Hygon ABarrier / EBarrier intrinsics (hardware slot id).
  *
  * See tl_templates/hcu/barrier.h for device wrappers.
  */

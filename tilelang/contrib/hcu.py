@@ -13,13 +13,13 @@ from tvm.base import py_str
 from tvm.contrib import utils
 from tvm.target import Target
 
-from tilelang.engine.callback import register_hip_postproc_callback
-from tilelang.env import TILELANG_TEMPLATE_PATH
+from tilelang.engine.callback import register_hcu_postproc_callback
+from tilelang.env import TILELANG_TEMPLATE_PATH, env
 from tilelang.transform.pass_config import PassConfigKey
 
 
 def get_hcu_compiler() -> str:
-    """Resolve the HIP/offload compiler for HCU toolchains."""
+    """Resolve the offload compiler for HCU toolchains."""
     return "aicc" if shutil.which("aicc") else "hipcc"
 
 
@@ -36,9 +36,9 @@ def find_hcu_path() -> str:
         return os.environ["ROCM_PATH"]
     if os.path.isdir("/opt/dtk"):
         return "/opt/dtk"
-    hip_exe = shutil.which(get_hcu_compiler())
-    if hip_exe:
-        return os.path.realpath(os.path.join(hip_exe, "../.."))
+    compiler_exe = shutil.which(get_hcu_compiler())
+    if compiler_exe:
+        return os.path.realpath(os.path.join(compiler_exe, "../.."))
     raise RuntimeError("Cannot find HCU toolchain path")
 
 
@@ -71,7 +71,7 @@ _GLOBAL_KERNEL_RE = re.compile(
 )
 
 
-def _extract_hip_kernel_symbols(code: str) -> list[str]:
+def _extract_device_kernel_symbols(code: str) -> list[str]:
     return list(dict.fromkeys(_GLOBAL_KERNEL_RE.findall(code)))
 
 
@@ -94,12 +94,12 @@ def _sanitize_hcu_visible_text(text: str) -> str:
     return text
 
 
-@register_hip_postproc_callback
-def hcu_recompute_from_source(code: str, _target: Target) -> str:
-    """Optional HIP device source replacement before hipcc.
+@register_hcu_postproc_callback
+def hcu_override_device_source(code: str, _target: Target) -> str:
+    """Optional HCU device source replacement before offload compilation.
 
     ``TILELANG_OVERRIDE_DEVICE_SOURCE``: absolute or relative path to one ``.cu``
-    file that should replace the full emitted HIP translation unit.
+    file that should replace the full emitted HCU translation unit.
 
     ``TILELANG_OVERRIDE_DEVICE_SOURCE_DIR``: directory of ``{kernel_symbol}.cu``
     (only when codegen exposes exactly one ``__global__`` kernel).
@@ -109,7 +109,7 @@ def hcu_recompute_from_source(code: str, _target: Target) -> str:
     manually in tests).
 
     With ``target="auto"``, ROCm PyTorch builds select HIP even when a CUDA toolkit is
-    on PATH; override env vars only affect HIP device codegen, not ``tilelang_cuda``.
+    on PATH; override env vars only affect HCU device codegen, not ``tilelang_cuda``.
 
     A kernel cache hit skips lowering; set ``TILELANG_DISABLE_CACHE=1`` or clear the
     cache entry to force this hook to run.
@@ -121,10 +121,10 @@ def hcu_recompute_from_source(code: str, _target: Target) -> str:
     if not single and not directory:
         return code
 
-    symbols = _extract_hip_kernel_symbols(code)
+    symbols = _extract_device_kernel_symbols(code)
     if not symbols:
         warnings.warn(
-            'HIP device source override env is set but no `extern "C" __global__` kernels matched; skipping override.',
+            'HCU device source override env is set but no `extern "C" __global__` kernels matched; skipping override.',
             stacklevel=2,
         )
         return code
@@ -150,7 +150,7 @@ def hcu_recompute_from_source(code: str, _target: Target) -> str:
 
     if path is None or not os.path.isfile(path):
         warnings.warn(
-            f"HIP device source override path is missing or not a file: {path!r}; skipping.",
+            f"HCU device source override path is missing or not a file: {path!r}; skipping.",
             stacklevel=2,
         )
         return code
@@ -160,14 +160,14 @@ def hcu_recompute_from_source(code: str, _target: Target) -> str:
             override = f.read()
     except OSError as exc:
         warnings.warn(
-            f"HIP device source override read failed ({path}): {exc}; skipping.",
+            f"HCU device source override read failed ({path}): {exc}; skipping.",
             stacklevel=2,
         )
         return code
 
     if not _override_declares_symbols(override, symbols):
         warnings.warn(
-            f"HIP device source override must declare every codegen kernel symbol {symbols!r}; skipping.",
+            f"HCU device source override must declare every codegen kernel symbol {symbols!r}; skipping.",
             stacklevel=2,
         )
         return code
@@ -206,7 +206,7 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
             flags.append("-mllvm=-enable-hcu-approx-func-fp-math=true")
         if _pass_config_truthy(pass_configs, PassConfigKey.TL_ENABLE_HCU_WDRA):
             flags.append("-mllvm=-vgpr-greedy-alloc-mode=local-wave")
-            # flags.append("-mllvm=-run-on-model=true") # just for cmodel testing
+            # flags.append("-mllvm=-turn-off-wdra-trap-handler=true")  # just for cmodel testing
         if arch in ["gfx938", "gfx92a", "gfx946"]:
             flags.append("-mllvm=-hcu-update-wait-by-reverse-search=true")
             flags.append("-mllvm=-hcu-pre-emit-load-store-opt=false")
@@ -217,7 +217,7 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
 
 
 def _debug_enabled():
-    return os.environ.get("TILELANG_HIPCC_DEBUG", "").lower() in ("1", "true", "yes", "on")
+    return os.environ.get("TILELANG_HCU_DEBUG", "").lower() in ("1", "true", "yes", "on")
 
 
 def _debug_log(msg):
@@ -274,12 +274,12 @@ def _parse_asm_map(raw):
         if not item:
             continue
         if "=" not in item:
-            raise RuntimeError("Invalid TILELANG_HIPCC_ASM_MAP item (missing '='): " + item)
+            raise RuntimeError("Invalid TILELANG_HCU_ASM_MAP item (missing '='): " + item)
         kernel_name, asm_path = item.split("=", 1)
         kernel_name = kernel_name.strip()
         asm_path = asm_path.strip()
         if not kernel_name or not asm_path:
-            raise RuntimeError("Invalid TILELANG_HIPCC_ASM_MAP item (empty key/value): " + item)
+            raise RuntimeError("Invalid TILELANG_HCU_ASM_MAP item (empty key/value): " + item)
         mapping[kernel_name] = asm_path
     return mapping
 
@@ -287,14 +287,14 @@ def _parse_asm_map(raw):
 def _normalize_asm_input_path(asm_input, temp):
     asm_input = os.path.abspath(os.path.expanduser(asm_input))
     if not os.path.exists(asm_input):
-        raise RuntimeError("TILELANG_HIPCC_ASM_MAP points to missing file: " + asm_input)
+        raise RuntimeError("TILELANG_HCU_ASM_MAP points to missing file: " + asm_input)
     if not os.path.isfile(asm_input):
-        raise RuntimeError("TILELANG_HIPCC_ASM_MAP points to non-file path: " + asm_input)
+        raise RuntimeError("TILELANG_HCU_ASM_MAP points to non-file path: " + asm_input)
     return _extract_device_bundle_asm(asm_input, temp)
 
 
 def _resolve_asm_input(code, temp, verbose=False):
-    asm_map = _parse_asm_map(os.environ.get("TILELANG_HIPCC_ASM_MAP"))
+    asm_map = _parse_asm_map(os.environ.get("TILELANG_HCU_ASM_MAP"))
     if asm_map:
         kernel_names = _extract_kernel_names_from_code(code)
         _debug_log(f"detected kernels: {sorted(kernel_names)}")
@@ -353,7 +353,7 @@ def compile_hcu(
     verbose=False,
     pass_config=None,
 ):
-    """Compile HIP device code for HCU with DTK/aicc tuning flags."""
+    """Compile HCU device code with DTK/aicc tuning flags."""
     if arch is None:
         arch = get_hcu_arch(find_hcu_path())
 
@@ -436,10 +436,5 @@ def tilelang_callback_hcu_compile(code, target, pass_config=None):
             "-I" + TILELANG_TEMPLATE_PATH,
         ],
         pass_config=cfg,
-        verbose=False,
+        verbose=env.get_default_verbose(),
     )
-
-
-@tvm_ffi.register_global_func("tilelang_callback_hcu_postproc", override=True)
-def tilelang_callback_hcu_postproc(code, target):
-    return hcu_recompute_from_source(code, target)

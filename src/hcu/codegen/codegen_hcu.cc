@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "hcu/target_utils.h"
 #include "op/builtin.h"
 
 namespace tvm {
@@ -1824,12 +1825,30 @@ void CodeGenTileLangHCU::PrintVecElemStore(const std::string &vec, DataType t,
 }
 
 void CodeGenTileLangHCU::PrintStorageSync(const CallNode *op) {
-  const std::string &sync = op->args[0].as<StringImmNode>()->value;
+  const auto &args = op->args;
+  const std::string &sync = args[0].as<StringImmNode>()->value;
   if (sync == "warp") {
     // DO nothing.
   } else if (sync == "shared" || sync == "shared.dyn") {
     this->PrintIndent();
-    this->stream << "__syncthreads();\n";
+    if (args.size() == 3 && tl::TargetSupportsHcuEBarrier(target_)) {
+      const auto *barrier_id = args[1].as<IntImmNode>();
+      const auto *thread_count = args[2].as<IntImmNode>();
+      ICHECK(barrier_id && thread_count)
+          << "HCU partial storage sync requires constant barrier ID and "
+             "thread count";
+      int warp_size = tl::TargetHcuGetWarpSize(target_);
+      ICHECK_EQ(thread_count->value % warp_size, 0)
+          << "HCU partial storage sync thread count must be a multiple of "
+          << warp_size;
+      ICHECK_GE(barrier_id->value, 0);
+      ICHECK_LT(barrier_id->value, 16);
+      this->stream << "tl::ebarrier_sync_cnt(" << barrier_id->value << ", "
+                   << thread_count->value / warp_size << ");\n";
+    } else {
+      // Preserve the existing behavior on HCU targets without EBarrier.
+      this->stream << "__syncthreads();\n";
+    }
   }
 }
 

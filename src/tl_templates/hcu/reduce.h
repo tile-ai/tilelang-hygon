@@ -1,6 +1,10 @@
 #pragma once
 
 #include <tl_templates/hcu/common.h>
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx92a__) ||                 \
+    defined(__gfx946__)
+#include <tl_templates/hcu/barrier.h>
+#endif
 
 namespace tl {
 
@@ -87,7 +91,25 @@ struct SharedReduceWarp {
   }
 };
 
-template <class Reducer, int threads, int scale, int thread_offset = 0>
+struct SyncThreadsBarrier {
+  template <int phase = 0> static TL_DEVICE void sync() { __syncthreads(); }
+};
+
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx92a__) ||                 \
+    defined(__gfx946__)
+// HCU partial barrier policy. The compiler allocates BarrierId from the exact
+// participating thread range before this template is instantiated.
+template <int BarrierId, int WaveCount> struct EBarrier {
+  static_assert(BarrierId >= 0 && BarrierId < 16,
+                "EBarrier ID must be in [0, 15]");
+  static_assert(WaveCount > 0, "EBarrier wave count must be positive");
+  static TL_DEVICE void sync() { tl::ebarrier_sync_cnt(BarrierId, WaveCount); }
+};
+#endif
+
+template <class Reducer, int threads, int scale, int thread_offset = 0,
+          class Barrier = SyncThreadsBarrier, int batch_size = 1,
+          int workspace_stride = 0>
 struct AllReduce {
   static_assert(threads == 1024 || threads == 512 || threads == 256 ||
                 threads == 128 || threads == 64 || threads == 32 ||
@@ -99,9 +121,9 @@ struct AllReduce {
     constexpr int warpSize = 64;
 
     if constexpr (offset >= warpSize) {
-      __syncthreads();
+      Barrier::sync();
       red_buf[threadIdx.x - thread_offset] = x;
-      __syncthreads();
+      Barrier::sync();
       x = Reducer()(x, red_buf[(threadIdx.x - thread_offset) ^ offset]);
     } else {
       x = Reducer()(x, tl::shfl_xor(x, offset));
@@ -109,7 +131,38 @@ struct AllReduce {
     if constexpr (offset == scale) {
       return x;
     } else {
-      return AllReduce<Reducer, offset, scale, thread_offset>::run(x, red_buf);
+      return AllReduce<Reducer, offset, scale, thread_offset, Barrier>::run(
+          x, red_buf);
+    }
+  }
+
+  template <typename T>
+  static TL_DEVICE void run_batch(T *x, T *red_buf = nullptr) {
+    constexpr int offset = threads / 2;
+    constexpr int warpSize = 64;
+
+    if constexpr (offset >= warpSize) {
+      Barrier::sync();
+#pragma unroll
+      for (int i = 0; i < batch_size; ++i) {
+        red_buf[(threadIdx.x - thread_offset) + i * workspace_stride] = x[i];
+      }
+      Barrier::sync();
+#pragma unroll
+      for (int i = 0; i < batch_size; ++i) {
+        x[i] =
+            Reducer()(x[i], red_buf[((threadIdx.x - thread_offset) ^ offset) +
+                                    i * workspace_stride]);
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < batch_size; ++i) {
+        x[i] = Reducer()(x[i], tl::shfl_xor(x[i], offset));
+      }
+    }
+    if constexpr (offset != scale) {
+      AllReduce<Reducer, offset, scale, thread_offset, Barrier, batch_size,
+                workspace_stride>::run_batch(x, red_buf);
     }
   }
 };

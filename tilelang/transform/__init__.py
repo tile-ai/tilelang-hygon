@@ -165,6 +165,17 @@ def ThreadSync(storage_scope: str):
     return _ffi_api.ThreadSync(storage_scope)  # type: ignore
 
 
+def ResolveHcuEBarrier():
+    """Resolve HCU partial-sync and AllReduce EBarrier policies.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass.
+    """
+    return _ffi_api.ResolveHcuEBarrier()  # type: ignore
+
+
 def IfStmtBinding():
     """IfStmtBinding
 

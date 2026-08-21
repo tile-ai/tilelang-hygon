@@ -5,6 +5,7 @@
 
 #include <cassert>
 #include <tl_templates/hcu/core.hpp>
+#include <type_traits>
 
 #include <tl_templates/hcu/mls/tl_mls_atom_dispatcher.hpp>
 #include <tl_templates/hcu/mls/tl_mls_traits.hpp>
@@ -1511,8 +1512,13 @@ struct mls_generic_detail {
   static constexpr auto EffectiveWarpCluster =
       ::tl::sequence<EffectiveWarpMN, EffectiveWarpK>{};
 
+  // Emit matrix loads in physical-storage major order.  Transposed MLS has K
+  // contiguous, so K is the inner (fastest-changing) access dimension.  The
+  // non-transposed form has MN contiguous and keeps MN as the inner dimension.
+  using WarpAccessOrder =
+      std::conditional_t<Trans, ::tl::sequence<0, 1>, ::tl::sequence<1, 0>>;
   using SFC_WarpAccess =
-      ::tl::space_filling_curve<decltype(WarpMlsIssueSeq), ::tl::sequence<1, 0>,
+      ::tl::space_filling_curve<decltype(WarpMlsIssueSeq), WarpAccessOrder,
                                 ::tl::sequence<1, 1>, false>;
 
   TL_DEVICE static constexpr auto make_lds_desc() {

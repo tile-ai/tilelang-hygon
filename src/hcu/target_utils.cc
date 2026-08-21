@@ -45,6 +45,21 @@ bool TargetSupportsHcuWdra(Target target) {
   return GetMcpu(target) == "gfx946";
 }
 
+bool TargetSupportsHcuEBarrier(Target target) {
+  if (!TargetIsHCU(target) || !TargetHasMcpu(target)) {
+    return false;
+  }
+  static const std::set<std::string> kSupported = {"gfx92a", "gfx946"};
+  return kSupported.count(GetMcpu(target)) > 0;
+}
+
+bool TargetSupportsHcuABarrier(Target target) {
+  if (!TargetIsHCU(target) || !TargetHasMcpu(target)) {
+    return false;
+  }
+  return GetMcpu(target) == "gfx946";
+}
+
 bool TargetHasMmacLitLts(Target target) {
   if (!TargetIsHCU(target) || !TargetHasMcpu(target)) {
     return false;
@@ -113,6 +128,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def("tl.TargetIsHCU", [](Target target) { return TargetIsHCU(target); })
       .def("tl.TargetSupportsHcuWdra",
            [](Target target) { return TargetSupportsHcuWdra(target); })
+      .def("tl.TargetSupportsHcuEBarrier",
+           [](Target target) { return TargetSupportsHcuEBarrier(target); })
+      .def("tl.TargetSupportsHcuABarrier",
+           [](Target target) { return TargetSupportsHcuABarrier(target); })
       .def("tl.TargetHasMmacLitLts",
            [](Target target) { return TargetHasMmacLitLts(target); })
       .def("tl.GetHcuArchString",

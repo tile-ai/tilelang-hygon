@@ -354,7 +354,7 @@ class Environment:
     TILELANG_KERNEL_CACHE_USE_LIB_STAMP = EnvVar(
         "TILELANG_KERNEL_CACHE_USE_LIB_STAMP", "0"
     )  # include native TileLang library content hash in kernel cache keys
-    # (tilelang.contrib.hcu): replace emitted HIP device TU from disk before hipcc (see hcu_recompute_from_source).
+    # Replace the emitted HCU device translation unit from disk before offload compilation.
     TILELANG_OVERRIDE_DEVICE_SOURCE = EnvVar("TILELANG_OVERRIDE_DEVICE_SOURCE", None)
     TILELANG_OVERRIDE_DEVICE_SOURCE_DIR = EnvVar("TILELANG_OVERRIDE_DEVICE_SOURCE_DIR", None)
     # When saving kernel disk cache (HCU/ROCm): run hip compiler (aicc if on PATH, else hipcc) for .asm / LLVM IR / TIR.

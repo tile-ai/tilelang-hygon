@@ -1,6 +1,7 @@
 #pragma once
 
-// Hygon gfx946 ABarrier / EBarrier wrappers (hardware slot id in [0, 15]).
+// Hygon ABarrier / EBarrier wrappers (hardware slot id in [0, 15]).
+// gfx946 supports both families; gfx92a supports EBarrier only.
 
 namespace tl {
 
@@ -80,6 +81,11 @@ TL_DEVICE void abarrier_complete_tx(int abar_id, int tx_cnt) {
 #endif
 }
 
+#endif // !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx946__)
+
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx92a__) ||                 \
+    defined(__gfx946__)
+
 TL_DEVICE void ebarrier_sync(int ebar_id) {
 #if defined(__HIP_DEVICE_COMPILE__)
   __builtin_hcu_s_ebarrier_sync(ebar_id);
@@ -98,12 +104,6 @@ TL_DEVICE void ebarrier_arrive(int ebar_id, int wave_cnt) {
 #endif
 }
 
-#else
-
-// Non-gfx946 device: no definitions. Include-only is fine; emitted
-// tl::abarrier_* / tl::ebarrier_* call sites fail at compile time (undefined in
-// namespace tl).
-
-#endif // !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx946__)
+#endif // host || gfx92a || gfx946
 
 } // namespace tl

@@ -6,6 +6,7 @@
 #include "backend/common/op/reduce.h"
 
 #include "hcu/target_utils.h"
+#include "hcu/utils/auto_ebarrier.h"
 #include "layout/layout.h"
 #include "layout/utils.h"
 #include "op/builtin.h"
@@ -26,7 +27,7 @@ using backend::reduce::MakeReduce;
 } // namespace reduce
 
 Stmt LowerWarpReduce(const ReduceOpNode &op, const LowerArgs &lower_args,
-                     arith::Analyzer *analyzer) {
+                     arith::Analyzer *) {
   ICHECK(op.src.scope() == "local.fragment" &&
          op.dst.scope() == "local.fragment")
       << "Reduce for shared memory not implemented.";
@@ -71,16 +72,23 @@ Stmt LowerWarpReduce(const ReduceOpNode &op, const LowerArgs &lower_args,
   ICHECK(all_threads_int)
       << "Thread bounds extent must be constant for warp reduce.";
   int all_threads = *all_threads_int;
+  auto thread_offset_int = as_const_int(lower_args.thread_bounds->min);
+  ICHECK(thread_offset_int)
+      << "Thread bounds minimum must be constant for warp reduce.";
+  int thread_offset_value = *thread_offset_int;
+
   int reducing_threads = all_threads;
 
   auto rep_extent = as_const_int(dst_layout->ReplicateExtent());
   ICHECK(rep_extent) << "ReplicateExtent must be constant for warp reduce.";
+  ICHECK_EQ(all_threads % (*rep_extent), 0)
+      << "Total threads must be divisible by ReplicateExtent for warp reduce.";
   int scale = all_threads / (*rep_extent);
 
   ICHECK(scale >= warp_size)
       << "Scale must be greater than or equal to warp size for warp reduce.";
-  ICHECK(all_threads % (*rep_extent) == 0)
-      << "Total threads must be divisible by ReplicateExtent for warp reduce.";
+  ICHECK_EQ(scale % warp_size, 0)
+      << "HCU warp reduce scale must contain complete waves.";
 
   Var rv = Var("rv");
   Array<PrimExpr> register_dst_indices;
@@ -90,6 +98,15 @@ Stmt LowerWarpReduce(const ReduceOpNode &op, const LowerArgs &lower_args,
 
   Stmt warp_reduce_body;
   bool need_allreduce = (all_threads != scale);
+  if (need_allreduce) {
+    ICHECK_EQ(thread_offset_value % warp_size, 0)
+        << "HCU cross-wave reduce must start at a wave boundary";
+    ICHECK_EQ(all_threads % warp_size, 0)
+        << "HCU cross-wave reduce must contain complete waves";
+    int reducing_waves = all_threads / warp_size;
+    ICHECK_EQ(reducing_waves & (reducing_waves - 1), 0)
+        << "HCU cross-wave reduce requires a power-of-two number of waves";
+  }
   auto codegen_reducer = reduce::MakeCodegenReducer(op).value();
 
   if (clear_buffer_same_as_src) {
@@ -99,16 +116,19 @@ Stmt LowerWarpReduce(const ReduceOpNode &op, const LowerArgs &lower_args,
     }
 
     if (need_allreduce) {
-      ICHECK(lower_args.add_workspace != nullptr);
       Array<PrimExpr> allreduce_args = {clear_value};
-      PrimExpr workspace =
-          lower_args.add_workspace(all_threads, clear_buffer->dtype);
-      allreduce_args.push_back(workspace);
+      ICHECK(lower_args.add_workspace != nullptr);
+      allreduce_args.push_back(
+          lower_args.add_workspace(all_threads, clear_buffer->dtype));
 
       std::stringstream ss;
       auto thread_offset = lower_args.thread_bounds->min;
       ss << "tl::AllReduce<" << codegen_reducer << ", " << reducing_threads
-         << ", " << scale << ", " << thread_offset << ">::run";
+         << ", " << scale << ", " << thread_offset;
+      if (TargetSupportsHcuEBarrier(lower_args.target)) {
+        ss << ", " << kAutoEBarrierPolicyMarker;
+      }
+      ss << ">::run";
 
       allreduce_args.insert(allreduce_args.begin(), StringImm(ss.str()));
 
@@ -149,17 +169,20 @@ Stmt LowerWarpReduce(const ReduceOpNode &op, const LowerArgs &lower_args,
     }
 
     if (need_allreduce) {
-      ICHECK(lower_args.add_workspace != nullptr);
       Array<PrimExpr> allreduce_args = {
           BufferLoad(clear_buffer, register_dst_indices)};
-      PrimExpr workspace =
-          lower_args.add_workspace(all_threads, clear_buffer->dtype);
-      allreduce_args.push_back(workspace);
+      ICHECK(lower_args.add_workspace != nullptr);
+      allreduce_args.push_back(
+          lower_args.add_workspace(all_threads, clear_buffer->dtype));
 
       std::stringstream ss;
       auto thread_offset = lower_args.thread_bounds->min;
       ss << "tl::AllReduce<" << codegen_reducer << ", " << reducing_threads
-         << ", " << scale << ", " << thread_offset << ">::run";
+         << ", " << scale << ", " << thread_offset;
+      if (TargetSupportsHcuEBarrier(lower_args.target)) {
+        ss << ", " << kAutoEBarrierPolicyMarker;
+      }
+      ss << ">::run";
 
       allreduce_args.insert(allreduce_args.begin(), StringImm(ss.str()));
 
@@ -188,23 +211,34 @@ struct HCUReduce : backend::ReduceLowerer<HCUReduce> {
 
   static std::string MakeBatchAllReduce(std::string reducer,
                                         int reducing_threads, int scale,
-                                        PrimExpr thread_offset, PrimExpr,
-                                        int batch, int workspace_stride,
-                                        Target) {
+                                        PrimExpr thread_offset,
+                                        PrimExpr all_threads, int batch,
+                                        int workspace_stride, Target target) {
     std::stringstream ss;
     ss << "tl::AllReduce<" << reducer << ", " << reducing_threads << ", "
-       << scale << ", " << thread_offset << ", " << batch << ", "
-       << workspace_stride << ">::run_batch";
+       << scale << ", " << thread_offset;
+    if (reducing_threads > TargetHcuGetWarpSize(target) &&
+        TargetSupportsHcuEBarrier(target)) {
+      ss << ", " << kAutoEBarrierPolicyMarker;
+    } else {
+      ss << ", tl::SyncThreadsBarrier";
+    }
+    ss << ", " << batch << ", " << workspace_stride << ">::run_batch";
     return ss.str();
   }
 
   static std::string MakeScalarAllReduce(std::string reducer,
                                          int reducing_threads, int scale,
-                                         PrimExpr thread_offset, PrimExpr,
-                                         Target) {
+                                         PrimExpr thread_offset,
+                                         PrimExpr all_threads, Target target) {
     std::stringstream ss;
     ss << "tl::AllReduce<" << reducer << ", " << reducing_threads << ", "
-       << scale << ", " << thread_offset << ">::run";
+       << scale << ", " << thread_offset;
+    if (reducing_threads > TargetHcuGetWarpSize(target) &&
+        TargetSupportsHcuEBarrier(target)) {
+      ss << ", " << kAutoEBarrierPolicyMarker;
+    }
+    ss << ">::run";
     return ss.str();
   }
 };

@@ -511,6 +511,22 @@ private:
   }
 
   void VisitStmt_(const IfThenElseNode *op) final {
+    // Only the outer threadIdx.x ladder defines WDRA register-allocation
+    // branches.  Ordinary control flow nested inside a producer/consumer
+    // branch does not change wave ownership and therefore must not require a
+    // second set_max_nreg marker.
+    if (in_branch_) {
+      StmtExprVisitor::VisitStmt_(op);
+      return;
+    }
+
+    // The lowered WDRA fork is the get_wave_id() upper-bound ladder.  Do not
+    // mistake unrelated prologue control flow for the producer branch.
+    if (before_fork_ && !ParseWaveUpperBound(op->condition).has_value()) {
+      StmtExprVisitor::VisitStmt_(op);
+      return;
+    }
+
     if (before_fork_) {
       before_fork_ = false;
     }
@@ -550,7 +566,9 @@ private:
       bool seen_fork = false;
       for (const Stmt &stmt : op->seq) {
         if (!seen_fork) {
-          if (stmt.as<IfThenElseNode>()) {
+          const auto *if_node = stmt.as<IfThenElseNode>();
+          if (if_node != nullptr &&
+              ParseWaveUpperBound(if_node->condition).has_value()) {
             seen_fork = true;
             VisitStmt(stmt);
           } else {
