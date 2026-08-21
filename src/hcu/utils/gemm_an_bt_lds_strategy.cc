@@ -25,7 +25,7 @@ using namespace tirx;
 
 namespace {
 
-constexpr int kStrategyVersion = 2;
+constexpr int kStrategyVersion = 3;
 constexpr int kDsReadTileK = 16;
 constexpr int kDsReadPanelN = 32;
 constexpr int kDsReadPhaseBytes = 128;
@@ -100,23 +100,24 @@ int64_t RequireConst(const PrimExpr &expr, arith::Analyzer *analyzer,
   return *value;
 }
 
-Fragment MakeCopyLoopLayout(const AnBtStrategyParams &params) {
+Fragment MakeCopyLoopLayout(const AnBtStrategyParams &params,
+                            bool permute_rows) {
   PrimExpr k = InputPlaceholder(0);
   PrimExpr n = InputPlaceholder(1);
   PrimExpr k_tile = floordiv(k, Integer(kDsReadTileK));
   PrimExpr k_inner = floormod(k, Integer(kDsReadTileK));
   PrimExpr n_segment =
       floordiv(n, Integer(params.copy_elements_per_lane));
-  // Follow the ds_read_m32x16 phase row order within each K16 tile:
-  //   0, 2, 1, 3, 4, 6, 5, 7, ...
-  // Flattening this row order with the N segments reproduces the established
-  // K16xN256/512-thread mapping and remains compact for other legal shapes.
-  PrimExpr permuted_k_inner =
-      floordiv(k_inner, Integer(4)) * 4 +
-      floormod(k_inner, Integer(2)) * 2 +
-      floordiv(floormod(k_inner, Integer(4)), Integer(2));
+  PrimExpr mapped_k_inner = k_inner;
+  if (permute_rows) {
+    // Assign repeated-bank K rows to different copy waves before applying
+    // wrap. Conflict-free linear layouts must retain the identity row order.
+    mapped_k_inner = floordiv(k_inner, Integer(4)) * 4 +
+                     floormod(k_inner, Integer(2)) * 2 +
+                     floordiv(floormod(k_inner, Integer(4)), Integer(2));
+  }
   PrimExpr canonical_segment =
-      (k_tile * kDsReadTileK + permuted_k_inner) *
+      (k_tile * kDsReadTileK + mapped_k_inner) *
           params.copy_segments_per_row +
       n_segment;
   PrimExpr transaction =
@@ -293,17 +294,28 @@ BankConflictScore EvaluateDsReadBankConflicts(
   return score;
 }
 
-bool SelectWrapStrategy(AnBtStrategyParams *params, const Fragment &copy_layout,
+bool SelectWrapStrategy(AnBtStrategyParams *params, Fragment *copy_layout,
                         Target target) {
   if (params->block_threads % params->warp_size != 0) {
     return false;
   }
   params->wrap_offset = 0;
   params->wrap_idx_mask = 0;
-  Layout linear_storage = MakeStorageLayout(*params, copy_layout);
+  *copy_layout = MakeCopyLoopLayout(*params, /*permute_rows=*/false);
+  Layout linear_storage = MakeStorageLayout(*params, *copy_layout);
   BankConflictScore linear_score =
       EvaluateDsReadBankConflicts(linear_storage, *params);
   if (linear_score.max_bank_uses <= 1) {
+    return true;
+  }
+
+  // Row permutation is part of the conflict-resolution strategy, not a
+  // baseline requirement of ds_read_m32x16_b16.
+  *copy_layout = MakeCopyLoopLayout(*params, /*permute_rows=*/true);
+  Layout permuted_storage = MakeStorageLayout(*params, *copy_layout);
+  BankConflictScore permuted_score =
+      EvaluateDsReadBankConflicts(permuted_storage, *params);
+  if (permuted_score.max_bank_uses <= 1) {
     return true;
   }
 
@@ -331,7 +343,7 @@ bool SelectWrapStrategy(AnBtStrategyParams *params, const Fragment &copy_layout,
       AnBtStrategyParams candidate = *params;
       candidate.wrap_offset = offset;
       candidate.wrap_idx_mask = mask;
-      Layout storage_layout = MakeStorageLayout(candidate, copy_layout);
+      Layout storage_layout = MakeStorageLayout(candidate, *copy_layout);
       BankConflictScore score =
           EvaluateDsReadBankConflicts(storage_layout, candidate);
       if (score.max_bank_uses > 1) {
@@ -455,8 +467,8 @@ DeriveHcuGemmAnBtLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   params.copy_segments_per_row =
       params.block_mn / params.copy_elements_per_lane;
 
-  Fragment copy_layout = MakeCopyLoopLayout(params);
-  if (!SelectWrapStrategy(&params, copy_layout, target)) {
+  Fragment copy_layout;
+  if (!SelectWrapStrategy(&params, &copy_layout, target)) {
     return std::nullopt;
   }
   Layout storage_layout = MakeStorageLayout(params, copy_layout);
