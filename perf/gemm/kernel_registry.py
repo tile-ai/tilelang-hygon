@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from perf.gemm.async_copy_gemm import gemm_async_copy_vanilla
+from perf.gemm.async_copy_gemm import gemm_async_copy_k_major, gemm_async_copy_n_major
 from perf.gemm.persistent_gemm import (
     gemm_persistent_v1,
     gemm_persistent_v2,
@@ -67,16 +67,14 @@ _N_MAJOR = "n_major"
 
 KERNEL_REGISTRY: dict[tuple[str, str | None, str], KernelSpec] = {
     ("async_copy", "vanilla", _K_MAJOR): KernelSpec(
-        "gemm_async_copy_vanilla",
-        gemm_async_copy_vanilla,
+        "gemm_async_copy_k_major",
+        gemm_async_copy_k_major,
         _async_copy_vanilla_config,
-        {"transpose_B": True},
     ),
     ("async_copy", "vanilla", _N_MAJOR): KernelSpec(
-        "gemm_async_copy_vanilla",
-        gemm_async_copy_vanilla,
+        "gemm_async_copy_n_major",
+        gemm_async_copy_n_major,
         _async_copy_vanilla_config,
-        {"transpose_B": False},
     ),
     ("persistent", "v1", _K_MAJOR): KernelSpec("gemm_persistent_v1", gemm_persistent_v1, _heuristic_config_getter("persistent", "v1")),
     ("persistent", "v2", _K_MAJOR): KernelSpec("gemm_persistent_v2", gemm_persistent_v2, _heuristic_config_getter("persistent", "v2")),

@@ -4,13 +4,7 @@ import tilelang as tl
 import tilelang.language as T
 
 
-@tl.jit(
-    out_idx=[-1],
-    pass_configs={
-        tl.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
-    },
-)
-def gemm_async_copy_vanilla(
+def _gemm_async_copy_vanilla(
     M,
     N,
     K,
@@ -20,6 +14,8 @@ def gemm_async_copy_vanilla(
     dtype="float16",
     accum_dtype="float32",
     transpose_B=False,
+    steady_wait=6,
+    shared_0_wait=6,
 ):
     """Four-stage GEMM using async copies and compiler-derived LDS layouts."""
     k_tiles = (K + block_K - 1) // block_K
@@ -110,7 +106,7 @@ def gemm_async_copy_vanilla(
                     async_copy_a(A, A_shared_0, by, k0 + 4)
                     async_copy_b(B, B_shared_0, bx, k0 + 4)
 
-                    T.s_waitcnt(6, "lgkmcnt")
+                    T.s_waitcnt(steady_wait, "lgkmcnt")
                     T.ptx_wait_group(4)
                     T.sync_warp()
                     T.sched_barrier()
@@ -123,7 +119,7 @@ def gemm_async_copy_vanilla(
                     async_copy_a(A, A_shared_1, by, k1_if + 4)
                     async_copy_b(B, B_shared_1, bx, k1_if + 4)
 
-                    T.s_waitcnt(6, "lgkmcnt")
+                    T.s_waitcnt(steady_wait, "lgkmcnt")
                     T.ptx_wait_group(4)
                     T.sync_warp()
                     T.sched_barrier()
@@ -136,7 +132,7 @@ def gemm_async_copy_vanilla(
                     async_copy_a(A, A_shared_2, by, k2_if + 4)
                     async_copy_b(B, B_shared_2, bx, k2_if + 4)
 
-                    T.s_waitcnt(6, "lgkmcnt")
+                    T.s_waitcnt(steady_wait, "lgkmcnt")
                     T.ptx_wait_group(4)
                     T.sync_warp()
                     T.sched_barrier()
@@ -149,7 +145,7 @@ def gemm_async_copy_vanilla(
                     async_copy_a(A, A_shared_3, by, k3_if + 4)
                     async_copy_b(B, B_shared_3, bx, k3_if + 4)
 
-                    T.s_waitcnt(6, "lgkmcnt")
+                    T.s_waitcnt(shared_0_wait, "lgkmcnt")
                     T.ptx_wait_group(4)
                     T.sync_warp()
                     T.sched_barrier()
@@ -161,7 +157,7 @@ def gemm_async_copy_vanilla(
                     async_copy_a(A, A_shared_0, by, k0 + 4)
                     async_copy_b(B, B_shared_0, bx, k0 + 4)
 
-                    T.s_waitcnt(6, "lgkmcnt")
+                    T.s_waitcnt(steady_wait, "lgkmcnt")
                     T.sched_barrier()
                     T.gemm(A_local_0, B_local_0, C_local, transpose_B=transpose_B, annotations={"trans_c": True})
                     T.sched_barrier()
@@ -174,7 +170,7 @@ def gemm_async_copy_vanilla(
                     async_copy_a(A, A_shared_1, by, k1_else + 4)
                     async_copy_b(B, B_shared_1, bx, k1_else + 4)
 
-                    T.s_waitcnt(6, "lgkmcnt")
+                    T.s_waitcnt(steady_wait, "lgkmcnt")
                     T.sched_barrier()
                     T.gemm(A_local_1, B_local_1, C_local, transpose_B=transpose_B, annotations={"trans_c": True})
                     T.sched_barrier()
@@ -187,7 +183,7 @@ def gemm_async_copy_vanilla(
                     async_copy_a(A, A_shared_2, by, k2_else + 4)
                     async_copy_b(B, B_shared_2, bx, k2_else + 4)
 
-                    T.s_waitcnt(6, "lgkmcnt")
+                    T.s_waitcnt(steady_wait, "lgkmcnt")
                     T.sched_barrier()
                     T.gemm(A_local_0, B_local_0, C_local, transpose_B=transpose_B, annotations={"trans_c": True})
                     T.sched_barrier()
@@ -200,7 +196,7 @@ def gemm_async_copy_vanilla(
                     async_copy_a(A, A_shared_3, by, k3_else + 4)
                     async_copy_b(B, B_shared_3, bx, k3_else + 4)
 
-                    T.s_waitcnt(6, "lgkmcnt")
+                    T.s_waitcnt(shared_0_wait, "lgkmcnt")
                     T.sched_barrier()
                     T.gemm(A_local_1, B_local_1, C_local, transpose_B=transpose_B, annotations={"trans_c": True})
                     T.sched_barrier()
@@ -236,3 +232,65 @@ def gemm_async_copy_vanilla(
             T.copy(C_local, C[by * block_M : (by + 1) * block_M, bx * block_N : (bx + 1) * block_N])
 
     return gemm
+
+
+@tl.jit(
+    out_idx=[-1],
+    pass_configs={
+        tl.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+    },
+)
+def gemm_async_copy_k_major(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K,
+    dtype="float16",
+    accum_dtype="float32",
+):
+    return _gemm_async_copy_vanilla(
+        M,
+        N,
+        K,
+        block_M,
+        block_N,
+        block_K,
+        dtype=dtype,
+        accum_dtype=accum_dtype,
+        transpose_B=True,
+        steady_wait=6,
+        shared_0_wait=6,
+    )
+
+
+@tl.jit(
+    out_idx=[-1],
+    pass_configs={
+        tl.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+    },
+)
+def gemm_async_copy_n_major(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K,
+    dtype="float16",
+    accum_dtype="float32",
+):
+    return _gemm_async_copy_vanilla(
+        M,
+        N,
+        K,
+        block_M,
+        block_N,
+        block_K,
+        dtype=dtype,
+        accum_dtype=accum_dtype,
+        transpose_B=False,
+        steady_wait=8,
+        shared_0_wait=6,
+    )
