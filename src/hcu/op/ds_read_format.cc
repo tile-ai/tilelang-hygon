@@ -61,14 +61,20 @@ static const MlsReadMap kMlsToReadTileB4 = {
     {{16, 256, true, 1}, {16, 128}},
 };
 
+static const MlsReadMap kMlsToReadTileB32 = {
+    {{16, 16, false, 1}, {16, 16}},
+    {{16, 16, true, 1}, {16, 16}},
+};
+
 void GetReadTileFromMlsTile(bool trans, int mls_tile_mn, int mls_tile_k,
                             int alt, int element_bits, int &read_tile_mn,
                             int &read_tile_k) {
   MlsReadKey key(mls_tile_mn, mls_tile_k, trans, alt);
-  const MlsReadMap *m = element_bits == 16  ? &kMlsToReadTileB16
-                        : element_bits == 8 ? &kMlsToReadTileB8
-                        : element_bits == 4 ? &kMlsToReadTileB4
-                                            : nullptr;
+  const MlsReadMap *m = element_bits == 16   ? &kMlsToReadTileB16
+                        : element_bits == 8  ? &kMlsToReadTileB8
+                        : element_bits == 4  ? &kMlsToReadTileB4
+                        : element_bits == 32 ? &kMlsToReadTileB32
+                                             : nullptr;
   ICHECK(m != nullptr) << "GetReadTileFromMlsTile: unsupported element "
                           "bitwidth="
                        << element_bits;
@@ -80,7 +86,7 @@ void GetReadTileFromMlsTile(bool trans, int mls_tile_mn, int mls_tile_k,
     LOG(FATAL) << "GetReadTileFromMlsTile: no entry for (mls_mn=" << mls_tile_mn
                << ", mls_k=" << mls_tile_k << ", trans=" << trans
                << ", alt=" << alt << ", element_bits=" << element_bits
-               << "). Add to kMlsToReadTileB16/B8/B4.";
+               << "). Add to kMlsToReadTileB16/B8/B4/B32.";
   }
 }
 
@@ -99,6 +105,12 @@ std::string DsReadFormatDTypeString(DataType dtype) {
   }
   if (dtype.is_float4()) {
     return "tl::pk_fp4_t";
+  }
+  if (dtype.is_tfloat32()) {
+    return "int";
+  }
+  if (dtype.is_float() && dtype.bits() == 32) {
+    return "float";
   }
   if (dtype.is_uint() && dtype.bits() == 8) {
     return "uint8_t";

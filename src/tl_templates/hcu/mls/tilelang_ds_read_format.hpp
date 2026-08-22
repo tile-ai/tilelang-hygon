@@ -30,8 +30,9 @@ namespace mls {
 template <typename LdsBlockSize, typename DsReadBlockSize, typename MlsTileSize,
           ::tl::index_t WarpMN, ::tl::index_t WarpK, typename DataType,
           ::tl::index_t Alt, bool Trans, ::tl::hcu_target_enum HcuArch,
+          typename TargetType = DataType,
           ::tl::index_t LdsBits = mls_elem_bits_v<DataType>,
-          ::tl::index_t RegBits = LdsBits>
+          ::tl::index_t RegBits = mls_elem_bits_v<TargetType>>
 struct ds_read_format_traits {
   static constexpr ::tl::index_t ReadBlockSizeMN =
       DsReadBlockSize::at(::tl::number<0>{});
@@ -44,8 +45,9 @@ struct ds_read_format_traits {
   using LdsTraits = mls_lds_desc_param_traits<LdsBlockSize, MlsTileSize, Bits,
                                               LdsBits, Alt, Trans, HcuArch>;
   using MlsAtom = typename LdsTraits::MlsAtom;
-  using DsFormatInst =
-      typename mls_ds_traits<MlsAtom, Bits, LdsBits, RegBits, Alt>::Type;
+  using DsFormatInst = typename mls_ds_traits_with_target<
+      MlsAtom, Bits, LdsBits, RegBits, Alt,
+      ::tl::remove_cvref_t<TargetType>>::Type;
 
   static constexpr auto LdsDesc = LdsTraits::get_tile_lds_desc();
 
@@ -72,12 +74,16 @@ struct ds_read_format_traits {
   // Gemm layout: (ki, Mi) -> offset (ki * warp_rows + Mi) * vec_size
   // Matches gemm.h body_rr: a_ptr = A_local + (ki * warp_rows + Mi) * vec_size
   static constexpr ::tl::index_t MmacMNSize = 16;
-  static constexpr ::tl::index_t MmacKSize =
-      RegBits == 4 ? 64 : (RegBits == 16 ? 16 : 32);
+  static constexpr ::tl::index_t MmacKSize = RegBits == 4    ? 64
+                                             : RegBits == 8  ? 32
+                                             : RegBits == 16 ? 16
+                                             : RegBits == 32 ? 8
+                                                             : 0;
+  static_assert(MmacKSize != 0, "Unsupported ds_read_format register bitwidth");
   static constexpr ::tl::index_t GemmWarpRows = PerWarpMN / MmacMNSize;
   static constexpr ::tl::index_t GemmInnerK = PerWarpK / MmacKSize;
   // VecSize is in storage elements; for b4 it counts packed bytes.
-  static constexpr ::tl::index_t VecSize = RegBits == 4 ? 8 : 64 / RegBits;
+  static constexpr ::tl::index_t VecSize = RegBits == 4 ? 8 : MmacKSize / 4;
   static constexpr ::tl::index_t GemmTensorSize =
       GemmInnerK * GemmWarpRows * VecSize;
 };
@@ -107,9 +113,10 @@ TL_DEVICE void
 ds_read_format_tensor(TL_LDS_ADDR DataType *smem_ptr, void *target,
                       ::tl::index_t warp_mn_idx, ::tl::index_t warp_k_idx,
                       ::tl::index_t origin_mn = 0, ::tl::index_t origin_k = 0) {
-  using Traits = ds_read_format_traits<LdsBlockSize, DsReadBlockSize,
-                                       MlsTileSize, WarpMN, WarpK, DataType,
-                                       Alt, Trans, HcuArch, LdsBits, RegBits>;
+  using Traits =
+      ds_read_format_traits<LdsBlockSize, DsReadBlockSize, MlsTileSize, WarpMN,
+                            WarpK, DataType, Alt, Trans, HcuArch, TargetType,
+                            LdsBits, RegBits>;
 
   using DsFormatInst = typename Traits::DsFormatInst;
   using StorageTargetType = typename ds_read_format_storage_type<
@@ -239,13 +246,11 @@ TL_DEVICE void ds_read_format_tensor_common(TL_LDS_ADDR void *smem_ptr,
                                             ::tl::index_t origin_k = 0) {
   static constexpr ::tl::index_t ReadBlockSizeMN =
       DsReadBlockSize::at(::tl::number<0>{});
-  static constexpr ::tl::index_t Bits = mls_elem_bits_v<DataType>;
-
-  using LdsTraits = mls_lds_desc_param_traits<LdsBlockSize, MlsTileSize, Bits,
-                                              LdsBits, Alt, Trans, HcuArch>;
-  using MlsAtom = typename LdsTraits::MlsAtom;
-  using DsFormatInst =
-      typename mls_ds_traits<MlsAtom, Bits, LdsBits, RegBits, Alt>::Type;
+  using Traits =
+      ds_read_format_traits<LdsBlockSize, DsReadBlockSize, MlsTileSize, WarpMN,
+                            WarpK, DataType, Alt, Trans, HcuArch, TargetType,
+                            LdsBits, RegBits>;
+  using DsFormatInst = typename Traits::DsFormatInst;
 
   static constexpr ::tl::index_t WarpMN_no_recompute =
       std::min(WarpMN, ReadBlockSizeMN / DsFormatInst::kMN);

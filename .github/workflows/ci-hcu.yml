@@ -180,7 +180,7 @@ jobs:
             pip3 install dist/*.whl
           fi
           # GitLab test job: regression deps (not full requirements-test.txt)
-          pip3 install numpy==1.24.3 allure-pytest pytest-xdist \
+          pip3 install "numpy>=1.26,<2" allure-pytest pytest-xdist \
             --index-url https://mirrors.aliyun.com/pypi/simple/ \
             --trusted-host mirrors.aliyun.com
           python3 -c "import torch; print('torch:', torch.__version__)"

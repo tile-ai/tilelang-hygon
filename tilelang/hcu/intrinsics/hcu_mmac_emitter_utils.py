@@ -150,6 +150,12 @@ def hcu_mls_ds_read_dtype_str(dtype) -> str:
         return "bfloat16_t"
     if ("float16" in s or s in ("fp16", "half")) and "float8" not in s:
         return "half_t"
+    if "tfloat32" in s:
+        return "int"
+    if s == "int32":
+        return "int"
+    if s == "float32":
+        return "float"
     raise ValueError(f"ldmatrix_mls unsupported dtype: {dtype}")
 
 
@@ -214,6 +220,8 @@ def build_ds_read_format_tensor_b_template(
         if reg_bits is None:
             raise ValueError("lds_bits requires reg_bits")
         target_type += f", {int(lds_bits)}, {int(reg_bits)}"
+    elif target_dtype_str is not None and min_n_per_warp:
+        target_type += f", tl::mls::mls_elem_bits_v<{dtype_str}>, tl::mls::mls_elem_bits_v<{target_dtype_str}>"
     elif min_n_per_warp:
         # ExtraMinNPerWarp follows three defaulted template parameters, so spell
         # those defaults explicitly when no widened target type was requested.

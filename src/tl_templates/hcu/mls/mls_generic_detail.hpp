@@ -753,6 +753,72 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_32x16_b16, 1, BlockSizeMN,
   }
 };
 
+template <::tl::index_t BlockSizeMN, ::tl::index_t BlockSizeK>
+struct make_lds_desc_generic<tl::mls::gfx946_mls_16x16_trans_b32, 1,
+                             BlockSizeMN, BlockSizeK, true> {
+  using MlsTraits = mls_traits<tl::mls::gfx946_mls_16x16_trans_b32, 1>;
+  static constexpr ::tl::index_t MlsTileMN = 16;
+  static constexpr ::tl::index_t MlsTileK = 16;
+
+  static constexpr auto apply() {
+    constexpr auto tile_issue_mn = ::tl::number<BlockSizeMN / MlsTileMN>{};
+    constexpr auto tile_issue_k = ::tl::number<BlockSizeK / MlsTileK>{};
+
+    if constexpr (tile_issue_k == 1) {
+      // (tile_issue_mn, kMN, kK)
+      constexpr auto lds_desc_raw =
+          ::tl::make_naive_tensor_descriptor_packed(::tl::concat_tuple(
+              ::tl::make_tuple(tile_issue_mn), MlsTraits::PackedShape));
+      return ::tl::transform_tensor_descriptor(
+          lds_desc_raw,
+          ::tl::make_tuple(::tl::make_merge_transform(
+                               ::tl::make_tuple(tile_issue_mn, MlsTraits::kMN)),
+                           ::tl::make_pass_through_transform(MlsTraits::kK)),
+          ::tl::make_tuple(::tl::sequence<0, 1>{}, ::tl::sequence<2>{}),
+          ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
+    } else {
+      // (tile_issue_k, tile_issue_mn, kMN, kK)
+      constexpr auto lds_desc_raw = ::tl::make_naive_tensor_descriptor_packed(
+          ::tl::concat_tuple(::tl::make_tuple(tile_issue_k, tile_issue_mn),
+                             MlsTraits::PackedShape));
+      return ::tl::transform_tensor_descriptor(
+          lds_desc_raw,
+          ::tl::make_tuple(::tl::make_merge_transform(
+                               ::tl::make_tuple(tile_issue_mn, MlsTraits::kMN)),
+                           ::tl::make_merge_transform(
+                               ::tl::make_tuple(tile_issue_k, MlsTraits::kK))),
+          ::tl::make_tuple(::tl::sequence<1, 2>{}, ::tl::sequence<0, 3>{}),
+          ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
+    }
+  }
+};
+
+template <::tl::index_t BlockSizeMN, ::tl::index_t BlockSizeK>
+struct make_lds_desc_generic<tl::mls::gfx946_mls_16x16_b32, 1, BlockSizeMN,
+                             BlockSizeK, false> {
+  using MlsTraits = mls_traits<tl::mls::gfx946_mls_16x16_b32, 1>;
+  static constexpr ::tl::index_t MlsTileMN = 16;
+  static constexpr ::tl::index_t MlsTileK = 16;
+
+  static constexpr auto apply() {
+    constexpr auto tile_issue_mn = ::tl::number<BlockSizeMN / MlsTileMN>{};
+    constexpr auto tile_issue_k = ::tl::number<BlockSizeK / MlsTileK>{};
+
+    // (tile_issue_mn, tile_issue_k, kK, kMN)
+    constexpr auto lds_desc_raw = ::tl::make_naive_tensor_descriptor_packed(
+        ::tl::concat_tuple(::tl::make_tuple(tile_issue_mn, tile_issue_k),
+                           MlsTraits::PackedShape));
+    return ::tl::transform_tensor_descriptor(
+        lds_desc_raw,
+        ::tl::make_tuple(::tl::make_merge_transform(
+                             ::tl::make_tuple(tile_issue_mn, MlsTraits::kMN)),
+                         ::tl::make_merge_transform(
+                             ::tl::make_tuple(tile_issue_k, MlsTraits::kK))),
+        ::tl::make_tuple(::tl::sequence<0, 3>{}, ::tl::sequence<1, 2>{}),
+        ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
+  }
+};
+
 // gfx946 64x16_b16: PackedShape=(kMN0, kSlots, kK, kMN1), differs from gfx938
 template <::tl::index_t Alt, ::tl::index_t BlockSizeMN,
           ::tl::index_t BlockSizeK>

@@ -22,6 +22,13 @@ template <typename MlsAtom, ::tl::index_t SrcBits, ::tl::index_t LdsBits,
           ::tl::index_t RegBits, ::tl::index_t Alt>
 struct mls_ds_traits;
 
+template <typename MlsAtom, ::tl::index_t SrcBits, ::tl::index_t LdsBits,
+          ::tl::index_t RegBits, ::tl::index_t Alt, typename TargetType>
+struct mls_ds_traits_with_target {
+  using Type =
+      typename mls_ds_traits<MlsAtom, SrcBits, LdsBits, RegBits, Alt>::Type;
+};
+
 #if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx938__)
 #include <tl_templates/hcu/mls/tl_mls_atom_gfx938.hpp>
 // gfx938 b16
@@ -289,6 +296,30 @@ template <> struct mls_ds_traits<tl::mls::gfx946_mls_64x16_fp4, 4, 8, 8, 1> {
 template <>
 struct mls_ds_traits<tl::mls::gfx946_mls_16x64_trans_fp4, 4, 8, 8, 1> {
   using Type = DsreadmFormatDispatcher<1, 16, 64, 1, true>;
+};
+
+template <::tl::index_t Alt>
+struct mls_ds_traits_with_target<tl::mls::gfx946_mls_16x16_b32, 32, 32, 32, Alt,
+                                 float> {
+  using Type = DsreadmFormatDispatcherB32<false, 16, 16, Alt, false>;
+};
+
+template <::tl::index_t Alt>
+struct mls_ds_traits_with_target<tl::mls::gfx946_mls_16x16_trans_b32, 32, 32,
+                                 32, Alt, float> {
+  using Type = DsreadmFormatDispatcherB32<false, 16, 16, Alt, true>;
+};
+
+template <::tl::index_t Alt>
+struct mls_ds_traits_with_target<tl::mls::gfx946_mls_16x16_b32, 32, 32, 32, Alt,
+                                 int> {
+  using Type = DsreadmFormatDispatcherB32<true, 16, 16, Alt, false>;
+};
+
+template <::tl::index_t Alt>
+struct mls_ds_traits_with_target<tl::mls::gfx946_mls_16x16_trans_b32, 32, 32,
+                                 32, Alt, int> {
+  using Type = DsreadmFormatDispatcherB32<true, 16, 16, Alt, true>;
 };
 
 template <> struct mls_ds_traits<tl::mls::gfx946_mls_128x16_b4, 4, 4, 8, 1> {
