@@ -36,6 +36,7 @@ public:
   int read_bytes_per_lane{0};
   int phase_bytes{0};
   int panel_mn{0};
+  // Physical wrap shift in dwords before target-specific field encoding.
   int wrap_offset{0};
   int wrap_idx_mask{0};
   Layout storage_layout;

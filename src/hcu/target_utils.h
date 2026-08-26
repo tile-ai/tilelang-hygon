@@ -39,7 +39,8 @@ int TargetHcuGetLdsBankCount(Target target);
 int TargetHcuGetLdsBankWidthBytes(Target target);
 HcuLdsWrapConfig TargetHcuGetLdsWrapConfig(Target target);
 int TargetHcuGetLdsWrapFieldBits(Target target);
-int TargetHcuGetLdsWrapMaxOffset(Target target, int offset_unit_bytes);
+int TargetHcuGetLdsWrapGranularityDwords(Target target);
+int TargetHcuGetLdsWrapMaxOffsetDwords(Target target);
 
 } // namespace tl
 } // namespace tvm

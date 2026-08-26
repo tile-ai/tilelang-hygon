@@ -215,21 +215,69 @@ template <int N = 0> TL_DEVICE void cp_async_wait() {
   // async_gld_sld_fence(N);
 }
 
+namespace detail {
+
+template <int N, int SmemOffset>
+TL_DEVICE void cp_async_gs_idxen_impl(
+    uint32_t lds_base, int32x4_t src_resource,
+    std::int32_t src_thread_byte_offset, std::int32_t idxen) {
+  static_assert(N == 4 || N == 8 || N == 16,
+                "idxen async copy only supports 4, 8, or 16 bytes");
+  typedef uint32_t uint32x2_t __attribute__((ext_vector_type(2)));
+  uint32x2_t v_addr = {static_cast<uint32_t>(idxen),
+                       static_cast<uint32_t>(src_thread_byte_offset)};
+  if constexpr (N == 4) {
+    asm volatile("s_add_u32 m0, %0, %3 \n\t"
+                 "buffer_load_dword %1, %2, 0, idxen offen offset:0, lds\n\t" ::
+                     "s"(lds_base),
+                 "v"(v_addr), "s"(src_resource), "n"(SmemOffset)
+                 : "memory");
+  } else if constexpr (N == 8) {
+    asm volatile("s_add_u32 m0, %0, %3 \n\t"
+                 "buffer_load_dwordx2 %1, %2, 0, idxen offen offset:0, lds\n\t" ::
+                     "s"(lds_base),
+                 "v"(v_addr), "s"(src_resource), "n"(SmemOffset)
+                 : "memory");
+  } else {
+    asm volatile("s_add_u32 m0, %0, %3 \n\t"
+                 "buffer_load_dwordx4 %1, %2, 0, idxen offen offset:0, lds\n\t" ::
+                     "s"(lds_base),
+                 "v"(v_addr), "s"(src_resource), "n"(SmemOffset)
+                 : "memory");
+  }
+}
+
+template <int N> TL_DEVICE void clear_cp_async_lds(void *lds_lane_ptr) {
+  if constexpr (N == 4) {
+    *reinterpret_cast<uint32_t *>(lds_lane_ptr) = 0;
+  } else if constexpr (N == 8) {
+    typedef uint32_t uint32x2_t __attribute__((ext_vector_type(2)));
+    *reinterpret_cast<uint32x2_t *>(lds_lane_ptr) = uint32x2_t{0, 0};
+  } else {
+    typedef uint32_t uint32x4_t __attribute__((ext_vector_type(4)));
+    *reinterpret_cast<uint32x4_t *>(lds_lane_ptr) = uint32x4_t{0, 0, 0, 0};
+  }
+}
+
+} // namespace detail
+
 template <int N, int SmemOffset = 0>
 TL_DEVICE void cp_async_gs_idxen(void *lds_base_ptr, int32x4_t src_resource,
                                  std::int32_t src_thread_byte_offset,
                                  std::int32_t idxen) {
-  static_assert(N == 16, "idxen async copy only supports 16 bytes");
-  typedef uint32_t uint32x2_t __attribute__((ext_vector_type(2)));
-  uint32x2_t v_addr = {static_cast<uint32_t>(idxen),
-                       static_cast<uint32_t>(src_thread_byte_offset)};
-  auto const lds_ptr_sgpr = __builtin_amdgcn_readfirstlane(
-      reinterpret_cast<uintptr_t>(lds_base_ptr));
-  asm volatile("s_add_u32 m0, %0, %3 \n\t"
-               "buffer_load_dwordx4 %1, %2, 0, idxen offen offset:0, lds\n\t" ::
-                   "s"(lds_ptr_sgpr),
-               "v"(v_addr), "s"(src_resource), "n"(SmemOffset)
-               : "memory");
+  const uint32_t lds_base = __builtin_amdgcn_readfirstlane(
+      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(lds_base_ptr)));
+  detail::cp_async_gs_idxen_impl<N, SmemOffset>(
+      lds_base, src_resource, src_thread_byte_offset, idxen);
+}
+
+template <int N, int SmemOffset = 0>
+TL_DEVICE void cp_async_gs_idxen(uint32_t lds_base,
+                                 int32x4_t src_resource,
+                                 std::int32_t src_thread_byte_offset,
+                                 std::int32_t idxen) {
+  detail::cp_async_gs_idxen_impl<N, SmemOffset>(
+      lds_base, src_resource, src_thread_byte_offset, idxen);
 }
 
 template <int N, int SmemOffset = 0>
@@ -240,8 +288,19 @@ TL_DEVICE void cp_async_gs_idxen_conditional(
     cp_async_gs_idxen<N, SmemOffset>(lds_base_ptr, src_resource,
                                      src_thread_byte_offset, idxen);
   } else {
-    typedef uint32_t uint32x4_t __attribute__((ext_vector_type(4)));
-    *reinterpret_cast<uint32x4_t *>(lds_base_ptr) = uint32x4_t{0, 0, 0, 0};
+    detail::clear_cp_async_lds<N>(lds_base_ptr);
+  }
+}
+
+template <int N, int SmemOffset = 0>
+TL_DEVICE void cp_async_gs_idxen_conditional(
+    void *lds_lane_ptr, uint32_t lds_base, int32x4_t src_resource,
+    std::int32_t src_thread_byte_offset, std::int32_t idxen, bool condition) {
+  if (condition) {
+    cp_async_gs_idxen<N, SmemOffset>(lds_base, src_resource,
+                                     src_thread_byte_offset, idxen);
+  } else {
+    detail::clear_cp_async_lds<N>(lds_lane_ptr);
   }
 }
 

@@ -61,6 +61,12 @@ DeriveHcuGemmLdsCopyGeometry(int bytes_per_row,
   geometry.block_threads = block_threads;
   geometry.num_copy_waves = block_threads / geometry.warp_size;
   geometry.copy_transaction_bytes = copy_transaction_bytes;
+  const HcuLdsWrapConfig wrap_config = TargetHcuGetLdsWrapConfig(target);
+  if (wrap_config.encoding == HcuLdsWrapEncoding::kNone) {
+    return std::nullopt;
+  }
+  geometry.wrap_granularity_dwords =
+      TargetHcuGetLdsWrapGranularityDwords(target);
   geometry.bytes_per_row = bytes_per_row;
   geometry.segments_per_row = bytes_per_row / copy_transaction_bytes;
 
@@ -70,18 +76,33 @@ DeriveHcuGemmLdsCopyGeometry(int bytes_per_row,
   geometry.rows_per_group = geometry.warp_size / geometry.row_wave_gcd;
   geometry.waves_per_group =
       geometry.segments_per_row / geometry.row_wave_gcd;
-  geometry.max_wrap_offset =
-      TargetHcuGetLdsWrapMaxOffset(target, copy_transaction_bytes);
+  geometry.max_wrap_offset_dwords =
+      TargetHcuGetLdsWrapMaxOffsetDwords(target);
   return geometry;
 }
 
-int GetHcuGemmLdsWrapOffset(const HcuGemmLdsCopyGeometry &geometry,
-                            int wrap_step_bytes) {
-  if (wrap_step_bytes <= 0 || geometry.copy_transaction_bytes <= 0 ||
-      wrap_step_bytes % geometry.copy_transaction_bytes != 0) {
+int SelectHcuGemmLdsCopyTransactionBytes(int bytes_per_row,
+                                         int copy_bytes_per_lane,
+                                         int element_bytes) {
+  if (bytes_per_row <= 0 || copy_bytes_per_lane <= 0 || element_bytes <= 0) {
     return 0;
   }
-  return wrap_step_bytes / geometry.copy_transaction_bytes;
+  constexpr int kTransferBytes[] = {16, 8, 4};
+  for (int transfer_bytes : kTransferBytes) {
+    if (transfer_bytes % element_bytes == 0 &&
+        bytes_per_row % transfer_bytes == 0 &&
+        copy_bytes_per_lane % transfer_bytes == 0) {
+      return transfer_bytes;
+    }
+  }
+  return 0;
+}
+
+int GetHcuGemmLdsWrapOffsetDwords(int wrap_step_bytes) {
+  if (wrap_step_bytes <= 0 || wrap_step_bytes % 4 != 0) {
+    return 0;
+  }
+  return wrap_step_bytes / 4;
 }
 
 bool IsLegalHcuGemmLdsWrap(const HcuGemmLdsCopyGeometry &geometry,
@@ -93,10 +114,14 @@ bool IsLegalHcuGemmLdsWrap(const HcuGemmLdsCopyGeometry &geometry,
   if (wrap_count == 1) {
     return wrap_step_bytes == 0;
   }
-  const int wrap_offset =
-      GetHcuGemmLdsWrapOffset(geometry, wrap_step_bytes);
-  return wrap_offset > 0 &&
-         wrap_offset * (wrap_count - 1) <= geometry.max_wrap_offset;
+  const int wrap_offset_dwords =
+      GetHcuGemmLdsWrapOffsetDwords(wrap_step_bytes);
+  if (geometry.wrap_granularity_dwords <= 0 || wrap_offset_dwords <= 0 ||
+      wrap_offset_dwords % geometry.wrap_granularity_dwords != 0) {
+    return false;
+  }
+  return wrap_offset_dwords * (wrap_count - 1) <=
+         geometry.max_wrap_offset_dwords;
 }
 
 HcuGemmLdsCopyStrategy MakeHcuGemmLdsCopyStrategy(

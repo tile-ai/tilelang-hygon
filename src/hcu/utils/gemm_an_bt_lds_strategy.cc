@@ -13,9 +13,7 @@
 #include <tvm/arith/analyzer.h>
 
 #include <algorithm>
-#include <array>
 #include <optional>
-#include <vector>
 
 namespace tvm {
 namespace tl {
@@ -24,28 +22,13 @@ using namespace tirx;
 
 namespace {
 
-constexpr int kStrategyVersion = 4;
+constexpr int kStrategyVersion = 6;
 constexpr int kDsReadTileK = 16;
 constexpr int kDsReadPanelN = 32;
 constexpr int kDsReadPhaseBytes = 128;
-constexpr int kDsReadPhaseCount = 8;
-constexpr int kDsReadRequestsPerPhase = 8;
-constexpr int kAsyncCopyBytesPerLane = 16;
 constexpr int kDsReadBytesPerLane = 16;
 constexpr int kDsReadWrapStepBytes = 64;
 constexpr int kDsReadWrapCount = 2;
-
-// ds_read_m32x16_b16 issues these eight lane addresses in each 128-byte phase.
-constexpr std::array<std::array<int, kDsReadRequestsPerPhase>,
-                     kDsReadPhaseCount>
-    kDsReadPhaseLanes = {{{0, 4, 1, 5, 18, 22, 19, 23},
-                          {32, 36, 33, 37, 50, 54, 51, 55},
-                          {2, 6, 3, 7, 16, 20, 17, 21},
-                          {40, 44, 41, 45, 58, 62, 59, 63},
-                          {8, 12, 9, 13, 26, 30, 27, 31},
-                          {42, 46, 43, 47, 56, 60, 57, 61},
-                          {10, 14, 11, 15, 24, 28, 25, 29},
-                          {34, 38, 35, 39, 48, 52, 49, 53}}};
 
 struct AnBtStrategyParams {
   int block_k{0};
@@ -67,15 +50,6 @@ struct AnBtStrategyParams {
   int wrap_idx_mask{0};
 };
 
-struct BankConflictScore {
-  int max_bank_uses{0};
-  int total_conflicts{0};
-  int first_panel{-1};
-  int first_phase{-1};
-  int first_lane{-1};
-  int first_bank{-1};
-};
-
 std::optional<int64_t> StaticExtent(const Array<Range> &ranges, size_t dim) {
   if (dim >= ranges.size()) {
     return std::nullopt;
@@ -89,16 +63,6 @@ std::optional<int64_t> StaticExtent(const Array<Range> &ranges, size_t dim) {
 
 bool IsPowerOfTwo(int value) {
   return value > 0 && (value & (value - 1)) == 0;
-}
-
-int64_t RequireConst(const PrimExpr &expr, arith::Analyzer *analyzer,
-                     const char *kind, int k, int n) {
-  PrimExpr simplified = analyzer->Simplify(expr);
-  const int64_t *value = as_const_int(simplified);
-  ICHECK(value) << "HCU GEMM AN/BT " << kind
-                << " mapping must be constant at logical coordinate (" << k
-                << ", " << n << "), got " << simplified;
-  return *value;
 }
 
 Fragment MakeCopyLoopLayout(const AnBtStrategyParams &params,
@@ -151,7 +115,11 @@ Layout MakeStorageLayout(const AnBtStrategyParams &params,
                          const Fragment &copy_layout) {
   PrimExpr k = InputPlaceholder(0);
   PrimExpr n = InputPlaceholder(1);
-  Array<PrimExpr> logical = {k, n};
+  const int read_elements_per_lane =
+      params.read_bytes_per_lane / params.element_bytes;
+  PrimExpr read_pack_start =
+      floordiv(n, Integer(read_elements_per_lane)) * read_elements_per_lane;
+  Array<PrimExpr> logical = {k, read_pack_start};
   PrimExpr thread = copy_layout->ForwardThread(logical, std::nullopt);
   Array<PrimExpr> local = copy_layout->Forward(logical);
   ICHECK(local.size() == 1U || local.size() == 2U);
@@ -161,18 +129,24 @@ Layout MakeStorageLayout(const AnBtStrategyParams &params,
 
   PrimExpr copy_warp = floordiv(thread, Integer(params.warp_size));
   PrimExpr copy_lane = floormod(thread, Integer(params.warp_size));
-  PrimExpr wrap = floormod(copy_warp, Integer(params.wrap_idx_mask + 1)) *
-                  params.wrap_offset;
-  PrimExpr physical_lane =
-      floormod(copy_lane + wrap, Integer(params.warp_size));
-  PrimExpr physical_offset =
-      (transaction * params.block_threads + copy_warp * params.warp_size +
-       physical_lane) *
+  ICHECK_EQ(4 % params.element_bytes, 0);
+  const int elements_per_dword = 4 / params.element_bytes;
+  PrimExpr wrap_offset_dwords =
+      floormod(copy_warp, Integer(params.wrap_idx_mask + 1)) *
+      params.wrap_offset;
+  PrimExpr wave_element = copy_lane * params.copy_elements_per_lane + intra;
+  PrimExpr physical_wave_element = floormod(
+      wave_element + wrap_offset_dwords * elements_per_dword,
+      Integer(params.warp_size * params.copy_elements_per_lane));
+  PrimExpr physical_pack_base =
+      (transaction * params.block_threads + copy_warp * params.warp_size) *
           params.copy_elements_per_lane +
-      intra;
+      physical_wave_element;
+  PrimExpr read_pack_intra = floormod(n, Integer(read_elements_per_lane));
   Array<PrimExpr> physical = {
-      floordiv(physical_offset, Integer(params.block_mn)),
-      floormod(physical_offset, Integer(params.block_mn))};
+      floordiv(physical_pack_base, Integer(params.block_mn)),
+      floormod(physical_pack_base, Integer(params.block_mn)) +
+          read_pack_intra};
   Array<PrimExpr> input_shape = {Integer(params.block_k),
                                  Integer(params.block_mn)};
   return Layout(input_shape, physical);
@@ -217,6 +191,7 @@ void ValidateStrategyParameters(const AnBtStrategyParams &params) {
   ICHECK_EQ(params.block_mn % params.panel_mn, 0);
   ICHECK_EQ(params.copy_transaction_bytes % params.element_bytes, 0);
   ICHECK_EQ(params.read_bytes_per_lane % params.element_bytes, 0);
+  ICHECK_EQ(params.read_bytes_per_lane % params.copy_transaction_bytes, 0);
   ICHECK_EQ(params.phase_bytes % params.read_bytes_per_lane, 0);
   ICHECK_EQ(params.block_mn % params.copy_elements_per_lane, 0);
   ICHECK_EQ(params.copy_segments_per_row * params.copy_elements_per_lane,
@@ -224,6 +199,9 @@ void ValidateStrategyParameters(const AnBtStrategyParams &params) {
   ICHECK_EQ(params.copy_bytes_per_lane,
             params.copy_transactions_per_lane *
                 params.copy_transaction_bytes);
+  ICHECK_EQ(params.block_threads %
+                (params.read_bytes_per_lane / params.copy_transaction_bytes),
+            0);
   ICHECK_GE(params.copy_transactions_per_lane, 1);
   ICHECK_GE(params.wrap_offset, 0);
   ICHECK_GE(params.wrap_idx_mask, 0);
@@ -233,54 +211,6 @@ void ValidateStrategyParameters(const AnBtStrategyParams &params) {
     ICHECK_GT(params.wrap_offset, 0);
     ICHECK(IsPowerOfTwo(params.wrap_idx_mask + 1));
   }
-}
-
-BankConflictScore EvaluateDsReadBankConflicts(
-    const Layout &storage_layout, const AnBtStrategyParams &params) {
-  ICHECK_EQ(params.read_bytes_per_lane % params.bank_width_bytes, 0);
-  const int banks_per_read =
-      params.read_bytes_per_lane / params.bank_width_bytes;
-  BankConflictScore score;
-  arith::Analyzer analyzer;
-  for (int k_tile = 0; k_tile < params.block_k / kDsReadTileK; ++k_tile) {
-    for (int panel = 0; panel < params.block_mn / params.panel_mn; ++panel) {
-      for (int phase = 0; phase < kDsReadPhaseCount; ++phase) {
-        std::vector<int> bank_uses(params.bank_num, 0);
-        for (int lane : kDsReadPhaseLanes[phase]) {
-          int k = k_tile * kDsReadTileK + (lane >> 2);
-          int n = panel * params.panel_mn + (lane & 3) * 8;
-          Array<PrimExpr> physical =
-              storage_layout->Forward({Integer(k), Integer(n)});
-          ICHECK_EQ(physical.size(), 2U);
-          int64_t physical_k =
-              RequireConst(physical[0], &analyzer, "ds-read row", k, n);
-          int64_t physical_n =
-              RequireConst(physical[1], &analyzer, "ds-read column", k, n);
-          int64_t byte_offset =
-              (physical_k * params.block_mn + physical_n) * params.element_bytes;
-          ICHECK_EQ(byte_offset % params.bank_width_bytes, 0)
-              << "HCU GEMM AN/BT ds-read address must be bank aligned";
-          int start_bank = static_cast<int>(
-              (byte_offset / params.bank_width_bytes) % params.bank_num);
-          for (int bank = 0; bank < banks_per_read; ++bank) {
-            int current = (start_bank + bank) % params.bank_num;
-            int uses = ++bank_uses[current];
-            score.max_bank_uses = std::max(score.max_bank_uses, uses);
-            if (uses > 1) {
-              ++score.total_conflicts;
-              if (score.first_panel < 0) {
-                score.first_panel = panel;
-                score.first_phase = phase;
-                score.first_lane = lane;
-                score.first_bank = current;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  return score;
 }
 
 bool SelectWrapStrategy(AnBtStrategyParams *params, Fragment *copy_layout,
@@ -326,16 +256,8 @@ bool SelectWrapStrategy(AnBtStrategyParams *params, Fragment *copy_layout,
     return false;
   }
   params->wrap_offset =
-      GetHcuGemmLdsWrapOffset(*geometry, kDsReadWrapStepBytes);
+      GetHcuGemmLdsWrapOffsetDwords(kDsReadWrapStepBytes);
   params->wrap_idx_mask = wrap_count - 1;
-  if (forced_wrap_count != 0) {
-    Layout wrapped_storage = MakeStorageLayout(*params, *copy_layout);
-    BankConflictScore wrapped_score =
-        EvaluateDsReadBankConflicts(wrapped_storage, *params);
-    if (wrapped_score.max_bank_uses > 1) {
-      return false;
-    }
-  }
   return true;
 }
 
@@ -425,22 +347,22 @@ DeriveHcuGemmAnBtLdsStrategyImpl(const CopyNode &copy, const GemmNode &gemm,
     return std::nullopt;
   }
 
-  params.copy_transaction_bytes = kAsyncCopyBytesPerLane;
   int64_t tile_bytes = static_cast<int64_t>(params.block_k) * params.block_mn *
                        params.element_bytes;
-  if (tile_bytes % params.copy_transaction_bytes != 0) {
+  if (tile_bytes % params.block_threads != 0) {
     return std::nullopt;
   }
-  const int64_t total_transactions =
-      tile_bytes / params.copy_transaction_bytes;
-  params.copy_transactions_per_lane = static_cast<int>(
-      (total_transactions + params.block_threads - 1) / params.block_threads);
-  params.copy_bytes_per_lane =
-      params.copy_transactions_per_lane * params.copy_transaction_bytes;
-  if (params.copy_transactions_per_lane <= 0 ||
-      params.copy_transaction_bytes % params.element_bytes != 0) {
+  params.copy_bytes_per_lane = static_cast<int>(tile_bytes / block_threads);
+  const int bytes_per_row = params.block_mn * params.element_bytes;
+  params.copy_transaction_bytes = SelectHcuGemmLdsCopyTransactionBytes(
+      bytes_per_row, params.copy_bytes_per_lane, params.element_bytes);
+  if (params.copy_transaction_bytes < 4 ||
+      params.copy_transaction_bytes % params.element_bytes != 0 ||
+      params.read_bytes_per_lane % params.copy_transaction_bytes != 0) {
     return std::nullopt;
   }
+  params.copy_transactions_per_lane =
+      params.copy_bytes_per_lane / params.copy_transaction_bytes;
   params.copy_elements_per_lane =
       params.copy_transaction_bytes / params.element_bytes;
   params.copy_segments_per_row =

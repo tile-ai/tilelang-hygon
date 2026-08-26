@@ -37,10 +37,8 @@ public:
   int read_bytes_per_lane{0};
   int row_period{0};
   int row_bank_stride{0};
-  int segment_shift{0};
   int rows_per_copy_wave{0};
-  int row_slab_count{0};
-  int warp_tile_mn{0};
+  // Physical wrap shift in dwords before target-specific field encoding.
   int wrap_offset{0};
   int wrap_idx_mask{0};
   Layout storage_layout;
@@ -71,8 +69,8 @@ void ValidateHcuGemmAtBnStorageLayout(
 void ValidateHcuGemmAtBnCopyLayout(
     const Fragment &actual, const HcuGemmAtBnLdsStrategy &strategy);
 
-bool HcuGemmAtBnLayoutHasBankConflict(
-    const Layout &storage_layout, const HcuGemmAtBnLdsStrategy &strategy);
+int GetHcuGemmAtBnRequiredWrapCount(
+    const HcuGemmAtBnLdsStrategy &strategy);
 
 } // namespace tl
 } // namespace tvm

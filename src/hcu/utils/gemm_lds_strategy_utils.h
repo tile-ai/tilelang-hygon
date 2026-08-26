@@ -28,6 +28,7 @@ public:
   int copy_transaction_bytes{0};
   int block_threads{0};
   int inner_extent{0};
+  // Physical wrap shift in dwords before target-specific field encoding.
   int wrap_offset{0};
   int wrap_idx_mask{0};
   Layout storage_layout;
@@ -57,12 +58,13 @@ struct HcuGemmLdsCopyGeometry {
   int block_threads{0};
   int num_copy_waves{0};
   int copy_transaction_bytes{0};
+  int wrap_granularity_dwords{0};
   int bytes_per_row{0};
   int segments_per_row{0};
   int row_wave_gcd{0};
   int rows_per_group{0};
   int waves_per_group{0};
-  int max_wrap_offset{0};
+  int max_wrap_offset_dwords{0};
 };
 
 std::optional<HcuGemmLdsCopyGeometry>
@@ -70,8 +72,11 @@ DeriveHcuGemmLdsCopyGeometry(int bytes_per_row,
                              int copy_transaction_bytes, int block_threads,
                              Target target);
 
-int GetHcuGemmLdsWrapOffset(const HcuGemmLdsCopyGeometry &geometry,
-                            int wrap_step_bytes);
+int SelectHcuGemmLdsCopyTransactionBytes(int bytes_per_row,
+                                         int copy_bytes_per_lane,
+                                         int element_bytes);
+
+int GetHcuGemmLdsWrapOffsetDwords(int wrap_step_bytes);
 
 bool IsLegalHcuGemmLdsWrap(const HcuGemmLdsCopyGeometry &geometry,
                            int wrap_step_bytes, int wrap_count);

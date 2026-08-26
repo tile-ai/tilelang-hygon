@@ -224,6 +224,12 @@ struct CPAsyncSourceInfo {
   std::optional<int> struct_bit;
 };
 
+struct CPAsyncDestinationInfo {
+  Var buffer_var;
+  DataType elem_type;
+  PrimExpr element_offset;
+};
+
 std::optional<CPAsyncSourceInfo> GetCPAsyncSourceInfo(const PrimExpr &expr) {
   const auto *ptr_call = expr.as<CallNode>();
   if (!ptr_call)
@@ -251,6 +257,31 @@ std::optional<CPAsyncSourceInfo> GetCPAsyncSourceInfo(const PrimExpr &expr) {
                              ptr_call->args[2]};
   }
   return std::nullopt;
+}
+
+std::optional<CPAsyncDestinationInfo>
+GetCPAsyncDestinationInfo(const PrimExpr &expr) {
+  const auto *ptr_call = expr.as<CallNode>();
+  if (!ptr_call)
+    return std::nullopt;
+  const BufferLoadNode *load =
+      ptr_call->args.empty() ? nullptr
+                             : ptr_call->args[0].as<BufferLoadNode>();
+  if (!load && ptr_call->op.same_as(builtin::tvm_access_ptr())) {
+    const auto *var = ptr_call->args[1].as<VarNode>();
+    auto elem_type = GetAccessPtrElementType(expr);
+    if (!var || !elem_type.has_value())
+      return std::nullopt;
+    return CPAsyncDestinationInfo{GetRef<Var>(var),
+                                  elem_type.value().element_of(),
+                                  ptr_call->args[2]};
+  }
+  if (!load)
+    return std::nullopt;
+
+  return CPAsyncDestinationInfo{
+      load->buffer->data, load->buffer->dtype.element_of(),
+      GetBufferLoadLinearizedOffset(load)};
 }
 
 int GetTileLangCPAsyncTransferBytes(const CallNode *op) {
@@ -563,11 +594,117 @@ std::string CodeGenTileLangHCU::Finish() {
   return CodeGenC::Finish();
 }
 
+int GetWrapAnnotation(const CallNode *call, const char *key) {
+  auto value = call->annotations.Get(key);
+  if (!value)
+    return 0;
+  const auto *imm = value.value().as<IntImmNode>();
+  ICHECK(imm) << key << " must be IntImm";
+  return static_cast<int>(imm->value);
+}
+
+std::string ApplyCPAsyncLdsWrap(const CallNode *op, const Target &target,
+                                std::string dst) {
+  const int wrap_offset = GetWrapAnnotation(op, "wrap_offset");
+  const int wrap_idx_mask = GetWrapAnnotation(op, "wrap_idx_mask");
+  ICHECK_EQ(wrap_offset != 0, wrap_idx_mask != 0)
+      << "wrap_offset and wrap_idx_mask must be enabled together";
+  if (wrap_offset == 0)
+    return dst;
+
+  const tl::HcuLdsWrapConfig wrap_config =
+      tl::TargetHcuGetLdsWrapConfig(target);
+  ICHECK(wrap_config.encoding != tl::HcuLdsWrapEncoding::kNone)
+      << "LDS wrap encoding is not defined for "
+      << tl::GetHcuArchString(target);
+  std::string wrap_index = "((((int)threadIdx.x) >> 6) & " +
+                           std::to_string(wrap_idx_mask) + ")";
+  std::string dword_offset = "(" + wrap_index + " * " +
+                             std::to_string(wrap_offset) + ")";
+  std::string encoded_field;
+  switch (wrap_config.encoding) {
+  case tl::HcuLdsWrapEncoding::kFourDword:
+    ICHECK_EQ(wrap_offset % 4, 0)
+        << "BMZ LDS wrap requires a 4-dword-aligned physical shift";
+    encoded_field =
+        "(" + wrap_index + " * " +
+        std::to_string(wrap_offset / 4) + ")";
+    break;
+  case tl::HcuLdsWrapEncoding::kHybridFourAndOneDword:
+    encoded_field = "((" + dword_offset + " / 4) | ((" + dword_offset +
+                    " % 4) << 3))";
+    break;
+  case tl::HcuLdsWrapEncoding::kOneDword:
+    encoded_field = dword_offset;
+    break;
+  case tl::HcuLdsWrapEncoding::kNone:
+    ICHECK(false) << "Unreachable LDS wrap encoding";
+  }
+  return "reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(" + dst +
+         ") | static_cast<uint64_t>((" + encoded_field + ") << " +
+         std::to_string(wrap_config.field_shift) + "))";
+}
+
 void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
   cp_async_resource_var_names_.clear();
   cp_async_idxen_resource_var_names_.clear();
+  cp_async_idxen_lds_bases_to_emit_.clear();
+  cp_async_idxen_lds_base_uses_.clear();
   std::vector<CPAsyncSourceInfo> normal_sources;
   std::vector<CPAsyncSourceInfo> idxen_sources;
+
+  struct SharedAliasInfo {
+    Var root;
+    int64_t byte_offset;
+  };
+  std::unordered_map<Var, SharedAliasInfo, ObjectPtrHash, ObjectPtrEqual>
+      shared_aliases;
+  Optional<Var> thread_x;
+  int64_t thread_x_extent = 0;
+
+  PostOrderVisit(func->body, [&](const ObjectRef &object) {
+    if (const auto *attr = object.as<AttrStmtNode>()) {
+      if (attr->attr_key == tirx::attr::thread_extent) {
+        const auto *iter_var = attr->node.as<IterVarNode>();
+        if (iter_var && iter_var->thread_tag == "threadIdx.x") {
+          thread_x = iter_var->var;
+          if (const auto *extent = attr->value.as<IntImmNode>())
+            thread_x_extent = extent->value;
+        }
+      }
+      return;
+    }
+    const auto *bind = object.as<BindNode>();
+    if (!bind)
+      return;
+    const auto *value = bind->value.as<CallNode>();
+    if (!value ||
+        !value->op.same_as(builtin::handle_add_byte_offset()) ||
+        value->args.size() != 2U)
+      return;
+    const auto *root = value->args[0].as<VarNode>();
+    const auto *offset = value->args[1].as<IntImmNode>();
+    if (!root || !offset)
+      return;
+    shared_aliases.emplace(bind->var,
+                           SharedAliasInfo{GetRef<Var>(root), offset->value});
+  });
+
+  struct LdsBaseGroup {
+    Var root;
+    int transaction_bytes{0};
+    int wrap_offset{0};
+    int wrap_idx_mask{0};
+    int64_t base_alias_offset{0};
+    Var base_alias;
+    Call base_call;
+    std::vector<std::pair<Call, int64_t>> calls;
+  };
+  std::vector<LdsBaseGroup> lds_groups;
+
+  const tl::HcuLdsWrapConfig wrap_config =
+      tl::TargetHcuGetLdsWrapConfig(target_);
+  arith::Analyzer analyzer;
 
   PostOrderVisit(func->body, [&](const ObjectRef &object) {
     const auto *call = object.as<CallNode>();
@@ -580,13 +717,73 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
       ICHECK_EQ(call->args.size(), 6U);
       const auto *struct_bit = call->args[5].as<IntImmNode>();
       ICHECK(struct_bit);
-      if (cp_async_idxen_resource_var_names_.count(source->buffer_var))
+      if (!cp_async_idxen_resource_var_names_.count(source->buffer_var)) {
+        source->struct_bit = static_cast<int>(struct_bit->value);
+        cp_async_idxen_resource_var_names_[source->buffer_var] =
+            name_supply_->FreshName(GetVarID(source->buffer_var) +
+                                    "_cp_async_idxen_resource");
+        idxen_sources.push_back(*source);
+      }
+
+      // Hoist only destinations where adjacent lanes write adjacent
+      // transactions. More general pointer expressions keep the old path.
+      const int transaction_bytes = GetTileLangCPAsyncTransferBytes(call);
+      if (!thread_x.defined() ||
+          !IsValidCPAsyncTransferBytes(transaction_bytes))
         return;
-      source->struct_bit = static_cast<int>(struct_bit->value);
-      cp_async_idxen_resource_var_names_[source->buffer_var] =
-          name_supply_->FreshName(GetVarID(source->buffer_var) +
-                                  "_cp_async_idxen_resource");
-      idxen_sources.push_back(*source);
+      auto destination = GetCPAsyncDestinationInfo(call->args[0]);
+      if (!destination.has_value())
+        return;
+      auto alias = shared_aliases.find(destination->buffer_var);
+      if (alias == shared_aliases.end())
+        return;
+      const int elem_bytes = destination->elem_type.bits() / 8;
+      if (elem_bytes <= 0 || transaction_bytes % elem_bytes != 0)
+        return;
+      PrimExpr expected_offset =
+          thread_x.value() * make_const(thread_x.value().dtype(),
+                                        transaction_bytes / elem_bytes);
+      if (!analyzer.CanProveEqual(destination->element_offset,
+                                  expected_offset))
+        return;
+      const int64_t destination_size = thread_x_extent * transaction_bytes;
+      if (wrap_config.lds_offset_bits <= 0 || destination_size <= 0 ||
+          alias->second.byte_offset < 0 ||
+          alias->second.byte_offset + destination_size >
+              (int64_t{1} << wrap_config.lds_offset_bits))
+        return;
+
+      const int wrap_offset = GetWrapAnnotation(call, "wrap_offset");
+      const int wrap_idx_mask = GetWrapAnnotation(call, "wrap_idx_mask");
+      LdsBaseGroup *group = nullptr;
+      for (LdsBaseGroup &candidate : lds_groups) {
+        if (candidate.root.same_as(alias->second.root) &&
+            candidate.transaction_bytes == transaction_bytes &&
+            candidate.wrap_offset == wrap_offset &&
+            candidate.wrap_idx_mask == wrap_idx_mask) {
+          group = &candidate;
+          break;
+        }
+      }
+      Call call_ref = GetRef<Call>(call);
+      if (!group) {
+        lds_groups.push_back(
+            LdsBaseGroup{alias->second.root,
+                         transaction_bytes,
+                         wrap_offset,
+                         wrap_idx_mask,
+                         alias->second.byte_offset,
+                         destination->buffer_var,
+                         call_ref,
+                         {{call_ref, alias->second.byte_offset}}});
+        return;
+      }
+      group->calls.emplace_back(call_ref, alias->second.byte_offset);
+      if (alias->second.byte_offset < group->base_alias_offset) {
+        group->base_alias_offset = alias->second.byte_offset;
+        group->base_alias = destination->buffer_var;
+        group->base_call = call_ref;
+      }
       return;
     }
     if (cp_async_resource_var_names_.count(source->buffer_var))
@@ -596,6 +793,20 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
                                 "_cp_async_resource");
     normal_sources.push_back(*source);
   });
+
+  for (const LdsBaseGroup &group : lds_groups) {
+    std::string base_name = name_supply_->FreshName(
+        group.base_alias->name_hint + "_cp_async_lds_base");
+    cp_async_idxen_lds_bases_to_emit_[group.base_alias].push_back(
+        HoistedCPAsyncLdsBase{base_name, group.base_call});
+    for (const auto &[call, alias_offset] : group.calls) {
+      const int64_t smem_offset = alias_offset - group.base_alias_offset;
+      ICHECK_GE(smem_offset, 0);
+      cp_async_idxen_lds_base_uses_.emplace(
+          call, HoistedCPAsyncLdsBaseUse{base_name,
+                                        static_cast<int>(smem_offset)});
+    }
+  }
 
   for (const auto &source : normal_sources) {
     PrintIndent();
@@ -613,15 +824,6 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
            << ">(reinterpret_cast<const void *>("
            << GetVarID(source.buffer_var) << "), 0xfffffffcu);\n";
   }
-}
-
-int GetWrapAnnotation(const CallNode *call, const char *key) {
-  auto value = call->annotations.Get(key);
-  if (!value)
-    return 0;
-  const auto *imm = value.value().as<IntImmNode>();
-  ICHECK(imm) << key << " must be IntImm";
-  return static_cast<int>(imm->value);
 }
 
 namespace {
@@ -915,6 +1117,24 @@ void CodeGenTileLangHCU::VisitStmt_(const BindNode *op) {
   // var_idmap_.
   let_initializer_expr_for_predicate_[op->var.get()] = op->value;
   CodeGenC::VisitStmt_(op);
+  auto lds_bases = cp_async_idxen_lds_bases_to_emit_.find(op->var);
+  if (lds_bases != cp_async_idxen_lds_bases_to_emit_.end()) {
+    for (const HoistedCPAsyncLdsBase &base : lds_bases->second) {
+      const auto *call = base.call.as<CallNode>();
+      ICHECK(call);
+      std::string lane_destination =
+          "reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(" +
+          GetVarID(op->var.get()) + ") + ((int)threadIdx.x) * " +
+          std::to_string(GetTileLangCPAsyncTransferBytes(call)) + ")";
+      PrintIndent();
+      stream << "const uint32_t " << base.name
+             << " = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>("
+                "reinterpret_cast<uintptr_t>("
+             << ApplyCPAsyncLdsWrap(call, target_, lane_destination)
+             << ")));\n";
+    }
+    cp_async_idxen_lds_bases_to_emit_.erase(lds_bases);
+  }
 }
 
 namespace {
@@ -2271,58 +2491,16 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::ptx_cp_async()) ||
              op->op.same_as(tl::hcu_cp_async_idxen())) {
     int total_bytes = GetTileLangCPAsyncTransferBytes(op);
-    std::string dst = this->PrintExpr(op->args[0]);
+    std::string dst =
+        ApplyCPAsyncLdsWrap(op, target_, this->PrintExpr(op->args[0]));
     std::string src = this->PrintExpr(op->args[1]);
     std::string size = std::to_string(total_bytes);
     bool use_idxen = op->op.same_as(tl::hcu_cp_async_idxen());
     if (use_idxen) {
       ICHECK_EQ(op->args.size(), 6U);
-      ICHECK_EQ(total_bytes, 16);
+      ICHECK(IsValidCPAsyncTransferBytes(total_bytes));
     } else {
       ICHECK(op->args.size() == 3U || op->args.size() == 4U);
-    }
-
-    int wrap_offset = GetWrapAnnotation(op, "wrap_offset");
-    int wrap_idx_mask = GetWrapAnnotation(op, "wrap_idx_mask");
-    ICHECK_EQ(wrap_offset != 0, wrap_idx_mask != 0)
-        << "wrap_offset and wrap_idx_mask must be enabled together";
-    if (wrap_offset != 0) {
-      const tl::HcuLdsWrapConfig wrap_config =
-          tl::TargetHcuGetLdsWrapConfig(target_);
-      ICHECK(wrap_config.encoding != tl::HcuLdsWrapEncoding::kNone)
-          << "LDS wrap encoding is not defined for "
-          << tl::GetHcuArchString(target_);
-      ICHECK_EQ(total_bytes % 4, 0)
-          << "LDS wrap requires a dword-aligned async-copy transaction";
-      const int dwords_per_offset = total_bytes / 4;
-      std::string wrap_index = "((((int)threadIdx.x) >> 6) & " +
-                               std::to_string(wrap_idx_mask) + ")";
-      std::string dword_offset = "(" + wrap_index + " * " +
-                                 std::to_string(wrap_offset *
-                                                dwords_per_offset) +
-                                 ")";
-      std::string encoded_field;
-      switch (wrap_config.encoding) {
-      case tl::HcuLdsWrapEncoding::kFourDword:
-        ICHECK_EQ(dwords_per_offset % 4, 0)
-            << "BMZ LDS wrap requires a 4-dword-aligned offset unit";
-        encoded_field =
-            "(" + wrap_index + " * " +
-            std::to_string(wrap_offset * dwords_per_offset / 4) + ")";
-        break;
-      case tl::HcuLdsWrapEncoding::kHybridFourAndOneDword:
-        encoded_field = "((" + dword_offset + " / 4) | ((" + dword_offset +
-                        " % 4) << 3))";
-        break;
-      case tl::HcuLdsWrapEncoding::kOneDword:
-        encoded_field = dword_offset;
-        break;
-      case tl::HcuLdsWrapEncoding::kNone:
-        ICHECK(false) << "Unreachable LDS wrap encoding";
-      }
-      dst = "reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(" + dst +
-            ") | static_cast<uint64_t>((" + encoded_field + ") << " +
-            std::to_string(wrap_config.field_shift) + "))";
     }
 
     auto source = GetCPAsyncSourceInfo(op->args[1]);
@@ -2337,9 +2515,20 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       ICHECK(resource != cp_async_idxen_resource_var_names_.end());
       std::string idxen = PrintExpr(op->args[4]);
       std::string condition = PrintExpr(op->args[3]);
-      this->stream << "tl::cp_async_gs_idxen_conditional<" << size << ">(" << dst
-                   << ", " << resource->second << ", " << source_offset_bytes
-                   << ", " << idxen << ", " << condition << ");\n";
+      PrimExpr call_ref = GetRef<Call>(op);
+      auto lds_base = cp_async_idxen_lds_base_uses_.find(call_ref);
+      if (lds_base != cp_async_idxen_lds_base_uses_.end()) {
+        this->stream << "tl::cp_async_gs_idxen_conditional<" << size << ", "
+                     << lds_base->second.smem_offset << ">(" << dst << ", "
+                     << lds_base->second.name << ", " << resource->second
+                     << ", " << source_offset_bytes << ", " << idxen << ", "
+                     << condition << ");\n";
+      } else {
+        this->stream << "tl::cp_async_gs_idxen_conditional<" << size << ">(" << dst
+                     << ", " << resource->second << ", "
+                     << source_offset_bytes << ", " << idxen << ", "
+                     << condition << ");\n";
+      }
     } else {
       auto resource = cp_async_resource_var_names_.find(source->buffer_var);
       ICHECK(resource != cp_async_resource_var_names_.end());

@@ -526,7 +526,10 @@ private:
     const int transaction_elements =
         copy_transaction_bytes * 8 / element_bits;
     ICHECK_EQ(copy_elements_per_lane % transaction_elements, 0);
-    ICHECK_EQ(transaction_elements % num_elems, 0);
+    ICHECK_EQ(transaction_elements,
+              num_elems * current_vectorized_lanes_)
+        << "HCU GEMM async-copy vector width does not match the "
+           "compiler-derived transaction width";
 
     const int local_iterations = copy_elements_per_lane / num_elems;
     int covered_iterations = 1;
@@ -870,6 +873,8 @@ int64_t TileWidthFromK(int64_t k_dim) {
   return std::min<int64_t>(LargestPow2LessThanOrEqual(k_dim), 4096);
 }
 
+constexpr int64_t kDynamicKTileWidth = 8192;
+
 int StructBitFromTileWidth(int64_t tile_width) {
   int bit = 0;
   while ((int64_t{1} << bit) < tile_width) {
@@ -878,32 +883,34 @@ int StructBitFromTileWidth(int64_t tile_width) {
   return bit;
 }
 
-Optional<PrimExpr> ExtractRowExpr(const PrimExpr &expr, int64_t k_dim) {
+Optional<PrimExpr> ExtractRowExpr(const PrimExpr &expr,
+                                  const PrimExpr &row_stride,
+                                  arith::Analyzer *analyzer) {
   if (const auto *mul = expr.as<MulNode>()) {
-    if (const auto *imm = mul->b.as<IntImmNode>()) {
-      if (imm->value == k_dim) {
-        return mul->a;
-      }
+    if (analyzer->CanProveEqual(mul->b, row_stride)) {
+      return mul->a;
     }
-    if (const auto *imm = mul->a.as<IntImmNode>()) {
-      if (imm->value == k_dim) {
-        return mul->b;
-      }
+    if (analyzer->CanProveEqual(mul->a, row_stride)) {
+      return mul->b;
     }
   }
   if (const auto *add = expr.as<AddNode>()) {
-    if (Optional<PrimExpr> lhs = ExtractRowExpr(add->a, k_dim)) {
+    if (Optional<PrimExpr> lhs =
+            ExtractRowExpr(add->a, row_stride, analyzer)) {
       return lhs;
     }
-    if (Optional<PrimExpr> rhs = ExtractRowExpr(add->b, k_dim)) {
+    if (Optional<PrimExpr> rhs =
+            ExtractRowExpr(add->b, row_stride, analyzer)) {
       return rhs;
     }
   }
   if (const auto *sub = expr.as<SubNode>()) {
-    if (Optional<PrimExpr> lhs = ExtractRowExpr(sub->a, k_dim)) {
+    if (Optional<PrimExpr> lhs =
+            ExtractRowExpr(sub->a, row_stride, analyzer)) {
       return lhs;
     }
-    if (Optional<PrimExpr> rhs = ExtractRowExpr(sub->b, k_dim)) {
+    if (Optional<PrimExpr> rhs =
+            ExtractRowExpr(sub->b, row_stride, analyzer)) {
       return rhs;
     }
   }
@@ -953,15 +960,27 @@ private:
     if (!src_buffer.defined() || src_buffer.value()->shape.size() != 2) {
       return call;
     }
-    const auto *k_imm = src_buffer.value()->shape[1].as<IntImmNode>();
-    if (!k_imm) {
-      return call;
+    PrimExpr k_dim = src_buffer.value()->shape[1];
+    const auto *k_imm = k_dim.as<IntImmNode>();
+    const bool dynamic_k = k_imm == nullptr;
+    if (dynamic_k) {
+      if (!k_dim.as<VarNode>()) {
+        return call;
+      }
+      const Array<PrimExpr> &strides = src_buffer.value()->strides;
+      if (!strides.empty() &&
+          (strides.size() != 2 ||
+           !analyzer_.CanProveEqual(strides[0], k_dim) ||
+           !analyzer_.CanProveEqual(strides[1], 1))) {
+        return call;
+      }
     }
 
-    const int64_t k_dim = k_imm->value;
-    const int64_t tile_width = TileWidthFromK(k_dim);
+    const int64_t tile_width =
+        dynamic_k ? kDynamicKTileWidth : TileWidthFromK(k_imm->value);
     PrimExpr old_offset = src_call->args[2];
-    Optional<PrimExpr> row_expr = ExtractRowExpr(old_offset, k_dim);
+    Optional<PrimExpr> row_expr =
+        ExtractRowExpr(old_offset, k_dim, &analyzer_);
     if (!row_expr.defined()) {
       return call;
     }

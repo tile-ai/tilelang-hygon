@@ -173,10 +173,7 @@ bool HaveSameAtBnStrategyParameters(const HcuGemmAtBnLdsStrategy &lhs,
          lhs->read_bytes_per_lane == rhs->read_bytes_per_lane &&
          lhs->row_period == rhs->row_period &&
          lhs->row_bank_stride == rhs->row_bank_stride &&
-         lhs->segment_shift == rhs->segment_shift &&
          lhs->rows_per_copy_wave == rhs->rows_per_copy_wave &&
-         lhs->row_slab_count == rhs->row_slab_count &&
-         lhs->warp_tile_mn == rhs->warp_tile_mn &&
          lhs->wrap_offset == rhs->wrap_offset &&
          lhs->wrap_idx_mask == rhs->wrap_idx_mask;
 }
@@ -437,25 +434,27 @@ private:
       }
     }
 
+    const int at_bn_required_wrap_count =
+        at_bn_strategy.defined()
+            ? GetHcuGemmAtBnRequiredWrapCount(at_bn_strategy.value())
+            : 1;
     if (at_bn_strategy.defined() && an_bt_strategy.defined() &&
         an_bt_strategy.value()->wrap_offset == 0 &&
         an_bt_strategy.value()->wrap_idx_mask == 0 &&
-        HcuGemmAtBnLayoutHasBankConflict(
-            an_bt_strategy.value()->storage_layout,
-            at_bn_strategy.value())) {
+        at_bn_required_wrap_count > 1) {
       const int bank_ring_bytes = an_bt_strategy.value()->bank_num *
                                   an_bt_strategy.value()->bank_width_bytes;
       constexpr int kCommonWrapStepBytes = 64;
+      constexpr int kCommonWrapCount = 2;
       const int common_wrap_count_limit =
           bank_ring_bytes / (2 * kCommonWrapStepBytes);
-      if (common_wrap_count_limit >= 2 && an_bt_consumer.has_value()) {
+      if (common_wrap_count_limit >= kCommonWrapCount &&
+          at_bn_required_wrap_count <= kCommonWrapCount &&
+          an_bt_consumer.has_value()) {
         Optional<HcuGemmAnBtLdsStrategy> common_strategy =
             TryDeriveAnBtCommonWrapStrategy(copy, *an_bt_consumer,
-                                            /*wrap_count=*/2);
-        if (common_strategy.defined() &&
-            !HcuGemmAtBnLayoutHasBankConflict(
-                common_strategy.value()->storage_layout,
-                at_bn_strategy.value())) {
+                                            kCommonWrapCount);
+        if (common_strategy.defined()) {
           an_bt_strategy = common_strategy;
         }
       }
