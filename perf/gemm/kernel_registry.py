@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from perf.gemm.async_copy_gemm import gemm_async_copy_k_major, gemm_async_copy_n_major
+from perf.gemm.async_copy_gemm_pp import (
+    gemm_async_copy_k_major as gemm_async_copy_pp_k_major,
+    gemm_async_copy_n_major as gemm_async_copy_pp_n_major,
+)
 from perf.gemm.persistent_gemm import (
     gemm_persistent_v1,
     gemm_persistent_v2,
@@ -61,6 +65,14 @@ def _async_copy_vanilla_config(M: int, N: int, K: int) -> dict[str, Any]:
     }
 
 
+def _async_copy_pingpong_config(M: int, N: int, K: int) -> dict[str, Any]:
+    return {
+        "block_M": 256,
+        "block_N": 256,
+        "block_K": 32,
+    }
+
+
 _K_MAJOR = "k_major"
 _N_MAJOR = "n_major"
 
@@ -75,6 +87,16 @@ KERNEL_REGISTRY: dict[tuple[str, str | None, str], KernelSpec] = {
         "gemm_async_copy_n_major",
         gemm_async_copy_n_major,
         _async_copy_vanilla_config,
+    ),
+    ("async_copy_pp", "pingpong", _K_MAJOR): KernelSpec(
+        "gemm_async_copy_pp_k_major",
+        gemm_async_copy_pp_k_major,
+        _async_copy_pingpong_config,
+    ),
+    ("async_copy_pp", "pingpong", _N_MAJOR): KernelSpec(
+        "gemm_async_copy_pp_n_major",
+        gemm_async_copy_pp_n_major,
+        _async_copy_pingpong_config,
     ),
     ("persistent", "v1", _K_MAJOR): KernelSpec("gemm_persistent_v1", gemm_persistent_v1, _heuristic_config_getter("persistent", "v1")),
     ("persistent", "v2", _K_MAJOR): KernelSpec("gemm_persistent_v2", gemm_persistent_v2, _heuristic_config_getter("persistent", "v2")),

@@ -46,18 +46,18 @@ def main(
         K: Matrix dimension K (default: 4096)
         dtype: Data type (fp16, bf16, fp32, default: fp16)
         autotune: Whether to use autotune (default: False)
-        impl: GEMM implementation (async_copy, vanilla, persistent, splitk, streamk; default: persistent)
+        impl: GEMM implementation (async_copy, async_copy_pp, vanilla, persistent, splitk, streamk; default: persistent)
         with_roller: Whether to enable BitBLAS roller for search space (default: False)
         device: Device ID (default: -1, auto find free device)
     """
     # Convert dtype string to torch dtype
     dtype = normalize_dtype(dtype)
 
-    if impl == "async_copy":
+    if impl in {"async_copy", "async_copy_pp"}:
         if autotune:
-            raise ValueError("Autotune is not supported for async_copy: vanilla")
+            raise ValueError(f"Autotune is not supported for {impl}")
         if dtype == "float32":
-            raise ValueError("async_copy: vanilla supports fp16 and bf16 inputs only")
+            raise ValueError(f"{impl} supports fp16 and bf16 inputs only")
     elif not transpose_B and (autotune or impl not in {"vanilla", "persistent"}):
         raise ValueError("N-major B is supported by async_copy, gemm_vanilla_v2, and gemm_persistent_v4 only")
 
@@ -141,7 +141,7 @@ if __name__ == "__main__":
         "-i",
         "--impl",
         type=str,
-        choices=["async_copy", "vanilla", "persistent", "splitk", "streamk"],
+        choices=["async_copy", "async_copy_pp", "vanilla", "persistent", "splitk", "streamk"],
         default="persistent",
         help="GEMM implementation (default: persistent)",
     )

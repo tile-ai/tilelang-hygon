@@ -369,6 +369,8 @@ def get_default_kernel_version(impl: str) -> str | None:
     """Default kernel variant used by perf/gemm/benchmark.py for each impl family."""
     if impl == "async_copy":
         return "vanilla"
+    if impl == "async_copy_pp":
+        return "pingpong"
 
     arch = _get_compile_target_arch()
     if arch == "gfx938":

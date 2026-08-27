@@ -1,0 +1,403 @@
+"""Double-buffered GEMM using asynchronous Global-to-LDS copies."""
+
+import tilelang as tl
+import tilelang.language as T
+
+
+BLOCK_K = 32
+K_PACK = 2
+
+
+def _gemm_async_copy_pingpong(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K=BLOCK_K,
+    dtype="float16",
+    accum_dtype="float32",
+    transpose_B=False,
+):
+    """GEMM with two LDS stages and a loop-carried LDS-to-register prefetch."""
+    assert block_K == BLOCK_K, "async_copy_gemm_pp requires block_K == 32"
+    assert block_N % 2 == 0, "block_N must be divisible by two"
+
+    sub_block_N = block_N // 2
+    k_tiles = (K + block_K - 1) // block_K
+    async_copy_stage_requests = 4
+
+    @T.macro
+    def async_copy_a(A, A_shared, by, k_tile):
+        T.async_copy(
+            A[
+                by * block_M : (by + 1) * block_M,
+                k_tile * block_K : (k_tile + 1) * block_K,
+            ],
+            A_shared,
+        )
+
+    @T.macro
+    def async_copy_b(B, B_shared, bx, k_tile):
+        if transpose_B:
+            T.async_copy(
+                B[
+                    bx * block_N : (bx + 1) * block_N,
+                    k_tile * block_K : (k_tile + 1) * block_K,
+                ],
+                B_shared,
+            )
+        else:
+            T.async_copy(
+                B[
+                    k_tile * block_K : (k_tile + 1) * block_K,
+                    bx * block_N : (bx + 1) * block_N,
+                ],
+                B_shared,
+            )
+
+    @T.macro
+    def copy_b_half(B_shared, B_local, n_half):
+        if transpose_B:
+            T.copy(
+                B_shared[n_half * sub_block_N : (n_half + 1) * sub_block_N, :],
+                B_local,
+            )
+        else:
+            T.copy(
+                B_shared[:, n_half * sub_block_N : (n_half + 1) * sub_block_N],
+                B_local,
+            )
+
+    @T.prim_func
+    def gemm(
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((N, K) if transpose_B else (K, N), dtype),
+        C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
+            
+            T.use_swizzle(
+                panel_size=1,
+                order="row",
+                enable=True,
+            )
+            
+            warp_idx = T.get_warp_idx()
+            A_shared_0 = T.alloc_shared((block_M, block_K), dtype)
+            A_shared_1 = T.alloc_shared((block_M, block_K), dtype)
+            b_shared_shape = (block_N, block_K) if transpose_B else (block_K, block_N)
+            B_shared_0 = T.alloc_shared(b_shared_shape, dtype)
+            B_shared_1 = T.alloc_shared(b_shared_shape, dtype)
+
+            A_local_0 = T.alloc_fragment((block_M, block_K), dtype)
+            A_local_1 = T.alloc_fragment((block_M, block_K), dtype)
+            b_local_shape = (
+                (sub_block_N, block_K) if transpose_B else (block_K, sub_block_N)
+            )
+            B_local_n0_0 = T.alloc_fragment(b_local_shape, dtype)
+            B_local_n1_0 = T.alloc_fragment(b_local_shape, dtype)
+            B_local_n0_1 = T.alloc_fragment(b_local_shape, dtype)
+            B_local_n1_1 = T.alloc_fragment(b_local_shape, dtype)
+            C_local_n0 = T.alloc_fragment((block_M, sub_block_N), accum_dtype)
+            C_local_n1 = T.alloc_fragment((block_M, sub_block_N), accum_dtype)
+            T.clear(C_local_n0)
+            T.clear(C_local_n1)
+
+            # Prime both LDS stages, then prepare the complete ping fragments.
+            T.sync_warp()
+            async_copy_a(A, A_shared_0, by, 0)
+            async_copy_b(B, B_shared_0, bx, 0)
+            T.ptx_wait_group(0)
+            T.sync_warp()
+            async_copy_a(A, A_shared_1, by, 1)
+            async_copy_b(B, B_shared_1, bx, 1)
+            T.copy(A_shared_0, A_local_0)
+            copy_b_half(B_shared_0, B_local_n0_0, 0)
+            copy_b_half(B_shared_0, B_local_n1_0, 1)
+
+            if warp_idx < 4:
+                for pair in T.Serial(k_tiles // 2 - 1):
+                    base = pair * 2 + 2
+                    
+                    ## consume pong, prefetch next ping
+                    
+                    # 1st s_barrier
+                    T.s_waitcnt(0, "lgkmcnt") 
+                    T.sync_warp()
+                    
+                    # prefetch next ping
+                    async_copy_a(A, A_shared_0, by, base)
+                    async_copy_b(B, B_shared_0, bx, base)
+                    
+                    # 2nd s_barrier
+                    T.ptx_wait_group(async_copy_stage_requests)
+                    T.sync_warp()
+                    
+                    T.copy(A_shared_1, A_local_1)
+                    T.sched_barrier()
+                    T.gemm(
+                        A_local_0,
+                        B_local_n0_0,
+                        C_local_n0,
+                        transpose_B=transpose_B,
+                        k_pack=K_PACK,
+                        annotations={"trans_c": True},
+                    )
+                    T.sched_barrier()
+                    copy_b_half(B_shared_1, B_local_n0_1, 0)
+                    copy_b_half(B_shared_1, B_local_n1_1, 1)
+                    
+                    # Wait for the back warps to finish the matching MMAC.
+                    T.sync_warp()
+                    T.sched_barrier()
+                    T.gemm(
+                        A_local_0,
+                        B_local_n1_0,
+                        C_local_n1,
+                        transpose_B=transpose_B,
+                        k_pack=K_PACK,
+                        annotations={"trans_c": True},
+                    )
+                    T.sched_barrier()
+                    
+                    ## consume ping, prefetch next pong
+
+                    T.s_waitcnt(0, "lgkmcnt")
+                    T.sync_warp()
+                    
+                    # prefetch next pong
+                    async_copy_a(A, A_shared_1, by, base + 1)
+                    async_copy_b(B, B_shared_1, bx, base + 1)
+                    
+                    T.ptx_wait_group(async_copy_stage_requests)
+                    T.sync_warp()
+                    T.copy(A_shared_0, A_local_0)
+                    T.sched_barrier()
+                    T.gemm(
+                        A_local_1,
+                        B_local_n0_1,
+                        C_local_n0,
+                        transpose_B=transpose_B,
+                        k_pack=K_PACK,
+                        annotations={"trans_c": True},
+                    )
+                    T.sched_barrier()
+                    copy_b_half(B_shared_0, B_local_n0_0, 0)
+                    copy_b_half(B_shared_0, B_local_n1_0, 1)
+                    # Wait for the back warps to finish the matching MMAC.
+                    T.sync_warp()
+                    T.sched_barrier()
+                    T.gemm(
+                        A_local_1,
+                        B_local_n1_1,
+                        C_local_n1,
+                        transpose_B=transpose_B,
+                        k_pack=K_PACK,
+                        annotations={"trans_c": True},
+                    )
+                    T.sched_barrier()
+            else:
+                for pair in T.Serial(k_tiles // 2 - 1):
+                    base = pair * 2 + 2
+                    
+                    ## consume pong, prefetch next ping
+                    
+                    # 1st s_barrier
+                    T.s_waitcnt(0, "lgkmcnt")
+                    T.sync_warp()
+                    T.sched_barrier()
+                    T.gemm(
+                        A_local_0,
+                        B_local_n0_0,
+                        C_local_n0,
+                        transpose_B=transpose_B,
+                        k_pack=K_PACK,
+                        annotations={"trans_c": True},
+                    )
+                    T.sched_barrier()
+
+                    # 2nd s_barrier
+                    T.ptx_wait_group(0)
+                    T.sync_warp()
+
+                    # prefetch next ping
+                    T.call_extern("tl::promote_prio", dtype="void")
+                    async_copy_a(A, A_shared_0, by, base)
+                    async_copy_b(B, B_shared_0, bx, base)
+                    T.copy(A_shared_1, A_local_1)
+                    T.call_extern("tl::restore_prio", dtype="void")
+                    
+                    T.sched_barrier()
+                    T.gemm(
+                        A_local_0,
+                        B_local_n1_0,
+                        C_local_n1,
+                        transpose_B=transpose_B,
+                        k_pack=K_PACK,
+                        annotations={"trans_c": True},
+                    )
+                    T.sched_barrier()
+                    # Release the front warps after the matching MMAC.
+                    T.sync_warp()
+                    copy_b_half(B_shared_1, B_local_n0_1, 0)
+                    copy_b_half(B_shared_1, B_local_n1_1, 1)
+
+                    T.s_waitcnt(0, "lgkmcnt")
+                    T.sync_warp()
+                    T.sched_barrier()
+                    T.gemm(
+                        A_local_1,
+                        B_local_n0_1,
+                        C_local_n0,
+                        transpose_B=transpose_B,
+                        k_pack=K_PACK,
+                        annotations={"trans_c": True},
+                    )
+                    T.sched_barrier()
+
+                    T.ptx_wait_group(0)
+                    T.sync_warp()
+                    
+                    # prefetch next pong
+                    T.call_extern("tl::promote_prio", dtype="void")
+                    async_copy_a(A, A_shared_1, by, base + 1)
+                    async_copy_b(B, B_shared_1, bx, base + 1)
+                    T.copy(A_shared_0, A_local_0)
+                    T.call_extern("tl::restore_prio", dtype="void")
+
+                    T.sched_barrier()
+                    T.gemm(
+                        A_local_1,
+                        B_local_n1_1,
+                        C_local_n1,
+                        transpose_B=transpose_B,
+                        k_pack=K_PACK,
+                        annotations={"trans_c": True},
+                    )
+                    T.sched_barrier()
+                    # Release the front warps after the matching MMAC.
+                    T.sync_warp()
+                    copy_b_half(B_shared_0, B_local_n0_0, 0)
+                    copy_b_half(B_shared_0, B_local_n1_0, 1)
+
+            # The loop leaves the final pong tile in LDS and the final ping tile in local.
+            T.ptx_wait_group(0)
+            T.s_waitcnt(0, "lgkmcnt")
+            T.sync_warp()
+            T.copy(A_shared_1, A_local_1)
+            copy_b_half(B_shared_1, B_local_n0_1, 0)
+            copy_b_half(B_shared_1, B_local_n1_1, 1)
+            T.s_waitcnt(0, "lgkmcnt")
+            T.sched_barrier()
+            T.gemm(
+                A_local_0,
+                B_local_n0_0,
+                C_local_n0,
+                transpose_B=transpose_B,
+                k_pack=K_PACK,
+                annotations={"trans_c": True},
+            )
+            T.sched_barrier()
+            T.gemm(
+                A_local_0,
+                B_local_n1_0,
+                C_local_n1,
+                transpose_B=transpose_B,
+                k_pack=K_PACK,
+                annotations={"trans_c": True},
+            )
+            T.sched_barrier()
+            T.gemm(
+                A_local_1,
+                B_local_n0_1,
+                C_local_n0,
+                transpose_B=transpose_B,
+                k_pack=K_PACK,
+                annotations={"trans_c": True},
+            )
+            T.sched_barrier()
+            T.gemm(
+                A_local_1,
+                B_local_n1_1,
+                C_local_n1,
+                transpose_B=transpose_B,
+                k_pack=K_PACK,
+                annotations={"trans_c": True},
+            )
+            T.sched_barrier()
+
+            T.copy(
+                C_local_n0,
+                C[
+                    by * block_M : (by + 1) * block_M,
+                    bx * block_N : bx * block_N + sub_block_N,
+                ],
+            )
+            T.copy(
+                C_local_n1,
+                C[
+                    by * block_M : (by + 1) * block_M,
+                    bx * block_N + sub_block_N : (bx + 1) * block_N,
+                ],
+            )
+
+    return gemm
+
+
+@tl.jit(
+    out_idx=[-1],
+    pass_configs={
+        tl.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+    },
+)
+def gemm_async_copy_k_major(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K=BLOCK_K,
+    dtype="float16",
+    accum_dtype="float32",
+):
+    return _gemm_async_copy_pingpong(
+        M,
+        N,
+        K,
+        block_M,
+        block_N,
+        block_K,
+        dtype=dtype,
+        accum_dtype=accum_dtype,
+        transpose_B=True,
+    )
+
+
+@tl.jit(
+    out_idx=[-1],
+    pass_configs={
+        tl.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+    },
+)
+def gemm_async_copy_n_major(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K=BLOCK_K,
+    dtype="float16",
+    accum_dtype="float32",
+):
+    return _gemm_async_copy_pingpong(
+        M,
+        N,
+        K,
+        block_M,
+        block_N,
+        block_K,
+        dtype=dtype,
+        accum_dtype=accum_dtype,
+        transpose_B=False,
+    )
