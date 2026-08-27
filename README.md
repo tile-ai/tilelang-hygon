@@ -21,7 +21,7 @@ tilelang-hygon supports almost all upstream TileLang syntax.
 
 ## Tested Devices
 
-tilelang-hygon has been tested on **Hygon HCU-2G** and **HCU-3G**.
+tilelang-hygon has been tested on **BW1000**, **BW1100**, **BW150** and **K100_AI**.
 
 **Toolchain**: requires **Hygon DTK**. Source the DTK environment before `build.sh` or compiling kernels.
 
