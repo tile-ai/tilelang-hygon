@@ -869,15 +869,18 @@ int64_t LargestPow2LessThanOrEqual(int64_t value) {
   return result;
 }
 
-int64_t TileWidthFromK(int64_t k_dim) {
-  return std::min<int64_t>(LargestPow2LessThanOrEqual(k_dim), 4096);
+// Bits [61:48] hold the byte stride; 8192 is the largest power of two that fits.
+constexpr int64_t kMaxStructStrideBytes = 8192;
+constexpr int64_t kDynamicKStructStrideBytes = 8192;
+
+int64_t TileWidthElementsFromK(int64_t k_dim, int64_t element_bytes) {
+  const int64_t max_tile_width = kMaxStructStrideBytes / element_bytes;
+  return std::min(LargestPow2LessThanOrEqual(k_dim), max_tile_width);
 }
 
-constexpr int64_t kDynamicKTileWidth = 8192;
-
-int StructBitFromTileWidth(int64_t tile_width) {
+int StructStrideByteBit(int64_t stride_bytes) {
   int bit = 0;
-  while ((int64_t{1} << bit) < tile_width) {
+  while ((int64_t{1} << bit) < stride_bytes) {
     ++bit;
   }
   return bit;
@@ -976,8 +979,17 @@ private:
       }
     }
 
-    const int64_t tile_width =
-        dynamic_k ? kDynamicKTileWidth : TileWidthFromK(k_imm->value);
+    const int64_t element_bytes = src_buffer.value()->dtype.bytes();
+    if (element_bytes <= 0 ||
+        (element_bytes & (element_bytes - 1)) != 0 ||
+        element_bytes > kMaxStructStrideBytes) {
+      return call;
+    }
+    const int64_t struct_stride_bytes =
+        dynamic_k ? kDynamicKStructStrideBytes
+                  : TileWidthElementsFromK(k_imm->value, element_bytes) *
+                        element_bytes;
+    const int64_t tile_width_elements = struct_stride_bytes / element_bytes;
     PrimExpr old_offset = src_call->args[2];
     Optional<PrimExpr> row_expr =
         ExtractRowExpr(old_offset, k_dim, &analyzer_);
@@ -985,8 +997,10 @@ private:
       return call;
     }
     PrimExpr idxen = analyzer_.Simplify(row_expr.value());
+    PrimExpr tile_width_elements_expr =
+        make_const(old_offset.dtype(), tile_width_elements);
     PrimExpr new_offset = analyzer_.Simplify(
-        old_offset - idxen * make_const(old_offset.dtype(), tile_width));
+        old_offset - idxen * tile_width_elements_expr);
     Array<PrimExpr> src_args = src_call->args;
     src_args.Set(2, new_offset);
     PrimExpr new_src = Call(call->args[1].dtype(), builtin::tvm_access_ptr(),
@@ -996,7 +1010,7 @@ private:
     return Call(call->dtype, tl::hcu_cp_async_idxen(),
                 {call->args[0], new_src, call->args[2], predicate, idxen,
                  IntImm(DataType::Int(32),
-                        StructBitFromTileWidth(tile_width))},
+                        StructStrideByteBit(struct_stride_bytes))},
                 call->annotations, call->span);
   }
 

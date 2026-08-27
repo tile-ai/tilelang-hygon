@@ -221,7 +221,7 @@ struct CPAsyncSourceInfo {
   const VarNode *buffer_var{nullptr};
   DataType elem_type;
   PrimExpr element_offset;
-  std::optional<int> struct_bit;
+  std::optional<int> struct_stride_byte_bit;
 };
 
 struct CPAsyncDestinationInfo {
@@ -715,10 +715,11 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
     ICHECK(source.has_value()) << "Unable to identify HCU async-copy source";
     if (call->op.same_as(tl::hcu_cp_async_idxen())) {
       ICHECK_EQ(call->args.size(), 6U);
-      const auto *struct_bit = call->args[5].as<IntImmNode>();
-      ICHECK(struct_bit);
+      const auto *struct_stride_byte_bit = call->args[5].as<IntImmNode>();
+      ICHECK(struct_stride_byte_bit);
       if (!cp_async_idxen_resource_var_names_.count(source->buffer_var)) {
-        source->struct_bit = static_cast<int>(struct_bit->value);
+        source->struct_stride_byte_bit =
+            static_cast<int>(struct_stride_byte_bit->value);
         cp_async_idxen_resource_var_names_[source->buffer_var] =
             name_supply_->FreshName(GetVarID(source->buffer_var) +
                                     "_cp_async_idxen_resource");
@@ -820,7 +821,8 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
     PrintIndent();
     stream << "const int32x4_t "
            << cp_async_idxen_resource_var_names_.at(source.buffer_var)
-           << " = tl::make_wave_buffer_resource<" << source.struct_bit.value()
+           << " = tl::make_wave_buffer_resource<"
+           << source.struct_stride_byte_bit.value()
            << ">(reinterpret_cast<const void *>("
            << GetVarID(source.buffer_var) << "), 0xfffffffcu);\n";
   }
