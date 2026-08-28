@@ -13,11 +13,11 @@ def _gemm_async_copy_vanilla(
     block_K,
     dtype="float16",
     accum_dtype="float32",
-    transpose_B=False,
     steady_wait=6,
     shared_0_wait=6,
 ):
     """Four-stage GEMM using async copies and compiler-derived LDS layouts."""
+    transpose_B = False
     k_tiles = (K + block_K - 1) // block_K
     k_groups = (k_tiles + 3) // 4
 
@@ -33,27 +33,18 @@ def _gemm_async_copy_vanilla(
 
     @T.macro
     def async_copy_b(B, B_shared, bx, k_tile):
-        if transpose_B:
-            T.async_copy(
-                B[
-                    bx * block_N : (bx + 1) * block_N,
-                    k_tile * block_K : (k_tile + 1) * block_K,
-                ],
-                B_shared,
-            )
-        else:
-            T.async_copy(
-                B[
-                    k_tile * block_K : (k_tile + 1) * block_K,
-                    bx * block_N : (bx + 1) * block_N,
-                ],
-                B_shared,
-            )
+        T.async_copy(
+            B[
+                k_tile * block_K : (k_tile + 1) * block_K,
+                bx * block_N : (bx + 1) * block_N,
+            ],
+            B_shared,
+        )
 
     @T.prim_func
     def gemm(
         A: T.Tensor((M, K), dtype),
-        B: T.Tensor((N, K) if transpose_B else (K, N), dtype),
+        B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
@@ -62,14 +53,14 @@ def _gemm_async_copy_vanilla(
             A_shared_1 = T.alloc_shared((block_M, block_K), dtype)
             A_shared_2 = T.alloc_shared((block_M, block_K), dtype)
             A_shared_3 = T.alloc_shared((block_M, block_K), dtype)
-            B_shared_0 = T.alloc_shared((block_N, block_K) if transpose_B else (block_K, block_N), dtype)
-            B_shared_1 = T.alloc_shared((block_N, block_K) if transpose_B else (block_K, block_N), dtype)
-            B_shared_2 = T.alloc_shared((block_N, block_K) if transpose_B else (block_K, block_N), dtype)
-            B_shared_3 = T.alloc_shared((block_N, block_K) if transpose_B else (block_K, block_N), dtype)
+            B_shared_0 = T.alloc_shared((block_K, block_N), dtype)
+            B_shared_1 = T.alloc_shared((block_K, block_N), dtype)
+            B_shared_2 = T.alloc_shared((block_K, block_N), dtype)
+            B_shared_3 = T.alloc_shared((block_K, block_N), dtype)
             A_local_0 = T.alloc_fragment((block_M, block_K), dtype)
-            B_local_0 = T.alloc_fragment((block_N, block_K) if transpose_B else (block_K, block_N), dtype)
+            B_local_0 = T.alloc_fragment((block_K, block_N), dtype)
             A_local_1 = T.alloc_fragment((block_M, block_K), dtype)
-            B_local_1 = T.alloc_fragment((block_N, block_K) if transpose_B else (block_K, block_N), dtype)
+            B_local_1 = T.alloc_fragment((block_K, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_local)
 
@@ -240,37 +231,6 @@ def _gemm_async_copy_vanilla(
         tl.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
     },
 )
-def gemm_async_copy_k_major(
-    M,
-    N,
-    K,
-    block_M,
-    block_N,
-    block_K,
-    dtype="float16",
-    accum_dtype="float32",
-):
-    return _gemm_async_copy_vanilla(
-        M,
-        N,
-        K,
-        block_M,
-        block_N,
-        block_K,
-        dtype=dtype,
-        accum_dtype=accum_dtype,
-        transpose_B=True,
-        steady_wait=6,
-        shared_0_wait=6,
-    )
-
-
-@tl.jit(
-    out_idx=[-1],
-    pass_configs={
-        tl.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
-    },
-)
 def gemm_async_copy_n_major(
     M,
     N,
@@ -290,7 +250,6 @@ def gemm_async_copy_n_major(
         block_K,
         dtype=dtype,
         accum_dtype=accum_dtype,
-        transpose_B=False,
         steady_wait=8,
         shared_0_wait=6,
     )

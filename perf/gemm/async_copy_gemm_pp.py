@@ -17,9 +17,9 @@ def _gemm_async_copy_pingpong(
     block_K=BLOCK_K,
     dtype="float16",
     accum_dtype="float32",
-    transpose_B=False,
 ):
     """GEMM with two LDS stages and a loop-carried LDS-to-register prefetch."""
+    transpose_B = True
     assert block_K == BLOCK_K, "async_copy_gemm_pp requires block_K == 32"
     assert block_N % 2 == 0, "block_N must be divisible by two"
 
@@ -39,40 +39,25 @@ def _gemm_async_copy_pingpong(
 
     @T.macro
     def async_copy_b(B, B_shared, bx, k_tile):
-        if transpose_B:
-            T.async_copy(
-                B[
-                    bx * block_N : (bx + 1) * block_N,
-                    k_tile * block_K : (k_tile + 1) * block_K,
-                ],
-                B_shared,
-            )
-        else:
-            T.async_copy(
-                B[
-                    k_tile * block_K : (k_tile + 1) * block_K,
-                    bx * block_N : (bx + 1) * block_N,
-                ],
-                B_shared,
-            )
+        T.async_copy(
+            B[
+                bx * block_N : (bx + 1) * block_N,
+                k_tile * block_K : (k_tile + 1) * block_K,
+            ],
+            B_shared,
+        )
 
     @T.macro
     def copy_b_half(B_shared, B_local, n_half):
-        if transpose_B:
-            T.copy(
-                B_shared[n_half * sub_block_N : (n_half + 1) * sub_block_N, :],
-                B_local,
-            )
-        else:
-            T.copy(
-                B_shared[:, n_half * sub_block_N : (n_half + 1) * sub_block_N],
-                B_local,
-            )
+        T.copy(
+            B_shared[n_half * sub_block_N : (n_half + 1) * sub_block_N, :],
+            B_local,
+        )
 
     @T.prim_func
     def gemm(
         A: T.Tensor((M, K), dtype),
-        B: T.Tensor((N, K) if transpose_B else (K, N), dtype),
+        B: T.Tensor((N, K), dtype),
         C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
@@ -86,19 +71,15 @@ def _gemm_async_copy_pingpong(
             warp_idx = T.get_warp_idx()
             A_shared_0 = T.alloc_shared((block_M, block_K), dtype)
             A_shared_1 = T.alloc_shared((block_M, block_K), dtype)
-            b_shared_shape = (block_N, block_K) if transpose_B else (block_K, block_N)
-            B_shared_0 = T.alloc_shared(b_shared_shape, dtype)
-            B_shared_1 = T.alloc_shared(b_shared_shape, dtype)
+            B_shared_0 = T.alloc_shared((block_N, block_K), dtype)
+            B_shared_1 = T.alloc_shared((block_N, block_K), dtype)
 
             A_local_0 = T.alloc_fragment((block_M, block_K), dtype)
             A_local_1 = T.alloc_fragment((block_M, block_K), dtype)
-            b_local_shape = (
-                (sub_block_N, block_K) if transpose_B else (block_K, sub_block_N)
-            )
-            B_local_n0_0 = T.alloc_fragment(b_local_shape, dtype)
-            B_local_n1_0 = T.alloc_fragment(b_local_shape, dtype)
-            B_local_n0_1 = T.alloc_fragment(b_local_shape, dtype)
-            B_local_n1_1 = T.alloc_fragment(b_local_shape, dtype)
+            B_local_n0_0 = T.alloc_fragment((sub_block_N, block_K), dtype)
+            B_local_n1_0 = T.alloc_fragment((sub_block_N, block_K), dtype)
+            B_local_n0_1 = T.alloc_fragment((sub_block_N, block_K), dtype)
+            B_local_n1_1 = T.alloc_fragment((sub_block_N, block_K), dtype)
             C_local_n0 = T.alloc_fragment((block_M, sub_block_N), accum_dtype)
             C_local_n1 = T.alloc_fragment((block_M, sub_block_N), accum_dtype)
             T.clear(C_local_n0)
@@ -392,34 +373,4 @@ def gemm_async_copy_k_major(
         block_K,
         dtype=dtype,
         accum_dtype=accum_dtype,
-        transpose_B=True,
-    )
-
-
-@tl.jit(
-    out_idx=[-1],
-    pass_configs={
-        tl.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
-    },
-)
-def gemm_async_copy_n_major(
-    M,
-    N,
-    K,
-    block_M,
-    block_N,
-    block_K=BLOCK_K,
-    dtype="float16",
-    accum_dtype="float32",
-):
-    return _gemm_async_copy_pingpong(
-        M,
-        N,
-        K,
-        block_M,
-        block_N,
-        block_K,
-        dtype=dtype,
-        accum_dtype=accum_dtype,
-        transpose_B=False,
     )
