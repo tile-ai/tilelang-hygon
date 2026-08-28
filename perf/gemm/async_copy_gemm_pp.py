@@ -78,8 +78,8 @@ def _gemm_async_copy_pingpong(
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
             
             T.use_swizzle(
-                panel_size=1,
-                order="row",
+                panel_size=4,
+                order="col",
                 enable=True,
             )
             
@@ -108,33 +108,32 @@ def _gemm_async_copy_pingpong(
             T.sync_warp()
             async_copy_a(A, A_shared_0, by, 0)
             async_copy_b(B, B_shared_0, bx, 0)
-            T.ptx_wait_group(0)
-            T.sync_warp()
+
             async_copy_a(A, A_shared_1, by, 1)
             async_copy_b(B, B_shared_1, bx, 1)
+            
+            # A/B shared_0 ready
+            T.ptx_wait_group(async_copy_stage_requests)
+            T.sync_warp()
+            
             T.copy(A_shared_0, A_local_0)
             copy_b_half(B_shared_0, B_local_n0_0, 0)
             copy_b_half(B_shared_0, B_local_n1_0, 1)
 
+            T.s_waitcnt(0, "lgkmcnt")
+            T.sync_warp()
+
             if warp_idx < 4:
                 for pair in T.Serial(k_tiles // 2 - 1):
                     base = pair * 2 + 2
-                    
-                    ## consume pong, prefetch next ping
-                    
-                    # 1st s_barrier
-                    T.s_waitcnt(0, "lgkmcnt") 
-                    T.sync_warp()
-                    
-                    # prefetch next ping
+
+                    # Phase 0: prepare pong A while the back warps compute ping.
                     async_copy_a(A, A_shared_0, by, base)
-                    async_copy_b(B, B_shared_0, bx, base)
-                    
-                    # 2nd s_barrier
-                    T.ptx_wait_group(async_copy_stage_requests)
+                    T.ptx_wait_group(4)
                     T.sync_warp()
-                    
-                    T.copy(A_shared_1, A_local_1)
+
+                    # Phase 1: compute ping n0 while the back warps prepare pong A.
+                    T.s_waitcnt(4, "lgkmcnt")
                     T.sched_barrier()
                     T.gemm(
                         A_local_0,
@@ -145,11 +144,16 @@ def _gemm_async_copy_pingpong(
                         annotations={"trans_c": True},
                     )
                     T.sched_barrier()
-                    copy_b_half(B_shared_1, B_local_n0_1, 0)
-                    copy_b_half(B_shared_1, B_local_n1_1, 1)
-                    
-                    # Wait for the back warps to finish the matching MMAC.
                     T.sync_warp()
+
+                    # Phase 2: prepare pong B while the back warps compute ping n1.
+                    async_copy_b(B, B_shared_0, bx, base)
+                    T.copy(A_shared_1, A_local_1)
+                    T.ptx_wait_group(4)
+                    T.sync_warp()
+
+                    # Phase 3 also starts the next pong half-cycle.
+                    T.s_waitcnt(4, "lgkmcnt")
                     T.sched_barrier()
                     T.gemm(
                         A_local_0,
@@ -160,19 +164,17 @@ def _gemm_async_copy_pingpong(
                         annotations={"trans_c": True},
                     )
                     T.sched_barrier()
-                    
-                    ## consume ping, prefetch next pong
-
-                    T.s_waitcnt(0, "lgkmcnt")
                     T.sync_warp()
                     
-                    # prefetch next pong
+                    # Phase 4
+                    copy_b_half(B_shared_1, B_local_n0_1, 0)
+                    copy_b_half(B_shared_1, B_local_n1_1, 1)
                     async_copy_a(A, A_shared_1, by, base + 1)
-                    async_copy_b(B, B_shared_1, bx, base + 1)
-                    
-                    T.ptx_wait_group(async_copy_stage_requests)
+                    T.ptx_wait_group(4)
                     T.sync_warp()
-                    T.copy(A_shared_0, A_local_0)
+
+                    # Phase 5
+                    T.s_waitcnt(4, "lgkmcnt")
                     T.sched_barrier()
                     T.gemm(
                         A_local_1,
@@ -183,10 +185,16 @@ def _gemm_async_copy_pingpong(
                         annotations={"trans_c": True},
                     )
                     T.sched_barrier()
-                    copy_b_half(B_shared_0, B_local_n0_0, 0)
-                    copy_b_half(B_shared_0, B_local_n1_0, 1)
-                    # Wait for the back warps to finish the matching MMAC.
                     T.sync_warp()
+
+                    # Phase 6
+                    T.copy(A_shared_0, A_local_0)
+                    async_copy_b(B, B_shared_1, bx, base + 1)
+                    T.ptx_wait_group(4)
+                    T.sync_warp()
+
+                    # Phase 7
+                    T.s_waitcnt(4, "lgkmcnt")
                     T.sched_barrier()
                     T.gemm(
                         A_local_1,
@@ -197,15 +205,16 @@ def _gemm_async_copy_pingpong(
                         annotations={"trans_c": True},
                     )
                     T.sched_barrier()
+                    T.sync_warp()
+                    
+                    copy_b_half(B_shared_0, B_local_n0_0, 0)
+                    copy_b_half(B_shared_0, B_local_n1_0, 1)
             else:
                 for pair in T.Serial(k_tiles // 2 - 1):
                     base = pair * 2 + 2
-                    
-                    ## consume pong, prefetch next ping
-                    
-                    # 1st s_barrier
-                    T.s_waitcnt(0, "lgkmcnt")
-                    T.sync_warp()
+
+                    # Phase 0: compute ping while the front warps prepare pong A.
+                    T.s_waitcnt(4, "lgkmcnt")
                     T.sched_barrier()
                     T.gemm(
                         A_local_0,
@@ -216,18 +225,18 @@ def _gemm_async_copy_pingpong(
                         annotations={"trans_c": True},
                     )
                     T.sched_barrier()
+                    T.ptx_wait_group(2)
+                    T.sync_warp() # A_shared_1 ready
 
-                    # 2nd s_barrier
-                    T.ptx_wait_group(0)
-                    T.sync_warp()
-
-                    # prefetch next ping
+                    # Phase 1: prepare pong A while the front warps compute ping.
                     T.call_extern("tl::promote_prio", dtype="void")
                     async_copy_a(A, A_shared_0, by, base)
-                    async_copy_b(B, B_shared_0, bx, base)
-                    T.copy(A_shared_1, A_local_1)
                     T.call_extern("tl::restore_prio", dtype="void")
-                    
+                    T.copy(A_shared_1, A_local_1)
+                    T.sync_warp()
+
+                    # Phase 2: compute ping n1 while the front warps prepare pong B.
+                    T.s_waitcnt(4, "lgkmcnt")
                     T.sched_barrier()
                     T.gemm(
                         A_local_0,
@@ -238,13 +247,19 @@ def _gemm_async_copy_pingpong(
                         annotations={"trans_c": True},
                     )
                     T.sched_barrier()
-                    # Release the front warps after the matching MMAC.
-                    T.sync_warp()
+                    T.ptx_wait_group(2)
+                    T.sync_warp() # B_shared_1 ready
+
+                    # Phase 3 also starts the next pong half-cycle.
+                    T.call_extern("tl::promote_prio", dtype="void")
+                    async_copy_b(B, B_shared_0, bx, base)
+                    T.call_extern("tl::restore_prio", dtype="void")
                     copy_b_half(B_shared_1, B_local_n0_1, 0)
                     copy_b_half(B_shared_1, B_local_n1_1, 1)
-
-                    T.s_waitcnt(0, "lgkmcnt")
                     T.sync_warp()
+                    
+                    # Phase 4
+                    T.s_waitcnt(4, "lgkmcnt")
                     T.sched_barrier()
                     T.gemm(
                         A_local_1,
@@ -255,17 +270,18 @@ def _gemm_async_copy_pingpong(
                         annotations={"trans_c": True},
                     )
                     T.sched_barrier()
+                    T.ptx_wait_group(2)
+                    T.sync_warp() # A_shared_0 ready
 
-                    T.ptx_wait_group(0)
-                    T.sync_warp()
-                    
-                    # prefetch next pong
+                    # Phase 5
                     T.call_extern("tl::promote_prio", dtype="void")
                     async_copy_a(A, A_shared_1, by, base + 1)
-                    async_copy_b(B, B_shared_1, bx, base + 1)
-                    T.copy(A_shared_0, A_local_0)
                     T.call_extern("tl::restore_prio", dtype="void")
+                    T.copy(A_shared_0, A_local_0)
+                    T.sync_warp()
 
+                    # Phase 6
+                    T.s_waitcnt(4, "lgkmcnt")
                     T.sched_barrier()
                     T.gemm(
                         A_local_1,
@@ -276,10 +292,16 @@ def _gemm_async_copy_pingpong(
                         annotations={"trans_c": True},
                     )
                     T.sched_barrier()
-                    # Release the front warps after the matching MMAC.
-                    T.sync_warp()
+                    T.ptx_wait_group(2)
+                    T.sync_warp() # B_shared_0 ready
+
+                    # Phase 7
+                    T.call_extern("tl::promote_prio", dtype="void")
+                    async_copy_b(B, B_shared_1, bx, base + 1)
+                    T.call_extern("tl::restore_prio", dtype="void")
                     copy_b_half(B_shared_0, B_local_n0_0, 0)
                     copy_b_half(B_shared_0, B_local_n1_0, 1)
+                    T.sync_warp()
 
             # The loop leaves the final pong tile in LDS and the final ping tile in local.
             T.ptx_wait_group(0)
