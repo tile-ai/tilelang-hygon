@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: MIT
+
 /*!
  * \file gemm_an_bt_lds_strategy.h
  * \brief Compiler-derived LDS strategy for HCU GEMM AN/BT ds-read copies.
@@ -53,24 +56,24 @@ public:
   explicit HcuGemmAnBtLdsStrategy(ObjectPtr<HcuGemmAnBtLdsStrategyNode> ptr)
       : ObjectRef(std::move(ptr)) {}
 
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(
-      HcuGemmAnBtLdsStrategy, ObjectRef, HcuGemmAnBtLdsStrategyNode);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(HcuGemmAnBtLdsStrategy,
+                                                ObjectRef,
+                                                HcuGemmAnBtLdsStrategyNode);
 };
 
 Optional<HcuGemmAnBtLdsStrategy>
 DeriveHcuGemmAnBtLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
                              bool feeds_a, int block_threads, Target target);
 
-Optional<HcuGemmAnBtLdsStrategy>
-DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
+Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
     const CopyNode &copy, const GemmNode &gemm, bool feeds_a, int block_threads,
     Target target, int wrap_count);
 
-void ValidateHcuGemmAnBtStorageLayout(
-    const Layout &actual, const HcuGemmAnBtLdsStrategy &strategy);
+void ValidateHcuGemmAnBtStorageLayout(const Layout &actual,
+                                      const HcuGemmAnBtLdsStrategy &strategy);
 
-void ValidateHcuGemmAnBtCopyLayout(
-    const Fragment &actual, const HcuGemmAnBtLdsStrategy &strategy);
+void ValidateHcuGemmAnBtCopyLayout(const Fragment &actual,
+                                   const HcuGemmAnBtLdsStrategy &strategy);
 
 } // namespace tl
 } // namespace tvm

@@ -7,10 +7,10 @@
 #include "hcu/op/ds_read_format.h"
 #include "hcu/op/mls.h"
 #include "hcu/target_utils.h"
-#include "hcu/utils/gemm_at_bn_lds_strategy.h"
 #include "hcu/utils/gemm_an_bt_lds_strategy.h"
-#include "hcu/utils/gemm_lds_strategy_utils.h"
+#include "hcu/utils/gemm_at_bn_lds_strategy.h"
 #include "hcu/utils/gemm_lds_access.h"
+#include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "hcu/utils/mls_gemm_dep.h"
 #include "hcu/utils/propagation_tir_collector.h"
 #include "hcu/utils/propagation_util.h"
@@ -116,8 +116,7 @@ bool IsAnBtLinearDsReadCopyCandidate(const CopyNode *copy,
 }
 
 bool IsBLinearDirectGemmCandidate(const GemmNode *gemm) {
-  return gemm && !gemm->transB_ && gemm->k_ % 16 == 0 &&
-         gemm->kPack_ == 1 &&
+  return gemm && !gemm->transB_ && gemm->k_ % 16 == 0 && gemm->kPack_ == 1 &&
          (gemm->b_->dtype.is_float16() || gemm->b_->dtype.is_bfloat16());
 }
 
@@ -157,7 +156,7 @@ private:
 };
 
 bool HaveSameAtBnStrategyParameters(const HcuGemmAtBnLdsStrategy &lhs,
-                                     const HcuGemmAtBnLdsStrategy &rhs) {
+                                    const HcuGemmAtBnLdsStrategy &rhs) {
   return lhs->strategy_version == rhs->strategy_version &&
          lhs->block_mn == rhs->block_mn && lhs->block_k == rhs->block_k &&
          lhs->block_threads == rhs->block_threads &&
@@ -168,8 +167,7 @@ bool HaveSameAtBnStrategyParameters(const HcuGemmAtBnLdsStrategy &lhs,
          lhs->element_bytes == rhs->element_bytes &&
          lhs->copy_bytes_per_lane == rhs->copy_bytes_per_lane &&
          lhs->copy_transaction_bytes == rhs->copy_transaction_bytes &&
-         lhs->copy_transactions_per_lane ==
-             rhs->copy_transactions_per_lane &&
+         lhs->copy_transactions_per_lane == rhs->copy_transactions_per_lane &&
          lhs->read_bytes_per_lane == rhs->read_bytes_per_lane &&
          lhs->row_period == rhs->row_period &&
          lhs->row_bank_stride == rhs->row_bank_stride &&
@@ -179,18 +177,16 @@ bool HaveSameAtBnStrategyParameters(const HcuGemmAtBnLdsStrategy &lhs,
 }
 
 bool HaveSameAnBtStrategyParameters(const HcuGemmAnBtLdsStrategy &lhs,
-                                     const HcuGemmAnBtLdsStrategy &rhs) {
+                                    const HcuGemmAnBtLdsStrategy &rhs) {
   return lhs->strategy_version == rhs->strategy_version &&
          lhs->block_k == rhs->block_k && lhs->block_mn == rhs->block_mn &&
          lhs->block_threads == rhs->block_threads &&
-         lhs->warp_size == rhs->warp_size &&
-         lhs->bank_num == rhs->bank_num &&
+         lhs->warp_size == rhs->warp_size && lhs->bank_num == rhs->bank_num &&
          lhs->bank_width_bytes == rhs->bank_width_bytes &&
          lhs->element_bytes == rhs->element_bytes &&
          lhs->copy_bytes_per_lane == rhs->copy_bytes_per_lane &&
          lhs->copy_transaction_bytes == rhs->copy_transaction_bytes &&
-         lhs->copy_transactions_per_lane ==
-             rhs->copy_transactions_per_lane &&
+         lhs->copy_transactions_per_lane == rhs->copy_transactions_per_lane &&
          lhs->read_bytes_per_lane == rhs->read_bytes_per_lane &&
          lhs->phase_bytes == rhs->phase_bytes &&
          lhs->panel_mn == rhs->panel_mn &&
@@ -212,8 +208,8 @@ bool HaveSameCopyStrategyParameters(const HcuGemmLdsCopyStrategy &lhs,
          lhs->copy_loop_layout->IsEqual(rhs->copy_loop_layout.get());
 }
 
-MlsGemmDepMeta BuildCopyToGemmLinearMeta(
-    const GemmWithInput &consumer, bool a_from_mls, bool b_from_mls) {
+MlsGemmDepMeta BuildCopyToGemmLinearMeta(const GemmWithInput &consumer,
+                                         bool a_from_mls, bool b_from_mls) {
   const GemmNode *gemm = consumer.gemm.get();
   const bool feeds_a = consumer.input.same_as(gemm->a_);
   ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
@@ -238,8 +234,7 @@ bool IsAtBnAccess(const GemmWithInput &consumer) {
   ICHECK(gemm != nullptr);
   const bool feeds_a = consumer.input.same_as(gemm->a_);
   ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
-  return GetHcuGemmLdsAccessKind(*gemm, feeds_a) ==
-         HcuGemmLdsAccessKind::kAtBn;
+  return GetHcuGemmLdsAccessKind(*gemm, feeds_a) == HcuGemmLdsAccessKind::kAtBn;
 }
 
 } // namespace
@@ -357,7 +352,7 @@ private:
 
   Optional<HcuGemmAtBnLdsStrategy>
   TryDeriveAtBnStrategy(const CopyNode &copy,
-                         const GemmWithInput &consumer) const {
+                        const GemmWithInput &consumer) const {
     const GemmNode *gemm = consumer.gemm.get();
     if (gemm == nullptr) {
       return std::nullopt;
@@ -365,12 +360,12 @@ private:
     const bool feeds_a = consumer.input.same_as(gemm->a_);
     ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
     return DeriveHcuGemmAtBnLdsStrategy(copy, *gemm, feeds_a, block_threads_,
-                                     target_);
+                                        target_);
   }
 
   Optional<HcuGemmAnBtLdsStrategy>
   TryDeriveAnBtStrategy(const CopyNode &copy,
-                         const GemmWithInput &consumer) const {
+                        const GemmWithInput &consumer) const {
     const GemmNode *gemm = consumer.gemm.get();
     if (gemm == nullptr) {
       return std::nullopt;
@@ -378,7 +373,7 @@ private:
     const bool feeds_a = consumer.input.same_as(gemm->a_);
     ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
     return DeriveHcuGemmAnBtLdsStrategy(copy, *gemm, feeds_a, block_threads_,
-                                     target_);
+                                        target_);
   }
 
   Optional<HcuGemmAnBtLdsStrategy>
@@ -395,11 +390,9 @@ private:
         copy, *gemm, feeds_a, block_threads_, target_, wrap_count);
   }
 
-  std::pair<Optional<HcuGemmAtBnLdsStrategy>,
-            Optional<HcuGemmAnBtLdsStrategy>>
-  SelectAutoStrategy(
-      const CopyNode &copy,
-      const std::vector<GemmWithInput> &consumers) const {
+  std::pair<Optional<HcuGemmAtBnLdsStrategy>, Optional<HcuGemmAnBtLdsStrategy>>
+  SelectAutoStrategy(const CopyNode &copy,
+                     const std::vector<GemmWithInput> &consumers) const {
     Optional<HcuGemmAtBnLdsStrategy> at_bn_strategy;
     Optional<HcuGemmAnBtLdsStrategy> an_bt_strategy;
     std::optional<GemmWithInput> an_bt_consumer;
@@ -475,8 +468,7 @@ private:
         ICHECK_EQ(at_bn->block_k, an_bt->block_mn);
         ICHECK_EQ(at_bn->block_threads, an_bt->block_threads);
         ICHECK_EQ(at_bn->copy_bytes_per_lane, an_bt->copy_bytes_per_lane);
-        ICHECK_EQ(at_bn->copy_transaction_bytes,
-                  an_bt->copy_transaction_bytes)
+        ICHECK_EQ(at_bn->copy_transaction_bytes, an_bt->copy_transaction_bytes)
             << "Mixed HCU GEMM consumers of shared buffer `" << copy.dst->name
             << "` require incompatible async-copy transactions";
         DLOG(WARNING)
@@ -486,9 +478,9 @@ private:
       }
       return MakeHcuGemmLdsCopyStrategy(
           /*use_idxen=*/false, an_bt->copy_bytes_per_lane,
-          an_bt->copy_transaction_bytes, an_bt->block_threads,
-          an_bt->block_mn, an_bt->wrap_offset, an_bt->wrap_idx_mask,
-          an_bt->storage_layout, an_bt->copy_loop_layout);
+          an_bt->copy_transaction_bytes, an_bt->block_threads, an_bt->block_mn,
+          an_bt->wrap_offset, an_bt->wrap_idx_mask, an_bt->storage_layout,
+          an_bt->copy_loop_layout);
     }
 
     const HcuGemmAtBnLdsStrategy &at_bn = at_bn_strategy.value();
@@ -499,11 +491,9 @@ private:
         at_bn->copy_loop_layout);
   }
 
-  bool IsLinearDsReadGemmInput(const Gemm &gemm,
-                               const Buffer &input) const {
+  bool IsLinearDsReadGemmInput(const Gemm &gemm, const Buffer &input) const {
     GemmWithInput consumer{gemm, input};
-    for (const ProducerRecord &record :
-         collector_->GetProducerRecords(input)) {
+    for (const ProducerRecord &record : collector_->GetProducerRecords(input)) {
       if (record.call == nullptr) {
         continue;
       }
@@ -577,9 +567,8 @@ private:
           IsAnBtLinearDsReadCopyCandidate(copy.get(), consumer.value())) {
         const GemmNode *consumer_gemm = consumer->gemm.get();
         const bool feeds_a = consumer->input.same_as(consumer_gemm->a_);
-        const bool has_layout =
-            HasAnnotatedLayout(copy->src) ||
-            auto_an_bt_strategies_.count(copy->src->data);
+        const bool has_layout = HasAnnotatedLayout(copy->src) ||
+                                auto_an_bt_strategies_.count(copy->src->data);
         // The fallback template is B-specific. AN must have an explicit
         // logical-to-physical map before it can use the generic vector read.
         if (feeds_a && !has_layout) {
@@ -587,20 +576,16 @@ private:
         }
         auto annotations = call->annotations;
         const Gemm &gemm = consumer->gemm;
-        const bool a_from_mls =
-            IsFromMls(gemm->a_, collector_) ||
-            IsLinearDsReadGemmInput(gemm, gemm->a_);
-        const bool b_from_mls =
-            IsFromMls(gemm->b_, collector_) ||
-            IsLinearDsReadGemmInput(gemm, gemm->b_);
+        const bool a_from_mls = IsFromMls(gemm->a_, collector_) ||
+                                IsLinearDsReadGemmInput(gemm, gemm->a_);
+        const bool b_from_mls = IsFromMls(gemm->b_, collector_) ||
+                                IsLinearDsReadGemmInput(gemm, gemm->b_);
         annotations.Set(attr::kMlsGemmDep,
                         BuildCopyToGemmLinearMeta(consumer.value(), a_from_mls,
                                                   b_from_mls));
-        annotations.Set(attr::kHcuLinearDsRead,
-                        IntImm(DataType::Int(32), 1));
+        annotations.Set(attr::kHcuLinearDsRead, IntImm(DataType::Int(32), 1));
         if (has_layout) {
-          annotations.Set(attr::kHcuLayoutDsRead,
-                          IntImm(DataType::Int(32), 1));
+          annotations.Set(attr::kHcuLayoutDsRead, IntImm(DataType::Int(32), 1));
         }
         copy_ds_read_outputs_.insert(copy->dst);
         return Evaluate(Call(call->dtype, DsReadFormat::Get(), call->args,
@@ -654,16 +639,16 @@ private:
             }
           }
           annotations.Set(attr::kHcuGemmLdsCopyStrategy, copy_strategy);
-          auto [copy_it, copy_inserted] = auto_copy_strategies_.emplace(
-              copy->dst->data, copy_strategy);
+          auto [copy_it, copy_inserted] =
+              auto_copy_strategies_.emplace(copy->dst->data, copy_strategy);
           if (!copy_inserted) {
-            ICHECK(HaveSameCopyStrategyParameters(copy_it->second,
-                                                  copy_strategy))
+            ICHECK(
+                HaveSameCopyStrategyParameters(copy_it->second, copy_strategy))
                 << "Conflicting HCU GEMM copy strategies for shared buffer "
                 << copy->dst->name;
           }
-          return Evaluate(Call(call->dtype, call->op, call->args, annotations,
-                               call->span));
+          return Evaluate(
+              Call(call->dtype, call->op, call->args, annotations, call->span));
         }
       }
       if (IsAsyncCopyOp(tir_op) && IsSharedBuffer(copy->dst) &&
@@ -686,13 +671,11 @@ private:
       auto a_at_bn_strategy = auto_at_bn_strategies_.find(gemm->a_->data);
       auto a_an_bt_strategy = auto_an_bt_strategies_.find(gemm->a_->data);
       const bool a_uses_at_bn = IsAtBnAccess({gemm, gemm->a_});
-      if (IsSharedBuffer(gemm->a_) &&
-          a_uses_at_bn &&
+      if (IsSharedBuffer(gemm->a_) && a_uses_at_bn &&
           a_at_bn_strategy != auto_at_bn_strategies_.end()) {
         annotations.Set(attr::kHcuGemmAtBnLdsStrategy,
                         a_at_bn_strategy->second);
-      } else if (IsSharedBuffer(gemm->a_) &&
-                 !a_uses_at_bn &&
+      } else if (IsSharedBuffer(gemm->a_) && !a_uses_at_bn &&
                  a_an_bt_strategy != auto_an_bt_strategies_.end()) {
         annotations.Set(attr::kHcuARespectLayoutMap,
                         IntImm(DataType::Int(32), 1));
@@ -707,15 +690,13 @@ private:
       auto b_an_bt_strategy = auto_an_bt_strategies_.find(gemm->b_->data);
       auto b_at_bn_strategy = auto_at_bn_strategies_.find(gemm->b_->data);
       const bool b_uses_at_bn = IsAtBnAccess({gemm, gemm->b_});
-      if (IsSharedBuffer(gemm->b_) &&
-          !b_uses_at_bn &&
+      if (IsSharedBuffer(gemm->b_) && !b_uses_at_bn &&
           b_an_bt_strategy != auto_an_bt_strategies_.end()) {
         annotations.Set(attr::kHcuGemmAnBtLdsStrategy,
                         b_an_bt_strategy->second);
         annotations.Set(attr::kHcuBRespectLayoutMap,
                         IntImm(DataType::Int(32), 1));
-      } else if (IsSharedBuffer(gemm->b_) &&
-                 b_uses_at_bn &&
+      } else if (IsSharedBuffer(gemm->b_) && b_uses_at_bn &&
                  b_at_bn_strategy != auto_at_bn_strategies_.end()) {
         annotations.Set(attr::kHcuBRespectLayoutMap,
                         IntImm(DataType::Int(32), 1));

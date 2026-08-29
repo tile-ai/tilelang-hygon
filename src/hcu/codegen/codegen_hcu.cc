@@ -265,28 +265,25 @@ GetCPAsyncDestinationInfo(const PrimExpr &expr) {
   if (!ptr_call)
     return std::nullopt;
   const BufferLoadNode *load =
-      ptr_call->args.empty() ? nullptr
-                             : ptr_call->args[0].as<BufferLoadNode>();
+      ptr_call->args.empty() ? nullptr : ptr_call->args[0].as<BufferLoadNode>();
   if (!load && ptr_call->op.same_as(builtin::tvm_access_ptr())) {
     const auto *var = ptr_call->args[1].as<VarNode>();
     auto elem_type = GetAccessPtrElementType(expr);
     if (!var || !elem_type.has_value())
       return std::nullopt;
-    return CPAsyncDestinationInfo{GetRef<Var>(var),
-                                  elem_type.value().element_of(),
-                                  ptr_call->args[2]};
+    return CPAsyncDestinationInfo{
+        GetRef<Var>(var), elem_type.value().element_of(), ptr_call->args[2]};
   }
   if (!load)
     return std::nullopt;
 
-  return CPAsyncDestinationInfo{
-      load->buffer->data, load->buffer->dtype.element_of(),
-      GetBufferLoadLinearizedOffset(load)};
+  return CPAsyncDestinationInfo{load->buffer->data,
+                                load->buffer->dtype.element_of(),
+                                GetBufferLoadLinearizedOffset(load)};
 }
 
 int GetTileLangCPAsyncTransferBytes(const CallNode *op) {
-  ICHECK(op->args.size() == 3 || op->args.size() == 4 ||
-         op->args.size() == 6)
+  ICHECK(op->args.size() == 3 || op->args.size() == 4 || op->args.size() == 6)
       << "HCU async copy expects 3, 4, or 6 arguments";
   const auto *num_elems_imm = op->args[2].as<IntImmNode>();
   ICHECK(num_elems_imm) << "tl::ptx_cp_async num_elems must be IntImm, but got "
@@ -617,22 +614,21 @@ std::string ApplyCPAsyncLdsWrap(const CallNode *op, const Target &target,
   ICHECK(wrap_config.encoding != tl::HcuLdsWrapEncoding::kNone)
       << "LDS wrap encoding is not defined for "
       << tl::GetHcuArchString(target);
-  std::string wrap_index = "((((int)threadIdx.x) >> 6) & " +
-                           std::to_string(wrap_idx_mask) + ")";
-  std::string dword_offset = "(" + wrap_index + " * " +
-                             std::to_string(wrap_offset) + ")";
+  std::string wrap_index =
+      "((((int)threadIdx.x) >> 6) & " + std::to_string(wrap_idx_mask) + ")";
+  std::string dword_offset =
+      "(" + wrap_index + " * " + std::to_string(wrap_offset) + ")";
   std::string encoded_field;
   switch (wrap_config.encoding) {
   case tl::HcuLdsWrapEncoding::kFourDword:
     ICHECK_EQ(wrap_offset % 4, 0)
         << "BMZ LDS wrap requires a 4-dword-aligned physical shift";
     encoded_field =
-        "(" + wrap_index + " * " +
-        std::to_string(wrap_offset / 4) + ")";
+        "(" + wrap_index + " * " + std::to_string(wrap_offset / 4) + ")";
     break;
   case tl::HcuLdsWrapEncoding::kHybridFourAndOneDword:
-    encoded_field = "((" + dword_offset + " / 4) | ((" + dword_offset +
-                    " % 4) << 3))";
+    encoded_field =
+        "((" + dword_offset + " / 4) | ((" + dword_offset + " % 4) << 3))";
     break;
   case tl::HcuLdsWrapEncoding::kOneDword:
     encoded_field = dword_offset;
@@ -678,8 +674,7 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
     if (!bind)
       return;
     const auto *value = bind->value.as<CallNode>();
-    if (!value ||
-        !value->op.same_as(builtin::handle_add_byte_offset()) ||
+    if (!value || !value->op.same_as(builtin::handle_add_byte_offset()) ||
         value->args.size() != 2U)
       return;
     const auto *root = value->args[0].as<VarNode>();
@@ -742,10 +737,9 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
       if (elem_bytes <= 0 || transaction_bytes % elem_bytes != 0)
         return;
       PrimExpr expected_offset =
-          thread_x.value() * make_const(thread_x.value().dtype(),
-                                        transaction_bytes / elem_bytes);
-      if (!analyzer.CanProveEqual(destination->element_offset,
-                                  expected_offset))
+          thread_x.value() *
+          make_const(thread_x.value().dtype(), transaction_bytes / elem_bytes);
+      if (!analyzer.CanProveEqual(destination->element_offset, expected_offset))
         return;
       const int64_t destination_size = thread_x_extent * transaction_bytes;
       if (wrap_config.lds_offset_bits <= 0 || destination_size <= 0 ||
@@ -789,9 +783,8 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
     }
     if (cp_async_resource_var_names_.count(source->buffer_var))
       return;
-    cp_async_resource_var_names_[source->buffer_var] =
-        name_supply_->FreshName(GetVarID(source->buffer_var) +
-                                "_cp_async_resource");
+    cp_async_resource_var_names_[source->buffer_var] = name_supply_->FreshName(
+        GetVarID(source->buffer_var) + "_cp_async_resource");
     normal_sources.push_back(*source);
   });
 
@@ -804,8 +797,8 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
       const int64_t smem_offset = alias_offset - group.base_alias_offset;
       ICHECK_GE(smem_offset, 0);
       cp_async_idxen_lds_base_uses_.emplace(
-          call, HoistedCPAsyncLdsBaseUse{base_name,
-                                        static_cast<int>(smem_offset)});
+          call,
+          HoistedCPAsyncLdsBaseUse{base_name, static_cast<int>(smem_offset)});
     }
   }
 
@@ -823,8 +816,8 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
            << cp_async_idxen_resource_var_names_.at(source.buffer_var)
            << " = tl::make_wave_buffer_resource<"
            << source.struct_stride_byte_bit.value()
-           << ">(reinterpret_cast<const void *>("
-           << GetVarID(source.buffer_var) << "), 0xfffffffcu);\n";
+           << ">(reinterpret_cast<const void *>(" << GetVarID(source.buffer_var)
+           << "), 0xfffffffcu);\n";
   }
 }
 
@@ -2526,8 +2519,8 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
                      << ", " << source_offset_bytes << ", " << idxen << ", "
                      << condition << ");\n";
       } else {
-        this->stream << "tl::cp_async_gs_idxen_conditional<" << size << ">(" << dst
-                     << ", " << resource->second << ", "
+        this->stream << "tl::cp_async_gs_idxen_conditional<" << size << ">("
+                     << dst << ", " << resource->second << ", "
                      << source_offset_bytes << ", " << idxen << ", "
                      << condition << ");\n";
       }
@@ -2536,8 +2529,8 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       ICHECK(resource != cp_async_resource_var_names_.end());
       if (op->args.size() == 3U) {
         this->stream << "tl::cp_async_gs<" << size << ">(" << dst << ", " << src
-                     << ", " << resource->second << ", "
-                     << source_offset_bytes << ");\n";
+                     << ", " << resource->second << ", " << source_offset_bytes
+                     << ");\n";
       } else {
         std::string condition = this->PrintExpr(op->args[3]);
         this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
@@ -2555,7 +2548,8 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       shared_dtype = load->buffer->dtype.element_of();
       std::ostringstream load_expr;
       PrintExpr(op->args[2], load_expr);
-      shared_byte_offset = "reinterpret_cast<uintptr_t>(&(" + load_expr.str() + "))";
+      shared_byte_offset =
+          "reinterpret_cast<uintptr_t>(&(" + load_expr.str() + "))";
     } else {
       PrimExpr shared_offset = InlineIfThenElseAsSelect().Rewrite(op->args[2]);
       shared_byte_offset = "(" + PrintExpr(shared_offset) + ") * sizeof(" +

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: MIT
+
 /*!
  * \file gemm_lds_strategy_utils.h
  * \brief Shared geometry helpers for compiler-derived HCU GEMM LDS strategies.
@@ -46,8 +49,9 @@ public:
       ffi::ObjectPtr<HcuGemmLdsCopyStrategyNode> ptr)
       : ObjectRef(std::move(ptr)) {}
 
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(
-      HcuGemmLdsCopyStrategy, ffi::ObjectRef, HcuGemmLdsCopyStrategyNode);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(HcuGemmLdsCopyStrategy,
+                                                ffi::ObjectRef,
+                                                HcuGemmLdsCopyStrategyNode);
 };
 
 struct HcuGemmLdsCopyGeometry {
@@ -68,9 +72,8 @@ struct HcuGemmLdsCopyGeometry {
 };
 
 std::optional<HcuGemmLdsCopyGeometry>
-DeriveHcuGemmLdsCopyGeometry(int bytes_per_row,
-                             int copy_transaction_bytes, int block_threads,
-                             Target target);
+DeriveHcuGemmLdsCopyGeometry(int bytes_per_row, int copy_transaction_bytes,
+                             int block_threads, Target target);
 
 int SelectHcuGemmLdsCopyTransactionBytes(int bytes_per_row,
                                          int copy_bytes_per_lane,
@@ -81,10 +84,11 @@ int GetHcuGemmLdsWrapOffsetDwords(int wrap_step_bytes);
 bool IsLegalHcuGemmLdsWrap(const HcuGemmLdsCopyGeometry &geometry,
                            int wrap_step_bytes, int wrap_count);
 
-HcuGemmLdsCopyStrategy MakeHcuGemmLdsCopyStrategy(
-    bool use_idxen, int copy_bytes_per_lane, int copy_transaction_bytes,
-    int block_threads, int inner_extent, int wrap_offset, int wrap_idx_mask,
-    Layout storage_layout, Fragment copy_loop_layout);
+HcuGemmLdsCopyStrategy
+MakeHcuGemmLdsCopyStrategy(bool use_idxen, int copy_bytes_per_lane,
+                           int copy_transaction_bytes, int block_threads,
+                           int inner_extent, int wrap_offset, int wrap_idx_mask,
+                           Layout storage_layout, Fragment copy_loop_layout);
 
 } // namespace tl
 } // namespace tvm

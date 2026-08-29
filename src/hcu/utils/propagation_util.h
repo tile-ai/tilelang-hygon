@@ -66,8 +66,7 @@ std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInputAfterCall(
     const CallNode *after_site_call);
 
 /*! \brief Collect all downstream Gemm consumers after a specific call site. */
-std::vector<GemmWithInput>
-PropagateToFindAllGemmConsumersAfterCall(
+std::vector<GemmWithInput> PropagateToFindAllGemmConsumersAfterCall(
     Buffer buffer, const PropagationTirCollector *tir_collector,
     const CallNode *after_site_call);
 

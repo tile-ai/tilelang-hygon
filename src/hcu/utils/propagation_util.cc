@@ -86,9 +86,10 @@ static Optional<TileOperator> PropagateToFindGemmConsumerOpTirImpl(
   return Optional<TileOperator>();
 }
 
-static Optional<TileOperator> PropagateToFindGemmConsumerOpTir(
-    const Buffer &buffer, const PropagationTirCollector *tir,
-    int after_stmt_order) {
+static Optional<TileOperator>
+PropagateToFindGemmConsumerOpTir(const Buffer &buffer,
+                                 const PropagationTirCollector *tir,
+                                 int after_stmt_order) {
   BufferSet visited_buffers;
   return PropagateToFindGemmConsumerOpTirImpl(buffer, tir, after_stmt_order,
                                               &visited_buffers);
@@ -117,9 +118,10 @@ PropagateToFindGemmConsumerOpWithInputTirImpl(
   return std::nullopt;
 }
 
-static std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInputTir(
-    const Buffer &buffer, const PropagationTirCollector *tir,
-    int after_stmt_order) {
+static std::optional<GemmWithInput>
+PropagateToFindGemmConsumerOpWithInputTir(const Buffer &buffer,
+                                          const PropagationTirCollector *tir,
+                                          int after_stmt_order) {
   BufferSet visited_buffers;
   return PropagateToFindGemmConsumerOpWithInputTirImpl(
       buffer, tir, after_stmt_order, &visited_buffers);
@@ -166,8 +168,7 @@ void CollectAllGemmConsumers(
   if (!visited_buffers->insert(buffer).second) {
     return;
   }
-  for (const ReaderCallRecord &reader :
-       tir_collector->GetReaderCalls(buffer)) {
+  for (const ReaderCallRecord &reader : tir_collector->GetReaderCalls(buffer)) {
     if (reader.stmt_order <= after_order || reader.call == nullptr) {
       continue;
     }
@@ -222,8 +223,8 @@ static bool PropagateToFindProducerMatrixLoadFoundTirImpl(
   if (tir->ProducerIsDsReadFormat(buffer)) {
     auto inputs = tir->GetProducerInputs(buffer);
     if (!inputs.empty()) {
-      return PropagateToFindProducerMatrixLoadFoundTirImpl(
-          inputs[0], tir, visited_buffers);
+      return PropagateToFindProducerMatrixLoadFoundTirImpl(inputs[0], tir,
+                                                           visited_buffers);
     }
   }
   for (const Buffer &in_buf : tir->GetProducerInputs(buffer)) {
@@ -232,17 +233,18 @@ static bool PropagateToFindProducerMatrixLoadFoundTirImpl(
     if (IsSharedLikeScope(in_buf))
       continue;
     if (PropagateToFindProducerMatrixLoadFoundTirImpl(in_buf, tir,
-                                                       visited_buffers))
+                                                      visited_buffers))
       return true;
   }
   return false;
 }
 
-static bool PropagateToFindProducerMatrixLoadFoundTir(
-    const Buffer &buffer, const PropagationTirCollector *tir) {
+static bool
+PropagateToFindProducerMatrixLoadFoundTir(const Buffer &buffer,
+                                          const PropagationTirCollector *tir) {
   BufferSet visited_buffers;
   return PropagateToFindProducerMatrixLoadFoundTirImpl(buffer, tir,
-                                                        &visited_buffers);
+                                                       &visited_buffers);
 }
 
 bool IsFromMls(Buffer buffer, const PropagationTirCollector *tir_collector) {

@@ -243,10 +243,7 @@ def build_ds_read_format_tensor_b_linear_template(
     warp_n: int,
     dtype_str: str,
 ) -> str:
-    return (
-        f"tl::mls::ds_read_format_tensor_b_linear<tl::sequence<{block_n}, {block_k}>, "
-        f"{total_warp}, {warp_n}, {dtype_str}>"
-    )
+    return f"tl::mls::ds_read_format_tensor_b_linear<tl::sequence<{block_n}, {block_k}>, {total_warp}, {warp_n}, {dtype_str}>"
 
 
 def block_col_warps_no_recompute(block_n: int, block_col_warps: int, min_n_per_warp: int) -> int:

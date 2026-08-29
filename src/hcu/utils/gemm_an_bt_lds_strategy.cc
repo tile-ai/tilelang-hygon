@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: MIT
+
 /*!
  * \file gemm_an_bt_lds_strategy.cc
  * \brief Compiler-derived LDS strategy for HCU GEMM AN/BT ds-read copies.
@@ -61,20 +64,17 @@ std::optional<int64_t> StaticExtent(const Array<Range> &ranges, size_t dim) {
   return *extent;
 }
 
-bool IsPowerOfTwo(int value) {
-  return value > 0 && (value & (value - 1)) == 0;
-}
+bool IsPowerOfTwo(int value) { return value > 0 && (value & (value - 1)) == 0; }
 
-Fragment MakeCopyLoopLayout(const AnBtStrategyParams &params,
-                            bool permute_rows, int rows_per_copy_wave = 0,
+Fragment MakeCopyLoopLayout(const AnBtStrategyParams &params, bool permute_rows,
+                            int rows_per_copy_wave = 0,
                             int wrap_count = kDsReadWrapCount,
                             bool permute_across_block_k = false) {
   PrimExpr k = InputPlaceholder(0);
   PrimExpr n = InputPlaceholder(1);
   PrimExpr k_tile = floordiv(k, Integer(kDsReadTileK));
   PrimExpr k_inner = floormod(k, Integer(kDsReadTileK));
-  PrimExpr n_segment =
-      floordiv(n, Integer(params.copy_elements_per_lane));
+  PrimExpr n_segment = floordiv(n, Integer(params.copy_elements_per_lane));
   PrimExpr mapped_k_inner = k_inner;
   if (permute_rows) {
     ICHECK_GT(rows_per_copy_wave, 0);
@@ -86,22 +86,19 @@ Fragment MakeCopyLoopLayout(const AnBtStrategyParams &params,
     PrimExpr wrap_class = floormod(row_index, Integer(wrap_count));
     // Group adjacent K rows into the two hardware wrap classes.  For
     // rows_per_copy_wave=2 this reduces to the original 0,2,1,3 ordering.
-    mapped_k_inner =
-        floordiv(row_pair, Integer(rows_per_copy_wave)) *
-            (wrap_count * rows_per_copy_wave) +
-        wrap_class * rows_per_copy_wave +
-        floormod(row_pair, Integer(rows_per_copy_wave));
+    mapped_k_inner = floordiv(row_pair, Integer(rows_per_copy_wave)) *
+                         (wrap_count * rows_per_copy_wave) +
+                     wrap_class * rows_per_copy_wave +
+                     floormod(row_pair, Integer(rows_per_copy_wave));
   }
-  PrimExpr mapped_k =
-      permute_rows && permute_across_block_k
-          ? mapped_k_inner
-          : k_tile * kDsReadTileK + mapped_k_inner;
+  PrimExpr mapped_k = permute_rows && permute_across_block_k
+                          ? mapped_k_inner
+                          : k_tile * kDsReadTileK + mapped_k_inner;
   PrimExpr canonical_segment =
       mapped_k * params.copy_segments_per_row + n_segment;
   PrimExpr transaction =
       floordiv(canonical_segment, Integer(params.block_threads));
-  PrimExpr thread =
-      floormod(canonical_segment, Integer(params.block_threads));
+  PrimExpr thread = floormod(canonical_segment, Integer(params.block_threads));
   PrimExpr intra = floormod(n, Integer(params.copy_elements_per_lane));
   if (params.copy_transactions_per_lane == 1) {
     return Fragment({Integer(params.block_k), Integer(params.block_mn)},
@@ -135,9 +132,9 @@ Layout MakeStorageLayout(const AnBtStrategyParams &params,
       floormod(copy_warp, Integer(params.wrap_idx_mask + 1)) *
       params.wrap_offset;
   PrimExpr wave_element = copy_lane * params.copy_elements_per_lane + intra;
-  PrimExpr physical_wave_element = floormod(
-      wave_element + wrap_offset_dwords * elements_per_dword,
-      Integer(params.warp_size * params.copy_elements_per_lane));
+  PrimExpr physical_wave_element =
+      floormod(wave_element + wrap_offset_dwords * elements_per_dword,
+               Integer(params.warp_size * params.copy_elements_per_lane));
   PrimExpr physical_pack_base =
       (transaction * params.block_threads + copy_warp * params.warp_size) *
           params.copy_elements_per_lane +
@@ -145,15 +142,14 @@ Layout MakeStorageLayout(const AnBtStrategyParams &params,
   PrimExpr read_pack_intra = floormod(n, Integer(read_elements_per_lane));
   Array<PrimExpr> physical = {
       floordiv(physical_pack_base, Integer(params.block_mn)),
-      floormod(physical_pack_base, Integer(params.block_mn)) +
-          read_pack_intra};
+      floormod(physical_pack_base, Integer(params.block_mn)) + read_pack_intra};
   Array<PrimExpr> input_shape = {Integer(params.block_k),
                                  Integer(params.block_mn)};
   return Layout(input_shape, physical);
 }
 
-void ValidateSameLayout(const Layout &actual, const Layout &expected, int block_k,
-                        int block_mn, const char *kind) {
+void ValidateSameLayout(const Layout &actual, const Layout &expected,
+                        int block_k, int block_mn, const char *kind) {
   ICHECK(actual.defined()) << kind << " layout is undefined";
   ICHECK(expected.defined()) << "Expected " << kind << " layout is undefined";
   ICHECK_EQ(actual->InputDim(), expected->InputDim())
@@ -197,8 +193,7 @@ void ValidateStrategyParameters(const AnBtStrategyParams &params) {
   ICHECK_EQ(params.copy_segments_per_row * params.copy_elements_per_lane,
             params.block_mn);
   ICHECK_EQ(params.copy_bytes_per_lane,
-            params.copy_transactions_per_lane *
-                params.copy_transaction_bytes);
+            params.copy_transactions_per_lane * params.copy_transaction_bytes);
   ICHECK_EQ(params.block_threads %
                 (params.read_bytes_per_lane / params.copy_transaction_bytes),
             0);
@@ -216,18 +211,16 @@ void ValidateStrategyParameters(const AnBtStrategyParams &params) {
 bool SelectWrapStrategy(AnBtStrategyParams *params, Fragment *copy_layout,
                         Target target, int forced_wrap_count = 0) {
   const int bytes_per_row = params->block_mn * params->element_bytes;
-  std::optional<HcuGemmLdsCopyGeometry> geometry =
-      DeriveHcuGemmLdsCopyGeometry(bytes_per_row,
-                                   params->copy_transaction_bytes,
-                                   params->block_threads, target);
+  std::optional<HcuGemmLdsCopyGeometry> geometry = DeriveHcuGemmLdsCopyGeometry(
+      bytes_per_row, params->copy_transaction_bytes, params->block_threads,
+      target);
   if (!geometry.has_value() || geometry->warp_size != params->warp_size) {
     return false;
   }
   params->wrap_offset = 0;
   params->wrap_idx_mask = 0;
   *copy_layout = MakeCopyLoopLayout(*params, /*permute_rows=*/false);
-  const bool linear_has_conflict =
-      bytes_per_row >= geometry->bank_ring_bytes;
+  const bool linear_has_conflict = bytes_per_row >= geometry->bank_ring_bytes;
   if (!linear_has_conflict && forced_wrap_count == 0) {
     return true;
   }
@@ -250,13 +243,11 @@ bool SelectWrapStrategy(AnBtStrategyParams *params, Fragment *copy_layout,
   *copy_layout = MakeCopyLoopLayout(*params, /*permute_rows=*/true,
                                     geometry->rows_per_group, wrap_count,
                                     /*permute_across_block_k=*/
-                                        forced_wrap_count != 0);
-  if (!IsLegalHcuGemmLdsWrap(*geometry, kDsReadWrapStepBytes,
-                             wrap_count)) {
+                                    forced_wrap_count != 0);
+  if (!IsLegalHcuGemmLdsWrap(*geometry, kDsReadWrapStepBytes, wrap_count)) {
     return false;
   }
-  params->wrap_offset =
-      GetHcuGemmLdsWrapOffsetDwords(kDsReadWrapStepBytes);
+  params->wrap_offset = GetHcuGemmLdsWrapOffsetDwords(kDsReadWrapStepBytes);
   params->wrap_idx_mask = wrap_count - 1;
   return true;
 }
@@ -287,13 +278,14 @@ void HcuGemmAnBtLdsStrategyNode::RegisterReflection() {
       .def_ro("wrap_offset", &HcuGemmAnBtLdsStrategyNode::wrap_offset)
       .def_ro("wrap_idx_mask", &HcuGemmAnBtLdsStrategyNode::wrap_idx_mask)
       .def_ro("storage_layout", &HcuGemmAnBtLdsStrategyNode::storage_layout)
-      .def_ro("copy_loop_layout", &HcuGemmAnBtLdsStrategyNode::copy_loop_layout);
+      .def_ro("copy_loop_layout",
+              &HcuGemmAnBtLdsStrategyNode::copy_loop_layout);
 }
 
 static Optional<HcuGemmAnBtLdsStrategy>
 DeriveHcuGemmAnBtLdsStrategyImpl(const CopyNode &copy, const GemmNode &gemm,
-                                 bool feeds_a, int block_threads,
-                                 Target target, int forced_wrap_count) {
+                                 bool feeds_a, int block_threads, Target target,
+                                 int forced_wrap_count) {
   if (!TargetIsHCU(target) || !TargetHcuHasAsyncCopy(target) ||
       block_threads <= 0 || !IsGlobalBuffer(copy.src) ||
       !IsSharedBuffer(copy.dst) || copy.src->dtype != copy.dst->dtype ||
@@ -306,8 +298,7 @@ DeriveHcuGemmAnBtLdsStrategyImpl(const CopyNode &copy, const GemmNode &gemm,
   // AN (A, transA=true) and BT (B, transB=false) share the same
   // K-leading MMAC fragment layout. Their physical LDS shape is [K, MN].
   const bool has_an_bt_access =
-      GetHcuGemmLdsAccessKind(gemm, feeds_a) ==
-      HcuGemmLdsAccessKind::kAnBt;
+      GetHcuGemmLdsAccessKind(gemm, feeds_a) == HcuGemmLdsAccessKind::kAnBt;
   if (!has_an_bt_access) {
     return std::nullopt;
   }
@@ -339,8 +330,7 @@ DeriveHcuGemmAnBtLdsStrategyImpl(const CopyNode &copy, const GemmNode &gemm,
   params.read_bytes_per_lane = kDsReadBytesPerLane;
   params.phase_bytes = kDsReadPhaseBytes;
   params.panel_mn = kDsReadPanelN;
-  if (params.warp_size != 64 ||
-      params.block_threads % params.warp_size != 0 ||
+  if (params.warp_size != 64 || params.block_threads % params.warp_size != 0 ||
       copy.dst->dtype.bits() != 16 ||
       params.phase_bytes % params.read_bytes_per_lane != 0 ||
       params.block_mn % params.panel_mn != 0) {
@@ -405,25 +395,24 @@ DeriveHcuGemmAnBtLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
                                           /*forced_wrap_count=*/0);
 }
 
-Optional<HcuGemmAnBtLdsStrategy>
-DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
+Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
     const CopyNode &copy, const GemmNode &gemm, bool feeds_a, int block_threads,
     Target target, int wrap_count) {
   if (wrap_count != kDsReadWrapCount) {
     return std::nullopt;
   }
-  return DeriveHcuGemmAnBtLdsStrategyImpl(
-      copy, gemm, feeds_a, block_threads, target, wrap_count);
+  return DeriveHcuGemmAnBtLdsStrategyImpl(copy, gemm, feeds_a, block_threads,
+                                          target, wrap_count);
 }
 
 void ValidateHcuGemmAnBtStorageLayout(const Layout &actual,
-                                   const HcuGemmAnBtLdsStrategy &strategy) {
+                                      const HcuGemmAnBtLdsStrategy &strategy) {
   ValidateSameLayout(actual, strategy->storage_layout, strategy->block_k,
                      strategy->block_mn, "storage");
 }
 
 void ValidateHcuGemmAnBtCopyLayout(const Fragment &actual,
-                                const HcuGemmAnBtLdsStrategy &strategy) {
+                                   const HcuGemmAnBtLdsStrategy &strategy) {
   ValidateSameLayout(actual, strategy->copy_loop_layout, strategy->block_k,
                      strategy->block_mn, "copy-loop local");
   arith::Analyzer analyzer;
@@ -437,9 +426,9 @@ void ValidateHcuGemmAnBtCopyLayout(const Fragment &actual,
       if (!is_zero(analyzer.Simplify(actual_thread - expected_thread))) {
         LOG(FATAL)
             << "HCU GEMM AN/BT copy-loop layout thread mapping mismatch at "
-                   << "logical coordinate (" << k << ", " << n
-                   << "): actual=" << actual_thread
-                   << ", expected=" << expected_thread;
+            << "logical coordinate (" << k << ", " << n
+            << "): actual=" << actual_thread
+            << ", expected=" << expected_thread;
       }
     }
   }

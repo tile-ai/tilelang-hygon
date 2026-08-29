@@ -518,11 +518,7 @@ class HCUMatrixCoreIntrinEmitter:
                 else thread_id_shared_access_64x4_to_16x16_layout_C_m_n_lit
             )
         else:
-            return (
-                thread_id_shared_access_64x4_to_16x16_layout_C_lts
-                if trans_c
-                else thread_id_shared_access_64x4_to_16x16_layout_C_m_n
-            )
+            return thread_id_shared_access_64x4_to_16x16_layout_C_lts if trans_c else thread_id_shared_access_64x4_to_16x16_layout_C_m_n
 
     def extract_thread_binding(self, thread_id, is_m_first=None) -> tuple[PrimExpr, PrimExpr, PrimExpr]:
         """Decode ``thread_id`` into ``(lane_id, warp_n, warp_m)``.
@@ -961,8 +957,14 @@ class HCUMatrixCoreIntrinEmitter:
             for kp, i, j in T.grid(k_pack, warp_rows, warp_cols):
                 if swap_operands_for_trans_c:
                     T.call_intrin(
-                        str(compute_out_dtype), mmac_op, mmac_suffix_imm, layout_imm, layout_imm,
-                        compute_b_dtype_imm, compute_a_dtype_imm, compute_out_dtype_imm,
+                        str(compute_out_dtype),
+                        mmac_op,
+                        mmac_suffix_imm,
+                        layout_imm,
+                        layout_imm,
+                        compute_b_dtype_imm,
+                        compute_a_dtype_imm,
+                        compute_out_dtype_imm,
                         B_local_buf.data,
                         (b_local_stride + (j * k_pack + kp) * local_size_b) // b_index_div,
                         A_local_buf.data,
@@ -973,8 +975,14 @@ class HCUMatrixCoreIntrinEmitter:
                     )
                 else:
                     T.call_intrin(
-                        str(compute_out_dtype), mmac_op, mmac_suffix_imm, layout_imm, layout_imm,
-                        compute_a_dtype_imm, compute_b_dtype_imm, compute_out_dtype_imm,
+                        str(compute_out_dtype),
+                        mmac_op,
+                        mmac_suffix_imm,
+                        layout_imm,
+                        layout_imm,
+                        compute_a_dtype_imm,
+                        compute_b_dtype_imm,
+                        compute_out_dtype_imm,
                         A_local_buf.data,
                         (a_local_stride + (i * k_pack + kp) * local_size_a) // a_index_div,
                         B_local_buf.data,

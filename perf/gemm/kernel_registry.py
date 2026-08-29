@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
+
 """Kernel dispatch and heuristic-config bindings for GEMM benchmarks."""
 
 from __future__ import annotations

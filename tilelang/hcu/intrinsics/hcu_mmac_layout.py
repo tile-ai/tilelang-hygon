@@ -348,11 +348,7 @@ def _micro_ab_fragment(element_bits: int, k_pack: int, *, spatial_leading: bool,
 
 def _micro_c_fragment(*, lit: bool, lts: bool = False) -> Fragment:
     if lts:
-        layout_fn = (
-            shared_16x16_to_local_64x4_layout_C_hcu_lit_lts
-            if lit
-            else shared_16x16_to_local_64x4_layout_C_hcu_lts
-        )
+        layout_fn = shared_16x16_to_local_64x4_layout_C_hcu_lit_lts if lit else shared_16x16_to_local_64x4_layout_C_hcu_lts
     else:
         layout_fn = shared_16x16_to_local_64x4_layout_C_hcu_lit if lit else shared_16x16_to_local_64x4_layout_C_hcu
     return _fragment_from_layout_fn(layout_fn, 16, 16)

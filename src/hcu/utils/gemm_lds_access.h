@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: MIT
+
 /*!
  * \file gemm_lds_access.h
  * \brief Operand-independent HCU GEMM LDS access classification.
@@ -18,8 +21,7 @@ enum class HcuGemmLdsAccessKind {
 inline HcuGemmLdsAccessKind GetHcuGemmLdsAccessKind(const GemmNode &gemm,
                                                     bool feeds_a) {
   const bool is_at_bn = feeds_a ? !gemm.transA_ : gemm.transB_;
-  return is_at_bn ? HcuGemmLdsAccessKind::kAtBn
-                  : HcuGemmLdsAccessKind::kAnBt;
+  return is_at_bn ? HcuGemmLdsAccessKind::kAtBn : HcuGemmLdsAccessKind::kAnBt;
 }
 
 inline int GetHcuGemmLdsMnExtent(const GemmNode &gemm, bool feeds_a) {

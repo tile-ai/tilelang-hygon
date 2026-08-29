@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: MIT
+
 /*!
  * \file gemm_at_bn_lds_strategy.h
  * \brief Compiler-derived LDS strategy for HCU GEMM AT/BN accesses.
@@ -55,22 +58,22 @@ public:
   explicit HcuGemmAtBnLdsStrategy(ObjectPtr<HcuGemmAtBnLdsStrategyNode> ptr)
       : ObjectRef(std::move(ptr)) {}
 
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(
-      HcuGemmAtBnLdsStrategy, ObjectRef, HcuGemmAtBnLdsStrategyNode);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(HcuGemmAtBnLdsStrategy,
+                                                ObjectRef,
+                                                HcuGemmAtBnLdsStrategyNode);
 };
 
 Optional<HcuGemmAtBnLdsStrategy>
 DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
                              bool feeds_a, int block_threads, Target target);
 
-void ValidateHcuGemmAtBnStorageLayout(
-    const Layout &actual, const HcuGemmAtBnLdsStrategy &strategy);
+void ValidateHcuGemmAtBnStorageLayout(const Layout &actual,
+                                      const HcuGemmAtBnLdsStrategy &strategy);
 
-void ValidateHcuGemmAtBnCopyLayout(
-    const Fragment &actual, const HcuGemmAtBnLdsStrategy &strategy);
+void ValidateHcuGemmAtBnCopyLayout(const Fragment &actual,
+                                   const HcuGemmAtBnLdsStrategy &strategy);
 
-int GetHcuGemmAtBnRequiredWrapCount(
-    const HcuGemmAtBnLdsStrategy &strategy);
+int GetHcuGemmAtBnRequiredWrapCount(const HcuGemmAtBnLdsStrategy &strategy);
 
 } // namespace tl
 } // namespace tvm

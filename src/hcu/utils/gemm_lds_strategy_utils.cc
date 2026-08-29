@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: MIT
+
 /*!
  * \file gemm_lds_strategy_utils.cc
  * \brief Shared geometry helpers for compiler-derived HCU GEMM LDS strategies.
@@ -14,9 +17,7 @@ namespace tl {
 
 namespace {
 
-bool IsPowerOfTwo(int value) {
-  return value > 0 && (value & (value - 1)) == 0;
-}
+bool IsPowerOfTwo(int value) { return value > 0 && (value & (value - 1)) == 0; }
 
 } // namespace
 
@@ -39,9 +40,8 @@ void HcuGemmLdsCopyStrategyNode::RegisterReflection() {
 }
 
 std::optional<HcuGemmLdsCopyGeometry>
-DeriveHcuGemmLdsCopyGeometry(int bytes_per_row,
-                             int copy_transaction_bytes, int block_threads,
-                             Target target) {
+DeriveHcuGemmLdsCopyGeometry(int bytes_per_row, int copy_transaction_bytes,
+                             int block_threads, Target target) {
   if (!TargetIsHCU(target) || bytes_per_row <= 0 ||
       copy_transaction_bytes <= 0 || block_threads <= 0 ||
       bytes_per_row % copy_transaction_bytes != 0) {
@@ -74,10 +74,8 @@ DeriveHcuGemmLdsCopyGeometry(int bytes_per_row,
   geometry.row_wave_gcd =
       std::gcd(geometry.segments_per_row, geometry.warp_size);
   geometry.rows_per_group = geometry.warp_size / geometry.row_wave_gcd;
-  geometry.waves_per_group =
-      geometry.segments_per_row / geometry.row_wave_gcd;
-  geometry.max_wrap_offset_dwords =
-      TargetHcuGetLdsWrapMaxOffsetDwords(target);
+  geometry.waves_per_group = geometry.segments_per_row / geometry.row_wave_gcd;
+  geometry.max_wrap_offset_dwords = TargetHcuGetLdsWrapMaxOffsetDwords(target);
   return geometry;
 }
 
@@ -114,8 +112,7 @@ bool IsLegalHcuGemmLdsWrap(const HcuGemmLdsCopyGeometry &geometry,
   if (wrap_count == 1) {
     return wrap_step_bytes == 0;
   }
-  const int wrap_offset_dwords =
-      GetHcuGemmLdsWrapOffsetDwords(wrap_step_bytes);
+  const int wrap_offset_dwords = GetHcuGemmLdsWrapOffsetDwords(wrap_step_bytes);
   if (geometry.wrap_granularity_dwords <= 0 || wrap_offset_dwords <= 0 ||
       wrap_offset_dwords % geometry.wrap_granularity_dwords != 0) {
     return false;
@@ -124,10 +121,11 @@ bool IsLegalHcuGemmLdsWrap(const HcuGemmLdsCopyGeometry &geometry,
          geometry.max_wrap_offset_dwords;
 }
 
-HcuGemmLdsCopyStrategy MakeHcuGemmLdsCopyStrategy(
-    bool use_idxen, int copy_bytes_per_lane, int copy_transaction_bytes,
-    int block_threads, int inner_extent, int wrap_offset, int wrap_idx_mask,
-    Layout storage_layout, Fragment copy_loop_layout) {
+HcuGemmLdsCopyStrategy
+MakeHcuGemmLdsCopyStrategy(bool use_idxen, int copy_bytes_per_lane,
+                           int copy_transaction_bytes, int block_threads,
+                           int inner_extent, int wrap_offset, int wrap_idx_mask,
+                           Layout storage_layout, Fragment copy_loop_layout) {
   auto node = ffi::make_object<HcuGemmLdsCopyStrategyNode>();
   node->use_idxen = use_idxen;
   node->copy_bytes_per_lane = copy_bytes_per_lane;

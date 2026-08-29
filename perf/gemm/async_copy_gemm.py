@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
+
 """Vanilla GEMM using asynchronous Global-to-LDS copies."""
 
 import tilelang as tl
@@ -92,7 +95,7 @@ def _gemm_async_copy_vanilla(
             if warp_idx < 4:
                 for kg in range(k_groups - 1):
                     k0 = kg * 4
-                    
+
                     # Phase 0
                     async_copy_a(A, A_shared_0, by, k0 + 4)
                     async_copy_b(B, B_shared_0, bx, k0 + 4)
@@ -100,7 +103,7 @@ def _gemm_async_copy_vanilla(
                     T.copy(B_shared_1, B_local_1)
                     T.ptx_wait_group(4)
                     T.sync_warp()
-                    
+
                     # Phase 1
                     T.s_waitcnt(steady_wait, "lgkmcnt")
                     T.sched_barrier()
@@ -116,7 +119,7 @@ def _gemm_async_copy_vanilla(
                     T.copy(B_shared_2, B_local_0)
                     T.ptx_wait_group(4)
                     T.sync_warp()
-                    
+
                     # Phase 3
                     T.s_waitcnt(steady_wait, "lgkmcnt")
                     T.sched_barrier()

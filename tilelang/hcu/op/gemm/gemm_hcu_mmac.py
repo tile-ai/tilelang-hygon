@@ -90,9 +90,7 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
     a_respect_layout_map = _int_annotation(annotations, "tl.hcu_a_respect_layout_map")
     b_respect_layout_map = _int_annotation(annotations, "tl.hcu_b_respect_layout_map")
     a_from_async_copy_linear = _int_annotation(annotations, "tl.hcu_a_from_async_copy_linear")
-    a_at_bn_auto_lds_strategy = _has_annotation(
-        annotations, "tl.hcu_gemm_at_bn_lds_strategy"
-    )
+    a_at_bn_auto_lds_strategy = _has_annotation(annotations, "tl.hcu_gemm_at_bn_lds_strategy")
     b_from_async_copy_linear = _int_annotation(annotations, "tl.hcu_b_from_async_copy_linear")
     trans_c = _int_annotation(annotations, "trans_c")
     trans_a = bool(gemm_node.transA)
@@ -206,8 +204,7 @@ def _make_hcu_emitter(
         min_n_per_warp=min_n_per_warp,
         use_tf32=gemm.use_tf32,
         fp4_mmac_mode=fp4_mmac_mode,
-        use_lts=bool(_int_annotation(getattr(gemm.gemm_node, "annotations", None), "trans_c"))
-        and target_has_mmac_lit_lts(target),
+        use_lts=bool(_int_annotation(getattr(gemm.gemm_node, "annotations", None), "trans_c")) and target_has_mmac_lit_lts(target),
     )
 
 

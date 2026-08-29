@@ -713,7 +713,6 @@ def gemm_persistent_v4_split_m(
 
     split_m = 2
     sub_block_M = block_M // split_m
-    split_n = 1
     sub_block_N = block_N
     k_loop_ = T.ceildiv(K, block_K)
     k_loop = T.ceildiv(k_loop_, 2)

@@ -32,10 +32,10 @@ using namespace ffi;
 
 class HCUAsyncCopyInjector : public StmtMutator {
 public:
-  explicit HCUAsyncCopyInjector(
-      bool async_without_async_commit_wait,
-      Map<String, ObjectRef> call_annotations, Var thread_var,
-      Map<Buffer, Buffer> buffer_remap)
+  explicit HCUAsyncCopyInjector(bool async_without_async_commit_wait,
+                                Map<String, ObjectRef> call_annotations,
+                                Var thread_var,
+                                Map<Buffer, Buffer> buffer_remap)
       : async_without_async_commit_wait_(async_without_async_commit_wait),
         call_annotations_(std::move(call_annotations)),
         thread_var_(std::move(thread_var)),
@@ -512,22 +512,20 @@ private:
                  IntImm(DataType::Int(32), rw_mask)});
   }
 
-  PrimExpr MakeGemmCommandDstAccessPtr(
-      const Buffer &buffer, int num_elems, int copy_bytes_per_lane,
-      int copy_transaction_bytes, int block_threads, int inner_extent,
-      const char *operand) {
+  PrimExpr MakeGemmCommandDstAccessPtr(const Buffer &buffer, int num_elems,
+                                       int copy_bytes_per_lane,
+                                       int copy_transaction_bytes,
+                                       int block_threads, int inner_extent,
+                                       const char *operand) {
     ICHECK(thread_var_.defined());
     const int element_bits = buffer->dtype.bits() * buffer->dtype.lanes();
     ICHECK_GT(element_bits, 0);
     ICHECK_EQ((copy_bytes_per_lane * 8) % element_bits, 0);
-    const int copy_elements_per_lane =
-        copy_bytes_per_lane * 8 / element_bits;
+    const int copy_elements_per_lane = copy_bytes_per_lane * 8 / element_bits;
     ICHECK_EQ((copy_transaction_bytes * 8) % element_bits, 0);
-    const int transaction_elements =
-        copy_transaction_bytes * 8 / element_bits;
+    const int transaction_elements = copy_transaction_bytes * 8 / element_bits;
     ICHECK_EQ(copy_elements_per_lane % transaction_elements, 0);
-    ICHECK_EQ(transaction_elements,
-              num_elems * current_vectorized_lanes_)
+    ICHECK_EQ(transaction_elements, num_elems * current_vectorized_lanes_)
         << "HCU GEMM async-copy vector width does not match the "
            "compiler-derived transaction width";
 
@@ -579,11 +577,11 @@ private:
         /*rw_mask=*/2);
   }
 
-  Optional<Stmt>
-  MakeCPAsyncStmtFromLoads(const BufferStoreNode *store,
-                           const BufferLoad &dst_base_load,
-                           const BufferLoad &src_base_load, int num_elems,
-                           bool predicated, const PrimExpr &predicate_value) {
+  Optional<Stmt> MakeCPAsyncStmtFromLoads(const BufferStoreNode *store,
+                                          const BufferLoad &dst_base_load,
+                                          const BufferLoad &src_base_load,
+                                          int num_elems, bool predicated,
+                                          const PrimExpr &predicate_value) {
     PrimExpr dst_access_ptr;
     if (copy_strategy_.defined()) {
       const HcuGemmLdsCopyStrategy &strategy = copy_strategy_.value();
@@ -661,9 +659,9 @@ private:
                                    int block_threads) {
     ICHECK(thread_var_.defined());
     for (int thread = 0; thread < block_threads; ++thread) {
-      PrimExpr prev = analyzer_.Simplify(Substitute(
-          expr, {{thread_var_, IntImm(thread_var_->dtype, thread)},
-                 {loop.loop_var, IntImm(loop.loop_var->dtype, 0)}}));
+      PrimExpr prev = analyzer_.Simplify(
+          Substitute(expr, {{thread_var_, IntImm(thread_var_->dtype, thread)},
+                            {loop.loop_var, IntImm(loop.loop_var->dtype, 0)}}));
       for (int value = 1; value < loop.extent; ++value) {
         PrimExpr curr = analyzer_.Simplify(Substitute(
             expr, {{thread_var_, IntImm(thread_var_->dtype, thread)},
@@ -690,12 +688,12 @@ private:
       // threadIdx.x. Prove the same property over the finite thread domain.
       if (strategy_block_threads > 0) {
         if (!src_contiguous) {
-          src_contiguous = HasUnitStrideForEveryThread(
-              src_index, loop, strategy_block_threads);
+          src_contiguous = HasUnitStrideForEveryThread(src_index, loop,
+                                                       strategy_block_threads);
         }
         if (!dst_contiguous) {
-          dst_contiguous = HasUnitStrideForEveryThread(
-              dst_index, loop, strategy_block_threads);
+          dst_contiguous = HasUnitStrideForEveryThread(dst_index, loop,
+                                                       strategy_block_threads);
         }
       }
       if (!src_contiguous || !dst_contiguous) {
@@ -869,7 +867,8 @@ int64_t LargestPow2LessThanOrEqual(int64_t value) {
   return result;
 }
 
-// Bits [61:48] hold the byte stride; 8192 is the largest power of two that fits.
+// Bits [61:48] hold the byte stride; 8192 is the largest power of two that
+// fits.
 constexpr int64_t kMaxStructStrideBytes = 8192;
 constexpr int64_t kDynamicKStructStrideBytes = 8192;
 
@@ -898,22 +897,18 @@ Optional<PrimExpr> ExtractRowExpr(const PrimExpr &expr,
     }
   }
   if (const auto *add = expr.as<AddNode>()) {
-    if (Optional<PrimExpr> lhs =
-            ExtractRowExpr(add->a, row_stride, analyzer)) {
+    if (Optional<PrimExpr> lhs = ExtractRowExpr(add->a, row_stride, analyzer)) {
       return lhs;
     }
-    if (Optional<PrimExpr> rhs =
-            ExtractRowExpr(add->b, row_stride, analyzer)) {
+    if (Optional<PrimExpr> rhs = ExtractRowExpr(add->b, row_stride, analyzer)) {
       return rhs;
     }
   }
   if (const auto *sub = expr.as<SubNode>()) {
-    if (Optional<PrimExpr> lhs =
-            ExtractRowExpr(sub->a, row_stride, analyzer)) {
+    if (Optional<PrimExpr> lhs = ExtractRowExpr(sub->a, row_stride, analyzer)) {
       return lhs;
     }
-    if (Optional<PrimExpr> rhs =
-            ExtractRowExpr(sub->b, row_stride, analyzer)) {
+    if (Optional<PrimExpr> rhs = ExtractRowExpr(sub->b, row_stride, analyzer)) {
       return rhs;
     }
   }
@@ -972,16 +967,14 @@ private:
       }
       const Array<PrimExpr> &strides = src_buffer.value()->strides;
       if (!strides.empty() &&
-          (strides.size() != 2 ||
-           !analyzer_.CanProveEqual(strides[0], k_dim) ||
+          (strides.size() != 2 || !analyzer_.CanProveEqual(strides[0], k_dim) ||
            !analyzer_.CanProveEqual(strides[1], 1))) {
         return call;
       }
     }
 
     const int64_t element_bytes = src_buffer.value()->dtype.bytes();
-    if (element_bytes <= 0 ||
-        (element_bytes & (element_bytes - 1)) != 0 ||
+    if (element_bytes <= 0 || (element_bytes & (element_bytes - 1)) != 0 ||
         element_bytes > kMaxStructStrideBytes) {
       return call;
     }
@@ -991,27 +984,25 @@ private:
                         element_bytes;
     const int64_t tile_width_elements = struct_stride_bytes / element_bytes;
     PrimExpr old_offset = src_call->args[2];
-    Optional<PrimExpr> row_expr =
-        ExtractRowExpr(old_offset, k_dim, &analyzer_);
+    Optional<PrimExpr> row_expr = ExtractRowExpr(old_offset, k_dim, &analyzer_);
     if (!row_expr.defined()) {
       return call;
     }
     PrimExpr idxen = analyzer_.Simplify(row_expr.value());
     PrimExpr tile_width_elements_expr =
         make_const(old_offset.dtype(), tile_width_elements);
-    PrimExpr new_offset = analyzer_.Simplify(
-        old_offset - idxen * tile_width_elements_expr);
+    PrimExpr new_offset =
+        analyzer_.Simplify(old_offset - idxen * tile_width_elements_expr);
     Array<PrimExpr> src_args = src_call->args;
     src_args.Set(2, new_offset);
     PrimExpr new_src = Call(call->args[1].dtype(), builtin::tvm_access_ptr(),
                             src_args, src_call->annotations, src_call->span);
-    PrimExpr predicate =
-        call->args.size() == 4U ? call->args[3] : const_true();
-    return Call(call->dtype, tl::hcu_cp_async_idxen(),
-                {call->args[0], new_src, call->args[2], predicate, idxen,
-                 IntImm(DataType::Int(32),
-                        StructStrideByteBit(struct_stride_bytes))},
-                call->annotations, call->span);
+    PrimExpr predicate = call->args.size() == 4U ? call->args[3] : const_true();
+    return Call(
+        call->dtype, tl::hcu_cp_async_idxen(),
+        {call->args[0], new_src, call->args[2], predicate, idxen,
+         IntImm(DataType::Int(32), StructStrideByteBit(struct_stride_bytes))},
+        call->annotations, call->span);
   }
 
   Optional<Buffer> LookupBuffer(const PrimExpr &expr) const {
@@ -1055,8 +1046,7 @@ tvm::transform::Pass InjectHcuCopyIdxen() {
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.InjectHcuCopyIdxen",
-                        InjectHcuCopyIdxen);
+  refl::GlobalDef().def("tl.transform.InjectHcuCopyIdxen", InjectHcuCopyIdxen);
 }
 
 } // namespace transform

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
+
 """Double-buffered GEMM using asynchronous Global-to-LDS copies."""
 
 import tilelang as tl
@@ -61,13 +64,12 @@ def _gemm_async_copy_pingpong(
         C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
-            
             T.use_swizzle(
                 panel_size=4,
                 order="col",
                 enable=True,
             )
-            
+
             warp_idx = T.get_warp_idx()
             A_shared_0 = T.alloc_shared((block_M, block_K), dtype)
             A_shared_1 = T.alloc_shared((block_M, block_K), dtype)
@@ -92,11 +94,11 @@ def _gemm_async_copy_pingpong(
 
             async_copy_a(A, A_shared_1, by, 1)
             async_copy_b(B, B_shared_1, bx, 1)
-            
+
             # A/B shared_0 ready
             T.ptx_wait_group(async_copy_stage_requests)
             T.sync_warp()
-            
+
             T.copy(A_shared_0, A_local_0)
             copy_b_half(B_shared_0, B_local_n0_0, 0)
             copy_b_half(B_shared_0, B_local_n1_0, 1)
@@ -146,7 +148,7 @@ def _gemm_async_copy_pingpong(
                     )
                     T.sched_barrier()
                     T.sync_warp()
-                    
+
                     # Phase 4
                     copy_b_half(B_shared_1, B_local_n0_1, 0)
                     copy_b_half(B_shared_1, B_local_n1_1, 1)
@@ -187,7 +189,7 @@ def _gemm_async_copy_pingpong(
                     )
                     T.sched_barrier()
                     T.sync_warp()
-                    
+
                     copy_b_half(B_shared_0, B_local_n0_0, 0)
                     copy_b_half(B_shared_0, B_local_n1_0, 1)
             else:
@@ -207,7 +209,7 @@ def _gemm_async_copy_pingpong(
                     )
                     T.sched_barrier()
                     T.ptx_wait_group(2)
-                    T.sync_warp() # A_shared_1 ready
+                    T.sync_warp()  # A_shared_1 ready
 
                     # Phase 1: prepare pong A while the front warps compute ping.
                     T.call_extern("tl::promote_prio", dtype="void")
@@ -229,7 +231,7 @@ def _gemm_async_copy_pingpong(
                     )
                     T.sched_barrier()
                     T.ptx_wait_group(2)
-                    T.sync_warp() # B_shared_1 ready
+                    T.sync_warp()  # B_shared_1 ready
 
                     # Phase 3 also starts the next pong half-cycle.
                     T.call_extern("tl::promote_prio", dtype="void")
@@ -238,7 +240,7 @@ def _gemm_async_copy_pingpong(
                     copy_b_half(B_shared_1, B_local_n0_1, 0)
                     copy_b_half(B_shared_1, B_local_n1_1, 1)
                     T.sync_warp()
-                    
+
                     # Phase 4
                     T.s_waitcnt(4, "lgkmcnt")
                     T.sched_barrier()
@@ -252,7 +254,7 @@ def _gemm_async_copy_pingpong(
                     )
                     T.sched_barrier()
                     T.ptx_wait_group(2)
-                    T.sync_warp() # A_shared_0 ready
+                    T.sync_warp()  # A_shared_0 ready
 
                     # Phase 5
                     T.call_extern("tl::promote_prio", dtype="void")
@@ -274,7 +276,7 @@ def _gemm_async_copy_pingpong(
                     )
                     T.sched_barrier()
                     T.ptx_wait_group(2)
-                    T.sync_warp() # B_shared_0 ready
+                    T.sync_warp()  # B_shared_0 ready
 
                     # Phase 7
                     T.call_extern("tl::promote_prio", dtype="void")
@@ -329,6 +331,41 @@ def _gemm_async_copy_pingpong(
                 annotations={"trans_c": True},
             )
             T.sched_barrier()
+
+            # The paired pipeline leaves one K tile unprocessed when k_tiles is odd.
+            if k_tiles % 2:
+                T.clear(A_shared_0)
+                T.clear(B_shared_0)
+                T.s_waitcnt(0, "lgkmcnt")
+                T.sync_warp()
+                async_copy_a(A, A_shared_0, by, k_tiles - 1)
+                async_copy_b(B, B_shared_0, bx, k_tiles - 1)
+                T.ptx_wait_group(0)
+                T.sync_warp()
+
+                T.copy(A_shared_0, A_local_0)
+                copy_b_half(B_shared_0, B_local_n0_0, 0)
+                copy_b_half(B_shared_0, B_local_n1_0, 1)
+                T.s_waitcnt(0, "lgkmcnt")
+                T.sched_barrier()
+                T.gemm(
+                    A_local_0,
+                    B_local_n0_0,
+                    C_local_n0,
+                    transpose_B=transpose_B,
+                    k_pack=K_PACK,
+                    annotations={"trans_c": True},
+                )
+                T.sched_barrier()
+                T.gemm(
+                    A_local_0,
+                    B_local_n1_0,
+                    C_local_n1,
+                    transpose_B=transpose_B,
+                    k_pack=K_PACK,
+                    annotations={"trans_c": True},
+                )
+                T.sched_barrier()
 
             T.copy(
                 C_local_n0,

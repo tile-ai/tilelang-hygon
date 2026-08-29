@@ -109,8 +109,7 @@ int TargetHcuGetWarpSize(Target target) {
 }
 
 int TargetHcuGetLdsBankCount(Target target) {
-  ICHECK(TargetIsHCU(target))
-      << "TargetHcuGetLdsBankCount requires HCU target";
+  ICHECK(TargetIsHCU(target)) << "TargetHcuGetLdsBankCount requires HCU target";
   const std::string arch = GetHcuArchString(target);
   if (arch == "gfx936" || arch == "gfx938" || arch == "gfx92a") {
     return 32;
@@ -141,8 +140,7 @@ HcuLdsWrapConfig TargetHcuGetLdsWrapConfig(Target target) {
   }
   if (arch == "gfx938" || arch == "gfx92a") {
     return {/*field_bits=*/5, /*field_shift=*/16,
-            /*lds_offset_bits=*/16,
-            HcuLdsWrapEncoding::kHybridFourAndOneDword};
+            /*lds_offset_bits=*/16, HcuLdsWrapEncoding::kHybridFourAndOneDword};
   }
   if (arch == "gfx946") {
     return {/*field_bits=*/6, /*field_shift=*/24,
@@ -225,9 +223,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            [](Target target) { return TargetHcuGetWarpSize(target); })
       .def("tl.TargetHcuGetLdsBankCount",
            [](Target target) { return TargetHcuGetLdsBankCount(target); })
-      .def("tl.TargetHcuGetLdsBankWidthBytes", [](Target target) {
-        return TargetHcuGetLdsBankWidthBytes(target);
-      })
+      .def("tl.TargetHcuGetLdsBankWidthBytes",
+           [](Target target) { return TargetHcuGetLdsBankWidthBytes(target); })
       .def("tl.TargetHcuGetLdsWrapFieldBits",
            [](Target target) { return TargetHcuGetLdsWrapFieldBits(target); });
 }

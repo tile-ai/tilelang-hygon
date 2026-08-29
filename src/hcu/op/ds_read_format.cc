@@ -357,13 +357,11 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   ICHECK_LE(read_k, lds_k);
 
   if (hcu_linear_ds_read_) {
-    ICHECK(gemm_dep_.defined())
-        << "linear ds_read requires a GEMM consumer";
+    ICHECK(gemm_dep_.defined()) << "linear ds_read requires a GEMM consumer";
     const auto *meta = gemm_dep_.get();
     const bool feeds_a = meta->feeds_slot == 0;
     ICHECK(feeds_a || meta->feeds_slot == 1);
-    ICHECK(!ds_trans &&
-           (feeds_a ? meta->gemm_trans_a : !meta->gemm_trans_b))
+    ICHECK(!ds_trans && (feeds_a ? meta->gemm_trans_a : !meta->gemm_trans_b))
         << "linear ds_read only supports GEMM AN or BT access";
     ICHECK(src->dtype.is_float16() || src->dtype.is_bfloat16());
     ICHECK_EQ(read_k % 16, 0);
@@ -374,10 +372,8 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
         *policy.get(), meta->gemm_m, meta->gemm_n, meta->gemm_k,
         meta->gemm_k_pack, dst->dtype.bits(), block_size, T.target,
         meta->a_from_mls, meta->b_from_mls, !meta->gemm_trans_a,
-        meta->gemm_trans_b,
-        meta->min_m_per_warp,
-        feeds_a ? meta->min_n_per_warp
-                : std::max(meta->min_n_per_warp, 32));
+        meta->gemm_trans_b, meta->min_m_per_warp,
+        feeds_a ? meta->min_n_per_warp : std::max(meta->min_n_per_warp, 32));
     int warp_mn = feeds_a ? policy->m_warp : policy->n_warp;
     int warp_k = policy->k_warp;
     ICHECK_EQ(warp_k, 1) << "linear AN/BT ds_read requires WarpK == 1";
@@ -420,8 +416,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
       int total_warp = block_size / warp_size;
       ICHECK_EQ(total_warp % warp_mn, 0);
       int warp_mn_no_recompute =
-          feeds_a ? warp_mn
-                  : std::min(warp_mn, static_cast<int>(read_mn / 32));
+          feeds_a ? warp_mn : std::min(warp_mn, static_cast<int>(read_mn / 32));
       ICHECK_GT(warp_mn_no_recompute, 0);
       ICHECK_EQ(read_mn % warp_mn_no_recompute, 0);
       int per_warp_mn = read_mn / warp_mn_no_recompute;
@@ -429,30 +424,27 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
 
       PrimExpr scoped_thread = analyzer->Simplify(
           T.thread_var - Cast(T.thread_var.dtype(), T.thread_bounds->min));
-      PrimExpr lane = FloorMod(scoped_thread,
-                               make_const(scoped_thread.dtype(), warp_size));
-      PrimExpr warp_id = FloorDiv(scoped_thread,
-                                  make_const(scoped_thread.dtype(), warp_size));
+      PrimExpr lane =
+          FloorMod(scoped_thread, make_const(scoped_thread.dtype(), warp_size));
+      PrimExpr warp_id =
+          FloorDiv(scoped_thread, make_const(scoped_thread.dtype(), warp_size));
       PrimExpr warp_mn_idx;
       if (feeds_a) {
-        warp_mn_idx =
-            FloorMod(warp_id, make_const(warp_id.dtype(), warp_mn));
+        warp_mn_idx = FloorMod(warp_id, make_const(warp_id.dtype(), warp_mn));
       } else {
-        warp_mn_idx = FloorDiv(
-            warp_id, make_const(warp_id.dtype(), policy->m_warp));
+        warp_mn_idx =
+            FloorDiv(warp_id, make_const(warp_id.dtype(), policy->m_warp));
       }
       if (warp_mn_no_recompute != warp_mn) {
         warp_mn_idx = FloorMod(
-            warp_mn_idx,
-            make_const(warp_mn_idx.dtype(), warp_mn_no_recompute));
+            warp_mn_idx, make_const(warp_mn_idx.dtype(), warp_mn_no_recompute));
       }
 
       Array<Stmt> reads;
       for (int mn_panel = 0; mn_panel < per_warp_mn / 32; ++mn_panel) {
         for (int k_tile = 0; k_tile < read_k / 16; ++k_tile) {
           PrimExpr panel = analyzer->Simplify(
-              warp_mn_idx *
-                  make_const(warp_mn_idx.dtype(), per_warp_mn / 32) +
+              warp_mn_idx * make_const(warp_mn_idx.dtype(), per_warp_mn / 32) +
               make_const(warp_mn_idx.dtype(), mn_panel));
           PrimExpr logical_k = analyzer->Simplify(
               origin_dim0 + make_const(lane.dtype(), k_tile * 16) +
@@ -461,13 +453,11 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
               origin_dim1 + panel * make_const(panel.dtype(), 32) +
               FloorMod(lane, make_const(lane.dtype(), 4)) *
                   make_const(lane.dtype(), 8));
-          Array<PrimExpr> physical =
-              layout->Forward({logical_k, logical_n});
+          Array<PrimExpr> physical = layout->Forward({logical_k, logical_n});
           Array<PrimExpr> physical_last = layout->Forward(
               {logical_k, logical_n + make_const(logical_n.dtype(), 7)});
           ICHECK(analyzer->CanProveEqual(physical[0], physical_last[0]) &&
-                 analyzer->CanProveEqual(physical[1] + 7,
-                                         physical_last[1]))
+                 analyzer->CanProveEqual(physical[1] + 7, physical_last[1]))
               << "each B ds_read 8-half segment must remain contiguous";
           PrimExpr local_offset = analyzer->Simplify(
               dst_leading_offset +
@@ -488,13 +478,13 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     std::string dtype_str = DsReadFormatDTypeString(src->dtype);
     int total_warp = block_size / TargetHcuGetWarpSize(T.target);
     std::stringstream ss;
-    ss << "tl::mls::ds_read_format_tensor_b_linear<tl::sequence<"
-       << read_mn << ", " << read_k << ">, " << total_warp << ", "
-       << warp_mn << ", " << dtype_str << ">";
-    auto src_ptr = src_buf.access_ptr(1, DataType::Handle(), 1,
-                                      src_leading_offset);
-    auto dst_ptr = dst_buf.access_ptr(2, DataType::Handle(), 1,
-                                      dst_leading_offset);
+    ss << "tl::mls::ds_read_format_tensor_b_linear<tl::sequence<" << read_mn
+       << ", " << read_k << ">, " << total_warp << ", " << warp_mn << ", "
+       << dtype_str << ">";
+    auto src_ptr =
+        src_buf.access_ptr(1, DataType::Handle(), 1, src_leading_offset);
+    auto dst_ptr =
+        dst_buf.access_ptr(2, DataType::Handle(), 1, dst_leading_offset);
     return Evaluate(Call(DataType::Handle(), builtin::call_extern(),
                          {StringImm(ss.str()), src_ptr, dst_ptr,
                           IntImm(DataType::Int(32), warp_id_offset)}));
