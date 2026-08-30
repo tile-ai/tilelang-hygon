@@ -235,6 +235,17 @@ def build_ds_read_format_tensor_b_template(
     )
 
 
+def build_ds_read_format_tensor_b_linear_template(
+    *,
+    block_n: int,
+    block_k: int,
+    total_warp: int,
+    warp_n: int,
+    dtype_str: str,
+) -> str:
+    return f"tl::mls::ds_read_format_tensor_b_linear<tl::sequence<{block_n}, {block_k}>, {total_warp}, {warp_n}, {dtype_str}>"
+
+
 def block_col_warps_no_recompute(block_n: int, block_col_warps: int, min_n_per_warp: int) -> int:
     return min(block_col_warps, block_n // min_n_per_warp)
 

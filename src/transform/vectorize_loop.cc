@@ -575,7 +575,7 @@ public:
 
     Array<PrimExpr> new_args = op->args;
     new_args.Set(2, new_offset);
-    return Call(op->dtype, op->op, new_args);
+    return Call(op->dtype, op->op, new_args, op->annotations, op->span);
   }
 
   // tl.access_ptr: substitute loop var with 0 in BufferLoad indices.
@@ -606,7 +606,7 @@ public:
 
     Array<PrimExpr> new_args = op->args;
     new_args.Set(0, new_load);
-    return Call(op->dtype, op->op, new_args);
+    return Call(op->dtype, op->op, new_args, op->annotations, op->span);
   }
 
   // Reinterpret expr
@@ -745,7 +745,7 @@ public:
       if (new_args.same_as(op->args)) {
         return GetRef<PrimExpr>(op);
       }
-      return Call(op->dtype, op->op, new_args);
+      return Call(op->dtype, op->op, new_args, op->annotations, op->span);
     }
 
     auto bits_per_call = GetCPAsyncBitsPerCall(op, count);
@@ -775,7 +775,7 @@ public:
     if (new_args.same_as(op->args)) {
       return GetRef<PrimExpr>(op);
     }
-    return Call(op->dtype, op->op, new_args);
+    return Call(op->dtype, op->op, new_args, op->annotations, op->span);
   }
 
   // Call

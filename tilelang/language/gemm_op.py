@@ -157,6 +157,7 @@ def gemm(
     k_pack: int = 1,
     mbar: BarrierType | None = None,
     use_tf32: bool = False,
+    annotations: dict | None = None,
 ) -> tirx.PrimExpr:
     """TileLang GEMM operator.
 
@@ -187,7 +188,9 @@ def gemm(
     Returns:
         tirx.Call: A handle to the GEMM operation.
     """
-    ann = {"use_tf32": tirx.const(1, "int32")} if use_tf32 else None
+    ann = annotations.copy() if annotations else {}
+    if use_tf32:
+        ann["use_tf32"] = tirx.const(1, "int32")
     return _gemm_impl(
         "tl.tileop.gemm",
         A,
@@ -200,7 +203,7 @@ def gemm(
         k_pack,
         0,
         mbar,
-        annotations=ann,
+        annotations=ann if ann else None,
     )
 
 

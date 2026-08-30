@@ -47,6 +47,11 @@ def AnnotateMlsGemmDep():
     return _ffi_api.AnnotateMlsGemmDep()  # type: ignore
 
 
+def InjectHcuCopyIdxen():
+    """Rewrite annotated HCU async copies to idxen/wrap addressing."""
+    return _ffi_api.InjectHcuCopyIdxen()  # type: ignore
+
+
 def AnnotateScaleGemmDep():
     """Bind copy_scale producers to gemm_blockscaled consumers (HCU only)."""
     return _ffi_api.AnnotateScaleGemmDep()  # type: ignore

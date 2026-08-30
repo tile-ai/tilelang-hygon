@@ -316,6 +316,16 @@ TIR_DEFINE_TL_BUILTIN(ptx_cp_async)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(hcu_cp_async_idxen)
+    .set_num_inputs(6)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ds_read_vector)
+    .set_num_inputs(3)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(async_gld_sld_fence)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
