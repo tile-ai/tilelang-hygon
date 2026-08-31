@@ -23,6 +23,19 @@ TL_DEVICE float32x4 ds_read_m32x16_b16_builtin(TL_LDS_ADDR bfloat16_t *ptr,
   return __builtin_hcu_ds_read_m32x16_bf16(ptr, offset);
 }
 
+} // namespace mls
+
+// Generic CodeGen entry points for layout-aware LDS-to-VGPR reads.
+TL_DEVICE void ds_read_vector(float32x4 &dst, TL_LDS_ADDR half_t *ptr) {
+  dst = mls::ds_read_m32x16_b16_builtin(ptr, 0);
+}
+
+TL_DEVICE void ds_read_vector(float32x4 &dst, TL_LDS_ADDR bfloat16_t *ptr) {
+  dst = mls::ds_read_m32x16_b16_builtin(ptr, 0);
+}
+
+namespace mls {
+
 /*
  * ds_read_format_traits: traits for reading MLS LDS with warp-chunk layout.
  * Block is divided into WarpMN x WarpK chunks; each warp loads its chunk.

@@ -18,12 +18,6 @@ using tl::int32x4_t;
 
 namespace tl {
 
-TL_DEVICE void ds_read_vector(float32x4 &dst, uint32_t lds_byte_offset) {
-  asm volatile("ds_read_m32x16_b16 %0, %1 offset:0\n\t"
-               : "+v"(dst)
-               : "v"(lds_byte_offset));
-}
-
 namespace detail {
 
 template <typename T, int ReadSize>

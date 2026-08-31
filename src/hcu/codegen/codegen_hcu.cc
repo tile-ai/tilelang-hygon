@@ -567,6 +567,10 @@ std::string CodeGenTileLangHCU::Finish() {
   } else {
     decl_stream << "#include <tl_templates/hcu/gemm.h>\n";
   }
+  if (enable_ds_read_vector_) {
+    decl_stream
+        << "#include <tl_templates/hcu/mls/tilelang_ds_read_format.hpp>\n";
+  }
   decl_stream << "#include <tl_templates/hcu/copy.h>\n";
   decl_stream << "#include <tl_templates/hcu/reduce.h>\n";
   decl_stream << "#include <tl_templates/hcu/scan.h>\n";
@@ -2540,24 +2544,23 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
   } else if (op->op.same_as(tl::ds_read_vector())) {
     ICHECK_EQ(op->args.size(), 3U);
+    enable_ds_read_vector_ = true;
     std::string dst = PrintExpr(op->args[0]);
     std::string local_offset = PrintExpr(op->args[1]);
-    std::string shared_byte_offset;
-    DataType shared_dtype = DataType::Float(16);
-    if (const auto *load = op->args[2].as<BufferLoadNode>()) {
-      shared_dtype = load->buffer->dtype.element_of();
-      std::ostringstream load_expr;
-      PrintExpr(op->args[2], load_expr);
-      shared_byte_offset =
-          "reinterpret_cast<uintptr_t>(&(" + load_expr.str() + "))";
-    } else {
-      PrimExpr shared_offset = InlineIfThenElseAsSelect().Rewrite(op->args[2]);
-      shared_byte_offset = "(" + PrintExpr(shared_offset) + ") * sizeof(" +
-                           HcuCkTemplateElemType(shared_dtype) + ")";
-    }
+    const auto *load = op->args[2].as<BufferLoadNode>();
+    ICHECK(load) << "HCU ds_read_vector requires a shared BufferLoad source";
+    DataType shared_dtype = load->buffer->dtype.element_of();
+    ICHECK(shared_dtype.is_float16() || shared_dtype.is_bfloat16())
+        << "HCU ds_read_vector only supports fp16/bf16 shared sources, got "
+        << shared_dtype;
+    const char *shared_elem_type =
+        shared_dtype.is_bfloat16() ? "bfloat16_t" : "half_t";
+    std::ostringstream load_expr;
+    PrintExpr(op->args[2], load_expr);
     PrintIndent();
     stream << "tl::ds_read_vector(*(float32x4 *)(" << dst << " + ("
-           << local_offset << ")), " << shared_byte_offset << ");\n";
+           << local_offset << ")), reinterpret_cast<TL_LDS_ADDR "
+           << shared_elem_type << " *>(&(" << load_expr.str() << ")));\n";
   } else if (op->op.same_as(builtin::ptx_commit_group())) {
     print_extern_call_stmt("tl::cp_async_commit");
   } else if (op->op.same_as(builtin::ptx_wait_group())) {

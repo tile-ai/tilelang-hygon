@@ -182,6 +182,8 @@ private:
   bool enable_fp8_{false};
   // whether need gemm_mls.h (when gemm uses MLS or matrix_load exists)
   bool enable_gemm_mls_{false};
+  // whether need tilelang_ds_read_format.hpp for layout-aware ds_read_m32x16
+  bool enable_ds_read_vector_{false};
   // whether need scale_buffer.hpp (ds_scale_copy / mmac_scale_fp4)
   bool enable_scale_buffer_{false};
   // IndexMap-generated compile-time LDS layout descriptors, deduplicated by
