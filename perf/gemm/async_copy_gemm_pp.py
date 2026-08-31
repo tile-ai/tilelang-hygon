@@ -20,6 +20,9 @@ def _gemm_async_copy_pingpong(
     block_K=BLOCK_K,
     dtype="float16",
     accum_dtype="float32",
+    swizzle_panel_size=0,
+    swizzle_order="row",
+    swizzle_enable=False,
 ):
     """GEMM with two LDS stages and a loop-carried LDS-to-register prefetch."""
     transpose_B = True
@@ -65,9 +68,9 @@ def _gemm_async_copy_pingpong(
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
             T.use_swizzle(
-                panel_size=4,
-                order="col",
-                enable=True,
+                panel_size=swizzle_panel_size,
+                order=swizzle_order,
+                enable=swizzle_enable,
             )
 
             warp_idx = T.get_warp_idx()
@@ -400,6 +403,9 @@ def gemm_async_copy_k_major(
     block_K=BLOCK_K,
     dtype="float16",
     accum_dtype="float32",
+    swizzle_panel_size=0,
+    swizzle_order="row",
+    swizzle_enable=False,
 ):
     return _gemm_async_copy_pingpong(
         M,
@@ -410,4 +416,7 @@ def gemm_async_copy_k_major(
         block_K,
         dtype=dtype,
         accum_dtype=accum_dtype,
+        swizzle_panel_size=swizzle_panel_size,
+        swizzle_order=swizzle_order,
+        swizzle_enable=swizzle_enable,
     )

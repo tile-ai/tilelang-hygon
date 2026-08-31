@@ -29,6 +29,42 @@ Kernel = Callable[..., Any]
 ConfigGetter = Callable[[int, int, int], dict[str, Any]]
 
 
+ASYNC_COPY_N_MAJOR_SWIZZLE_CONFIG: dict[int, dict[str, Any]] = {
+    4096: {},
+    5120: {},
+    8192: {
+        "swizzle_panel_size": 8,
+        "swizzle_order": "row",
+    },
+    16384: {
+        "swizzle_panel_size": 4,
+        "swizzle_order": "row",
+    },
+}
+
+
+ASYNC_COPY_K_MAJOR_SWIZZLE_CONFIG: dict[int, dict[str, Any]] = {
+    4096: {
+        "swizzle_enable": False,
+    },
+    5120: {
+        "swizzle_panel_size": 10,
+        "swizzle_order": "col",
+        "swizzle_enable": True,
+    },
+    8192: {
+        "swizzle_panel_size": 4,
+        "swizzle_order": "row",
+        "swizzle_enable": True,
+    },
+    16384: {
+        "swizzle_panel_size": 4,
+        "swizzle_order": "row",
+        "swizzle_enable": True,
+    },
+}
+
+
 @dataclass(frozen=True)
 class KernelSpec:
     """A kernel together with its config policy and fixed invocation kwargs."""
@@ -58,19 +94,23 @@ def _persistent_v4_split_m_config(M: int, N: int, K: int) -> dict[str, Any]:
 
 
 def _async_copy_vanilla_config(M: int, N: int, K: int) -> dict[str, Any]:
-    return {
+    config = {
         "block_M": 256,
         "block_N": 256,
         "block_K": 16,
     }
+    config.update(ASYNC_COPY_N_MAJOR_SWIZZLE_CONFIG.get(M, {}))
+    return config
 
 
 def _async_copy_pingpong_config(M: int, N: int, K: int) -> dict[str, Any]:
-    return {
+    config = {
         "block_M": 256,
         "block_N": 256,
         "block_K": 32,
     }
+    config.update(ASYNC_COPY_K_MAJOR_SWIZZLE_CONFIG.get(M, {}))
+    return config
 
 
 _K_MAJOR = "k_major"

@@ -18,6 +18,8 @@ def _gemm_async_copy_vanilla(
     accum_dtype="float32",
     steady_wait=6,
     shared_0_wait=6,
+    swizzle_panel_size=0,
+    swizzle_order="row",
 ):
     """Four-stage GEMM using async copies and compiler-derived LDS layouts."""
     transpose_B = False
@@ -51,6 +53,11 @@ def _gemm_async_copy_vanilla(
         C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
+            T.use_swizzle(
+                panel_size=swizzle_panel_size,
+                order=swizzle_order,
+                enable=swizzle_panel_size > 0,
+            )
             warp_idx = T.get_warp_idx()
             A_shared_0 = T.alloc_shared((block_M, block_K), dtype)
             A_shared_1 = T.alloc_shared((block_M, block_K), dtype)
@@ -272,6 +279,8 @@ def gemm_async_copy_n_major(
     block_K,
     dtype="float16",
     accum_dtype="float32",
+    swizzle_panel_size=0,
+    swizzle_order="row",
 ):
     return _gemm_async_copy_vanilla(
         M,
@@ -284,4 +293,6 @@ def gemm_async_copy_n_major(
         accum_dtype=accum_dtype,
         steady_wait=8,
         shared_0_wait=6,
+        swizzle_panel_size=swizzle_panel_size,
+        swizzle_order=swizzle_order,
     )
