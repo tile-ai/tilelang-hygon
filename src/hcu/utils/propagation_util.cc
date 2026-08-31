@@ -61,9 +61,12 @@ static bool IsSharedLikeScope(const Buffer &buffer) {
   return scope == "shared" || scope == "shared.dyn" || scope == "shared.tmem";
 }
 
-static Optional<TileOperator> PropagateToFindGemmConsumerOpTir(
-    Buffer buffer, const PropagationTirCollector *tir, int after_stmt_order) {
-  if (!tir)
+using BufferSet = std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>;
+
+static Optional<TileOperator> PropagateToFindGemmConsumerOpTirImpl(
+    const Buffer &buffer, const PropagationTirCollector *tir,
+    int after_stmt_order, BufferSet *visited_buffers) {
+  if (!tir || !visited_buffers->insert(buffer).second)
     return Optional<TileOperator>();
   for (const Buffer &out_buf : tir->GetConsumerOutputs(buffer)) {
     // Stop at shared: register-side chains (fragment/local) keep propagating.
@@ -75,17 +78,28 @@ static Optional<TileOperator> PropagateToFindGemmConsumerOpTir(
         return found->gemm;
       }
     }
-    auto found =
-        PropagateToFindGemmConsumerOpTir(out_buf, tir, after_stmt_order);
+    auto found = PropagateToFindGemmConsumerOpTirImpl(
+        out_buf, tir, after_stmt_order, visited_buffers);
     if (found.defined())
       return found;
   }
   return Optional<TileOperator>();
 }
 
-static std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInputTir(
-    Buffer buffer, const PropagationTirCollector *tir, int after_stmt_order) {
-  if (!tir)
+static Optional<TileOperator>
+PropagateToFindGemmConsumerOpTir(const Buffer &buffer,
+                                 const PropagationTirCollector *tir,
+                                 int after_stmt_order) {
+  BufferSet visited_buffers;
+  return PropagateToFindGemmConsumerOpTirImpl(buffer, tir, after_stmt_order,
+                                              &visited_buffers);
+}
+
+static std::optional<GemmWithInput>
+PropagateToFindGemmConsumerOpWithInputTirImpl(
+    const Buffer &buffer, const PropagationTirCollector *tir,
+    int after_stmt_order, BufferSet *visited_buffers) {
+  if (!tir || !visited_buffers->insert(buffer).second)
     return std::nullopt;
   for (const Buffer &out_buf : tir->GetConsumerOutputs(buffer)) {
     if (IsSharedLikeScope(out_buf))
@@ -96,12 +110,21 @@ static std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInputTir(
         return found;
       }
     }
-    auto found = PropagateToFindGemmConsumerOpWithInputTir(out_buf, tir,
-                                                           after_stmt_order);
+    auto found = PropagateToFindGemmConsumerOpWithInputTirImpl(
+        out_buf, tir, after_stmt_order, visited_buffers);
     if (found)
       return found;
   }
   return std::nullopt;
+}
+
+static std::optional<GemmWithInput>
+PropagateToFindGemmConsumerOpWithInputTir(const Buffer &buffer,
+                                          const PropagationTirCollector *tir,
+                                          int after_stmt_order) {
+  BufferSet visited_buffers;
+  return PropagateToFindGemmConsumerOpWithInputTirImpl(
+      buffer, tir, after_stmt_order, &visited_buffers);
 }
 
 bool PropagateToFindGemmConsumer(Buffer buffer,
@@ -133,6 +156,55 @@ std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInputAfterCall(
                                                 after_order);
 }
 
+namespace {
+
+void CollectAllGemmConsumers(
+    const Buffer &buffer, const PropagationTirCollector *tir_collector,
+    int after_order,
+    std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual> *visited_buffers,
+    std::unordered_set<const CallNode *, CallNodePtrHash, CallNodePtrEqual>
+        *seen_calls,
+    std::vector<GemmWithInput> *result) {
+  if (!visited_buffers->insert(buffer).second) {
+    return;
+  }
+  for (const ReaderCallRecord &reader : tir_collector->GetReaderCalls(buffer)) {
+    if (reader.stmt_order <= after_order || reader.call == nullptr) {
+      continue;
+    }
+    if (auto gemm = GemmWithInputFromCall(reader.call, buffer)) {
+      if (seen_calls->insert(reader.call).second) {
+        result->push_back(*gemm);
+      }
+      continue;
+    }
+    if (!IsSharedLikeScope(reader.write)) {
+      CollectAllGemmConsumers(reader.write, tir_collector, after_order,
+                              visited_buffers, seen_calls, result);
+    }
+  }
+}
+
+} // namespace
+
+std::vector<GemmWithInput> PropagateToFindAllGemmConsumersAfterCall(
+    Buffer buffer, const PropagationTirCollector *tir_collector,
+    const CallNode *after_site_call) {
+  std::vector<GemmWithInput> result;
+  if (tir_collector == nullptr) {
+    return result;
+  }
+  int after_order = after_site_call == nullptr
+                        ? -1
+                        : tir_collector->GetCallStmtOrder(after_site_call);
+  std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual> visited_buffers;
+  std::unordered_set<const CallNode *, CallNodePtrHash, CallNodePtrEqual>
+      seen_calls;
+  CollectAllGemmConsumers(buffer, tir_collector, after_order, &visited_buffers,
+                          &seen_calls, &result);
+  return result;
+}
+
 std::vector<ReaderCallRecord>
 GetReaderCallsFromTir(Buffer buffer,
                       const PropagationTirCollector *tir_collector) {
@@ -141,15 +213,18 @@ GetReaderCallsFromTir(Buffer buffer,
   return tir_collector->GetReaderCalls(buffer);
 }
 
-static bool
-PropagateToFindProducerMatrixLoadFoundTir(Buffer buffer,
-                                          const PropagationTirCollector *tir) {
+static bool PropagateToFindProducerMatrixLoadFoundTirImpl(
+    const Buffer &buffer, const PropagationTirCollector *tir,
+    BufferSet *visited_buffers) {
+  if (!tir || !visited_buffers->insert(buffer).second)
+    return false;
   if (tir->ProducerIsMatrixLoad(buffer))
     return true;
   if (tir->ProducerIsDsReadFormat(buffer)) {
     auto inputs = tir->GetProducerInputs(buffer);
     if (!inputs.empty()) {
-      return PropagateToFindProducerMatrixLoadFoundTir(inputs[0], tir);
+      return PropagateToFindProducerMatrixLoadFoundTirImpl(inputs[0], tir,
+                                                           visited_buffers);
     }
   }
   for (const Buffer &in_buf : tir->GetProducerInputs(buffer)) {
@@ -157,10 +232,19 @@ PropagateToFindProducerMatrixLoadFoundTir(Buffer buffer,
     // already handled by ProducerIsMatrixLoad above.
     if (IsSharedLikeScope(in_buf))
       continue;
-    if (PropagateToFindProducerMatrixLoadFoundTir(in_buf, tir))
+    if (PropagateToFindProducerMatrixLoadFoundTirImpl(in_buf, tir,
+                                                      visited_buffers))
       return true;
   }
   return false;
+}
+
+static bool
+PropagateToFindProducerMatrixLoadFoundTir(const Buffer &buffer,
+                                          const PropagationTirCollector *tir) {
+  BufferSet visited_buffers;
+  return PropagateToFindProducerMatrixLoadFoundTirImpl(buffer, tir,
+                                                       &visited_buffers);
 }
 
 bool IsFromMls(Buffer buffer, const PropagationTirCollector *tir_collector) {

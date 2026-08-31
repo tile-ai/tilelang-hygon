@@ -572,6 +572,9 @@ private:
                                : combined;
       Array<PrimExpr> new_args{call->args[0], call->args[1], call->args[2]};
       new_args.push_back(predicate);
+      for (size_t i = 4; i < call->args.size(); ++i) {
+        new_args.push_back(call->args[i]);
+      }
       return Evaluate(
           Call(call->dtype, call->op, new_args, call->annotations, call->span));
     }

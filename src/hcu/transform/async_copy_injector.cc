@@ -3,6 +3,7 @@
  * \file hcu/transform/async_copy_injector.cc
  */
 #include "support/check.h"
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include "hcu/transform/async_copy_injector.h"
+#include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "tir/ir/buffer_common.h"
@@ -30,8 +32,20 @@ using namespace ffi;
 
 class HCUAsyncCopyInjector : public StmtMutator {
 public:
-  explicit HCUAsyncCopyInjector(bool async_without_async_commit_wait)
-      : async_without_async_commit_wait_(async_without_async_commit_wait) {}
+  explicit HCUAsyncCopyInjector(bool async_without_async_commit_wait,
+                                Map<String, ObjectRef> call_annotations,
+                                Var thread_var,
+                                Map<Buffer, Buffer> buffer_remap)
+      : async_without_async_commit_wait_(async_without_async_commit_wait),
+        call_annotations_(std::move(call_annotations)),
+        thread_var_(std::move(thread_var)),
+        buffer_remap_(std::move(buffer_remap)) {
+    if (auto value = call_annotations_.Get(attr::kHcuGemmLdsCopyStrategy)) {
+      copy_strategy_ = Downcast<HcuGemmLdsCopyStrategy>(value.value());
+      SetCompilerDerivedWrapAnnotations(copy_strategy_.value()->wrap_offset,
+                                        copy_strategy_.value()->wrap_idx_mask);
+    }
+  }
 
   bool InjectedHCUAsyncCopy() const { return injected_hcu_async_copy_; }
 
@@ -64,8 +78,14 @@ public:
     // int4/fp4/int2/int1 remain representable here.
     int previous_vectorized_lanes = current_vectorized_lanes_;
     bool pushed_vectorized_loop = false;
+    const auto *extent_imm = op->extent.as<IntImmNode>();
+    bool pushed_active_loop = false;
+    if (extent_imm && extent_imm->value > 1) {
+      active_loops_.push_back(
+          {op->loop_var, static_cast<int>(extent_imm->value)});
+      pushed_active_loop = true;
+    }
     if (op->kind == ForKind::kVectorized) {
-      const auto *extent_imm = op->extent.as<IntImmNode>();
       ICHECK(extent_imm)
           << "Vectorized loops must have constant extent, but got "
           << op->extent;
@@ -80,6 +100,9 @@ public:
     Stmt stmt = StmtMutator::VisitStmt_(op);
     if (pushed_vectorized_loop) {
       active_vectorized_loops_.pop_back();
+    }
+    if (pushed_active_loop) {
+      active_loops_.pop_back();
     }
     current_vectorized_lanes_ = previous_vectorized_lanes;
     return stmt;
@@ -271,6 +294,21 @@ public:
   }
 
 private:
+  void SetCompilerDerivedWrapAnnotations(int wrap_offset, int wrap_idx_mask) {
+    ICHECK_EQ(wrap_offset != 0, wrap_idx_mask != 0)
+        << "Compiler-derived HCU LDS wrap offset and mask must be enabled "
+           "together";
+    if (wrap_offset == 0) {
+      return;
+    }
+    // These scalar annotations are an internal codegen protocol. Public Copy
+    // annotations are intentionally not forwarded here.
+    call_annotations_.Set("wrap_offset",
+                          IntImm(DataType::Int(32), wrap_offset));
+    call_annotations_.Set("wrap_idx_mask",
+                          IntImm(DataType::Int(32), wrap_idx_mask));
+  }
+
   bool UseExplicitAsyncSemantics() const {
     return async_without_async_commit_wait_;
   }
@@ -290,6 +328,11 @@ private:
   };
 
   struct ActiveVectorizedLoop {
+    Var loop_var;
+    int extent;
+  };
+
+  struct ActiveLoop {
     Var loop_var;
     int extent;
   };
@@ -469,13 +512,87 @@ private:
                  IntImm(DataType::Int(32), rw_mask)});
   }
 
-  static Optional<Stmt>
-  MakeCPAsyncStmtFromLoads(const BufferStoreNode *store,
-                           const BufferLoad &dst_base_load,
-                           const BufferLoad &src_base_load, int num_elems,
-                           bool predicated, const PrimExpr &predicate_value) {
-    PrimExpr dst_access_ptr =
-        MakeAccessPtrFromLoad(dst_base_load, num_elems, /*rw_mask=*/2);
+  PrimExpr MakeGemmCommandDstAccessPtr(const Buffer &buffer, int num_elems,
+                                       int copy_bytes_per_lane,
+                                       int copy_transaction_bytes,
+                                       int block_threads, int inner_extent,
+                                       const char *operand) {
+    ICHECK(thread_var_.defined());
+    const int element_bits = buffer->dtype.bits() * buffer->dtype.lanes();
+    ICHECK_GT(element_bits, 0);
+    ICHECK_EQ((copy_bytes_per_lane * 8) % element_bits, 0);
+    const int copy_elements_per_lane = copy_bytes_per_lane * 8 / element_bits;
+    ICHECK_EQ((copy_transaction_bytes * 8) % element_bits, 0);
+    const int transaction_elements = copy_transaction_bytes * 8 / element_bits;
+    ICHECK_EQ(copy_elements_per_lane % transaction_elements, 0);
+    ICHECK_EQ(transaction_elements, num_elems * current_vectorized_lanes_)
+        << "HCU GEMM async-copy vector width does not match the "
+           "compiler-derived transaction width";
+
+    const int local_iterations = copy_elements_per_lane / num_elems;
+    int covered_iterations = 1;
+    size_t first_local_loop = active_loops_.size();
+    while (first_local_loop > 0 && covered_iterations < local_iterations) {
+      const ActiveLoop &loop = active_loops_[first_local_loop - 1];
+      ICHECK_EQ(local_iterations % (covered_iterations * loop.extent), 0)
+          << "HCU GEMM " << operand
+          << " async-copy loop structure does not match the compiler-derived "
+             "transaction layout";
+      covered_iterations *= loop.extent;
+      --first_local_loop;
+    }
+    ICHECK_EQ(covered_iterations, local_iterations)
+        << "HCU GEMM " << operand << " strategy expects "
+        << copy_elements_per_lane
+        << " elements per thread, but the innermost async-copy loops cover "
+        << covered_iterations * num_elems;
+
+    PrimExpr local_iteration = make_const(thread_var_->dtype, 0);
+    for (size_t i = first_local_loop; i < active_loops_.size(); ++i) {
+      const ActiveLoop &loop = active_loops_[i];
+      local_iteration = local_iteration * loop.extent + loop.loop_var;
+    }
+    PrimExpr local_element = local_iteration * num_elems;
+    PrimExpr transaction =
+        floordiv(local_element, Integer(transaction_elements));
+    PrimExpr intra_transaction =
+        floormod(local_element, Integer(transaction_elements));
+    // Each issued transaction is contiguous across lanes. Multiple
+    // transactions owned by one thread are placed transaction-major.
+    PrimExpr physical_offset = analyzer_.Simplify(
+        (transaction * block_threads + thread_var_) * transaction_elements +
+        intra_transaction);
+    Array<PrimExpr> physical_indices = {
+        floordiv(physical_offset, Integer(inner_extent)),
+        floormod(physical_offset, Integer(inner_extent))};
+    // Address the remapped buffer directly so the enclosing layout lowering
+    // does not apply the final LDS storage layout to this pre-wrap address.
+    Optional<Buffer> physical_buffer = buffer_remap_.Get(buffer);
+    ICHECK(physical_buffer.defined())
+        << "HCU GEMM " << operand
+        << " strategy requires a remapped physical LDS buffer for "
+        << buffer->name;
+    return MakeAccessPtrFromLoad(
+        BufferLoad(physical_buffer.value(), physical_indices), num_elems,
+        /*rw_mask=*/2);
+  }
+
+  Optional<Stmt> MakeCPAsyncStmtFromLoads(const BufferStoreNode *store,
+                                          const BufferLoad &dst_base_load,
+                                          const BufferLoad &src_base_load,
+                                          int num_elems, bool predicated,
+                                          const PrimExpr &predicate_value) {
+    PrimExpr dst_access_ptr;
+    if (copy_strategy_.defined()) {
+      const HcuGemmLdsCopyStrategy &strategy = copy_strategy_.value();
+      dst_access_ptr = MakeGemmCommandDstAccessPtr(
+          store->buffer, num_elems, strategy->copy_bytes_per_lane,
+          strategy->copy_transaction_bytes, strategy->block_threads,
+          strategy->inner_extent, "GEMM");
+    } else {
+      dst_access_ptr =
+          MakeAccessPtrFromLoad(dst_base_load, num_elems, /*rw_mask=*/2);
+    }
     PrimExpr src_access_ptr =
         MakeAccessPtrFromLoad(src_base_load, num_elems, /*rw_mask=*/1);
 
@@ -486,8 +603,8 @@ private:
     } else {
       cp_async_args = {dst_access_ptr, src_access_ptr, PrimExpr(num_elems)};
     }
-    return Evaluate(
-        Call(store->buffer->dtype, tvm::tl::ptx_cp_async(), cp_async_args));
+    return Evaluate(Call(store->buffer->dtype, tvm::tl::ptx_cp_async(),
+                         cp_async_args, call_annotations_));
   }
 
   static Stmt MakeCommitGroupStmt() {
@@ -533,11 +650,53 @@ private:
     return stride == 1;
   }
 
+  int GetGemmStrategyBlockThreads() const {
+    return copy_strategy_.defined() ? copy_strategy_.value()->block_threads : 0;
+  }
+
+  bool HasUnitStrideForEveryThread(const PrimExpr &expr,
+                                   const ActiveVectorizedLoop &loop,
+                                   int block_threads) {
+    ICHECK(thread_var_.defined());
+    for (int thread = 0; thread < block_threads; ++thread) {
+      PrimExpr prev = analyzer_.Simplify(
+          Substitute(expr, {{thread_var_, IntImm(thread_var_->dtype, thread)},
+                            {loop.loop_var, IntImm(loop.loop_var->dtype, 0)}}));
+      for (int value = 1; value < loop.extent; ++value) {
+        PrimExpr curr = analyzer_.Simplify(Substitute(
+            expr, {{thread_var_, IntImm(thread_var_->dtype, thread)},
+                   {loop.loop_var, IntImm(loop.loop_var->dtype, value)}}));
+        int64_t delta = 0;
+        if (!TryGetConstInt64(analyzer_.Simplify(curr - prev), &delta) ||
+            delta != 1) {
+          return false;
+        }
+        prev = curr;
+      }
+    }
+    return true;
+  }
+
   bool HasContiguousVectorizedOffsets(const PrimExpr &src_index,
                                       const PrimExpr &dst_index) {
+    const int strategy_block_threads = GetGemmStrategyBlockThreads();
     for (const auto &loop : active_vectorized_loops_) {
-      if (!HasUnitStrideForVectorizedLoop(src_index, loop) ||
-          !HasUnitStrideForVectorizedLoop(dst_index, loop)) {
+      bool src_contiguous = HasUnitStrideForVectorizedLoop(src_index, loop);
+      bool dst_contiguous = HasUnitStrideForVectorizedLoop(dst_index, loop);
+      // Strategy-generated layouts can retain floor/mod expressions that are
+      // contiguous for every concrete lane but not simplifiable with symbolic
+      // threadIdx.x. Prove the same property over the finite thread domain.
+      if (strategy_block_threads > 0) {
+        if (!src_contiguous) {
+          src_contiguous = HasUnitStrideForEveryThread(src_index, loop,
+                                                       strategy_block_threads);
+        }
+        if (!dst_contiguous) {
+          dst_contiguous = HasUnitStrideForEveryThread(dst_index, loop,
+                                                       strategy_block_threads);
+        }
+      }
+      if (!src_contiguous || !dst_contiguous) {
         return false;
       }
     }
@@ -671,8 +830,13 @@ private:
   // `SummarizeAsyncIntrinsics` helpers to avoid redundant traversals.
 
   bool async_without_async_commit_wait_{false};
+  Map<String, ObjectRef> call_annotations_;
+  Optional<HcuGemmLdsCopyStrategy> copy_strategy_;
+  Var thread_var_;
+  Map<Buffer, Buffer> buffer_remap_;
   int current_vectorized_lanes_{1};
   std::vector<ActiveVectorizedLoop> active_vectorized_loops_;
+  std::vector<ActiveLoop> active_loops_;
   arith::Analyzer analyzer_;
   bool injected_hcu_async_copy_{false};
   bool pending_sync_copies_{false};
@@ -680,11 +844,212 @@ private:
 };
 
 HCUAsyncCopyInjectResult
-InjectHCUAsyncCopy(const Stmt &body, bool async_without_async_commit_wait) {
-  HCUAsyncCopyInjector injector(async_without_async_commit_wait);
+InjectHCUAsyncCopy(const Stmt &body, bool async_without_async_commit_wait,
+                   Map<String, ObjectRef> call_annotations, Var thread_var,
+                   Map<Buffer, Buffer> buffer_remap) {
+  HCUAsyncCopyInjector injector(async_without_async_commit_wait,
+                                std::move(call_annotations),
+                                std::move(thread_var), std::move(buffer_remap));
   Stmt injected = injector(body);
   return {injector.Finalize(injected), injector.InjectedHCUAsyncCopy()};
 }
+
+namespace {
+
+int64_t LargestPow2LessThanOrEqual(int64_t value) {
+  if (value <= 1) {
+    return 1;
+  }
+  int64_t result = 1;
+  while ((result << 1) <= value) {
+    result <<= 1;
+  }
+  return result;
+}
+
+// Bits [61:48] hold the byte stride; 8192 is the largest power of two that
+// fits.
+constexpr int64_t kMaxStructStrideBytes = 8192;
+constexpr int64_t kDynamicKStructStrideBytes = 8192;
+
+int64_t TileWidthElementsFromK(int64_t k_dim, int64_t element_bytes) {
+  const int64_t max_tile_width = kMaxStructStrideBytes / element_bytes;
+  return std::min(LargestPow2LessThanOrEqual(k_dim), max_tile_width);
+}
+
+int StructStrideByteBit(int64_t stride_bytes) {
+  int bit = 0;
+  while ((int64_t{1} << bit) < stride_bytes) {
+    ++bit;
+  }
+  return bit;
+}
+
+Optional<PrimExpr> ExtractRowExpr(const PrimExpr &expr,
+                                  const PrimExpr &row_stride,
+                                  arith::Analyzer *analyzer) {
+  if (const auto *mul = expr.as<MulNode>()) {
+    if (analyzer->CanProveEqual(mul->b, row_stride)) {
+      return mul->a;
+    }
+    if (analyzer->CanProveEqual(mul->a, row_stride)) {
+      return mul->b;
+    }
+  }
+  if (const auto *add = expr.as<AddNode>()) {
+    if (Optional<PrimExpr> lhs = ExtractRowExpr(add->a, row_stride, analyzer)) {
+      return lhs;
+    }
+    if (Optional<PrimExpr> rhs = ExtractRowExpr(add->b, row_stride, analyzer)) {
+      return rhs;
+    }
+  }
+  if (const auto *sub = expr.as<SubNode>()) {
+    if (Optional<PrimExpr> lhs = ExtractRowExpr(sub->a, row_stride, analyzer)) {
+      return lhs;
+    }
+    if (Optional<PrimExpr> rhs = ExtractRowExpr(sub->b, row_stride, analyzer)) {
+      return rhs;
+    }
+  }
+  return Optional<PrimExpr>();
+}
+
+class HcuGemmIdxenRewriter : public StmtExprMutator {
+public:
+  explicit HcuGemmIdxenRewriter(const PrimFunc &func) {
+    for (const auto &[var, buffer] : func->buffer_map) {
+      buffer_data_to_buffer_.Set(buffer->data, buffer);
+    }
+  }
+
+private:
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    for (const Buffer &buffer : op->alloc_buffers) {
+      buffer_data_to_buffer_.Set(buffer->data, buffer);
+    }
+    for (const MatchBufferRegion &match_buffer : op->match_buffers) {
+      buffer_data_to_buffer_.Set(match_buffer->buffer->data,
+                                 match_buffer->buffer);
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    if (!call->op.same_as(tl::ptx_cp_async())) {
+      return call;
+    }
+    Optional<ObjectRef> strategy_value =
+        call->annotations.Get(attr::kHcuGemmLdsCopyStrategy);
+    if (!strategy_value.defined() ||
+        !Downcast<HcuGemmLdsCopyStrategy>(strategy_value.value())->use_idxen) {
+      return call;
+    }
+
+    if (call->args.size() != 3U && call->args.size() != 4U) {
+      return call;
+    }
+    const auto *src_call = call->args[1].as<CallNode>();
+    if (!src_call || !src_call->op.same_as(builtin::tvm_access_ptr())) {
+      return call;
+    }
+    Optional<Buffer> src_buffer = LookupBuffer(src_call->args[1]);
+    if (!src_buffer.defined() || src_buffer.value()->shape.size() != 2) {
+      return call;
+    }
+    PrimExpr k_dim = src_buffer.value()->shape[1];
+    const auto *k_imm = k_dim.as<IntImmNode>();
+    const bool dynamic_k = k_imm == nullptr;
+    if (dynamic_k) {
+      if (!k_dim.as<VarNode>()) {
+        return call;
+      }
+      const Array<PrimExpr> &strides = src_buffer.value()->strides;
+      if (!strides.empty() &&
+          (strides.size() != 2 || !analyzer_.CanProveEqual(strides[0], k_dim) ||
+           !analyzer_.CanProveEqual(strides[1], 1))) {
+        return call;
+      }
+    }
+
+    const int64_t element_bytes = src_buffer.value()->dtype.bytes();
+    if (element_bytes <= 0 || (element_bytes & (element_bytes - 1)) != 0 ||
+        element_bytes > kMaxStructStrideBytes) {
+      return call;
+    }
+    const int64_t struct_stride_bytes =
+        dynamic_k ? kDynamicKStructStrideBytes
+                  : TileWidthElementsFromK(k_imm->value, element_bytes) *
+                        element_bytes;
+    const int64_t tile_width_elements = struct_stride_bytes / element_bytes;
+    PrimExpr old_offset = src_call->args[2];
+    Optional<PrimExpr> row_expr = ExtractRowExpr(old_offset, k_dim, &analyzer_);
+    if (!row_expr.defined()) {
+      return call;
+    }
+    PrimExpr idxen = analyzer_.Simplify(row_expr.value());
+    PrimExpr tile_width_elements_expr =
+        make_const(old_offset.dtype(), tile_width_elements);
+    PrimExpr new_offset =
+        analyzer_.Simplify(old_offset - idxen * tile_width_elements_expr);
+    Array<PrimExpr> src_args = src_call->args;
+    src_args.Set(2, new_offset);
+    PrimExpr new_src = Call(call->args[1].dtype(), builtin::tvm_access_ptr(),
+                            src_args, src_call->annotations, src_call->span);
+    PrimExpr predicate = call->args.size() == 4U ? call->args[3] : const_true();
+    return Call(
+        call->dtype, tl::hcu_cp_async_idxen(),
+        {call->args[0], new_src, call->args[2], predicate, idxen,
+         IntImm(DataType::Int(32), StructStrideByteBit(struct_stride_bytes))},
+        call->annotations, call->span);
+  }
+
+  Optional<Buffer> LookupBuffer(const PrimExpr &expr) const {
+    if (const auto *var = expr.as<VarNode>()) {
+      auto it = buffer_data_to_buffer_.find(ffi::GetRef<Var>(var));
+      if (it != buffer_data_to_buffer_.end()) {
+        return (*it).second;
+      }
+    }
+    return Optional<Buffer>();
+  }
+
+  Map<Var, Buffer> buffer_data_to_buffer_;
+  arith::Analyzer analyzer_;
+};
+
+PrimFunc InjectHcuCopyIdxenPrimFunc(PrimFunc func) {
+  if (!func.defined() || !func->body.defined()) {
+    return func;
+  }
+  PrimFuncNode *node = func.CopyOnWrite();
+  HcuGemmIdxenRewriter rewriter(func);
+  node->body = rewriter(std::move(node->body));
+  return func;
+}
+
+} // namespace
+
+namespace transform {
+
+tvm::transform::Pass InjectHcuCopyIdxen() {
+  auto pass_func = [](PrimFunc func, const IRModule &mod,
+                      const tvm::transform::PassContext &ctx) {
+    (void)mod;
+    (void)ctx;
+    return InjectHcuCopyIdxenPrimFunc(std::move(func));
+  };
+  return tirx::transform::CreatePrimFuncPass(pass_func, 0,
+                                             "tl.InjectHcuCopyIdxen", {});
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.InjectHcuCopyIdxen", InjectHcuCopyIdxen);
+}
+
+} // namespace transform
 
 } // namespace tl
 } // namespace tvm

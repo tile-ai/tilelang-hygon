@@ -5,22 +5,9 @@ Benchmark script for all GEMM implementations.
 import argparse
 import torch
 import tilelang as tl
-from perf.gemm.utils import ref_program, get_heuristic_config, get_default_kernel_version
-from perf.gemm.vanilla_gemm import (
-    get_best_vanilla_config,
-    gemm_vanilla_v1,
-    gemm_vanilla_v2,
-)
-from perf.gemm.persistent_gemm import (
-    get_best_persistent_config_v1,
-    gemm_persistent_v1,
-    gemm_persistent_v2,
-    gemm_persistent_v3,
-    gemm_persistent_v4,
-    gemm_persistent_v5,
-)
-from perf.gemm.splitk_gemm import gemm_splitk
-from perf.gemm.streamk_gemm import gemm_streamk
+from perf.gemm.kernel_registry import dispatch_kernel, get_kernel_config
+from perf.gemm.vanilla_gemm import get_best_vanilla_config
+from perf.gemm.persistent_gemm import get_best_persistent_config_v1
 from perf.utils.device import get_free_devices
 
 from tilelang.profiler import do_bench_cudagraph
@@ -48,6 +35,7 @@ def main(
     impl: str = "persistent",
     with_roller: bool = False,
     device: int = -1,
+    transpose_B: bool = True,
 ):
     """
     Main benchmark function for GEMM implementations.
@@ -58,12 +46,20 @@ def main(
         K: Matrix dimension K (default: 4096)
         dtype: Data type (fp16, bf16, fp32, default: fp16)
         autotune: Whether to use autotune (default: False)
-        impl: GEMM implementation (vanilla, persistent, splitk, streamk, default: persistent)
+        impl: GEMM implementation (async_copy, vanilla, persistent, splitk, streamk; default: persistent)
         with_roller: Whether to enable BitBLAS roller for search space (default: False)
         device: Device ID (default: -1, auto find free device)
     """
     # Convert dtype string to torch dtype
     dtype = normalize_dtype(dtype)
+
+    if impl == "async_copy":
+        if autotune:
+            raise ValueError(f"Autotune is not supported for {impl}")
+        if dtype == "float32":
+            raise ValueError(f"{impl} supports fp16 and bf16 inputs only")
+    elif not transpose_B and (autotune or impl not in {"vanilla", "persistent"}):
+        raise ValueError("N-major B is supported by async_copy, gemm_vanilla_v2, and gemm_persistent_v4 only")
 
     if autotune:
         if impl == "persistent":
@@ -78,44 +74,9 @@ def main(
         else:
             raise ValueError(f"Autotune not supported for {impl} implementation. Supported: persistent, vanilla")
     else:
-        kernel_version = get_default_kernel_version(impl)
-        config = get_heuristic_config(impl, kernel_version, M, N, K)
-
-        if impl == "persistent":
-            # kernel = gemm_persistent(M, N, K, dtype=dtype, **config)
-            # kernel = gemm_persistent_v1(M, N, K, dtype=dtype, **config)
-            # kernel = gemm_persistent_v2(M, N, K, dtype=dtype, **config)
-            # kernel = gemm_persistent_v3(M, N, K, dtype=dtype, **config)
-            # kernel = gemm_persistent_v4(M, N, K, dtype=dtype, **config)
-            # kernel = gemm_persistent_v5(M, N, K, dtype=dtype, **config)
-            persistent_kernels = {
-                "v1": gemm_persistent_v1,
-                "v2": gemm_persistent_v2,
-                "v3": gemm_persistent_v3,
-                "v4": gemm_persistent_v4,
-                "v5": gemm_persistent_v5,
-            }
-            if kernel_version not in persistent_kernels:
-                raise ValueError(f"Unsupported persistent kernel version: {kernel_version}")
-            kernel = persistent_kernels[kernel_version](M, N, K, dtype=dtype, **config)
-        elif impl == "vanilla":
-            # kernel = gemm_vanilla(M, N, K, dtype=dtype, **config)
-            # kernel = gemm_vanilla_v1(M, N, K, dtype=dtype, **config)
-            # kernel = gemm_vanilla_v2(M, N, K, dtype=dtype, **config)
-            vanilla_kernels = {
-                "v1": gemm_vanilla_v1,
-                "v2": gemm_vanilla_v2,
-            }
-            if kernel_version not in vanilla_kernels:
-                raise ValueError(f"Unsupported vanilla kernel version: {kernel_version}")
-            kernel = vanilla_kernels[kernel_version](M, N, K, dtype=dtype, **config)
-        elif impl == "splitk":
-            kernel = gemm_splitk(M, N, K, dtype=dtype, **config)
-        elif impl == "streamk":
-            # streamk doesn't need additional config parameters
-            kernel = gemm_streamk(M, N, K, dtype=dtype, **config)
-        else:
-            raise ValueError(f"Unknown implementation: {impl}. Supported: vanilla, persistent, splitk, streamk")
+        kernel_spec = dispatch_kernel(impl, transpose_B=transpose_B)
+        config = get_kernel_config(kernel_spec, M, N, K)
+        kernel = kernel_spec.kernel(M, N, K, dtype=dtype, **kernel_spec.kernel_kwargs, **config)
 
     free_hcus = get_free_devices()
     if len(free_hcus) == 0:
@@ -124,6 +85,7 @@ def main(
         device_id = free_hcus[0]
     else:
         device_id = device
+    # device_id = 5
     torch.cuda.set_device(device_id)
     print(f"Using HCU device: {device_id}")
     print(f"GEMM shape: M={M}, N={N}, K={K}")
@@ -131,6 +93,7 @@ def main(
     print(f"GEMM implementation: {impl}")
     print(f"Autotune: {autotune}")
     print(f"With roller: {with_roller}")
+    print(f"B layout: {'K-major [N, K]' if transpose_B else 'N-major [K, N]'}")
 
     # benchmark
     profiler = kernel.get_profiler(tensor_supply_type=tl.TensorSupplyType.Auto)
@@ -139,8 +102,11 @@ def main(
     def tilelang_run():
         profiler.func(*inputs)
 
+    def layout_ref_program(A, B):
+        return A @ (B.T if transpose_B else B)
+
     def ref_run():
-        ref_program(*inputs)
+        layout_ref_program(*inputs)
 
     # tilelang_latency = profiler.do_bench()
     # ref_latency = profiler.do_bench(ref_program)
@@ -148,7 +114,7 @@ def main(
     tilelang_latency = do_bench_cudagraph(tilelang_run)
     ref_latency = do_bench_cudagraph(ref_run)
 
-    profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
+    profiler.assert_allclose(layout_ref_program, atol=1e-2, rtol=1e-2)
     print("\n=== Benchmark Results ===")
     print(f"TileLang latency: {tilelang_latency:.6f} ms")
     print(f"Ref latency: {ref_latency:.6f} ms")
@@ -175,10 +141,11 @@ if __name__ == "__main__":
         "-i",
         "--impl",
         type=str,
-        choices=["vanilla", "persistent", "splitk", "streamk"],
+        choices=["async_copy", "vanilla", "persistent", "splitk", "streamk"],
         default="persistent",
         help="GEMM implementation (default: persistent)",
     )
     parser.add_argument("--with_roller", action="store_true", default=False, help="Whether to enable BitBLAS roller for search space")
+    parser.add_argument("--n-major", action="store_true", help="Use N-major B layout [K, N] (default: K-major [N, K])")
     args = parser.parse_args()
-    main(args.m, args.n, args.k, args.dtype, args.autotune, args.impl, args.with_roller, args.device)
+    main(args.m, args.n, args.k, args.dtype, args.autotune, args.impl, args.with_roller, args.device, not args.n_major)

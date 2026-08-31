@@ -13,6 +13,29 @@
 namespace tl {
 namespace mls {
 
+TL_DEVICE float32x4 ds_read_m32x16_b16_builtin(TL_LDS_ADDR half_t *ptr,
+                                               int offset) {
+  return __builtin_hcu_ds_read_m32x16_f16(ptr, offset);
+}
+
+TL_DEVICE float32x4 ds_read_m32x16_b16_builtin(TL_LDS_ADDR bfloat16_t *ptr,
+                                               int offset) {
+  return __builtin_hcu_ds_read_m32x16_bf16(ptr, offset);
+}
+
+} // namespace mls
+
+// Generic CodeGen entry points for layout-aware LDS-to-VGPR reads.
+TL_DEVICE void ds_read_vector(float32x4 &dst, TL_LDS_ADDR half_t *ptr) {
+  dst = mls::ds_read_m32x16_b16_builtin(ptr, 0);
+}
+
+TL_DEVICE void ds_read_vector(float32x4 &dst, TL_LDS_ADDR bfloat16_t *ptr) {
+  dst = mls::ds_read_m32x16_b16_builtin(ptr, 0);
+}
+
+namespace mls {
+
 /*
  * ds_read_format_traits: traits for reading MLS LDS with warp-chunk layout.
  * Block is divided into WarpMN x WarpK chunks; each warp loads its chunk.
@@ -267,6 +290,51 @@ TL_DEVICE void ds_read_format_tensor_common(TL_LDS_ADDR void *smem_ptr,
                         HcuArch, TargetType, LdsBits, RegBits>(
       reinterpret_cast<TL_LDS_ADDR DataType *>(smem_ptr), target, warp_mn_idx,
       warp_k_idx, origin_mn, origin_k);
+}
+
+/* Linear LDS B[K,N] to GEMM-B VGPR layout using independent 32N x 16K panels.
+ */
+template <typename BlockSize, ::tl::index_t TotalWarp, ::tl::index_t WarpN,
+          typename DataType>
+TL_DEVICE void
+ds_read_format_tensor_b_linear(TL_LDS_ADDR DataType *smem_ptr, DataType *target,
+                               ::tl::index_t warp_id_offset = 0) {
+  static_assert(sizeof(DataType) == 2);
+  static constexpr ::tl::index_t BlockN = BlockSize::at(::tl::number<0>{});
+  static constexpr ::tl::index_t BlockK = BlockSize::at(::tl::number<1>{});
+  static_assert(BlockK % 16 == 0 && BlockN % 32 == 0);
+  static constexpr ::tl::index_t WarpM = TotalWarp / WarpN;
+  static constexpr ::tl::index_t WarpNNoRecompute =
+      std::min(WarpN, BlockN / 32);
+  static constexpr ::tl::index_t PerWarpN = BlockN / WarpNNoRecompute;
+  static_assert(PerWarpN % 32 == 0);
+  static constexpr ::tl::index_t NumNAccess = PerWarpN / 32;
+  static constexpr ::tl::index_t NumKAccess = BlockK / 16;
+  static constexpr ::tl::index_t FragmentLength = 4;
+  using FragmentType = ::tl::ext_vector_t<DataType, FragmentLength>;
+
+  const ::tl::index_t warp_id = ::tl::get_warp_id() - warp_id_offset;
+  ::tl::index_t warp_n_idx = warp_id / WarpM;
+  if constexpr (WarpNNoRecompute != WarpN)
+    warp_n_idx %= WarpNNoRecompute;
+  const ::tl::index_t lane = ::tl::get_lane_id();
+
+  ::tl::static_for<0, NumNAccess, 1>{}([&](auto n_panel) {
+    ::tl::static_for<0, NumKAccess, 1>{}([&](auto k_tile) {
+      const ::tl::index_t panel_id = warp_n_idx * (PerWarpN / 32) + n_panel;
+      const ::tl::index_t k_addr = k_tile * 16 + (lane >> 2);
+      const ::tl::index_t n_addr = panel_id * 32 + (lane & 3) * 8;
+      auto value = ::tl::bit_cast<float32x4>(
+          ds_read_m32x16_b16_builtin(smem_ptr + k_addr * BlockN + n_addr, 0));
+      *reinterpret_cast<FragmentType *>(
+          target + (k_tile * PerWarpN / 16 + n_panel * 2) * FragmentLength) =
+          reinterpret_cast<FragmentType *>(&value)[0];
+      *reinterpret_cast<FragmentType *>(
+          target +
+          (k_tile * PerWarpN / 16 + n_panel * 2 + 1) * FragmentLength) =
+          reinterpret_cast<FragmentType *>(&value)[1];
+    });
+  });
 }
 
 /*

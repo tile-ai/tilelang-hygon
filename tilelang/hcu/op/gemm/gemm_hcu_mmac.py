@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 from tilelang import _ffi_api
@@ -10,7 +11,7 @@ from tilelang.hcu.intrinsics.hcu_mmac_layout import (
     make_gemm_fragment_hcu,
 )
 from tilelang.hcu.intrinsics.hcu_mmac_macro_generator import HCUMatrixCoreIntrinEmitter
-from tilelang.layout.swizzle import make_hcu_swizzled_layout
+from tilelang.layout.swizzle import make_hcu_swizzled_layout, make_linear_layout
 from tilelang.transform.simplify import _Simplify
 from tilelang.utils.language import is_fragment, is_full_region, is_shared, is_shared_dynamic
 from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import hcu_mmac_k_dim_for_operand
@@ -22,6 +23,7 @@ from tvm.target import Target
 from tilelang.tileop.gemm.gemm_base import GemmBase
 
 GEMM_INST_HCU_MMAC = "hcu.mmac"
+logger = logging.getLogger(__name__)
 
 
 def _int_annotation(annotations, key: str, default: int = 0) -> int:
@@ -39,6 +41,16 @@ def _int_annotation(annotations, key: str, default: int = 0) -> int:
     if attr_val is not None:
         return int(attr_val)
     return default
+
+
+def _has_annotation(annotations, key: str) -> bool:
+    if not annotations:
+        return False
+    try:
+        annotations[key]
+    except (KeyError, TypeError):
+        return False
+    return True
 
 
 def _is_shared_like(buf) -> bool:
@@ -75,6 +87,12 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
     annotations = getattr(gemm_node, "annotations", None) or {}
     a_from_mls = _int_annotation(annotations, "tl.a_from_mls")
     b_from_mls = _int_annotation(annotations, "tl.b_from_mls")
+    a_respect_layout_map = _int_annotation(annotations, "tl.hcu_a_respect_layout_map")
+    b_respect_layout_map = _int_annotation(annotations, "tl.hcu_b_respect_layout_map")
+    a_from_async_copy_linear = _int_annotation(annotations, "tl.hcu_a_from_async_copy_linear")
+    a_at_bn_auto_lds_strategy = _has_annotation(annotations, "tl.hcu_gemm_at_bn_lds_strategy")
+    b_from_async_copy_linear = _int_annotation(annotations, "tl.hcu_b_from_async_copy_linear")
+    trans_c = _int_annotation(annotations, "trans_c")
     trans_a = bool(gemm_node.transA)
     trans_b = bool(gemm_node.transB)
     a_mls_trans = not trans_a
@@ -96,6 +114,12 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
     return SimpleNamespace(
         a_from_mls=a_from_mls,
         b_from_mls=b_from_mls,
+        a_respect_layout_map=a_respect_layout_map,
+        b_respect_layout_map=b_respect_layout_map,
+        a_from_async_copy_linear=a_from_async_copy_linear,
+        a_at_bn_auto_lds_strategy=a_at_bn_auto_lds_strategy,
+        b_from_async_copy_linear=b_from_async_copy_linear,
+        trans_c=trans_c,
         a_mls_trans=int(a_mls_trans),
         b_mls_trans=int(b_mls_trans),
         mmac_mode=mmac_mode,
@@ -114,6 +138,8 @@ def _compute_hcu_warp_partition(gemm, thread_nums: int, target: Target, meta) ->
     annotations = getattr(gemm.gemm_node, "annotations", None) or {}
     min_m = _int_annotation(annotations, "tl.scale_min_m_per_warp", 0)
     min_n = _int_annotation(annotations, "tl.scale_min_n_per_warp", 0)
+    if meta.b_from_async_copy_linear:
+        min_n = max(min_n, 32)
     floors = _ffi_api.GemmWarpPolicyComputeWarpPartitionHCU(
         gemm.policy,
         int(gemm.M),
@@ -125,9 +151,9 @@ def _compute_hcu_warp_partition(gemm, thread_nums: int, target: Target, meta) ->
         target,
         0,  # gemm_inst unused; HCU warp partition is target-gated in C++
         bool(meta.a_from_mls),
-        bool(meta.b_from_mls),
+        bool(meta.b_from_mls or meta.b_from_async_copy_linear),
         bool(meta.a_mls_trans),
-        bool(meta.b_mls_trans),
+        bool(meta.b_mls_trans) if meta.b_from_mls else False,
         int(min_m),
         int(min_n),
     )
@@ -178,6 +204,7 @@ def _make_hcu_emitter(
         min_n_per_warp=min_n_per_warp,
         use_tf32=gemm.use_tf32,
         fp4_mmac_mode=fp4_mmac_mode,
+        use_lts=bool(_int_annotation(getattr(gemm.gemm_node, "annotations", None), "trans_c")) and target_has_mmac_lit_lts(target),
     )
 
 
@@ -275,10 +302,21 @@ class GemmHCUMMAC(GemmBase):
             elem_bits_c,
             min_n_per_warp,
             lit=target_has_mmac_lit_lts(target),
+            lts=bool(meta.trans_c),
         )
         out = {self.C: frag_c}
         if _is_shared_like(self.A):
-            out[self.A] = make_hcu_swizzled_layout(self.A, int(self.k_pack))
+            if meta.a_at_bn_auto_lds_strategy:
+                pass
+            elif meta.a_respect_layout_map:
+                logger.warning(
+                    "HCU MMAC GEMM A uses custom annotate_layout; TileLang will not inject the default A shared swizzle. "
+                    "The annotated layout must match GEMM-A matrix-core load semantics."
+                )
+            elif meta.a_from_async_copy_linear:
+                out[self.A] = make_linear_layout(self.A)
+            else:
+                out[self.A] = make_hcu_swizzled_layout(self.A, int(self.k_pack))
         elif is_fragment(self.A):
             out[self.A] = make_gemm_fragment_a_hcu(
                 int(self.M),
@@ -295,7 +333,15 @@ class GemmHCUMMAC(GemmBase):
         else:
             raise ValueError(f"Unsupported A scope for HCU gemm: {self.A.scope()}")
         if _is_shared_like(self.B):
-            out[self.B] = make_hcu_swizzled_layout(self.B, int(self.k_pack))
+            if meta.b_respect_layout_map:
+                logger.warning(
+                    "HCU MMAC GEMM B uses custom annotate_layout; TileLang will not inject the default B shared swizzle. "
+                    "The annotated layout must match GEMM-B matrix-core load semantics."
+                )
+            elif meta.b_from_async_copy_linear:
+                out[self.B] = make_linear_layout(self.B)
+            else:
+                out[self.B] = make_hcu_swizzled_layout(self.B, int(self.k_pack))
         elif is_fragment(self.B):
             out[self.B] = make_gemm_fragment_b_hcu(
                 int(self.M),
@@ -681,6 +727,8 @@ class GemmHCUMMAC(GemmBase):
         meta = _resolve_hcu_mls_meta(self.gemm_node, self.A, self.B, thread_nums, target)
         a_from_mls = int(meta.a_from_mls)
         b_from_mls = int(meta.b_from_mls)
+        b_from_async_copy_linear = int(meta.b_from_async_copy_linear)
+        mmac_trans_c = bool(meta.trans_c)
         fp4_mmac_mode = meta.mmac_mode
         warp_m, warp_n, warp_k, _m_per_warp, min_n_per_warp = _compute_hcu_warp_partition(self, thread_nums, target, meta)
         emitter = _make_hcu_emitter(
@@ -721,11 +769,28 @@ class GemmHCUMMAC(GemmBase):
         assert is_full_region(C_region), "Fragment output C must be a full region"
 
         use_gemm_mls = (a_from_mls and not is_fragment(self.A)) or (b_from_mls and not is_fragment(self.B))
+        use_b_linear_ds_read = b_from_async_copy_linear and not is_fragment(self.B)
         if use_gemm_mls:
             if k_pack != 1:
                 raise ValueError("gemm_mls does not support kPack > 1")
             if warp_k != 1:
                 raise ValueError("gemm_mls does not support warp on K")
+            if self.use_tf32:
+                raise ValueError("HCU gemm: use_tf32=True is not supported for gemm_mls (MLS) path")
+        if use_b_linear_ds_read:
+            if b_from_mls:
+                raise ValueError("HCU gemm: B cannot be both MLS-fed and async-copy-linear")
+            if a_from_mls:
+                raise NotImplementedError("HCU gemm: A MLS + B async-copy-linear is not implemented")
+            if self.trans_B:
+                raise ValueError("HCU gemm: B async-copy-linear only supports non-transposed B")
+            if k_pack != 1 or warp_k != 1:
+                raise ValueError("HCU gemm: B async-copy-linear requires kPack == 1 and warp_k == 1")
+            if self.use_tf32 or fp4_mmac_mode != "native":
+                raise ValueError("HCU gemm: B async-copy-linear only supports native fp16/bf16 MMAC")
+            b_dtype_name = str(self.B.dtype).lower()
+            if "float16" not in b_dtype_name and "bfloat16" not in b_dtype_name:
+                raise ValueError("HCU gemm: B async-copy-linear only supports fp16/bf16")
 
         if use_gemm_mls and a_from_mls and b_from_mls:
 
@@ -738,7 +803,7 @@ class GemmHCUMMAC(GemmBase):
                 emitter.ldmatrix_mls_a(A_local, A_region)
                 emitter.ldmatrix_mls_b(B_local, B_region)
                 for ki in T.serial(0, inner_k):
-                    emitter.mmac(A_local, B_local, C_buf, ki)
+                    emitter.mmac(A_local, B_local, C_buf, ki, trans_c=mmac_trans_c)
 
             return _Simplify(_gemm_mls_mls, inline_let=True)
 
@@ -756,7 +821,7 @@ class GemmHCUMMAC(GemmBase):
                         T.clear(C_buf)
                     emitter.ldmatrix_mls_b(B_local, B_region)
                     for ki in T.serial(0, inner_k):
-                        emitter.mmac(A_buf, B_local, C_buf, ki)
+                        emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c)
 
                 return _Simplify(_gemm_r_mls, inline_let=True)
 
@@ -771,11 +836,43 @@ class GemmHCUMMAC(GemmBase):
                     emitter.ldmatrix_mls_b(B_local, B_region)
                     for ki in T.serial(0, inner_k):
                         emitter.ldmatrix_a(A_local, A_region, ki)
-                        emitter.mmac(A_local, B_local, C_buf, ki)
+                        emitter.mmac(A_local, B_local, C_buf, ki, trans_c=mmac_trans_c)
 
                 return _Simplify(_gemm_s_mls, inline_let=True)
 
             raise ValueError(f"Unsupported A scope for HCU gemm_mls: {self.A.scope()}")
+
+        elif use_b_linear_ds_read:
+            if is_fragment(self.A):
+                assert is_full_region(A_region), "Fragment input A must be a full region"
+
+                @T.prim_func
+                def _gemm_r_b_linear() -> None:
+                    B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_dtype)
+                    if clear_accum:
+                        T.clear(C_buf)
+                    emitter.ldmatrix_b_linear(B_local, B_region)
+                    for ki in T.serial(0, inner_k):
+                        emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c)
+
+                return _Simplify(_gemm_r_b_linear, inline_let=True)
+
+            if _is_shared_like(self.A):
+
+                @T.prim_func
+                def _gemm_s_b_linear() -> None:
+                    A_local = T.alloc_local(emitter.local_elems_a(), a_dtype)
+                    B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_dtype)
+                    if clear_accum:
+                        T.clear(C_buf)
+                    emitter.ldmatrix_b_linear(B_local, B_region)
+                    for ki in T.serial(0, inner_k):
+                        emitter.ldmatrix_a(A_local, A_region, ki)
+                        emitter.mmac(A_local, B_local, C_buf, ki, trans_c=mmac_trans_c)
+
+                return _Simplify(_gemm_s_b_linear, inline_let=True)
+
+            raise ValueError(f"Unsupported A scope for HCU B async-copy-linear gemm: {self.A.scope()}")
 
         elif _is_shared_like(self.A) and _is_shared_like(self.B):
 
@@ -788,7 +885,7 @@ class GemmHCUMMAC(GemmBase):
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_a(A_local, A_region, ki)
                     emitter.ldmatrix_b(B_local, B_region, ki)
-                    emitter.mmac(A_local, B_local, C_buf, ki)
+                    emitter.mmac(A_local, B_local, C_buf, ki, trans_c=mmac_trans_c)
 
             return _Simplify(_gemm_ss, inline_let=True)
 
@@ -802,7 +899,7 @@ class GemmHCUMMAC(GemmBase):
                     T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_a(A_local, A_region, ki)
-                    emitter.mmac(A_local, B_buf, C_buf, ki)
+                    emitter.mmac(A_local, B_buf, C_buf, ki, trans_c=mmac_trans_c)
 
             return _Simplify(_gemm_sr, inline_let=True)
 
@@ -816,7 +913,7 @@ class GemmHCUMMAC(GemmBase):
                     T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_b(B_local, B_region, ki)
-                    emitter.mmac(A_buf, B_local, C_buf, ki)
+                    emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c)
 
             return _Simplify(_gemm_rs, inline_let=True)
 
@@ -829,7 +926,7 @@ class GemmHCUMMAC(GemmBase):
                 if clear_accum:
                     T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
-                    emitter.mmac(A_buf, B_buf, C_buf, ki)
+                    emitter.mmac(A_buf, B_buf, C_buf, ki, trans_c=mmac_trans_c)
 
             return _Simplify(_gemm_rr, inline_let=True)
 

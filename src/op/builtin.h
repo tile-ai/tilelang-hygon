@@ -557,6 +557,12 @@ TVM_DLL const Op &ptx_cp_async_barrier_noinc();
  */
 TVM_DLL const Op &ptx_cp_async();
 
+/*! \brief HCU async global-to-LDS copy using structured idxen addressing. */
+TVM_DLL const Op &hcu_cp_async_idxen();
+
+/*! \brief HCU ds_read_m32x16_b16 shared-to-register load. */
+TVM_DLL const Op &ds_read_vector();
+
 /*!
  * \brief Wait for outstanding LDS/LGKM async operations on HIP/HCU.
  *

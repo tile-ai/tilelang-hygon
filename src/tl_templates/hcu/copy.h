@@ -88,6 +88,54 @@ TL_DEVICE void hcu_direct_load_global_to_lds(
 
 namespace detail {
 
+template <int NumUint32PerThread>
+TL_DEVICE void hcu_cp_async_gs_via_direct_lds_with_resource(
+    void *lds_base_ptr, void const *global_thread_ptr, int32x4_t src_resource,
+    std::int32_t src_thread_byte_offset, bool is_valid) {
+  static_assert(NumUint32PerThread == 1 || NumUint32PerThread == 2 ||
+                NumUint32PerThread == 4);
+  (void)global_thread_ptr;
+  uint32_t *const lds_ptr = static_cast<uint32_t *>(lds_base_ptr);
+  auto const lds_ptr_sgpr =
+      __builtin_amdgcn_readfirstlane(reinterpret_cast<uintptr_t>(lds_ptr));
+  const std::int32_t byte_offset =
+      is_valid ? src_thread_byte_offset : src_resource.z;
+
+#if defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
+#define TL_HCU_GLOBAL_TO_LDS_ASYNC_MULTIDWORD_RESOURCE 1
+#else
+#define TL_HCU_GLOBAL_TO_LDS_ASYNC_MULTIDWORD_RESOURCE 0
+#endif
+  if constexpr (NumUint32PerThread == 1) {
+    asm volatile(
+        "s_mov_b32 m0, %0; \n\t"
+        "buffer_load_dword %1, %2, 0 offen lds;\n\t" ::"s"(lds_ptr_sgpr),
+        "v"(byte_offset), "s"(src_resource)
+        : "memory");
+  } else if constexpr (TL_HCU_GLOBAL_TO_LDS_ASYNC_MULTIDWORD_RESOURCE) {
+    if constexpr (NumUint32PerThread == 2) {
+      asm volatile(
+          "s_mov_b32 m0, %0; \n\t"
+          "buffer_load_dwordx2 %1, %2, 0 offen lds;\n\t" ::"s"(lds_ptr_sgpr),
+          "v"(byte_offset), "s"(src_resource)
+          : "memory");
+    } else {
+      asm volatile(
+          "s_mov_b32 m0, %0; \n\t"
+          "buffer_load_dwordx4 %1, %2, 0 offen lds;\n\t" ::"s"(lds_ptr_sgpr),
+          "v"(byte_offset), "s"(src_resource)
+          : "memory");
+    }
+  } else if constexpr (NumUint32PerThread == 2) {
+    *(uint2 *)lds_base_ptr =
+        is_valid ? *(const uint2 *)global_thread_ptr : make_uint2(0, 0);
+  } else {
+    *(uint4 *)lds_base_ptr =
+        is_valid ? *(const uint4 *)global_thread_ptr : make_uint4(0, 0, 0, 0);
+  }
+#undef TL_HCU_GLOBAL_TO_LDS_ASYNC_MULTIDWORD_RESOURCE
+}
+
 // 与 codegen_hcu.cc 约定：全局/global 传入「本线程区域起点」，须折算为 wave
 // 统一基址 g_wave + 元素偏移 off（buffer_load + readfirstlane）。LDS 侧 impl
 // 会做 lds_ptr = base + lds_offset， 与 (lds_wave, off) 代数上等价于 (l,
@@ -161,6 +209,98 @@ template <int N = 0> TL_DEVICE void cp_async_wait() {
   // async_gld_sld_fence(N);
 }
 
+namespace detail {
+
+template <int N, int SmemOffset>
+TL_DEVICE void cp_async_gs_idxen_impl(uint32_t lds_base, int32x4_t src_resource,
+                                      std::int32_t src_thread_byte_offset,
+                                      std::int32_t idxen) {
+  static_assert(N == 4 || N == 8 || N == 16,
+                "idxen async copy only supports 4, 8, or 16 bytes");
+  typedef uint32_t uint32x2_t __attribute__((ext_vector_type(2)));
+  uint32x2_t v_addr = {static_cast<uint32_t>(idxen),
+                       static_cast<uint32_t>(src_thread_byte_offset)};
+  if constexpr (N == 4) {
+    asm volatile(
+        "s_add_u32 m0, %0, %3 \n\t"
+        "buffer_load_dword %1, %2, 0, idxen offen offset:0, lds\n\t" ::"s"(
+            lds_base),
+        "v"(v_addr), "s"(src_resource), "n"(SmemOffset)
+        : "memory");
+  } else if constexpr (N == 8) {
+    asm volatile(
+        "s_add_u32 m0, %0, %3 \n\t"
+        "buffer_load_dwordx2 %1, %2, 0, idxen offen offset:0, lds\n\t" ::"s"(
+            lds_base),
+        "v"(v_addr), "s"(src_resource), "n"(SmemOffset)
+        : "memory");
+  } else {
+    asm volatile(
+        "s_add_u32 m0, %0, %3 \n\t"
+        "buffer_load_dwordx4 %1, %2, 0, idxen offen offset:0, lds\n\t" ::"s"(
+            lds_base),
+        "v"(v_addr), "s"(src_resource), "n"(SmemOffset)
+        : "memory");
+  }
+}
+
+template <int N> TL_DEVICE void clear_cp_async_lds(void *lds_lane_ptr) {
+  if constexpr (N == 4) {
+    *reinterpret_cast<uint32_t *>(lds_lane_ptr) = 0;
+  } else if constexpr (N == 8) {
+    typedef uint32_t uint32x2_t __attribute__((ext_vector_type(2)));
+    *reinterpret_cast<uint32x2_t *>(lds_lane_ptr) = uint32x2_t{0, 0};
+  } else {
+    typedef uint32_t uint32x4_t __attribute__((ext_vector_type(4)));
+    *reinterpret_cast<uint32x4_t *>(lds_lane_ptr) = uint32x4_t{0, 0, 0, 0};
+  }
+}
+
+} // namespace detail
+
+template <int N, int SmemOffset = 0>
+TL_DEVICE void cp_async_gs_idxen(void *lds_base_ptr, int32x4_t src_resource,
+                                 std::int32_t src_thread_byte_offset,
+                                 std::int32_t idxen) {
+  const uint32_t lds_base = __builtin_amdgcn_readfirstlane(
+      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(lds_base_ptr)));
+  detail::cp_async_gs_idxen_impl<N, SmemOffset>(lds_base, src_resource,
+                                                src_thread_byte_offset, idxen);
+}
+
+template <int N, int SmemOffset = 0>
+TL_DEVICE void cp_async_gs_idxen(uint32_t lds_base, int32x4_t src_resource,
+                                 std::int32_t src_thread_byte_offset,
+                                 std::int32_t idxen) {
+  detail::cp_async_gs_idxen_impl<N, SmemOffset>(lds_base, src_resource,
+                                                src_thread_byte_offset, idxen);
+}
+
+template <int N, int SmemOffset = 0>
+TL_DEVICE void
+cp_async_gs_idxen_conditional(void *lds_base_ptr, int32x4_t src_resource,
+                              std::int32_t src_thread_byte_offset,
+                              std::int32_t idxen, bool condition) {
+  if (condition) {
+    cp_async_gs_idxen<N, SmemOffset>(lds_base_ptr, src_resource,
+                                     src_thread_byte_offset, idxen);
+  } else {
+    detail::clear_cp_async_lds<N>(lds_base_ptr);
+  }
+}
+
+template <int N, int SmemOffset = 0>
+TL_DEVICE void cp_async_gs_idxen_conditional(
+    void *lds_lane_ptr, uint32_t lds_base, int32x4_t src_resource,
+    std::int32_t src_thread_byte_offset, std::int32_t idxen, bool condition) {
+  if (condition) {
+    cp_async_gs_idxen<N, SmemOffset>(lds_base, src_resource,
+                                     src_thread_byte_offset, idxen);
+  } else {
+    detail::clear_cp_async_lds<N>(lds_lane_ptr);
+  }
+}
+
 template <int N>
 TL_DEVICE void cp_async_gs(void *lds_base_ptr, void const *global_base_ptr) {
   static_assert(N == 4 || N == 8 || N == 16,
@@ -170,12 +310,33 @@ TL_DEVICE void cp_async_gs(void *lds_base_ptr, void const *global_base_ptr) {
 }
 
 template <int N>
+TL_DEVICE void cp_async_gs(void *lds_base_ptr, void const *global_thread_ptr,
+                           int32x4_t src_resource,
+                           std::int32_t src_thread_byte_offset) {
+  static_assert(N == 4 || N == 8 || N == 16);
+  detail::hcu_cp_async_gs_via_direct_lds_with_resource<N / 4>(
+      lds_base_ptr, global_thread_ptr, src_resource, src_thread_byte_offset,
+      true);
+}
+
+template <int N>
 TL_DEVICE void cp_async_gs_conditional(void *lds_base_ptr,
                                        void const *global_base_ptr, bool cond) {
   static_assert(N == 4 || N == 8 || N == 16,
                 "tl::cp_async_gs_conditional: only N in {4,8,16}");
   detail::hcu_cp_async_gs_via_direct_lds<N / 4>(lds_base_ptr, global_base_ptr,
                                                 cond);
+}
+
+template <int N>
+TL_DEVICE void
+cp_async_gs_conditional(void *lds_base_ptr, void const *global_thread_ptr,
+                        int32x4_t src_resource,
+                        std::int32_t src_thread_byte_offset, bool condition) {
+  static_assert(N == 4 || N == 8 || N == 16);
+  detail::hcu_cp_async_gs_via_direct_lds_with_resource<N / 4>(
+      lds_base_ptr, global_thread_ptr, src_resource, src_thread_byte_offset,
+      condition);
 }
 
 template <typename T, tl::index_t N, bool oob_conditional_check = true>

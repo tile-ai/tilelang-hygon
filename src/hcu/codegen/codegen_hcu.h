@@ -96,6 +96,16 @@ private:
     int num_elements;
   };
 
+  struct HoistedCPAsyncLdsBase {
+    std::string name;
+    PrimExpr call;
+  };
+
+  struct HoistedCPAsyncLdsBaseUse {
+    std::string name;
+    int smem_offset;
+  };
+
   // Handle volatile loads
   void HandleVolatileLoads(const std::string &value, const BufferLoadNode *op,
                            std::ostream &os) final;
@@ -159,6 +169,7 @@ private:
   }
 
   bool TryToEmitLDSBufferOp(const BufferStoreNode *op);
+  void EmitHoistedCPAsyncResources(const PrimFunc &f);
 
   friend void PrintConst(const FloatImmNode *op, std::ostream &os,
                          CodeGenTileLangHCU *p);
@@ -171,6 +182,8 @@ private:
   bool enable_fp8_{false};
   // whether need gemm_mls.h (when gemm uses MLS or matrix_load exists)
   bool enable_gemm_mls_{false};
+  // whether need tilelang_ds_read_format.hpp for layout-aware ds_read_m32x16
+  bool enable_ds_read_vector_{false};
   // whether need scale_buffer.hpp (ds_scale_copy / mmac_scale_fp4)
   bool enable_scale_buffer_{false};
   // IndexMap-generated compile-time LDS layout descriptors, deduplicated by
@@ -195,6 +208,15 @@ private:
   /// resolution behavior.
   std::unordered_map<const VarNode *, PrimExpr>
       let_initializer_expr_for_predicate_;
+  std::unordered_map<const VarNode *, std::string> cp_async_resource_var_names_;
+  std::unordered_map<const VarNode *, std::string>
+      cp_async_idxen_resource_var_names_;
+  std::unordered_map<Var, std::vector<HoistedCPAsyncLdsBase>,
+                     ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      cp_async_idxen_lds_bases_to_emit_;
+  std::unordered_map<PrimExpr, HoistedCPAsyncLdsBaseUse, ffi::ObjectPtrHash,
+                     ffi::ObjectPtrEqual>
+      cp_async_idxen_lds_base_uses_;
   int mls_resource_object_counter_{0};
   bool wdra_init_emitted_{false};
   Target target_;

@@ -10,6 +10,7 @@
 
 #include "hcu/target_utils.h"
 #include "hcu/transform/async_copy_injector.h"
+#include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "transform/common/loop_fusion_utils.h"
@@ -48,6 +49,14 @@ bool GetIsAsyncCopy(const CopyNode &op) {
 
 bool GetNoImplicitAsyncCommitWait(const CopyNode &op) {
   return GetBoolAnnotation(op, attr::kAsyncCopyNoImplicitCommitWait);
+}
+
+Map<String, ObjectRef> GetHCUAsyncCopyAnnotations(const CopyNode &op) {
+  Map<String, ObjectRef> result;
+  if (auto value = op.annotations.Get(attr::kHcuGemmLdsCopyStrategy)) {
+    result.Set(attr::kHcuGemmLdsCopyStrategy, value.value());
+  }
+  return result;
 }
 
 } // namespace
@@ -134,10 +143,11 @@ private:
         lower_args.layout_map, par_op->GetPredicate(lower_args.thread_var),
         /*parallel_loop=*/true,
         /*should_vectorize=*/true, par_op->LoopLayoutRequiresPaddingGuard());
-
     auto inject_result =
         InjectHCUAsyncCopy(lowered_loop, /*async_without_async_commit_wait=*/
-                           no_implicit_commit_wait || GetIsAsyncCopy(op));
+                           no_implicit_commit_wait || GetIsAsyncCopy(op),
+                           GetHCUAsyncCopyAnnotations(op),
+                           lower_args.thread_var, lower_args.buffer_remap);
     Stmt async_copy_loop = inject_result.stmt;
     if (!inject_result.injected_hcu_async_copy) {
       DLOG(WARNING) << "HCU async-copy rewrite miss for copy src="
