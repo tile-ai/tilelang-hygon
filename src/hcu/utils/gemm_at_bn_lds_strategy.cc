@@ -116,9 +116,11 @@ int SelectWrapOffset(const AtBnStrategyParams &params,
        offset_dwords * params.wrap_idx_mask <= geometry.max_wrap_offset_dwords;
        offset_dwords += geometry.wrap_granularity_dwords) {
     const int wrap_step_bytes = offset_dwords * 4;
-    // Keep the physical wrap shift aligned to one LDS read pack, and enforce
-    // the target-specific wrap-field granularity and range.
+    // Keep the physical wrap shift aligned to both the LDS read pack and the
+    // async-copy transaction so each copy write remains one contiguous
+    // transaction after layout lowering.
     if (wrap_step_bytes % params.read_bytes_per_lane != 0 ||
+        wrap_step_bytes % params.copy_transaction_bytes != 0 ||
         !IsLegalHcuGemmLdsWrap(geometry, wrap_step_bytes, wrap_count)) {
       continue;
     }
