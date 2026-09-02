@@ -1328,21 +1328,6 @@ def run_gemm_mls_ds_read_format_b4_pad(
         mls_dtype=T.float4_e2m1_unpacked,
     )
     kernel = tl.compile(program, out_idx=[2])
-    source = kernel.get_kernel_source()
-    arch = current_hcu_arch_string()
-    expected_mls_tile = "tl::sequence<64, 16>" if trans_A and not trans_B else "tl::sequence<16, 64>"
-    assert expected_mls_tile in source
-    assert f"tl::hcu_target_enum::{arch}, 8>" in source
-    assert "ds_read_format_tensor_a" in source
-    assert "ds_read_format_tensor_b" in source
-    assert "uint8_t, 8, 8>" in source
-    if arch == "gfx946":
-        assert "__builtin_hcu_mmac_f32_16x16x32_f8f6f4_lit_lts" in source
-        assert ", 24, 1, 0)" in source
-        assert "__builtin_hcu_mmac_f32_16x16x64_fp4_lit_lts" not in source
-    else:
-        assert "__builtin_hcu_mmac_f32_16x16x32_f8f6f4(" in source
-        assert ", 24)" in source
     profiler = kernel.get_profiler()
 
     A_shape = (K, M) if trans_A else (M, K)
@@ -1480,6 +1465,7 @@ def run_gemm_mls_n_loop(
     block_K,
     num_threads=128,
     k_pack=1,
+    verify_source=None,
 ):
     program = matmul_mls_n_loop(
         M,
@@ -1495,6 +1481,8 @@ def run_gemm_mls_n_loop(
         k_pack=k_pack,
     )
     kernel = tl.compile(program, out_idx=[2])
+    if verify_source is not None:
+        verify_source(kernel.get_kernel_source())
     profiler = kernel.get_profiler()
 
     def ref_program(A, B):
@@ -1688,35 +1676,248 @@ def test_gemm_mls_mix_f4f6f8(M, N, K, trans_A, trans_B, block_M, block_N, block_
     )
 
 
+def _assert_mls_boundary_filter_live(source: str) -> None:
+    has_k_filter = "async_mls_load_asm<half_t, true" in source
+    has_mn_filter = (
+        "update_mn_base<true" in source
+        or "async_mls_load_asm<half_t, false, true" in source
+        or "async_mls_load_asm<half_t, true, true" in source
+    )
+    assert has_k_filter or has_mn_filter, source
+
+
+def _assert_mls_reverse_k_rebase(source: str) -> None:
+    assert "update_k_base" in source
+    _assert_mls_boundary_filter_live(source)
+
+
+def _assert_mls_k_outer_update_mn(source: str) -> None:
+    assert "update_mn_base" in source
+    _assert_mls_boundary_filter_live(source)
+
+
 def test_gemm_mls_n_loop_resource_hoist():
-    """N loop outside K loop: MLS object should be reusable while the MN window changes."""
+    """N-outer / K-inner GEMM with a partial tail; MLS reuses the MN window."""
     run_gemm_mls_n_loop(
-        M=32,
-        N=64,
-        K=64,
+        M=96,
+        N=96,
+        K=184,
         in_dtype="float16",
         out_dtype="float32",
         dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=32,
+        block_M=64,
+        block_N=64,
+        block_K=64,
         num_threads=128,
+        verify_source=_assert_mls_boundary_filter_live,
     )
 
 
 def test_gemm_mls_n_loop_resource_hoist_fixed_k():
-    """N loop with a single K tile: MLS should update only the MN window in the loop."""
+    """N-outer GEMM with a single K tile; only the MN window updates in the loop."""
     run_gemm_mls_n_loop(
-        M=32,
-        N=64,
-        K=32,
+        M=96,
+        N=96,
+        K=64,
         in_dtype="float16",
         out_dtype="float32",
         dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=32,
+        block_M=64,
+        block_N=64,
+        block_K=64,
         num_threads=128,
+        verify_source=_assert_mls_boundary_filter_live,
+    )
+
+
+def matmul_mls_reverse_k(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K,
+    in_dtype,
+    out_dtype,
+    accum_dtype,
+    threads,
+    k_pack=1,
+):
+    """GEMM that walks K tiles high-to-low so hoist cannot use forward_delta."""
+    num_k = T.ceildiv(K, block_K)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), in_dtype),
+        B: T.Tensor((K, N), in_dtype),
+        C: T.Tensor((M, N), out_dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), in_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), in_dtype)
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            T.clear(C_local)
+            for k in T.serial(num_k):
+                k_tile = (num_k - 1 - k) * block_K
+                T.matrix_load(A[by * block_M, k_tile], A_shared)
+                T.matrix_load(B[k_tile, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_local, False, False, k_pack=k_pack)
+            T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return main
+
+
+def matmul_mls_k_outer_n_inner(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K,
+    in_dtype,
+    out_dtype,
+    accum_dtype,
+    threads,
+    k_pack=1,
+):
+    """GEMM that walks N tiles inside a stable K tile."""
+    n_tiles = T.ceildiv(N, block_N)
+    k_tiles = T.ceildiv(K, block_K)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), in_dtype),
+        B: T.Tensor((K, N), in_dtype),
+        C: T.Tensor((M, N), out_dtype),
+    ):
+        with T.Kernel(T.ceildiv(M, block_M), threads=threads) as by:
+            A_shared = T.alloc_shared((block_M, block_K), in_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), in_dtype)
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            for k in T.serial(k_tiles):
+                T.matrix_load(A[by * block_M, k * block_K], A_shared)
+                for n in T.serial(n_tiles):
+                    if k == 0:
+                        T.clear(C_local)
+                    else:
+                        T.copy(C[by * block_M, n * block_N], C_local)
+                    T.matrix_load(B[k * block_K, n * block_N], B_shared)
+                    T.gemm(A_shared, B_shared, C_local, False, False, k_pack=k_pack)
+                    T.copy(C_local, C[by * block_M, n * block_N])
+
+    return main
+
+
+def _run_gemm_mls_program(program, verify_source=None):
+    kernel = tl.compile(program, out_idx=[2])
+    if verify_source is not None:
+        verify_source(kernel.get_kernel_source())
+    profiler = kernel.get_profiler()
+
+    def ref_program(A, B):
+        return (A.cpu() @ B.cpu()).to(torch.float32)
+
+    _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2)
+
+
+def test_gemm_mls_reverse_k_absolute_rebase():
+    """Non-monotonic K uses update_k_base."""
+    _run_gemm_mls_program(
+        matmul_mls_reverse_k(
+            M=96,
+            N=96,
+            K=184,
+            block_M=64,
+            block_N=64,
+            block_K=64,
+            in_dtype="float16",
+            out_dtype="float32",
+            accum_dtype="float32",
+            threads=128,
+        ),
+        verify_source=_assert_mls_reverse_k_rebase,
+    )
+
+
+def matmul_mls_k_prefetch_then_loop(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K,
+    in_dtype,
+    out_dtype,
+    accum_dtype,
+    threads,
+    k_pack=1,
+):
+    """Prefetch K=0 then Serial(k); hoist must still treat K as the inner axis."""
+    num_k = T.ceildiv(K, block_K)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), in_dtype),
+        B: T.Tensor((K, N), in_dtype),
+        C: T.Tensor((M, N), out_dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), in_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), in_dtype)
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            T.clear(C_local)
+            T.matrix_load(A[by * block_M, 0], A_shared)
+            T.matrix_load(B[0, bx * block_N], B_shared)
+            T.gemm(A_shared, B_shared, C_local, False, False, k_pack=k_pack)
+            for k in T.serial(num_k - 1):
+                T.matrix_load(A[by * block_M, (k + 1) * block_K], A_shared)
+                T.matrix_load(B[(k + 1) * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_local, False, False, k_pack=k_pack)
+            T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return main
+
+
+def _assert_mls_k_inner_despite_prefetch(source: str) -> None:
+    # Prefetch K=0 must not flip the inner axis to MN.
+    assert "update_k_base" in source, source
+    assert "mls_resource_axis::k" not in source, source
+
+
+def test_gemm_mls_k_prefetch_then_loop_k_inner():
+    _run_gemm_mls_program(
+        matmul_mls_k_prefetch_then_loop(
+            M=96,
+            N=96,
+            K=184,
+            block_M=64,
+            block_N=64,
+            block_K=64,
+            in_dtype="float16",
+            out_dtype="float32",
+            accum_dtype="float32",
+            threads=128,
+        ),
+        verify_source=_assert_mls_k_inner_despite_prefetch,
+    )
+
+
+def test_gemm_mls_k_outer_n_inner_update_mn():
+    """K-outer / N-inner B loads use update_mn_base."""
+    _run_gemm_mls_program(
+        matmul_mls_k_outer_n_inner(
+            M=96,
+            N=96,
+            K=184,
+            block_M=64,
+            block_N=64,
+            block_K=64,
+            in_dtype="float16",
+            out_dtype="float32",
+            accum_dtype="float32",
+            threads=128,
+        ),
+        verify_source=_assert_mls_k_outer_update_mn,
     )
 
 

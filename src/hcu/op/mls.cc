@@ -5,6 +5,7 @@
 
 #include "mls.h"
 #include "hcu/target_utils.h"
+#include "hcu/utils/mls_boundary.h"
 #include "hcu/utils/mls_gemm_dep.h"
 #include "op/builtin.h"
 #include "op/operator.h"
@@ -206,9 +207,8 @@ Optional<PrimExpr> TryGetMlsPackedLeadingElemOffset(
 
 MatrixLoad::MatrixLoad(Array<PrimExpr> args,
                        Map<String, ObjectRef> annotations) {
-  ICHECK(args.size() >= 4)
-      << "matrix_load expects at least 4 args: src_region, dst_region, "
-         "check_last_k_load, last_k_load";
+  ICHECK_EQ(args.size(), 4)
+      << "matrix_load expects src_region, dst_region, mn_boundary, k_boundary";
   auto src_call = args[0].as<CallNode>();
   auto dst_call = args[1].as<CallNode>();
   ICHECK(src_call) << "matrix_load args[0] must be region call (src)";
@@ -237,8 +237,10 @@ MatrixLoad::MatrixLoad(Array<PrimExpr> args,
   AccessRegion dst_access{BufferRegion(node->dst, node->dst_ranges),
                           kAccessWrite};
   node->SetAccessRegions({src_access, dst_access});
-  node->check_last_load = args[2].as<IntImmNode>()->value != 0;
-  node->last_load = args[3].as<IntImmNode>()->value != 0;
+  node->mn_boundary =
+      static_cast<int>(MlsModeFromInt(args[2].as<IntImmNode>()->value));
+  node->k_boundary =
+      static_cast<int>(MlsModeFromInt(args[3].as<IntImmNode>()->value));
   if (auto mls_trans = GetMlsTransFromAnnotations(annotations)) {
     node->mls_trans_ = mls_trans.value();
   }
@@ -375,10 +377,11 @@ int MlsScopedWarpIdOffset(const Range &thread_bounds, Target target) {
 }
 
 /*
- * MLS tile size rules (MN interleave=1):
+ * MLS tile size rules:
  * num_warps = block_size / TargetHcuGetWarpSize(target); warp_mn * warp_k =
- * num_warps. One warp group extent in K = warp_k * mlsTilesizeK. If > block_k,
- * warps repeat load.
+ * num_warps. Pack warps along the storage-major axis first (K if trans, MN
+ * otherwise). Leftover warps go to the non-major axis; if that axis is already
+ * full, extra warps repeat the same non-major tiles.
  */
 void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
                              int block_size, Target target, int elem_bits,
@@ -410,21 +413,29 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
     }
     if (block_k % tile_k != 0 || block_mn % tile_mn != 0)
       return false;
-    int wm = std::min(block_mn / tile_mn, num_warps);
-    if (num_warps % wm != 0)
-      return false;
-    int wk = num_warps / wm;
-    if (config.require_no_repeat) {
-      if (wm * tile_mn > block_mn || block_mn % (wm * tile_mn) != 0)
-        return false;
-      if (wk * tile_k > block_k || block_k % (wk * tile_k) != 0)
-        return false;
+    const int slots_mn = block_mn / tile_mn;
+    const int slots_k = block_k / tile_k;
+    const int slots_major = trans ? slots_k : slots_mn;
+    const int max_major = std::min(slots_major, num_warps);
+    for (int w_major = max_major; w_major >= 1; --w_major) {
+      if (num_warps % w_major != 0)
+        continue;
+      const int w_minor = num_warps / w_major;
+      const int wm = trans ? w_minor : w_major;
+      const int wk = trans ? w_major : w_minor;
+      if (config.require_no_repeat) {
+        if (wm * tile_mn > block_mn || block_mn % (wm * tile_mn) != 0)
+          continue;
+        if (wk * tile_k > block_k || block_k % (wk * tile_k) != 0)
+          continue;
+      }
+      warp_mn = wm;
+      warp_k = wk;
+      mls_tile_mn = tile_mn;
+      mls_tile_k = tile_k;
+      return true;
     }
-    warp_mn = wm;
-    warp_k = wk;
-    mls_tile_mn = tile_mn;
-    mls_tile_k = tile_k;
-    return true;
+    return false;
   };
 
   auto try_configs = [&](const MlsTileConfig *configs, int config_count) {
@@ -585,8 +596,7 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
      << ", " << warp_k << ", " << dtype_str << ", 1, "
      << (mls_trans ? "true" : "false")
      << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
-     << lds_physical_bits << ", " << (check_last_load ? "true" : "false")
-     << ", " << (last_load ? "true" : "false") << ">";
+     << lds_physical_bits << ", " << k_boundary << ", " << mn_boundary << ">";
 
   Buffer src_buf = T.buffer_remap.count(src) ? T.buffer_remap[src] : src;
   Buffer dst_buf = T.buffer_remap.count(dst) ? T.buffer_remap[dst] : dst;

@@ -38,13 +38,15 @@ template <typename T> struct mls_storage_traits {
       "MLS storage type must hold a whole number of logical elements");
   static constexpr ::tl::index_t LogicalPerStorage = StorageBits / LogicalBits;
 
-  TL_HOST_DEVICE static constexpr ::tl::index_t
-  logical_offset_to_storage_offset(::tl::index_t logical_offset) {
+  template <typename Index>
+  TL_HOST_DEVICE static constexpr Index
+  logical_offset_to_storage_offset(Index logical_offset) {
     return logical_offset / LogicalPerStorage;
   }
 
-  TL_HOST_DEVICE static constexpr ::tl::index_t
-  logical_offset_to_byte_offset(::tl::index_t logical_offset) {
+  template <typename Index>
+  TL_HOST_DEVICE static constexpr Index
+  logical_offset_to_byte_offset(Index logical_offset) {
     return logical_offset_to_storage_offset(logical_offset) * sizeof(Type);
   }
 };

@@ -21,18 +21,36 @@ import tvm
 from tvm import ir, tirx
 
 
+def _encode_mls_boundary_dim(value: bool | None) -> int:
+    """Map one (MN or K) hint to a TIR int8 policy.
+
+    None  -> -1, compiler may prove in-range or refresh at runtime.
+    False ->  0, caller contract: in-range, skip filter.
+    True  ->  1, caller contract: always apply filter.
+    """
+    if value is None:
+        return -1
+    return 1 if value else 0
+
+
 def matrix_load(
     src: tirx.Buffer | tirx.BufferLoad | tirx.BufferRegion,
     dst: tirx.Buffer | tirx.BufferLoad | tirx.BufferRegion,
-    last_k_load: bool | None = None,
+    boundary: tuple[bool | None, bool | None] | None = None,
 ):
-    """MLS (Matrix Load Store) load from global memory to shared memory."""
-    if last_k_load is None:
-        check_last_k_load = True
-        last_k_load_val = False
+    """MLS load from global to shared.
+
+    ``boundary`` is ``(mn, k)`` over the last two logical tile axes.
+    Each entry is None (analyze), False (in-range), or True (partial).
+    """
+    if boundary is None:
+        mn_hint, k_hint = None, None
     else:
-        check_last_k_load = False
-        last_k_load_val = last_k_load
+        if len(boundary) != 2:
+            raise ValueError("matrix_load boundary must be (mn, k) over the last two tile axes")
+        mn_hint, k_hint = boundary
+    mn_mode = _encode_mls_boundary_dim(mn_hint)
+    k_mode = _encode_mls_boundary_dim(k_hint)
 
     def _get_extent(data):
         if isinstance(data, tirx.Var) and T.has_let_value(data):
@@ -98,8 +116,8 @@ def matrix_load(
         tirx.op.Op.get("tl.tileop.matrix_load"),
         src_region,
         dst_region,
-        tirx.IntImm("int32", 1 if check_last_k_load else 0),
-        tirx.IntImm("int32", 1 if last_k_load_val else 0),
+        tirx.IntImm("int32", mn_mode),
+        tirx.IntImm("int32", k_mode),
     )
 
 
