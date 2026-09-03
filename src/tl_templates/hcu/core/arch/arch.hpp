@@ -253,6 +253,15 @@ TL_DEVICE void restore_prio()
     __builtin_amdgcn_sched_barrier(0);
 }
 
+template <int Prio>
+TL_DEVICE void set_prio()
+{
+    static_assert(Prio >= 0 && Prio <= 3, "wave priority must be in [0, 3]");
+    __builtin_amdgcn_sched_barrier(0);
+    __builtin_amdgcn_s_setprio(Prio);
+    __builtin_amdgcn_sched_barrier(0);
+}
+
 TL_DEVICE void lds_wait()
 {
     __builtin_amdgcn_sched_barrier(0);

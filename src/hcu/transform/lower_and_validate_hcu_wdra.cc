@@ -25,7 +25,9 @@ using namespace ffi;
 namespace {
 
 constexpr int kWaveSize = 64;
-constexpr int kVgprGranularity = 8;
+// Temporary gfx946 WDRA constraint: branch allocations are encoded in groups
+// of four VGPRs.
+constexpr int kVgprGranularity = 4;
 constexpr int kWavesPerWdraBranch = 4;
 constexpr int kMaxWdraBranches = 4;
 
@@ -39,23 +41,6 @@ bool PassConfigEnabled(const tvm::transform::PassContext &ctx,
     return cfg.value()->value;
   }
   return false;
-}
-
-bool ExprUsesVar(const PrimExpr &expr, const VarNode *var) {
-  struct Visitor : public ExprVisitor {
-    const VarNode *target{nullptr};
-    bool found{false};
-
-    void VisitExpr_(const VarNode *op) final {
-      if (op == target) {
-        found = true;
-      }
-      ExprVisitor::VisitExpr_(op);
-    }
-  } visitor;
-  visitor.target = var;
-  visitor(expr);
-  return visitor.found;
 }
 
 bool IsThreadBindingLet(const BindNode *let, const Var &thread_x) {
@@ -157,8 +142,21 @@ void CollectBranchNregsFromLadder(const IfThenElse &node, int start_wave,
 
   if (node->else_case.defined()) {
     if (const auto *nested_if = node->else_case.value().as<IfThenElseNode>()) {
-      CollectBranchNregsFromLadder(ffi::GetRef<IfThenElse>(nested_if),
-                                   upper.value(), waves_per_tg, branch_nregs);
+      if (ParseWaveUpperBound(nested_if->condition).has_value()) {
+        CollectBranchNregsFromLadder(ffi::GetRef<IfThenElse>(nested_if),
+                                     upper.value(), waves_per_tg, branch_nregs);
+      } else {
+        ICHECK_EQ(waves_per_tg - upper.value(), kWavesPerWdraBranch)
+            << "HCU WDRA final branch must cover exactly "
+            << kWavesPerWdraBranch << " waves, got [" << upper.value() << ", "
+            << waves_per_tg << ")";
+        Optional<int> else_nreg =
+            ExtractFirstSetMaxNreg(node->else_case.value());
+        ICHECK(else_nreg.has_value())
+            << "HCU WDRA else branch must begin with tl.set_max_nreg; an "
+               "ordinary else-if cannot replace the role-level setup";
+        branch_nregs->push_back(else_nreg.value());
+      }
     } else {
       ICHECK_EQ(waves_per_tg - upper.value(), kWavesPerWdraBranch)
           << "HCU WDRA final branch must cover exactly " << kWavesPerWdraBranch
@@ -174,6 +172,14 @@ void CollectBranchNregsFromLadder(const IfThenElse &node, int start_wave,
 Evaluate MakeWdraInit(const std::vector<int> &branch_nregs) {
   ICHECK_LE(branch_nregs.size(), kMaxWdraBranches)
       << "HCU WDRA supports at most " << kMaxWdraBranches << " branches";
+  int total_nregs = 0;
+  for (int nreg : branch_nregs) {
+    total_nregs += nreg;
+  }
+  ICHECK_EQ(total_nregs % static_cast<int>(branch_nregs.size()), 0)
+      << "HCU WDRA requires the sum of branch VGPR allocations to be "
+         "divisible by the branch count, got sum="
+      << total_nregs << " and branches=" << branch_nregs.size();
   Array<PrimExpr> args;
   args.reserve(kMaxWdraBranches);
   for (int i = 0; i < kMaxWdraBranches; ++i) {
@@ -247,8 +253,12 @@ IfThenElse RewriteIfLadder(const IfThenElse &node, Optional<Var> tx_var,
   Optional<Stmt> else_case = node->else_case;
   if (else_case.defined()) {
     if (const auto *nested_if = else_case.value().as<IfThenElseNode>()) {
-      else_case = RewriteIfLadder(ffi::GetRef<IfThenElse>(nested_if), tx_var,
-                                  wave_size);
+      TxConditionRewriter nested_rewriter(tx_var, wave_size);
+      PrimExpr nested_condition = nested_rewriter.Rewrite(nested_if->condition);
+      if (ParseWaveUpperBound(nested_condition).has_value()) {
+        else_case = RewriteIfLadder(ffi::GetRef<IfThenElse>(nested_if), tx_var,
+                                    wave_size);
+      }
     }
   }
   return IfThenElse(condition, then_case, else_case);
@@ -257,57 +267,48 @@ IfThenElse RewriteIfLadder(const IfThenElse &node, Optional<Var> tx_var,
 Stmt PrependBranchSetup(Stmt body, Optional<Var> tx_var, const Var &thread_x) {
   Optional<Evaluate> max_nreg_eval;
 
-  if (ContainsSetMaxNreg(body)) {
-    struct Hoister : public StmtExprMutator {
-      Optional<Evaluate> first;
-      bool changed{false};
-
-      Stmt VisitStmt_(const SeqStmtNode *op) final {
-        Array<Stmt> seq;
-        for (const Stmt &stmt : op->seq) {
-          if (!first.defined()) {
-            if (const auto *eval = stmt.as<EvaluateNode>()) {
-              if (const auto *call = eval->value.as<CallNode>()) {
-                if (call->op.same_as(set_max_nreg())) {
-                  int nreg = call->args[0].as<IntImmNode>()->value;
-                  int is_inc = call->args[1].as<IntImmNode>()->value;
-                  first = Evaluate(Call(DataType::Handle(), set_max_nreg(),
-                                        {IntImm(DataType::Int(32), nreg),
-                                         IntImm(DataType::Int(32), is_inc)}));
-                  changed = true;
-                  continue;
-                }
-              }
-            }
-          }
-          seq.push_back(VisitStmt(stmt));
+  // set_max_nreg is role setup, so only hoist it from the role's top-level
+  // statement list.  Recursively finding one under ordinary control flow
+  // would incorrectly turn a conditional register allocation into an
+  // unconditional one.
+  auto parse_set_max = [](const Stmt &stmt) -> Optional<Evaluate> {
+    if (const auto *eval = stmt.as<EvaluateNode>()) {
+      if (const auto *call = eval->value.as<CallNode>()) {
+        if (call->op.same_as(set_max_nreg())) {
+          return ffi::GetRef<Evaluate>(eval);
         }
-        if (!changed) {
-          return ffi::GetRef<Stmt>(op);
-        }
-        return seq.size() == 1 ? seq[0] : SeqStmt(seq);
       }
-
-      Stmt VisitStmt_(const EvaluateNode *op) final {
-        if (!first.defined()) {
-          if (const auto *call = op->value.as<CallNode>()) {
-            if (call->op.same_as(set_max_nreg())) {
-              int nreg = call->args[0].as<IntImmNode>()->value;
-              int is_inc = call->args[1].as<IntImmNode>()->value;
-              first = Evaluate(Call(DataType::Handle(), set_max_nreg(),
-                                    {IntImm(DataType::Int(32), nreg),
-                                     IntImm(DataType::Int(32), is_inc)}));
-              return Evaluate(0);
-            }
-          }
+    }
+    return Optional<Evaluate>();
+  };
+  if (Optional<Evaluate> direct = parse_set_max(body)) {
+    max_nreg_eval = direct;
+    body = Evaluate(0);
+  } else if (const auto *seq = body.as<SeqStmtNode>()) {
+    Array<Stmt> remaining;
+    bool removed = false;
+    for (const Stmt &stmt : seq->seq) {
+      if (!removed) {
+        if (Optional<Evaluate> direct = parse_set_max(stmt)) {
+          max_nreg_eval = direct;
+          removed = true;
+          continue;
         }
-        return StmtExprMutator::VisitStmt_(op);
       }
-    } hoister;
-
-    body = hoister(body);
-    max_nreg_eval = hoister.first;
+      remaining.push_back(stmt);
+    }
+    if (removed) {
+      body = remaining.empty()
+                 ? Stmt(Evaluate(0))
+                 : (remaining.size() == 1 ? remaining[0]
+                                          : Stmt(SeqStmt(remaining)));
+    }
   }
+
+  ICHECK(!(max_nreg_eval.defined() && ContainsSetMaxNreg(body)))
+      << "HCU WDRA role must contain exactly one tl.set_max_nreg at role "
+         "scope; additional or nested register-allocation markers are "
+         "ambiguous";
 
   if (max_nreg_eval.defined() && tx_var.defined() &&
       !tx_var.value().same_as(thread_x)) {
@@ -329,8 +330,12 @@ IfThenElse RewriteBranchBodies(const IfThenElse &node, Optional<Var> tx_var,
   Optional<Stmt> else_case = node->else_case;
   if (else_case.defined()) {
     if (const auto *nested_if = else_case.value().as<IfThenElseNode>()) {
-      else_case = RewriteBranchBodies(ffi::GetRef<IfThenElse>(nested_if),
-                                      tx_var, thread_x);
+      if (ParseWaveUpperBound(nested_if->condition).has_value()) {
+        else_case = RewriteBranchBodies(ffi::GetRef<IfThenElse>(nested_if),
+                                        tx_var, thread_x);
+      } else {
+        else_case = PrependBranchSetup(else_case.value(), tx_var, thread_x);
+      }
     } else {
       else_case = PrependBranchSetup(else_case.value(), tx_var, thread_x);
     }
@@ -346,10 +351,17 @@ struct ForkSite {
 
 bool IsTxForkCondition(const PrimExpr &condition, const Var &thread_x,
                        Optional<Var> *tx_var) {
-  if (tx_var->defined() && ExprUsesVar(condition, tx_var->value().get())) {
+  // TxConditionRewriter only supports an immediate upper-bound comparison.
+  // Match that exact grammar here instead of accepting arbitrary expressions
+  // which merely happen to mention tx/threadIdx.x.
+  const auto *lt = condition.as<LTNode>();
+  if (lt == nullptr || lt->b.as<IntImmNode>() == nullptr) {
+    return false;
+  }
+  if (tx_var->defined() && lt->a.same_as(tx_var->value())) {
     return true;
   }
-  if (ExprUsesVar(condition, thread_x.get())) {
+  if (lt->a.same_as(thread_x)) {
     if (!tx_var->defined()) {
       *tx_var = thread_x;
     }
@@ -541,8 +553,21 @@ private:
         << "HCU WDRA branch must begin with tl.set_max_nreg";
 
     if (op->else_case.defined()) {
-      if (op->else_case.value().as<IfThenElseNode>()) {
-        VisitStmt(op->else_case.value());
+      if (const auto *nested_if = op->else_case.value().as<IfThenElseNode>()) {
+        // Continue the wave ladder only for `get_wave_id() < N`.  An ordinary
+        // else-if is the final role body, not another WDRA fork.
+        if (ParseWaveUpperBound(nested_if->condition).has_value()) {
+          VisitStmt(op->else_case.value());
+        } else {
+          branch_seen_set_max_nreg_ = false;
+          in_branch_ = true;
+          branch_depth_++;
+          VisitStmt(op->else_case.value());
+          branch_depth_--;
+          in_branch_ = false;
+          ICHECK(branch_seen_set_max_nreg_)
+              << "HCU WDRA else branch must begin with tl.set_max_nreg";
+        }
       } else {
         branch_seen_set_max_nreg_ = false;
         in_branch_ = true;

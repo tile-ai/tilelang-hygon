@@ -775,8 +775,6 @@ class GemmHCUMMAC(GemmBase):
                 raise ValueError("gemm_mls does not support kPack > 1")
             if warp_k != 1:
                 raise ValueError("gemm_mls does not support warp on K")
-            if self.use_tf32:
-                raise ValueError("HCU gemm: use_tf32=True is not supported for gemm_mls (MLS) path")
         if use_b_linear_ds_read:
             if b_from_mls:
                 raise ValueError("HCU gemm: B cannot be both MLS-fed and async-copy-linear")

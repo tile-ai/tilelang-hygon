@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "hcu/target_utils.h"
+#include "hcu/utils/mls_boundary.h"
 #include "op/builtin.h"
 
 namespace tvm {
@@ -1186,8 +1187,7 @@ std::string MlsBaseTemplateFromLoadTile(const std::string &sym) {
       << "mls_load_tile expects at least 8 template args";
   std::ostringstream os;
   os << "tl::mls::tilelang_mls_base<";
-  const bool has_dst_bits_arg =
-      args.size() > 8 && args[8] != "true" && args[8] != "false";
+  const bool has_dst_bits_arg = ::tvm::tl::MlsLoadTileHasDstBits(args);
   const size_t base_arg_count = has_dst_bits_arg ? 9 : 8;
   for (size_t i = 0; i < base_arg_count; ++i) {
     if (i != 0)
@@ -1207,36 +1207,22 @@ std::string MlsDataTypeFromLoadTile(const std::string &sym) {
   return args[4];
 }
 
-std::pair<std::string, std::string>
-MlsLastLoadTemplateArgs(const std::string &sym) {
+::tvm::tl::MlsBoundaryModes MlsBoundaryFromLoadTile(const std::string &sym) {
   const std::string prefix = "tl::mls::mls_load_tile<";
   auto args = SplitTopLevelTemplateArgs(
       sym.substr(prefix.size(), sym.size() - prefix.size() - 1));
-  const bool has_dst_bits_arg =
-      args.size() > 8 && args[8] != "true" && args[8] != "false";
-  const size_t check_idx = has_dst_bits_arg ? 9 : 8;
-  const size_t last_idx = has_dst_bits_arg ? 10 : 9;
-  std::string check_last_load =
-      args.size() > check_idx ? args[check_idx] : "true";
-  std::string last_load = args.size() > last_idx ? args[last_idx] : "false";
-  return {check_last_load, last_load};
+  return ::tvm::tl::MlsParseBoundaryArgs(args);
 }
 
 std::string MlsAsyncLoadTemplateArgs(const std::string &template_args) {
   auto args = SplitTopLevelTemplateArgs(template_args);
   ICHECK_GE(args.size(), 1U)
       << "MLS async_load expects at least DataType template arg";
-  const bool has_dst_bits_arg =
-      args.size() > 1 && args[1] != "true" && args[1] != "false";
-  const size_t check_idx = has_dst_bits_arg ? 2 : 1;
-  const size_t last_idx = has_dst_bits_arg ? 3 : 2;
-  const std::string check_last_load =
-      args.size() > check_idx ? args[check_idx] : "true";
-  const std::string last_load =
-      args.size() > last_idx ? args[last_idx] : "false";
-
+  // Hoist emits async_load<dtype, refresh_k, refresh_mn>.
+  const std::string refresh_k = args.size() > 1 ? args[1] : "true";
+  const std::string refresh_mn = args.size() > 2 ? args[2] : "true";
   std::ostringstream os;
-  os << args[0] << ", " << check_last_load << ", " << last_load;
+  os << args[0] << ", " << refresh_k << ", " << refresh_mn;
   return os.str();
 }
 
@@ -1307,7 +1293,10 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
       }
       const std::string resource_init_prefix = "tl::mls::resource_init<";
       const std::string async_load_prefix = "tl::mls::async_load<";
-      const std::string async_load_mn_prefix = "tl::mls::async_load_mn<";
+      const std::string update_k_base_prefix = "tl::mls::update_k_base<";
+      const std::string update_mn_base_prefix = "tl::mls::update_mn_base<";
+      const std::string move_k_base_prefix = "tl::mls::move_k_base<";
+      const std::string move_mn_base_prefix = "tl::mls::move_mn_base<";
 
       if (sym.find(resource_init_prefix) == 0) {
         ICHECK(call->args.size() == 6U || call->args.size() == 7U)
@@ -1346,33 +1335,71 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         return;
       }
 
-      if (sym == "tl::mls::update_base") {
+      if (sym.find(update_k_base_prefix) == 0) {
         ICHECK_EQ(call->args.size(), 3U)
-            << "MLS update_base expects symbol, name, k_base";
+            << "MLS update_k_base expects symbol, name, k_base";
         enable_gemm_mls_ = true;
         const auto *name = call->args[1].as<StringImmNode>();
-        ICHECK(name) << "MLS update_base expects a string resource name";
+        ICHECK(name) << "MLS update_k_base expects a string resource name";
         PrintIndent();
-        stream << name->value << ".update_base(" << PrintExpr(call->args[2])
+        const std::string refresh_k =
+            sym.substr(update_k_base_prefix.size(),
+                       sym.size() - update_k_base_prefix.size() - 1);
+        stream << name->value << ".template update_k_base<" << refresh_k << ">("
+               << PrintExpr(call->args[2]) << ");\n";
+        return;
+      }
+
+      if (sym.find(move_k_base_prefix) == 0) {
+        ICHECK_EQ(call->args.size(), 4U)
+            << "MLS move_k_base expects symbol, name, k_delta, next_k_base";
+        enable_gemm_mls_ = true;
+        const auto *name = call->args[1].as<StringImmNode>();
+        ICHECK(name) << "MLS move_k_base expects a string resource name";
+        const std::string filter_args =
+            sym.substr(move_k_base_prefix.size(),
+                       sym.size() - move_k_base_prefix.size() - 1);
+        PrintIndent();
+        stream << name->value << ".template move_k_base<" << filter_args << ">("
+               << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3])
                << ");\n";
         return;
       }
 
-      if (sym == "tl::mls::update_mn_base") {
+      if (sym.find(move_mn_base_prefix) == 0) {
+        ICHECK_EQ(call->args.size(), 4U)
+            << "MLS move_mn_base expects symbol, name, mn_delta, next_mn_base";
+        enable_gemm_mls_ = true;
+        const auto *name = call->args[1].as<StringImmNode>();
+        ICHECK(name) << "MLS move_mn_base expects a string resource name";
+        const std::string filter_args =
+            sym.substr(move_mn_base_prefix.size(),
+                       sym.size() - move_mn_base_prefix.size() - 1);
+        PrintIndent();
+        stream << name->value << ".template move_mn_base<" << filter_args
+               << ">(" << PrintExpr(call->args[2]) << ", "
+               << PrintExpr(call->args[3]) << ");\n";
+        return;
+      }
+
+      if (sym.find(update_mn_base_prefix) == 0) {
         ICHECK_EQ(call->args.size(), 3U)
             << "MLS update_mn_base expects symbol, name, mn_base";
         enable_gemm_mls_ = true;
         const auto *name = call->args[1].as<StringImmNode>();
         ICHECK(name) << "MLS update_mn_base expects a string resource name";
         PrintIndent();
-        stream << name->value << ".update_mn_base(" << PrintExpr(call->args[2])
-               << ");\n";
+        const std::string refresh_mn =
+            sym.substr(update_mn_base_prefix.size(),
+                       sym.size() - update_mn_base_prefix.size() - 1);
+        stream << name->value << ".template update_mn_base<" << refresh_mn
+               << ">(" << PrintExpr(call->args[2]) << ");\n";
         return;
       }
 
       if (sym.find(async_load_prefix) == 0) {
-        ICHECK_EQ(call->args.size(), 4U)
-            << "MLS async_load expects symbol, name, dst, k_base";
+        ICHECK(call->args.size() == 4U || call->args.size() == 5U)
+            << "MLS async_load expects symbol, name, dst, k_base[, mn_base]";
         enable_gemm_mls_ = true;
         const auto *name = call->args[1].as<StringImmNode>();
         ICHECK(name) << "MLS async_load expects a string resource name";
@@ -1382,24 +1409,10 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         PrintIndent();
         stream << name->value << ".template async_mls_load_asm<"
                << MlsAsyncLoadTemplateArgs(template_args) << ">("
-               << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3])
-               << ");\n";
-        return;
-      }
-
-      if (sym.find(async_load_mn_prefix) == 0) {
-        ICHECK_EQ(call->args.size(), 4U)
-            << "MLS async_load_mn expects symbol, name, dst, mn_base";
-        enable_gemm_mls_ = true;
-        const auto *name = call->args[1].as<StringImmNode>();
-        ICHECK(name) << "MLS async_load_mn expects a string resource name";
-        const std::string template_args =
-            sym.substr(async_load_mn_prefix.size(),
-                       sym.size() - async_load_mn_prefix.size() - 1);
-        PrintIndent();
-        stream << name->value << ".template async_mls_load_asm_mn<"
-               << template_args << ">(" << PrintExpr(call->args[2]) << ", "
-               << PrintExpr(call->args[3]) << ");\n";
+               << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3]);
+        if (call->args.size() == 5U)
+          stream << ", " << PrintExpr(call->args[4]);
+        stream << ");\n";
         return;
       }
     }
@@ -1414,7 +1427,9 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
 
     const std::string base_template = MlsBaseTemplateFromLoadTile(sym);
     const std::string data_type = MlsDataTypeFromLoadTile(sym);
-    const auto [check_last_load, last_load] = MlsLastLoadTemplateArgs(sym);
+    const auto modes = MlsBoundaryFromLoadTile(sym);
+    const std::string refresh_k = ::tvm::tl::MlsRefreshLiteral(modes.k);
+    const std::string refresh_mn = ::tvm::tl::MlsRefreshLiteral(modes.mn);
     const std::string src_ptr = PrintExpr(call->args[1]);
     const std::string stride = PrintExpr(call->args[2]);
     const std::string mn_len = PrintExpr(call->args[3]);
@@ -1435,13 +1450,11 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
            << ");\n";
     PrintIndent();
     stream << obj_name << ".set_window_origin(tl::make_array<tl::index_t>("
-           << mn_base << ", 0));\n";
-    PrintIndent();
-    stream << obj_name << ".update_base(" << k_base << ");\n";
+           << mn_base << ", " << k_base << "));\n";
     PrintIndent();
     stream << obj_name << ".template async_mls_load_asm<" << data_type << ", "
-           << check_last_load << ", " << last_load << ">(" << dst_ptr << ", "
-           << k_base << ");\n";
+           << refresh_k << ", " << refresh_mn << ">(" << dst_ptr << ", "
+           << k_base << ", " << mn_base << ");\n";
     return;
   }
 
@@ -1452,6 +1465,10 @@ void CodeGenTileLangHCU::VisitStmt_(const tirx::ForNode *op) {
   if (op->kind == tirx::ForKind::kUnrolled) {
     PrintIndent();
     stream << "#pragma unroll\n";
+  } else if (op->annotations.find("tl.hcu_loop_unroll_disable") !=
+             op->annotations.end()) {
+    PrintIndent();
+    stream << "#pragma clang loop unroll(disable)\n";
   }
   std::string extent =
       PrintExpr(arith::Analyzer().Simplify(op->extent + op->min));
