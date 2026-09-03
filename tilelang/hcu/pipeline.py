@@ -36,7 +36,8 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.PipelinePlanning()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)
     mod = tilelang.transform.Simplify()(mod)
-    mod = tilelang.transform.InsertMlsWaitcnt()(mod)
+    # MatrixLoad producers use the pipeline async-group path. Keep the legacy
+    # MLS waitcnt planner disabled while this path owns commit/wait placement.
     mod = tilelang.transform.InsertScaleBufferSync()(mod)
 
     mod = tilelang.transform.LayoutInference()(mod)

@@ -561,6 +561,15 @@ private:
 
     if (IsCopyLikeOp(tir_op)) {
       auto copy = Downcast<Copy>(ParseOperator(ffi::GetRef<Call>(call)));
+      if (IsMatrixLoadPreferredCopy(*copy.get())) {
+        bool trans = true;
+        LookupSharedMlsTrans(copy->dst, &trans);
+        auto annotations = call->annotations;
+        annotations.Set(attr::kMlsTrans,
+                        IntImm(DataType::Int(32), trans ? 1 : 0));
+        return Evaluate(
+            Call(call->dtype, call->op, call->args, annotations, call->span));
+      }
       auto consumer = PropagateToFindGemmConsumerOpWithInputAfterCall(
           copy->dst, collector_, call);
       if (consumer &&
