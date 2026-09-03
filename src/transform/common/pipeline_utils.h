@@ -46,10 +46,35 @@ static constexpr const char *kRegisterPipelineOrder =
     "tl_register_pipeline_order";
 static constexpr const char *kRegisterPipelineAsyncStages =
     "tl_register_pipeline_async_stages";
-/*! Whether T.Pipelined requested register ping-pong (default off). */
 static constexpr const char *kEnableRegisterPipeline =
     "enable_register_pipeline";
 static constexpr const char *kNumRegisterStages = "num_register_stages";
+static constexpr const char *kEnableWarpDivergence = "enable_warp_divergence";
+static constexpr const char *kRegisterPipelineApplied =
+    "tl_register_pipeline_applied";
+static constexpr int kDefaultNumRegisterStages = 2;
+static constexpr const char *kRegisterPipelineBufferSuffix = "_reg_pipe";
+
+inline bool LoopAnnotationIsTruthy(const ForNode *loop, const char *key) {
+  if (loop == nullptr) {
+    return false;
+  }
+  if (auto val = loop->annotations.Get(key)) {
+    if (const auto *imm = val.value().as<IntImmNode>()) {
+      return imm->value != 0;
+    }
+  }
+  return false;
+}
+
+inline bool LoopHasRegisterPipeline(const ForNode *loop) {
+  return LoopAnnotationIsTruthy(loop, kRegisterPipelineApplied) ||
+         LoopAnnotationIsTruthy(loop, kEnableRegisterPipeline);
+}
+
+inline bool LoopHasWarpDivergence(const ForNode *loop) {
+  return LoopAnnotationIsTruthy(loop, kEnableWarpDivergence);
+}
 
 inline bool IsRegisterPipelineBufferScope(const ffi::String &scope) {
   std::string s = scope;
@@ -65,10 +90,10 @@ inline bool IsRegisterPipelineProducerBuffer(const Buffer &buffer) {
   if (!IsRegisterPipelineBuffer(buffer)) {
     return false;
   }
-  static constexpr const char kSuffix[] = "_reg_pipe";
-  constexpr size_t n = sizeof(kSuffix) - 1;
+  const std::string suffix = kRegisterPipelineBufferSuffix;
   const std::string &name = buffer->name;
-  return name.size() >= n && name.compare(name.size() - n, n, kSuffix) == 0;
+  return name.size() >= suffix.size() &&
+         name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 /*! \brief Whether a flat TIRX statement declares pipeline-local buffer storage.

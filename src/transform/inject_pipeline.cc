@@ -3067,7 +3067,8 @@ private:
         keep_if_present("num_stages");
         keep_if_present(kEnableRegisterPipeline);
         keep_if_present(kNumRegisterStages);
-        preserved_annotations.Set("tl_register_pipeline_applied", Integer(1));
+        keep_if_present(kEnableWarpDivergence);
+        preserved_annotations.Set(kRegisterPipelineApplied, Integer(1));
       }
       new_loop = For(Downcast<Var>(new_loop_var), pipeline_loop_->min, extent,
                      unroll_loop ? ForKind::kUnrolled : pipeline_loop_->kind,
@@ -3452,7 +3453,7 @@ private:
         }
       }
       pipeline_allocs = filtered;
-    } else if (op->annotations.count("tl_register_pipeline_applied")) {
+    } else if (op->annotations.count(kRegisterPipelineApplied)) {
       Array<Buffer> filtered;
       for (const Buffer &buffer : pipeline_allocs) {
         if (!IsRegisterPipelineBuffer(buffer)) {
@@ -4065,7 +4066,7 @@ private:
 
   bool HasPipelineAnnotation(const ForNode *op) const {
     if (kind_ == PipelineKind::kShared &&
-        op->annotations.count("tl_register_pipeline_applied")) {
+        op->annotations.count(kRegisterPipelineApplied)) {
       return false;
     }
     const char *stage_key = kind_ == PipelineKind::kRegister

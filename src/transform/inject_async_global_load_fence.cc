@@ -1,6 +1,6 @@
 /*!
  * \file inject_async_global_load_fence.cc
- * \brief Lower async wait scopes to async_gld_fence and insert wave_barrier.
+ * \brief Lower async wait scopes and insert warp barriers after G2S waits.
  */
 
 #include "common/gemm_k_loop_utils.h"
@@ -13,6 +13,8 @@
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
+
+#include <vector>
 
 namespace tvm {
 namespace tl {
@@ -70,6 +72,15 @@ bool IsWaveBarrierStmt(const Stmt &stmt) {
   return false;
 }
 
+bool IsSyncWarpStmt(const Stmt &stmt) {
+  if (const auto *eval = stmt.as<EvaluateNode>()) {
+    if (const auto *call = eval->value.as<CallNode>()) {
+      return call->op.same_as(sync_warp());
+    }
+  }
+  return false;
+}
+
 Stmt MakeAsyncGldFenceStmt(int wait_count) {
   if (wait_count < 0) {
     wait_count = 0;
@@ -78,8 +89,20 @@ Stmt MakeAsyncGldFenceStmt(int wait_count) {
       Call(DataType::Void(), async_gld_fence(), {Integer(wait_count)}));
 }
 
+Stmt MakePtxWaitGroupStmt(int wait_count) {
+  if (wait_count < 0) {
+    wait_count = 0;
+  }
+  return Evaluate(
+      Call(DataType::Handle(), builtin::ptx_wait_group(), {Integer(wait_count)}));
+}
+
 Stmt MakeWaveBarrierStmt() {
   return Evaluate(Call(DataType::Void(), wave_barrier(), {}));
+}
+
+Stmt MakeSyncWarpStmt() {
+  return Evaluate(Call(DataType::Void(), sync_warp(), {}));
 }
 
 void AppendWaveBarrierIfNeeded(Array<Stmt> &result) {
@@ -88,26 +111,11 @@ void AppendWaveBarrierIfNeeded(Array<Stmt> &result) {
   }
 }
 
-bool IsAsyncCopyRootStmt(const Stmt &stmt) {
-  if (const auto *eval = stmt.as<EvaluateNode>()) {
-    if (const auto *call = eval->value.as<CallNode>()) {
-      return IsAsyncCopyCall(call);
-    }
-    return false;
+void AppendGldWaitSync(Array<Stmt> &result) {
+  if (result.empty() ||
+      (!IsSyncWarpStmt(result.back()) && !IsWaveBarrierStmt(result.back()))) {
+    result.push_back(MakeSyncWarpStmt());
   }
-  if (const auto *attr = stmt.as<AttrStmtNode>()) {
-    if (IsWaitAttr(attr) || IsCommitAttr(attr)) {
-      return IsAsyncCopyRootStmt(attr->body);
-    }
-    return false;
-  }
-  if (const auto *for_op = stmt.as<ForNode>()) {
-    return IsAsyncCopyRootStmt(for_op->body);
-  }
-  if (const auto *ife = stmt.as<IfThenElseNode>()) {
-    return IsAsyncCopyRootStmt(ife->then_case);
-  }
-  return false;
 }
 
 bool IsSharedToLocalCopy(const Stmt &stmt) {
@@ -246,20 +254,97 @@ struct SharedPipelineWaitPlan {
   int commits_per_tile{0};
   int main_wait{0};
   bool register_pipeline{false};
+  std::vector<int> epilogue_gld_fence_values;
 };
 
-bool AnnotationIsTruthy(const ForNode *loop, const char *key) {
-  if (auto val = loop->annotations.Get(key)) {
-    if (const auto *imm = val.value().as<IntImmNode>()) {
-      return imm->value != 0;
+// Collect epilogue async_wait_inflight values after the K loop.
+std::vector<int> CollectEpilogueWaitCounts(const Stmt &root) {
+  struct Collector : public StmtVisitor {
+    std::vector<int> counts;
+    bool past_main_loop{false};
+
+    void VisitStmt_(const ForNode *op) override {
+      StmtVisitor::VisitStmt_(op);
+      if (IsGemmKLoop(op)) {
+        past_main_loop = true;
+      }
     }
-  }
-  return false;
+
+    void VisitStmt_(const AttrStmtNode *op) override {
+      if (past_main_loop) {
+        if (op->attr_key == s_tir::attr::async_wait_queue_scope ||
+            op->attr_key == "async_wait_queue_scope") {
+          const auto *inner = op->body.as<AttrStmtNode>();
+          if (inner && (inner->attr_key == s_tir::attr::async_wait_inflight_count ||
+                        inner->attr_key == "async_wait_inflight_count")) {
+            if (const auto *imm = inner->value.as<IntImmNode>()) {
+              counts.push_back(static_cast<int>(imm->value));
+            }
+            VisitStmt(inner->body);
+            return;
+          }
+        } else if (op->attr_key == s_tir::attr::async_wait_inflight_count ||
+                   op->attr_key == "async_wait_inflight_count") {
+          if (const auto *imm = op->value.as<IntImmNode>()) {
+            counts.push_back(static_cast<int>(imm->value));
+          }
+          VisitStmt(op->body);
+          return;
+        }
+      }
+      StmtVisitor::VisitStmt_(op);
+    }
+  };
+  Collector collector;
+  collector(root);
+  return collector.counts;
 }
 
-bool LoopHasRegisterPipeline(const ForNode *loop) {
-  return AnnotationIsTruthy(loop, "tl_register_pipeline_applied") ||
-         AnnotationIsTruthy(loop, kEnableRegisterPipeline);
+// Scale iteration-unit waits into commit units when needed.
+std::vector<int> ScaleWaitCountsToCommitUnits(const std::vector<int> &counts,
+                                              int commits_per_tile,
+                                              int main_wait) {
+  if (counts.empty() || commits_per_tile <= 1) {
+    return counts;
+  }
+  std::vector<int> scaled = counts;
+  if (counts[0] != main_wait && counts[0] * commits_per_tile == main_wait) {
+    for (int &v : scaled) {
+      v *= commits_per_tile;
+    }
+  }
+  return scaled;
+}
+
+std::vector<int> SynthesizeEpilogueWaitCounts(int main_wait, int commits_per_tile) {
+  std::vector<int> counts;
+  if (commits_per_tile <= 0) {
+    return counts;
+  }
+  int v = main_wait;
+  while (true) {
+    counts.push_back(v);
+    if (v <= 0) {
+      break;
+    }
+    v -= commits_per_tile;
+    if (v < 0) {
+      v = 0;
+    }
+  }
+  return counts;
+}
+
+std::vector<int> BuildEpilogueGldFenceValues(const std::vector<int> &wait_counts) {
+  std::vector<int> shifted;
+  if (wait_counts.size() <= 1) {
+    return shifted;
+  }
+  shifted.reserve(wait_counts.size() - 1);
+  for (size_t i = 1; i < wait_counts.size(); ++i) {
+    shifted.push_back(wait_counts[i]);
+  }
+  return shifted;
 }
 
 int CountPrologueOutermostCommits(const Stmt &root) {
@@ -327,12 +412,24 @@ SharedPipelineWaitPlan MakeWaitPlan(const Stmt &root) {
     num_stages = static_cast<int>(ns.value().IntValue());
   }
   if (num_stages >= 2 && cpt > 0) {
-    plan.main_wait = num_stages * cpt - cpt;
+    if (plan.register_pipeline) {
+      plan.main_wait = (num_stages - 2) * cpt;
+    } else {
+      plan.main_wait = (num_stages - 1) * cpt;
+    }
   } else {
     plan.main_wait = CountPrologueOutermostCommits(root);
   }
   if (plan.main_wait < 0) {
     plan.main_wait = 0;
+  }
+  if (plan.register_pipeline) {
+    std::vector<int> epi = ScaleWaitCountsToCommitUnits(
+        CollectEpilogueWaitCounts(root), plan.commits_per_tile, plan.main_wait);
+    if (epi.size() <= 1) {
+      epi = SynthesizeEpilogueWaitCounts(plan.main_wait, plan.commits_per_tile);
+    }
+    plan.epilogue_gld_fence_values = BuildEpilogueGldFenceValues(epi);
   }
   return plan;
 }
@@ -346,7 +443,7 @@ public:
 
   Stmt VisitStmt_(const AttrStmtNode *op) override {
     if (IsWaitAttr(op)) {
-      if (phase_ == PipelinePhase::kPrologue) {
+      if (phase_ == PipelinePhase::kPrologue && !plan_.register_pipeline) {
         return StmtMutator::VisitStmt_(op);
       }
       const auto *inner = op->body.as<AttrStmtNode>();
@@ -391,7 +488,7 @@ public:
     Array<Stmt> result;
     result.reserve(seq_op->seq.size() + 8);
     bool in_lds_cluster = false;
-    int prologue_stage_copies = 0;
+    int prologue_stage_commits = 0;
     auto append_stmt = [&](const Stmt &stmt) {
       if (const auto *inner = stmt.as<SeqStmtNode>()) {
         for (const Stmt &child : inner->seq) {
@@ -404,9 +501,11 @@ public:
 
     for (const Stmt &s : seq_op->seq) {
       Stmt cur = UnwrapWaitAttrs(s);
-      if (IsAsyncGldFenceStmt(cur) ||
-          (phase_ != PipelinePhase::kPrologue && IsPtxWaitGroupStmt(cur))) {
-        continue;
+      if (IsAsyncGldFenceStmt(cur) || IsPtxWaitGroupStmt(cur)) {
+        if (plan_.register_pipeline ||
+            phase_ != PipelinePhase::kPrologue || IsAsyncGldFenceStmt(cur)) {
+          continue;
+        }
       }
 
       if (cur.as<SeqStmtNode>()) {
@@ -416,22 +515,42 @@ public:
       }
 
       const bool lds = IsSharedToLocalCopy(cur);
-      if (lds && !in_lds_cluster) {
+      if (plan_.register_pipeline) {
+        if (phase_ == PipelinePhase::kPrologue) {
+          if (lds && !in_lds_cluster) {
+            MaybeInsertGldFence(result);
+            in_lds_cluster = true;
+          } else if (!lds) {
+            in_lds_cluster = false;
+          }
+        } else {
+          if (in_lds_cluster && !lds) {
+            MaybeInsertGldFence(result);
+            in_lds_cluster = false;
+          }
+          if (lds) {
+            in_lds_cluster = true;
+          }
+        }
+      } else if (lds && !in_lds_cluster) {
         MaybeInsertGldFence(result);
         in_lds_cluster = true;
       } else if (!lds) {
         in_lds_cluster = false;
       }
-      const bool async_copy = IsAsyncCopyRootStmt(cur);
       append_stmt(VisitStmt(cur));
-      if (phase_ == PipelinePhase::kPrologue && async_copy &&
-          plan_.commits_per_tile > 0) {
-        prologue_stage_copies += 1;
-        if (prologue_stage_copies >= plan_.commits_per_tile) {
+      if (phase_ == PipelinePhase::kPrologue &&
+          plan_.commits_per_tile > 0 && IsOutermostCommitStmt(cur)) {
+        prologue_stage_commits += 1;
+        if (prologue_stage_commits >= plan_.commits_per_tile) {
           AppendWaveBarrierIfNeeded(result);
-          prologue_stage_copies = 0;
+          prologue_stage_commits = 0;
         }
       }
+    }
+    if (plan_.register_pipeline && phase_ != PipelinePhase::kPrologue &&
+        in_lds_cluster) {
+      MaybeInsertGldFence(result);
     }
     if (result.empty()) {
       return Evaluate(0);
@@ -445,8 +564,15 @@ public:
 private:
   int NextWaitCount() {
     int wait_count = 0;
-    if (phase_ == PipelinePhase::kMainLoop) {
+    if (phase_ == PipelinePhase::kMainLoop ||
+        phase_ == PipelinePhase::kPrologue) {
       wait_count = plan_.main_wait;
+    } else if (plan_.register_pipeline) {
+      if (epilogue_gld_insert_idx_ >=
+          static_cast<int>(plan_.epilogue_gld_fence_values.size())) {
+        return -1;
+      }
+      wait_count = plan_.epilogue_gld_fence_values[epilogue_gld_insert_idx_++];
     } else {
       wait_count = outstanding_ - plan_.commits_per_tile;
       if (wait_count < 0) {
@@ -461,17 +587,27 @@ private:
     if (suppress_inner_lds_insert_ > 0) {
       return;
     }
-    if (phase_ == PipelinePhase::kPrologue) {
+    if (phase_ == PipelinePhase::kPrologue && !plan_.register_pipeline) {
       return;
     }
-    result.push_back(MakeAsyncGldFenceStmt(NextWaitCount()));
-    AppendWaveBarrierIfNeeded(result);
+    const int wait_count = NextWaitCount();
+    if (wait_count < 0) {
+      return;
+    }
+    if (plan_.register_pipeline) {
+      result.push_back(MakePtxWaitGroupStmt(wait_count));
+      AppendGldWaitSync(result);
+    } else {
+      result.push_back(MakeAsyncGldFenceStmt(wait_count));
+      AppendWaveBarrierIfNeeded(result);
+    }
   }
 
   SharedPipelineWaitPlan plan_;
   PipelinePhase phase_{PipelinePhase::kPrologue};
   int outstanding_{0};
   int suppress_inner_lds_insert_{0};
+  int epilogue_gld_insert_idx_{0};
 };
 
 } // namespace

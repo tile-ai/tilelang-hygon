@@ -1339,10 +1339,27 @@ private:
       return -1;
     }();
     if (copy_stage_at_end > 0 && num_stages >= 2) {
+      bool register_pipeline_enabled = false;
+      if (auto reg_anno = loop->annotations.Get(kNumRegisterStages)) {
+        if (const auto *imm = reg_anno.value().as<IntImmNode>()) {
+          register_pipeline_enabled = imm->value > 1;
+        }
+      }
+      if (!register_pipeline_enabled) {
+        if (auto en_anno = loop->annotations.Get(kEnableRegisterPipeline)) {
+          if (const auto *imm = en_anno.value().as<IntImmNode>()) {
+            register_pipeline_enabled = imm->value != 0;
+          }
+        }
+      }
       for (auto &pinfo : pipeline_stage_infos) { // move copy to the beginning
         pinfo.order =
             (pinfo.order + copy_stage_at_end) % pipeline_stage_infos.size();
-        if (!pinfo.IsCopyStage() && !pinfo.IsProducerForCopy())
+        // Register pipeline: shared consumer is S2R, not MMA. Keep compute at
+        // num_stages so prologue prefetches num_stages global→shared tiles
+        // (InjectRegisterSoftwarePipeline uses max_stage as prologue length).
+        if (!pinfo.IsCopyStage() && !pinfo.IsProducerForCopy() &&
+            !register_pipeline_enabled)
           pinfo.stage--;
       }
     }

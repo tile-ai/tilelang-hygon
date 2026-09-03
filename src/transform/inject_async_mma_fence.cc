@@ -1,8 +1,6 @@
 /*!
  * \file inject_async_mma_fence.cc
- * \brief Insert LDS waits before MMA. Register pipeline uses packed
- *        s_waitcnt(lgkmcnt=N) where N is the LDS op count of the preceding
- *        S2R cluster (same as T.s_waitcnt(N, "lgkmcnt")).
+ * \brief Insert LDS waits before MMA.
  */
 
 #include "common/gemm_k_loop_utils.h"
@@ -41,11 +39,16 @@ Stmt MakeSldFenceStmt(int wait_count) {
       Call(DataType::Void(), async_gld_sld_fence(), {Integer(wait_count)}));
 }
 
-// Same packing as T.s_waitcnt(cnt, "lgkmcnt") in tilelang/language/builtin.py.
+// AMDGCN s_waitcnt immediate: wait only on lgkmcnt, leave vmcnt/expcnt idle.
 int PackLgkmcntImm(int cnt) {
   constexpr int kLgkmcntMax = 15;
+  constexpr int kIdleVmcnt = 0xF;
+  constexpr int kIdleExpcnt = 7;
+  constexpr int kWaitcntBit7 = 1;
+  constexpr int kWaitcntHi = 3;
   cnt = std::max(0, std::min(cnt, kLgkmcntMax));
-  return 0xF | (7 << 4) | (1 << 7) | (cnt << 8) | (3 << 12) | (3 << 14);
+  return kIdleVmcnt | (kIdleExpcnt << 4) | (kWaitcntBit7 << 7) | (cnt << 8) |
+         (kWaitcntHi << 12) | (kWaitcntHi << 14);
 }
 
 Stmt MakeLgkmcntWaitcntStmt(int cnt) {
@@ -54,15 +57,8 @@ Stmt MakeLgkmcntWaitcntStmt(int cnt) {
                         IntImm(DataType::Int(32), PackLgkmcntImm(cnt))}));
 }
 
-Stmt MakeSchedBarrierStmt() {
-  return Evaluate(Call(DataType::Void(), builtin::call_extern(),
-                       {StringImm("__builtin_amdgcn_sched_barrier"),
-                        IntImm(DataType::Int(32), 0)}));
-}
-
 void AppendRegisterPipelineLdsWait(Array<Stmt> &seq, int lds_count) {
   seq.push_back(MakeLgkmcntWaitcntStmt(lds_count));
-  seq.push_back(MakeSchedBarrierStmt());
 }
 
 class LoadCounter : public StmtExprVisitor {
@@ -112,63 +108,97 @@ bool IsAsyncWaitScopeStmt(const Stmt &stmt) {
          op->attr_key == "async_wait_inflight_count";
 }
 
-bool AnnotationIsTruthy(const ForNode *loop, const char *key) {
-  if (auto val = loop->annotations.Get(key)) {
-    if (const auto *imm = val.value().as<IntImmNode>()) {
-      return imm->value != 0;
+bool StmtContainsAsyncCopy(const Stmt &stmt) {
+  bool found = false;
+  PostOrderVisit(stmt, [&found](const ObjectRef &node) {
+    if (const auto *call = node.as<CallNode>()) {
+      if (IsAsyncCopyCall(call)) {
+        found = true;
+      }
+    }
+  });
+  return found;
+}
+
+// MMA cluster: compute only, excluding the surrounding K loop.
+bool IsMmaCluster(const Stmt &stmt) {
+  if (!StmtContainsMma(stmt)) {
+    return false;
+  }
+  if (const auto *for_op = stmt.as<ForNode>()) {
+    if (IsGemmKLoop(for_op)) {
+      return false;
     }
   }
-  return false;
+  return !StmtContainsAsyncCopy(stmt);
 }
 
-bool LoopHasRegisterPipeline(const ForNode *loop) {
-  return AnnotationIsTruthy(loop, "tl_register_pipeline_applied") ||
-         AnnotationIsTruthy(loop, kEnableRegisterPipeline);
-}
+struct EpilogueMmaCounts {
+  int total{0};
+  int with_pending_lds{0};
+};
 
-Stmt ComputeEpilogueLastMmaStmt(const Stmt &root) {
+EpilogueMmaCounts CountEpilogueMmas(const Stmt &root) {
   struct Collector : public StmtVisitor {
-    Stmt last_mma;
+    EpilogueMmaCounts counts;
     bool past_main_loop{false};
+    int pending_load_count{0};
 
     void VisitStmt_(const ForNode *op) override {
-      StmtVisitor::VisitStmt_(op);
       if (IsGemmKLoop(op)) {
+        VisitStmt(op->body);
         past_main_loop = true;
+        pending_load_count = 0;
+        return;
       }
+      StmtVisitor::VisitStmt_(op);
     }
 
     void VisitStmt_(const SeqStmtNode *op) override {
-      for (const Stmt &s : op->seq) {
-        if (past_main_loop && StmtContainsMma(s)) {
-          last_mma = s;
+      Stmt flattened = SeqStmt::Flatten(GetRef<Stmt>(op));
+      const auto *seq_op = flattened.as<SeqStmtNode>();
+      if (seq_op == nullptr) {
+        VisitStmt(flattened);
+        return;
+      }
+      for (const Stmt &s : seq_op->seq) {
+        if (past_main_loop && IsMmaCluster(s)) {
+          ++counts.total;
+          if (pending_load_count > 0) {
+            ++counts.with_pending_lds;
+          }
+          pending_load_count = 0;
+          continue;
+        }
+        if (past_main_loop && !StmtContainsMma(s)) {
+          LoadCounter counter;
+          counter(s);
+          if (IsAsyncWaitScopeStmt(s) && counter.total_loads > 0) {
+            pending_load_count = counter.total_loads;
+          } else {
+            pending_load_count += counter.total_loads;
+          }
         }
         VisitStmt(s);
       }
     }
-
-    void VisitStmt_(const IfThenElseNode *op) override {
-      if (past_main_loop) {
-        if (StmtContainsMma(op->then_case)) {
-          last_mma = op->then_case;
-        }
-        if (op->else_case.defined() &&
-            StmtContainsMma(op->else_case.value())) {
-          last_mma = op->else_case.value();
-        }
-      }
-      StmtVisitor::VisitStmt_(op);
-    }
   };
   Collector collector;
   collector(root);
-  return collector.last_mma;
+  return collector.counts;
 }
 
 class MMABarrierMutator : public StmtExprMutator {
 public:
   explicit MMABarrierMutator(const Stmt &root_body)
-      : epilogue_last_mma_(ComputeEpilogueLastMmaStmt(root_body)) {}
+      : epilogue_counts_(CountEpilogueMmas(root_body)) {
+    for (const ForNode *loop : CollectGemmKLoops(root_body)) {
+      if (LoopHasRegisterPipeline(loop)) {
+        register_pipeline_ = true;
+        break;
+      }
+    }
+  }
 
   Stmt VisitStmt_(const ForNode *op) override {
     bool is_main_loop = IsGemmKLoop(op);
@@ -196,10 +226,26 @@ public:
     Array<Stmt> new_seq;
     int pending_load_count = 0;
     for (const Stmt &stmt : seq_op->seq) {
-      if (StmtContainsMma(stmt)) {
+      if (IsMmaCluster(stmt)) {
+        if (in_mma_stmt_ > 0) {
+          new_seq.push_back(VisitStmt(stmt));
+          continue;
+        }
+        ++in_mma_stmt_;
+        bool last_epilogue_mma = false;
+        if (phase_ == PipelinePhase::kAfterMainLoop) {
+          ++epilogue_mma_seen_;
+          last_epilogue_mma = epilogue_counts_.total > 0 &&
+                              epilogue_mma_seen_ >= epilogue_counts_.total;
+        }
         if (pending_load_count > 0) {
           if (register_pipeline_) {
-            AppendRegisterPipelineLdsWait(new_seq, pending_load_count);
+            const int wait_n =
+                last_epilogue_mma
+                    ? 0
+                    : ResolveRegisterLgkmcnt(pending_load_count);
+            AppendRegisterPipelineLdsWait(new_seq, wait_n);
+            last_sld_fence_val_ = wait_n;
           } else {
             new_seq.push_back(MakeSldFenceStmt(0));
             if (phase_ != PipelinePhase::kAfterMainLoop) {
@@ -207,11 +253,23 @@ public:
             }
           }
           pending_load_count = 0;
-        } else if (register_pipeline_ &&
-                   phase_ == PipelinePhase::kAfterMainLoop &&
-                   epilogue_last_mma_.defined() &&
-                   stmt.same_as(epilogue_last_mma_)) {
+        } else if (register_pipeline_ && last_epilogue_mma) {
           AppendRegisterPipelineLdsWait(new_seq, 0);
+        }
+        new_seq.push_back(VisitStmt(stmt));
+        --in_mma_stmt_;
+      } else if (StmtContainsMma(stmt)) {
+        if (pending_load_count > 0) {
+          if (register_pipeline_) {
+            AppendRegisterPipelineLdsWait(new_seq, 0);
+            last_sld_fence_val_ = 0;
+          } else {
+            new_seq.push_back(MakeSldFenceStmt(0));
+            if (phase_ != PipelinePhase::kAfterMainLoop) {
+              new_seq.push_back(MakeWaveBarrierStmt());
+            }
+          }
+          pending_load_count = 0;
         }
         new_seq.push_back(VisitStmt(stmt));
       } else {
@@ -232,9 +290,19 @@ public:
   }
 
 private:
-  Stmt epilogue_last_mma_;
+  int ResolveRegisterLgkmcnt(int pending_load_count) {
+    if (phase_ == PipelinePhase::kAfterMainLoop && last_sld_fence_val_ > 0) {
+      return last_sld_fence_val_;
+    }
+    return pending_load_count;
+  }
+
+  EpilogueMmaCounts epilogue_counts_;
+  int epilogue_mma_seen_{0};
+  int in_mma_stmt_{0};
   PipelinePhase phase_{PipelinePhase::kBeforeMainLoop};
   bool register_pipeline_{false};
+  int last_sld_fence_val_{0};
 };
 
 } // namespace

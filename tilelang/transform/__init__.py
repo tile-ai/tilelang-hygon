@@ -126,6 +126,10 @@ def InjectAsyncMmaFence():
     return _ffi_api.InjectAsyncMmaFence()  # type: ignore
 
 
+def InjectRegisterPipelineSchedBarrier():
+    return _ffi_api.InjectRegisterPipelineSchedBarrier()  # type: ignore
+
+
 def InjectAsyncGlobalLoadFence():
     return _ffi_api.InjectAsyncGlobalLoadFence()  # type: ignore
 
@@ -134,8 +138,8 @@ def UnrollPipelinedKLoop():
     return _ffi_api.UnrollPipelinedKLoop()  # type: ignore
 
 
-def InjectWarpKLoopDivergence():
-    return _ffi_api.InjectWarpKLoopDivergence()  # type: ignore
+def InjectWarpDivergence():
+    return _ffi_api.InjectWarpDivergence()  # type: ignore
 
 
 def LowerAsyncCommitWait():

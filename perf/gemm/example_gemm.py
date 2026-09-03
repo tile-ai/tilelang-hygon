@@ -19,7 +19,12 @@ def matmul(A, B, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float
         C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
 
         T.clear(C_local)
-        for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=4, enable_register_pipeline=True):
+        for k in T.Pipelined(
+            T.ceildiv(K, block_K),
+            num_stages=4,
+            enable_register_pipeline=True,
+            enable_warp_divergence=True,
+        ):
             T.copy(A[by * block_M, k * block_K], A_shared, enable_async=True)
             T.copy(B[k * block_K, bx * block_N], B_shared, enable_async=True)
             T.copy(A_shared, A_local)

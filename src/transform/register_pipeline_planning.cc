@@ -266,7 +266,7 @@ int ResolveNumRegisterStages(const ForNode *op) {
                  op->annotations.Get(kEnableRegisterPipeline)) {
     if (const auto *imm = enable_anno.value().as<IntImmNode>()) {
       if (imm->value != 0) {
-        num_register_stages = 2;
+        num_register_stages = kDefaultNumRegisterStages;
       }
     }
   }
@@ -397,10 +397,8 @@ public:
         }
       }
     }
-    if (auto num_stages_anno = op->annotations.Get("num_stages")) {
-      if (const auto *imm = num_stages_anno->as<IntImmNode>()) {
-        compute_stage = std::max<int64_t>(compute_stage, imm->value);
-      }
+    if (num_shared_stages > 0) {
+      compute_stage = std::max(compute_stage, num_shared_stages);
     }
     int register_stage = std::max(0, compute_stage - 1);
     if (register_stage <= 0) {
@@ -535,13 +533,15 @@ private:
         BufferRegion b_region = gemm->bRegion_;
         Array<Stmt> copies;
         if (a_shared) {
-          Buffer frag = GetOrCreateFragmentBuffer(a_region, "_reg_pipe");
+          Buffer frag = GetOrCreateFragmentBuffer(
+              a_region, kRegisterPipelineBufferSuffix);
           BufferRegion frag_region = MakeFragmentRegion(frag, a_region);
           copies.push_back(MakeCopyEvaluate(a_region, frag_region));
           a_region = frag_region;
         }
         if (b_shared) {
-          Buffer frag = GetOrCreateFragmentBuffer(b_region, "_reg_pipe");
+          Buffer frag = GetOrCreateFragmentBuffer(
+              b_region, kRegisterPipelineBufferSuffix);
           BufferRegion frag_region = MakeFragmentRegion(frag, b_region);
           copies.push_back(MakeCopyEvaluate(b_region, frag_region));
           b_region = frag_region;

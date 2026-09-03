@@ -118,6 +118,7 @@ def Pipelined(
     sync: list[list[int]] | None = None,
     group: list[list[int]] | None = None,
     enable_register_pipeline: bool = False,
+    enable_warp_divergence: bool = False,
 ) -> frame.ForFrame:
     """Tools to construct pipelined for loop.
 
@@ -146,10 +147,9 @@ def Pipelined(
     group : Optional[List[List[int]]]
         Optional producer grouping metadata for manual pipeline lowering.
     enable_register_pipeline : bool
-        Whether to enable register ping-pong (shared→fragment copy overlapping
-        MMA). Default is False. When True, the compiler splits
-        ``T.gemm(shared, shared, acc)`` into fragment copies plus GEMM and
-        injects a two-stage register software pipeline.
+        Enable shared-to-fragment overlapping with MMA. Default False.
+    enable_warp_divergence : bool
+        Split the main loop across warp groups. Requires register pipeline.
 
     Notes
     -----
@@ -195,7 +195,15 @@ def Pipelined(
         group = []
     # type: ignore[attr-defined] # pylint: disable=no-member
     return _ffi_api.Pipelined(
-        start, stop, num_stages, order, stage, sync, group, enable_register_pipeline
+        start,
+        stop,
+        num_stages,
+        order,
+        stage,
+        sync,
+        group,
+        enable_register_pipeline,
+        enable_warp_divergence,
     )
 
 
