@@ -1,0 +1,27 @@
+#ifndef TVM_TL_TRANSFORM_COMMON_GEMM_K_LOOP_UTILS_H_
+#define TVM_TL_TRANSFORM_COMMON_GEMM_K_LOOP_UTILS_H_
+
+#include <tvm/tirx/stmt.h>
+#include <vector>
+
+namespace tvm {
+namespace tl {
+
+bool IsAsyncCopyCall(const tirx::CallNode *call);
+bool IsMmaCall(const tirx::CallNode *call);
+bool StmtContainsMma(const tirx::Stmt &stmt);
+
+struct GemmKLoopFeatures {
+  bool has_mma{false};
+  bool has_memory_access{false};
+  bool has_global_src{false};
+};
+
+GemmKLoopFeatures AnalyzeGemmKLoopBody(const tirx::Stmt &body);
+bool IsGemmKLoop(const tirx::ForNode *loop);
+std::vector<const tirx::ForNode *> CollectGemmKLoops(const tirx::Stmt &stmt);
+
+} // namespace tl
+} // namespace tvm
+
+#endif

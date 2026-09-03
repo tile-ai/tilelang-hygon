@@ -6,7 +6,7 @@
 import tilelang as tl
 import tilelang.language as T
 
-
+tl.disable_cache()
 def _gemm_async_copy_vanilla(
     M,
     N,
@@ -28,22 +28,24 @@ def _gemm_async_copy_vanilla(
 
     @T.macro
     def async_copy_a(A, A_shared, by, k_tile):
-        T.async_copy(
+        T.copy(
             A[
                 by * block_M : (by + 1) * block_M,
                 k_tile * block_K : (k_tile + 1) * block_K,
             ],
             A_shared,
+            enable_async=True,
         )
 
     @T.macro
     def async_copy_b(B, B_shared, bx, k_tile):
-        T.async_copy(
+        T.copy(
             B[
                 k_tile * block_K : (k_tile + 1) * block_K,
                 bx * block_N : (bx + 1) * block_N,
             ],
             B_shared,
+            enable_async=True,
         )
 
     @T.prim_func
@@ -296,3 +298,72 @@ def gemm_async_copy_n_major(
         swizzle_panel_size=swizzle_panel_size,
         swizzle_order=swizzle_order,
     )
+
+
+def main():
+    """Correctness check and latency benchmark for ``gemm_async_copy_n_major``."""
+    M, N, K = 19200, 5120, 5120
+    block_M, block_N, block_K = 256, 256, 16
+
+    kernel = gemm_async_copy_n_major(
+        M,
+        N,
+        K,
+        block_M,
+        block_N,
+        block_K,
+        dtype="float16",
+        accum_dtype="float32",
+    )
+
+    import torch
+
+    a = torch.randn(M, K, device="cuda").half()
+    b = torch.randn(K, N, device="cuda").half()
+
+    c = kernel(a, b)
+
+    # B is N-major [K, N], so the reference is A @ B (no transpose).
+    ref_c = a @ b
+
+    print("c:")
+    print(c)
+    print("ref_c:")
+    print(ref_c)
+
+    torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+    print("All check passed.")
+
+    # Get CUDA Source
+    print("CUDA Source:")
+    print(kernel.get_kernel_source())
+
+    # benchmark (default "event" backend works on both CUDA and ROCm)
+    profiler = kernel.get_profiler()
+    latency = profiler.do_bench()
+    tflops = 2 * M * N * K / latency * 1e-9
+    print(f"tilelang Latency: {latency}ms")
+    print(f"tilelang TFlops: {tflops:.4f}")
+
+
+def run_regression_perf():
+    """Compile a small shape and return the benchmark latency in milliseconds."""
+    M, N, K = 1024, 1024, 1024
+    block_M, block_N, block_K = 128, 128, 32
+
+    kernel = gemm_async_copy_n_major(
+        M,
+        N,
+        K,
+        block_M,
+        block_N,
+        block_K,
+        dtype="float16",
+        accum_dtype="float32",
+    )
+    profiler = kernel.get_profiler()
+    return profiler.do_bench()
+
+
+if __name__ == "__main__":
+    main()

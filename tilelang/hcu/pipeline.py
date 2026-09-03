@@ -34,6 +34,8 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.IfStmtBinding()(mod)
     mod = tilelang.transform.PipelinePlanning()(mod)
+    mod = tilelang.transform.RegisterPipelinePlanning()(mod)
+    mod = tilelang.transform.InjectRegisterSoftwarePipeline()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.InsertMlsWaitcnt()(mod)
@@ -92,6 +94,10 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.MakePackedAPI()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
+    mod = tilelang.transform.InjectAsyncMmaFence()(mod)
+    mod = tilelang.transform.InjectAsyncGlobalLoadFence()(mod)
+    mod = tilelang.transform.LowerAsyncCommitWait()(mod)
+    mod = tilelang.transform.UnrollPipelinedKLoop()(mod)
     return mod
 
 

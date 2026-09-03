@@ -41,10 +41,7 @@ bool GetBoolAnnotation(const CopyNode &op, const char *key) {
 }
 
 bool GetIsAsyncCopy(const CopyNode &op) {
-  if (GetBoolAnnotation(op, "is_async_copy")) {
-    return true;
-  }
-  return GetBoolAnnotation(op, "force_cp_async");
+  return HasExplicitAsyncCopySemantics(op);
 }
 
 bool GetNoImplicitAsyncCommitWait(const CopyNode &op) {

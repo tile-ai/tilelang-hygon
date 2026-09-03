@@ -36,6 +36,7 @@ public:
   // Common SIMT annotation keys:
   //   - "coalesced_width": IntImm, width for coalesced memory access.
   //   - "dst_block": PrimExpr, destination CTA rank for cluster copy.
+  //   - attr::kIsAsyncCopy ("is_async_copy"): IntImm, explicit async copy.
   //   - attr::kParallelLoopLayout ("parallel_loop_layout"): Fragment, loop
   //     layout hint applied to the outermost generated parallel loop of this
   //     copy's SIMT loop nest.
@@ -163,6 +164,48 @@ public:
    */
   static const Op &Get();
 };
+
+inline bool GetCopyBoolAnnotation(const Map<String, ObjectRef> &annotations,
+                                  const char *key) {
+  if (auto val = annotations.Get(key)) {
+    if (auto int_val = val->as<IntImmNode>()) {
+      return int_val->value != 0;
+    }
+  }
+  return false;
+}
+
+inline bool HasExplicitAsyncCopySemantics(
+    const Map<String, ObjectRef> &annotations) {
+  if (GetCopyBoolAnnotation(annotations, attr::kIsAsyncCopy)) {
+    return true;
+  }
+  return GetCopyBoolAnnotation(annotations, "force_cp_async");
+}
+
+inline bool HasExplicitAsyncCopySemantics(const CopyNode &op) {
+  return HasExplicitAsyncCopySemantics(op.annotations);
+}
+
+inline bool IsCopyLikeOp(const Op &op) {
+  static const Op &async_copy = Op::Get("tl.tileop.async_copy");
+  return op.same_as(Copy::Get()) || op.same_as(async_copy);
+}
+
+inline bool HasExplicitAsyncCopySemantics(const Call &call) {
+  if (!call->op.as<OpNode>()) {
+    return false;
+  }
+  Op tir_op = Downcast<Op>(call->op);
+  static const Op &async_copy = Op::Get("tl.tileop.async_copy");
+  if (tir_op.same_as(async_copy)) {
+    return true;
+  }
+  if (!tir_op.same_as(Copy::Get())) {
+    return false;
+  }
+  return HasExplicitAsyncCopySemantics(call->annotations);
+}
 
 /*!
  * \brief Special operator for Im2Col transformation.

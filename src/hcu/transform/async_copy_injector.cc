@@ -512,11 +512,12 @@ private:
                  IntImm(DataType::Int(32), rw_mask)});
   }
 
-  PrimExpr MakeGemmCommandDstAccessPtr(const Buffer &buffer, int num_elems,
-                                       int copy_bytes_per_lane,
+  PrimExpr MakeGemmCommandDstAccessPtr(const BufferLoad &dst_base_load,
+                                       int num_elems, int copy_bytes_per_lane,
                                        int copy_transaction_bytes,
                                        int block_threads, int inner_extent,
                                        const char *operand) {
+    const Buffer &buffer = dst_base_load->buffer;
     ICHECK(thread_var_.defined());
     const int element_bits = buffer->dtype.bits() * buffer->dtype.lanes();
     ICHECK_GT(element_bits, 0);
@@ -562,7 +563,7 @@ private:
     PrimExpr physical_offset = analyzer_.Simplify(
         (transaction * block_threads + thread_var_) * transaction_elements +
         intra_transaction);
-    Array<PrimExpr> physical_indices = {
+    Array<PrimExpr> tile_indices = {
         floordiv(physical_offset, Integer(inner_extent)),
         floormod(physical_offset, Integer(inner_extent))};
     // Address the remapped buffer directly so the enclosing layout lowering
@@ -572,9 +573,43 @@ private:
         << "HCU GEMM " << operand
         << " strategy requires a remapped physical LDS buffer for "
         << buffer->name;
+    // Software pipelining prepends a version dimension to shared buffers.
+    // Keep those leading indices; only the trailing 2-D tile is rewritten.
+    Array<PrimExpr> physical_indices = PrependLeadingIndices(
+        dst_base_load->indices, tile_indices,
+        physical_buffer.value()->shape.size(), buffer->name, operand);
     return MakeAccessPtrFromLoad(
         BufferLoad(physical_buffer.value(), physical_indices), num_elems,
         /*rw_mask=*/2);
+  }
+
+  static Array<PrimExpr> PrependLeadingIndices(const Array<PrimExpr> &src_indices,
+                                               const Array<PrimExpr> &tile_indices,
+                                               size_t dst_ndim,
+                                               const String &buffer_name,
+                                               const char *operand) {
+    ICHECK_GE(dst_ndim, tile_indices.size())
+        << "HCU GEMM " << operand << " physical buffer " << buffer_name
+        << " has rank " << dst_ndim << ", expected at least "
+        << tile_indices.size();
+    const size_t extra = dst_ndim - tile_indices.size();
+    ICHECK_GE(src_indices.size(), extra)
+        << "HCU GEMM " << operand << " async-copy to " << buffer_name
+        << " needs " << extra << " leading index(es) for the pipelined "
+           "buffer, but the store only has "
+        << src_indices.size();
+    if (extra == 0) {
+      return tile_indices;
+    }
+    Array<PrimExpr> full_indices;
+    full_indices.reserve(dst_ndim);
+    for (size_t i = 0; i < extra; ++i) {
+      full_indices.push_back(src_indices[i]);
+    }
+    for (const PrimExpr &index : tile_indices) {
+      full_indices.push_back(index);
+    }
+    return full_indices;
   }
 
   Optional<Stmt> MakeCPAsyncStmtFromLoads(const BufferStoreNode *store,
@@ -586,7 +621,7 @@ private:
     if (copy_strategy_.defined()) {
       const HcuGemmLdsCopyStrategy &strategy = copy_strategy_.value();
       dst_access_ptr = MakeGemmCommandDstAccessPtr(
-          store->buffer, num_elems, strategy->copy_bytes_per_lane,
+          dst_base_load, num_elems, strategy->copy_bytes_per_lane,
           strategy->copy_transaction_bytes, strategy->block_threads,
           strategy->inner_extent, "GEMM");
     } else {

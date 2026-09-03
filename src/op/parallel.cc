@@ -280,13 +280,27 @@ bool ParallelOpNode::IsBufferCompletelyReplicated(
   if (!IsFragmentBuffer(buffer))
     return false;
   auto frag = layout_map[buffer].as<Fragment>().value();
-  // buffer indices should be IntImm
-  for (const auto &index : GetAccessInfo(buffer).indices) {
-    if (!index.as<IntImmNode>()) {
-      return false;
-    } else if (index.as<IntImmNode>()->value != 0) {
-      LOG(FATAL) << "buffer " << buffer << " is not completed replicated";
+  // Completely-replicated fragments are written as `frag[0]` (all indices
+  // constant zero). A leading non-zero IntImm is the register-pipeline
+  // version slot, e.g. frag[1, i, j], and must not be treated as the scalar
+  // `fragment[K]` error. Only a 1-D constant access with K != 0 is fatal.
+  bool all_const = true;
+  bool has_nonzero_const = false;
+  const auto &indices = GetAccessInfo(buffer).indices;
+  for (const auto &index : indices) {
+    if (const auto *imm = index.as<IntImmNode>()) {
+      if (imm->value != 0) {
+        has_nonzero_const = true;
+      }
+    } else {
+      all_const = false;
     }
+  }
+  if (has_nonzero_const && all_const && indices.size() == 1) {
+    LOG(FATAL) << "buffer " << buffer << " is not completed replicated";
+  }
+  if (!all_const || has_nonzero_const) {
+    return false;
   }
   return frag->IsCompletedReplicated();
 }
@@ -348,16 +362,21 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &layout_args,
       if (!IsFragmentBuffer(buffer))
         continue;
 
-      // Check if all indices are zero
+      // Check if all indices are zero. Scalar `fragment[K]` with K != 0 is
+      // unsupported. A leading constant (register-pipeline version slot)
+      // plus spatial loop indices, e.g. frag[1, i, j], is allowed.
       bool all_indices_zero = true;
       for (const auto &index : access.indices) {
         if (const auto *imm = index.as<IntImmNode>()) {
           if (imm->value != 0) {
             all_indices_zero = false;
-            LOG(FATAL)
-                << "Fragment buffer access with non-zero index [" << imm->value
-                << "] is not supported. "
-                << "Only fragment[0] access is allowed within T.Parallel loop.";
+            if (access.indices.size() == 1) {
+              LOG(FATAL)
+                  << "Fragment buffer access with non-zero index ["
+                  << imm->value << "] is not supported. "
+                  << "Only fragment[0] access is allowed within T.Parallel "
+                     "loop.";
+            }
           }
         } else {
           // Non-constant index, not all zero

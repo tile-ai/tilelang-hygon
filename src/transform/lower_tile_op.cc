@@ -63,12 +63,31 @@ static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout,
   }
   Array<PrimExpr> layout_shape = layout->OutputShape();
   Array<PrimExpr> output_shape = layout_shape;
+  // Pipeline / register-pipeline versioning prepends leading dims that are
+  // not part of the spatial layout. Keep them on the remapped storage so
+  // Layout::Forward([stage, ...spatial]) matches buffer rank.
+  size_t n_extra = 0;
+  if (buffer->shape.size() > layout->InputDim()) {
+    n_extra = buffer->shape.size() - layout->InputDim();
+    Array<PrimExpr> expanded;
+    expanded.reserve(n_extra + layout_shape.size());
+    for (size_t i = 0; i < n_extra; ++i) {
+      expanded.push_back(buffer->shape[i]);
+    }
+    for (const auto &dim : layout_shape) {
+      expanded.push_back(dim);
+    }
+    output_shape = std::move(expanded);
+  }
   if (IsSharedBuffer(buffer)) {
     int replicate_extent = 1;
     Array<PrimExpr> buffer_shape = buffer->shape;
     int buffer_extent = 1;
     int layout_extent = 1;
-    for (size_t i = 0; i < buffer_shape.size(); i++) {
+    // Extra leading dims are already copied above; do not count them again
+    // as a replicate prefix (that would turn [stage, K, N] into
+    // [stage, stage, K, N]).
+    for (size_t i = n_extra; i < buffer_shape.size(); i++) {
       auto shape = buffer_shape[i].as<IntImmNode>();
       buffer_extent *= shape->value;
     }

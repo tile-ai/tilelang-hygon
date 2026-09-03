@@ -673,6 +673,73 @@ public:
         }
       }
     }
+
+    // Shared-memory software pipeline should only prefetch Global→Shared
+    // copies. Shared→register copies (and ds_read_format) are part of the
+    // compute stage; if they remain the G2S last-use, InjectSoftwarePipeline
+    // emits S2R / G2S / S2R / G2S / MMA instead of G2S then S2R+MMA.
+    ExtendCopyLastUseThroughRegisterLoads(pipeline_stage_infos);
+  }
+
+  static bool IsSharedToRegisterStage(const PipelineStageInfo &pinfo) {
+    if (pinfo.IsCopyStage() || pinfo.writes.empty()) {
+      return false;
+    }
+    bool reads_shared = false;
+    for (const BufferRegion &read : pinfo.reads) {
+      if (IsSharedBuffer(read->buffer)) {
+        reads_shared = true;
+        break;
+      }
+    }
+    if (!reads_shared) {
+      return false;
+    }
+    for (const BufferRegion &write : pinfo.writes) {
+      if (!(IsFragmentBuffer(write->buffer) || IsLocalBuffer(write->buffer))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void ExtendCopyLastUseThroughRegisterLoads(
+      std::vector<PipelineStageInfo> *pipeline_stage_infos) const {
+    auto last_reader_index = [&](const PipelineStageInfo &producer) -> int {
+      int last = -1;
+      for (int i = producer.original_stmt_index + 1;
+           i < static_cast<int>(pipeline_stage_infos->size()); ++i) {
+        for (const BufferRegion &read : (*pipeline_stage_infos)[i].reads) {
+          if (std::find_if(producer.writes.begin(), producer.writes.end(),
+                           [&](const BufferRegion &write) {
+                             return write->buffer == read->buffer &&
+                                    MayConflict(write->region, read->region);
+                           }) != producer.writes.end()) {
+            last = i;
+          }
+        }
+      }
+      return last;
+    };
+
+    for (auto &pinfo : *pipeline_stage_infos) {
+      if (!pinfo.IsCopyStage() || !pinfo.IsLastUseStmtIndexValid()) {
+        continue;
+      }
+      int consumer = pinfo.last_use_stmt_index;
+      std::unordered_set<int> seen;
+      while (consumer >= 0 &&
+             consumer < static_cast<int>(pipeline_stage_infos->size()) &&
+             seen.insert(consumer).second &&
+             IsSharedToRegisterStage((*pipeline_stage_infos)[consumer])) {
+        int next = last_reader_index((*pipeline_stage_infos)[consumer]);
+        if (next < 0) {
+          break;
+        }
+        consumer = next;
+      }
+      pinfo.last_use_stmt_index = consumer;
+    }
   }
 
   void PropagateBufferProducersForCopy(

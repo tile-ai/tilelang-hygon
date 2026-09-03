@@ -25,6 +25,7 @@
 #include "./common/thread_sync_types.h"
 #include "arith/ir_mutator_with_analyzer.h"
 #include "common/attr.h"
+#include "hcu/target_utils.h"
 #include "hcu/utils/extern_call_checker.h"
 #include "runtime/thread_storage_scope.h"
 #include "support/check.h"
@@ -566,8 +567,9 @@ private:
 
 struct TileLangThreadSyncPlanner : public ConstrVisitor {
   explicit TileLangThreadSyncPlanner(StorageScope sync_scope,
-                                     int warp_size = 32)
-      : sync_scope_(std::move(sync_scope)), warp_size_(warp_size) {
+                                     int warp_size = 32, bool is_hcu = false)
+      : sync_scope_(std::move(sync_scope)), warp_size_(warp_size),
+        is_hcu_(is_hcu) {
     scope_.push_back(std::vector<StmtEntry>());
   }
 
@@ -1016,7 +1018,8 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
       if (auto opt = op->op.as<Op>()) {
         const Op &call_op = opt.value();
         return call_op.same_as(builtin::ptx_cp_async()) ||
-               call_op.same_as(tl::ptx_cp_async());
+               call_op.same_as(tl::ptx_cp_async()) ||
+               call_op.same_as(tl::hcu_cp_async_idxen());
       }
       return false;
     }();
@@ -1443,6 +1446,7 @@ private:
   StorageScope sync_scope_;
   // warp size from target
   int warp_size_;
+  bool is_hcu_{false};
 
   void insert_syncs(const Object *obj) {
     if (syncs_inserted_.count(obj))
@@ -1739,6 +1743,12 @@ private:
         curr.is_async_copy) {
       return false;
     }
+    if (is_hcu_ && ((prev.is_async_copy && prev.type == kWrite &&
+                     curr.type == kRead) ||
+                    (curr.is_async_copy && curr.type == kWrite &&
+                     prev.type == kRead))) {
+      return false;
+    }
     // Access to different buffers does not conflict.
     if (!prev.buffer.same_as(curr.buffer)) {
       return false;
@@ -2020,18 +2030,20 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
   }
   auto *n = func.CopyOnWrite();
   auto stmt = n->body;
-  if (sync_scope.rank == StorageRank::kShared && sync_scope.tag.empty()) {
-    stmt = ThreadSyncAfterWaitGroupInserter(sync_scope)(stmt);
-  }
-  // Get warp size from target, defaulting to 32 if not available
   int warp_size = 32;
+  bool is_hcu = false;
   if (auto target = func->GetAttr<Target>(tvm::attr::kTarget)) {
+    is_hcu = TargetIsHCU(target.value());
     warp_size = target.value()
                     ->GetAttr<Integer>("thread_warp_size", 32)
                     .value()
                     .IntValue();
   }
-  TileLangThreadSyncPlanner planner(sync_scope, warp_size);
+  if (sync_scope.rank == StorageRank::kShared && sync_scope.tag.empty() &&
+      !is_hcu) {
+    stmt = ThreadSyncAfterWaitGroupInserter(sync_scope)(stmt);
+  }
+  TileLangThreadSyncPlanner planner(sync_scope, warp_size, is_hcu);
   for (const auto &[_, buffer] : func->buffer_map) {
     planner.SetBufferDataToBuffer(buffer->data, buffer);
   }

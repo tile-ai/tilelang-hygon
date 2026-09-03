@@ -26,6 +26,33 @@ GEMM_INST_HCU_MMAC = "hcu.mmac"
 logger = logging.getLogger(__name__)
 
 
+def _is_pipeline_version_region(buffer_region) -> bool:
+    """True when the region is one pipeline stage of an otherwise full buffer."""
+    buf = buffer_region.buffer
+    ranges = buffer_region.region
+    if len(buf.shape) != len(ranges) or len(ranges) < 2:
+        return False
+    expr_equal = tirx.analysis.expr_deep_equal
+    if not expr_equal(ranges[0].extent, 1):
+        return False
+    for dim, r in zip(buf.shape[1:], ranges[1:]):
+        if not expr_equal(r.min, 0) or not expr_equal(r.extent, dim):
+            return False
+    return True
+
+
+def _is_full_fragment_region(buffer_region) -> bool:
+    return is_full_region(buffer_region) or _is_pipeline_version_region(buffer_region)
+
+
+def _fragment_pipeline_ptr_base(buffer_region, elems_per_version):
+    if is_full_region(buffer_region):
+        return 0
+    if _is_pipeline_version_region(buffer_region):
+        return buffer_region.region[0].min * elems_per_version
+    raise AssertionError("Fragment operand must be a full region or a single pipeline version")
+
+
 def _int_annotation(annotations, key: str, default: int = 0) -> int:
     if not annotations:
         return default
@@ -494,7 +521,7 @@ class GemmHCUMMAC(GemmBase):
             return _Simplify(_gemm_bs_mls_mls, inline_let=True)
 
         if use_gemm_mls and b_from_mls and is_fragment(self.A) and _is_shared_like(self.B):
-            assert is_full_region(A_region), "Fragment input A must be a full region"
+            assert _is_full_fragment_region(A_region), "Fragment input A must be a full region"
 
             @T.prim_func
             def _gemm_bs_r_mls() -> None:
@@ -523,7 +550,7 @@ class GemmHCUMMAC(GemmBase):
             return _Simplify(_gemm_bs_r_mls, inline_let=True)
 
         if use_gemm_mls and a_from_mls and _is_shared_like(self.A) and is_fragment(self.B):
-            assert is_full_region(B_region), "Fragment input B must be a full region"
+            assert _is_full_fragment_region(B_region), "Fragment input B must be a full region"
 
             @T.prim_func
             def _gemm_bs_mls_r() -> None:
@@ -616,7 +643,7 @@ class GemmHCUMMAC(GemmBase):
             return _Simplify(_gemm_bs_ss, inline_let=True)
 
         if _is_shared_like(self.A) and is_fragment(self.B):
-            assert is_full_region(B_region), "Fragment input B must be a full region"
+            assert _is_full_fragment_region(B_region), "Fragment input B must be a full region"
             inner_k = emitter.inner_k_per_warp()
 
             @T.prim_func
@@ -647,7 +674,7 @@ class GemmHCUMMAC(GemmBase):
             return _Simplify(_gemm_bs_sr, inline_let=True)
 
         if is_fragment(self.A) and _is_shared_like(self.B):
-            assert is_full_region(A_region), "Fragment input A must be a full region"
+            assert _is_full_fragment_region(A_region), "Fragment input A must be a full region"
             inner_k = emitter.inner_k_per_warp()
 
             @T.prim_func
@@ -678,8 +705,8 @@ class GemmHCUMMAC(GemmBase):
             return _Simplify(_gemm_bs_rs, inline_let=True)
 
         if is_fragment(self.A) and is_fragment(self.B):
-            assert is_full_region(A_region), "Fragment input A must be a full region"
-            assert is_full_region(B_region), "Fragment input B must be a full region"
+            assert _is_full_fragment_region(A_region), "Fragment input A must be a full region"
+            assert _is_full_fragment_region(B_region), "Fragment input B must be a full region"
 
             @T.prim_func
             def _gemm_bs_rr() -> None:
@@ -767,6 +794,16 @@ class GemmHCUMMAC(GemmBase):
             f"block_K ({block_K}) must be divisible by micro_size_k ({micro_size_k}) * k_pack ({k_pack})"
         )
         assert is_full_region(C_region), "Fragment output C must be a full region"
+        a_ptr_base = (
+            _fragment_pipeline_ptr_base(A_region, emitter.local_elems_a(full_k=True))
+            if is_fragment(self.A)
+            else 0
+        )
+        b_ptr_base = (
+            _fragment_pipeline_ptr_base(B_region, emitter.local_elems_b(full_k=True))
+            if is_fragment(self.B)
+            else 0
+        )
 
         use_gemm_mls = (a_from_mls and not is_fragment(self.A)) or (b_from_mls and not is_fragment(self.B))
         use_b_linear_ds_read = b_from_async_copy_linear and not is_fragment(self.B)
@@ -812,7 +849,7 @@ class GemmHCUMMAC(GemmBase):
                 raise NotImplementedError("gemm_mls_s (A mls, B r or s) not implemented")
 
             if is_fragment(self.A):
-                assert is_full_region(A_region), "Fragment input A must be a full region"
+                assert _is_full_fragment_region(A_region), "Fragment input A must be a full region"
 
                 @T.prim_func
                 def _gemm_r_mls() -> None:
@@ -821,7 +858,9 @@ class GemmHCUMMAC(GemmBase):
                         T.clear(C_buf)
                     emitter.ldmatrix_mls_b(B_local, B_region)
                     for ki in T.serial(0, inner_k):
-                        emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c)
+                        emitter.mmac(
+                            A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, a_ptr_base=a_ptr_base
+                        )
 
                 return _Simplify(_gemm_r_mls, inline_let=True)
 
@@ -844,7 +883,7 @@ class GemmHCUMMAC(GemmBase):
 
         elif use_b_linear_ds_read:
             if is_fragment(self.A):
-                assert is_full_region(A_region), "Fragment input A must be a full region"
+                assert _is_full_fragment_region(A_region), "Fragment input A must be a full region"
 
                 @T.prim_func
                 def _gemm_r_b_linear() -> None:
@@ -853,7 +892,9 @@ class GemmHCUMMAC(GemmBase):
                         T.clear(C_buf)
                     emitter.ldmatrix_b_linear(B_local, B_region)
                     for ki in T.serial(0, inner_k):
-                        emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c)
+                        emitter.mmac(
+                            A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, a_ptr_base=a_ptr_base
+                        )
 
                 return _Simplify(_gemm_r_b_linear, inline_let=True)
 
@@ -890,7 +931,7 @@ class GemmHCUMMAC(GemmBase):
             return _Simplify(_gemm_ss, inline_let=True)
 
         elif _is_shared_like(self.A) and is_fragment(self.B):
-            assert is_full_region(B_region), "Fragment input B must be a full region"
+            assert _is_full_fragment_region(B_region), "Fragment input B must be a full region"
 
             @T.prim_func
             def _gemm_sr() -> None:
@@ -899,12 +940,14 @@ class GemmHCUMMAC(GemmBase):
                     T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_a(A_local, A_region, ki)
-                    emitter.mmac(A_local, B_buf, C_buf, ki, trans_c=mmac_trans_c)
+                    emitter.mmac(
+                        A_local, B_buf, C_buf, ki, trans_c=mmac_trans_c, b_ptr_base=b_ptr_base
+                    )
 
             return _Simplify(_gemm_sr, inline_let=True)
 
         elif is_fragment(self.A) and _is_shared_like(self.B):
-            assert is_full_region(A_region), "Fragment input A must be a full region"
+            assert _is_full_fragment_region(A_region), "Fragment input A must be a full region"
 
             @T.prim_func
             def _gemm_rs() -> None:
@@ -913,20 +956,30 @@ class GemmHCUMMAC(GemmBase):
                     T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_b(B_local, B_region, ki)
-                    emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c)
+                    emitter.mmac(
+                        A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, a_ptr_base=a_ptr_base
+                    )
 
             return _Simplify(_gemm_rs, inline_let=True)
 
         elif is_fragment(self.A) and is_fragment(self.B):
-            assert is_full_region(A_region), "Fragment input A must be a full region"
-            assert is_full_region(B_region), "Fragment input B must be a full region"
+            assert _is_full_fragment_region(A_region), "Fragment input A must be a full region"
+            assert _is_full_fragment_region(B_region), "Fragment input B must be a full region"
 
             @T.prim_func
             def _gemm_rr() -> None:
                 if clear_accum:
                     T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
-                    emitter.mmac(A_buf, B_buf, C_buf, ki, trans_c=mmac_trans_c)
+                    emitter.mmac(
+                        A_buf,
+                        B_buf,
+                        C_buf,
+                        ki,
+                        trans_c=mmac_trans_c,
+                        a_ptr_base=a_ptr_base,
+                        b_ptr_base=b_ptr_base,
+                    )
 
             return _Simplify(_gemm_rr, inline_let=True)
 

@@ -12,6 +12,7 @@
 #define TVM_TL_TRANSFORM_COMMON_PIPELINE_UTILS_H_
 
 #include "support/check.h"
+#include <string>
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/cast.h>
 #include <tvm/s_tir/stmt.h>
@@ -38,6 +39,37 @@ static constexpr const char *kPipelineAsyncProducerGroups =
 /*! Per-original-statement replayable scalar Bind flag (1 = replayable). */
 static constexpr const char *kPipelineReplayableScalarBinds =
     "software_pipeline_replayable_scalar_binds";
+
+static constexpr const char *kRegisterPipelineStage =
+    "tl_register_pipeline_stage";
+static constexpr const char *kRegisterPipelineOrder =
+    "tl_register_pipeline_order";
+static constexpr const char *kRegisterPipelineAsyncStages =
+    "tl_register_pipeline_async_stages";
+/*! Whether T.Pipelined requested register ping-pong (default off). */
+static constexpr const char *kEnableRegisterPipeline =
+    "enable_register_pipeline";
+static constexpr const char *kNumRegisterStages = "num_register_stages";
+
+inline bool IsRegisterPipelineBufferScope(const ffi::String &scope) {
+  std::string s = scope;
+  return s == "local" ||
+         (s.size() > 6 && s.compare(0, 6, "local.") == 0);
+}
+
+inline bool IsRegisterPipelineBuffer(const Buffer &buffer) {
+  return buffer.defined() && IsRegisterPipelineBufferScope(buffer.scope());
+}
+
+inline bool IsRegisterPipelineProducerBuffer(const Buffer &buffer) {
+  if (!IsRegisterPipelineBuffer(buffer)) {
+    return false;
+  }
+  static constexpr const char kSuffix[] = "_reg_pipe";
+  constexpr size_t n = sizeof(kSuffix) - 1;
+  const std::string &name = buffer->name;
+  return name.size() >= n && name.compare(name.size() - n, n, kSuffix) == 0;
+}
 
 /*! \brief Whether a flat TIRX statement declares pipeline-local buffer storage.
  *

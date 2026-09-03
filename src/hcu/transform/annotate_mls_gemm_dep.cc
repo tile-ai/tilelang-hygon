@@ -267,14 +267,11 @@ public:
   }
 
 private:
-  bool IsCopyLikeOp(const Op &op) const {
-    static const Op &async_copy = Op::Get("tl.tileop.async_copy");
-    return op.same_as(Copy::Get()) || op.same_as(async_copy);
-  }
+  bool IsCopyLikeOp(const Op &op) const { return tl::IsCopyLikeOp(op); }
 
-  bool IsAsyncCopyOp(const Op &op) const {
-    static const Op &async_copy = Op::Get("tl.tileop.async_copy");
-    return op.same_as(async_copy);
+  bool IsAsyncCopyCall(const CallNode *call) const {
+    return HasExplicitAsyncCopySemantics(
+        tvm::ffi::GetRef<Call>(call));
   }
 
   Stmt VisitStmt_(const SBlockNode *op) final {
@@ -591,7 +588,7 @@ private:
         return Evaluate(Call(call->dtype, DsReadFormat::Get(), call->args,
                              annotations, call->span));
       }
-      if (IsAsyncCopyOp(tir_op) && consumer) {
+      if (IsAsyncCopyCall(call) && consumer) {
         std::vector<GemmWithInput> consumers =
             PropagateToFindAllGemmConsumersAfterCall(copy->dst, collector_,
                                                      call);
@@ -651,7 +648,7 @@ private:
               Call(call->dtype, call->op, call->args, annotations, call->span));
         }
       }
-      if (IsAsyncCopyOp(tir_op) && IsSharedBuffer(copy->dst) &&
+      if (IsAsyncCopyCall(call) && IsSharedBuffer(copy->dst) &&
           !HasAnnotatedLayout(copy->dst)) {
         async_copy_linear_outputs_.insert(copy->dst->data);
       }

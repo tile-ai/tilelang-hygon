@@ -110,6 +110,38 @@ def InjectSoftwarePipeline():
     return _ffi_api.InjectSoftwarePipeline()  # type: ignore
 
 
+def RegisterPipelinePlanning():
+    return _ffi_api.RegisterPipelinePlanning()  # type: ignore
+
+
+def InjectRegisterSoftwarePipeline():
+    return _ffi_api.InjectRegisterSoftwarePipeline()  # type: ignore
+
+
+def CanonicalizeAsyncWaitCount():
+    return _ffi_api.CanonicalizeAsyncWaitCount()  # type: ignore
+
+
+def InjectAsyncMmaFence():
+    return _ffi_api.InjectAsyncMmaFence()  # type: ignore
+
+
+def InjectAsyncGlobalLoadFence():
+    return _ffi_api.InjectAsyncGlobalLoadFence()  # type: ignore
+
+
+def UnrollPipelinedKLoop():
+    return _ffi_api.UnrollPipelinedKLoop()  # type: ignore
+
+
+def InjectWarpKLoopDivergence():
+    return _ffi_api.InjectWarpKLoopDivergence()  # type: ignore
+
+
+def LowerAsyncCommitWait():
+    return _ffi_api.LowerAsyncCommitWait()  # type: ignore
+
+
 def InsertMlsWaitcnt():
     """Insert conservative s_waitcnt before LDS consumers of MLS async loads."""
     return _ffi_api.InsertMlsWaitcnt()  # type: ignore
