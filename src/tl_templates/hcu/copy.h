@@ -187,9 +187,9 @@ TL_DEVICE void cp_async_gs_idxen_impl(uint32_t lds_base, int32x4_t src_resource,
                                       std::int32_t idxen) {
   static_assert(N == 4 || N == 8 || N == 16,
                 "idxen async copy only supports 4, 8, or 16 bytes");
-  __attribute__((address_space(3))) int* lds_ptr =
-      reinterpret_cast<__attribute__((address_space(3))) int*>(
-      static_cast<uintptr_t>(lds_base + SmemOffset));
+  __attribute__((address_space(3))) int *lds_ptr =
+      reinterpret_cast<__attribute__((address_space(3))) int *>(
+          static_cast<uintptr_t>(lds_base + SmemOffset));
   __builtin_amdgcn_struct_buffer_load_async_lds(
       src_resource, lds_ptr, N, static_cast<uint32_t>(idxen),
       static_cast<uint32_t>(src_thread_byte_offset), 0, 0, 0);

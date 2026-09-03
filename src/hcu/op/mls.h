@@ -74,7 +74,7 @@ public:
         .def_ro("mn_boundary", &MatrixLoadNode::mn_boundary)
         .def_ro("k_boundary", &MatrixLoadNode::k_boundary)
         .def_ro("no_implicit_async_commit_wait",
-                 &MatrixLoadNode::no_implicit_async_commit_wait_);
+                &MatrixLoadNode::no_implicit_async_commit_wait_);
   }
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
