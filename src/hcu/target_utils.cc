@@ -88,7 +88,8 @@ bool IsHCUEnableAutoAsyncCopyTarget(Target target) {
   if (!TargetIsHCU(target) || !TargetHasMcpu(target)) {
     return false;
   }
-  static const std::set<std::string> auto_async_whitelist = {};
+  static const std::set<std::string> auto_async_whitelist = {
+      "gfx936", "gfx938", "gfx92a", "gfx946"};
   return auto_async_whitelist.count(GetMcpu(target)) > 0;
 }
 

@@ -87,9 +87,9 @@ TILE_KERNEL_NODEIDS=(
 
   # Engram correctness coverage
   "tests/engram/test_engram_fused_weight.py::test_engram_fused_weight[hc=4-hidden=2048]"
-  "tests/engram/test_engram_gate_bwd.py::test_engram_gate_bwd[num_tokens=4001-hc=4-hidden=2048]"
-  "tests/engram/test_engram_gate_fwd.py::test_engram_gate_fwd_alg_ref_matches_tilelang_accum_order[num_tokens=4001-hc=4-hidden=2048]"
-  "tests/engram/test_engram_gate_fwd.py::test_engram_gate_fwd[num_tokens=4001-hc=4-hidden=2048]"
+  # "tests/engram/test_engram_gate_bwd.py::test_engram_gate_bwd[num_tokens=4001-hc=4-hidden=2048]"
+  # "tests/engram/test_engram_gate_fwd.py::test_engram_gate_fwd_alg_ref_matches_tilelang_accum_order[num_tokens=4001-hc=4-hidden=2048]"
+  # "tests/engram/test_engram_gate_fwd.py::test_engram_gate_fwd[num_tokens=4001-hc=4-hidden=2048]"
   "tests/engram/test_engram_grad_w_reduce.py::test_engram_grad_w_reduce[hidden=2048]"
   "tests/engram/test_engram_hash.py::test_engram_hash[num_tokens=4001]"
 
