@@ -1865,6 +1865,8 @@ def matmul_mls_reverse_k(
                 k_tile = (num_k - 1 - k) * block_K
                 T.matrix_load(A[by * block_M, k_tile], A_shared)
                 T.matrix_load(B[k_tile, bx * block_N], B_shared)
+                T.ptx_wait_group(0)
+                T.sync_warp()
                 T.gemm(A_shared, B_shared, C_local, False, False, k_pack=k_pack)
             T.copy(C_local, C[by * block_M, bx * block_N])
 
@@ -1906,6 +1908,8 @@ def matmul_mls_k_outer_n_inner(
                     else:
                         T.copy(C[by * block_M, n * block_N], C_local)
                     T.matrix_load(B[k * block_K, n * block_N], B_shared)
+                    T.ptx_wait_group(0)
+                    T.sync_warp()
                     T.gemm(A_shared, B_shared, C_local, False, False, k_pack=k_pack)
                     T.copy(C_local, C[by * block_M, n * block_N])
 
@@ -1972,10 +1976,14 @@ def matmul_mls_k_prefetch_then_loop(
             T.clear(C_local)
             T.matrix_load(A[by * block_M, 0], A_shared)
             T.matrix_load(B[0, bx * block_N], B_shared)
+            T.ptx_wait_group(0)
+            T.sync_warp()
             T.gemm(A_shared, B_shared, C_local, False, False, k_pack=k_pack)
             for k in T.serial(num_k - 1):
                 T.matrix_load(A[by * block_M, (k + 1) * block_K], A_shared)
                 T.matrix_load(B[(k + 1) * block_K, bx * block_N], B_shared)
+                T.ptx_wait_group(0)
+                T.sync_warp()
                 T.gemm(A_shared, B_shared, C_local, False, False, k_pack=k_pack)
             T.copy(C_local, C[by * block_M, bx * block_N])
 

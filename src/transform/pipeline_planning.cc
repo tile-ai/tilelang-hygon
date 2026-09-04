@@ -19,6 +19,7 @@
 
 #include "../hcu/op/ds_read_format.h"
 #include "../hcu/op/mls.h"
+#include "../hcu/utils/gemm_lds_strategy_utils.h"
 #include "../op/builtin.h"
 #include "../op/copy.h"
 #include "../op/operator.h"
@@ -45,6 +46,7 @@ public:
   bool GetGlobalCopyPattern() const;
   bool GetTmaCopyPattern() const;
   bool HasMatrixLoadPreferredCopy() const;
+  bool HasHcuAsyncPromotableCopy() const;
   bool HasNonCopyTileOp() const;
 
 private:
@@ -64,6 +66,7 @@ private:
   bool is_global_copy_pattern_ = false;
   bool is_tma_copy_ = false;
   bool has_matrix_load_preferred_copy_ = false;
+  bool has_hcu_async_promotable_copy_ = false;
   bool has_non_copy_tile_op_ = false;
   bool within_condition_expr_ = false;
 };
@@ -106,6 +109,10 @@ bool BufferRegionCollector::HasMatrixLoadPreferredCopy() const {
   return has_matrix_load_preferred_copy_;
 }
 
+bool BufferRegionCollector::HasHcuAsyncPromotableCopy() const {
+  return has_hcu_async_promotable_copy_;
+}
+
 bool BufferRegionCollector::HasNonCopyTileOp() const {
   return has_non_copy_tile_op_;
 }
@@ -130,6 +137,8 @@ void BufferRegionCollector::HandleTileOp(const TileOperator &tile_op) {
     is_tma_copy_ = is_tma_copy_ || nested.GetTmaCopyPattern();
     has_matrix_load_preferred_copy_ =
         has_matrix_load_preferred_copy_ || nested.HasMatrixLoadPreferredCopy();
+    has_hcu_async_promotable_copy_ =
+        has_hcu_async_promotable_copy_ || nested.HasHcuAsyncPromotableCopy();
     has_non_copy_tile_op_ = has_non_copy_tile_op_ || nested.HasNonCopyTileOp();
     return;
   }
@@ -142,6 +151,9 @@ void BufferRegionCollector::HandleTileOp(const TileOperator &tile_op) {
     }
     has_matrix_load_preferred_copy_ =
         has_matrix_load_preferred_copy_ || IsMatrixLoadPreferredCopy(*copy);
+    if (copy->annotations.count(attr::kHcuCopyAsyncPromotable)) {
+      has_hcu_async_promotable_copy_ = true;
+    }
   }
   if (const auto *matrix_load = tile_op.as<MatrixLoadNode>()) {
     if (IsGlobalLikeBuffer(matrix_load->src) &&
@@ -427,6 +439,7 @@ struct PipelineStageInfo {
   int order = -1, stage = -1;
   bool copy_stage = false;
   bool matrix_load_copy_stage = false;
+  bool hcu_async_promotable_copy_stage = false;
   bool tma_copy = false; // true if this copy stage uses TMA (not cp.async)
   bool conditional_execution = false;
   bool producer_for_copy = false;
@@ -501,7 +514,10 @@ public:
     if (pinfo.IsMatrixLoadCopyStage()) {
       return true;
     }
-    return use_async_copy_ && pinfo.IsCopyStage();
+    if (TargetIsHCU(target_)) {
+      return pinfo.IsCopyStage() && pinfo.hcu_async_promotable_copy_stage;
+    }
+    return pinfo.IsCopyStage();
   }
 
   bool IsPureCopyStmt(const Stmt &stmt) const {
@@ -875,7 +891,7 @@ public:
   bool EmitImplicitAsyncAnnotations(
       const std::vector<PipelineStageInfo> &pipeline_stage_infos,
       Map<String, Any> *annotations) const {
-    if (!TargetHasAsyncCopy(target_)) {
+    if (!TargetHasAsyncCopy(target_) || !use_async_copy_) {
       return false;
     }
 
@@ -947,7 +963,7 @@ public:
                                             const Array<Integer> &order_array,
                                             const Array<Integer> &stage_array,
                                             Map<String, Any> *annotations) {
-    if (!TargetHasAsyncCopy(target_)) {
+    if (!TargetHasAsyncCopy(target_) || !use_async_copy_) {
       return;
     }
     ICHECK_EQ(pipeline_stmts.size(), order_array.size());
@@ -1007,6 +1023,8 @@ public:
     pinfo.copy_stage = pure_copy_stage;
     pinfo.matrix_load_copy_stage =
         pure_copy_stage && collector.HasMatrixLoadPreferredCopy();
+    pinfo.hcu_async_promotable_copy_stage =
+        pure_copy_stage && collector.HasHcuAsyncPromotableCopy();
     pinfo.tma_copy = pure_copy_stage && !pinfo.conditional_execution &&
                      collector.GetTmaCopyPattern();
     ClassifyCopyLikeStage(block->body, &pinfo);
@@ -1035,8 +1053,7 @@ public:
 
 private:
   PipelinePlanner() = default;
-  explicit PipelinePlanner(bool use_async_copy)
-      : use_async_copy_(use_async_copy) {}
+  PipelinePlanner(bool use_async_copy) : use_async_copy_(use_async_copy) {}
 
   PipelineStageAnalyzer MakeStageAnalyzer() const {
     return PipelineStageAnalyzer(buffer_data_to_buffer_, target_,

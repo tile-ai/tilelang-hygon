@@ -21,6 +21,8 @@ namespace tl {
 namespace attr {
 static constexpr const char *kHcuGemmLdsCopyStrategy =
     "tl.hcu_gemm_lds_copy_strategy";
+static constexpr const char *kHcuCopyAsyncPromotable =
+    "tl.hcu_copy_async_promotable";
 } // namespace attr
 
 class HcuGemmLdsCopyStrategyNode : public ffi::Object {
