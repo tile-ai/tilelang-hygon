@@ -34,6 +34,7 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.IfStmtBinding()(mod)
     mod = tilelang.transform.PipelinePlanning()(mod)
+    mod = tilelang.transform.MaterializeHcuGemmLdsStrategy()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)
     mod = tilelang.transform.Simplify()(mod)
     # MatrixLoad producers use the pipeline async-group path. Keep the legacy
