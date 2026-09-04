@@ -375,10 +375,11 @@ int MlsScopedWarpIdOffset(const Range &thread_bounds, Target target) {
 }
 
 /*
- * MLS tile size rules (MN interleave=1):
+ * MLS tile size rules:
  * num_warps = block_size / TargetHcuGetWarpSize(target); warp_mn * warp_k =
- * num_warps. One warp group extent in K = warp_k * mlsTilesizeK. If > block_k,
- * warps repeat load.
+ * num_warps. Pack warps along the storage-major axis first (K if trans, MN
+ * otherwise). Leftover warps go to the non-major axis; if that axis is already
+ * full, extra warps repeat the same non-major tiles.
  */
 void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
                              int block_size, Target target, int elem_bits,
@@ -410,21 +411,29 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
     }
     if (block_k % tile_k != 0 || block_mn % tile_mn != 0)
       return false;
-    int wm = std::min(block_mn / tile_mn, num_warps);
-    if (num_warps % wm != 0)
-      return false;
-    int wk = num_warps / wm;
-    if (config.require_no_repeat) {
-      if (wm * tile_mn > block_mn || block_mn % (wm * tile_mn) != 0)
-        return false;
-      if (wk * tile_k > block_k || block_k % (wk * tile_k) != 0)
-        return false;
+    const int slots_mn = block_mn / tile_mn;
+    const int slots_k = block_k / tile_k;
+    const int slots_major = trans ? slots_k : slots_mn;
+    const int max_major = std::min(slots_major, num_warps);
+    for (int w_major = max_major; w_major >= 1; --w_major) {
+      if (num_warps % w_major != 0)
+        continue;
+      const int w_minor = num_warps / w_major;
+      const int wm = trans ? w_minor : w_major;
+      const int wk = trans ? w_major : w_minor;
+      if (config.require_no_repeat) {
+        if (wm * tile_mn > block_mn || block_mn % (wm * tile_mn) != 0)
+          continue;
+        if (wk * tile_k > block_k || block_k % (wk * tile_k) != 0)
+          continue;
+      }
+      warp_mn = wm;
+      warp_k = wk;
+      mls_tile_mn = tile_mn;
+      mls_tile_k = tile_k;
+      return true;
     }
-    warp_mn = wm;
-    warp_k = wk;
-    mls_tile_mn = tile_mn;
-    mls_tile_k = tile_k;
-    return true;
+    return false;
   };
 
   auto try_configs = [&](const MlsTileConfig *configs, int config_count) {

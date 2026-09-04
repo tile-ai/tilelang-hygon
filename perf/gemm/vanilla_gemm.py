@@ -196,12 +196,12 @@ def gemm_vanilla_v1(
                     T.matrix_load(B[bx * block_N, k * block_K], B_shared_0)
 
                     # A_shared -> A_local_0_
-                    T.s_waitcnt(1)
+                    T.ptx_wait_group(1)
                     T.sync_threads()
                     T.ds_read_format(A_shared, A_local_0_)
 
                     # B_shared_0 -> B_local_0_
-                    T.s_waitcnt(0)
+                    T.ptx_wait_group(0)
                     T.sync_threads()
                     T.ds_read_format(B_shared_0, B_local_0_)
 
@@ -209,7 +209,7 @@ def gemm_vanilla_v1(
                     T.matrix_load(B[bx * block_N + sub_block_N, k * block_K], B_shared_0)
 
                     # B_shared_0 -> B_local_1_
-                    T.s_waitcnt(0)
+                    T.ptx_wait_group(0)
                     T.sync_threads()
                     T.ds_read_format(B_shared_0, B_local_1_)
 
@@ -320,7 +320,7 @@ def gemm_vanilla_v2(
                 matrix_load_b(B, bx * block_N, 0, B_shared_0[0, :, :])
                 matrix_load_b(B, bx * block_N + sub_block_N, 0, B_shared_1[0, :, :])
                 T.sched_barrier()
-                T.s_waitcnt(0)
+                T.ptx_wait_group(0)
                 T.sync_warp()
                 T.matrix_load(A[by * block_M, block_K], A_shared[1, :, :])
                 matrix_load_b(B, bx * block_N, block_K, B_shared_0[1, :, :])
@@ -340,7 +340,8 @@ def gemm_vanilla_v2(
                     matrix_load_b(B, bx * block_N, base * block_K, B_shared_0[0, :, :])
                     matrix_load_b(B, bx * block_N + sub_block_N, base * block_K, B_shared_1[0, :, :])
 
-                    T.s_waitcnt(3)
+                    # Keep the three newer shared_0 MatrixLoad groups in flight.
+                    T.ptx_wait_group(3)
                     T.sync_warp()
                     T.ds_read_format(A_shared[1, :, :], A_local_0_)
                     T.ds_read_format(B_shared_0[1, :, :], B_local_0_)
@@ -359,7 +360,8 @@ def gemm_vanilla_v2(
                     matrix_load_b(B, bx * block_N + sub_block_N, (base + 1) * block_K, B_shared_1[1, :, :])
 
                     T.sched_barrier()
-                    T.s_waitcnt(3)
+                    # Keep the three newer shared_1 MatrixLoad groups in flight.
+                    T.ptx_wait_group(3)
                     T.sync_warp()
                     T.ds_read_format(A_shared[0, :, :], A_local_0)
                     T.ds_read_format(B_shared_0[0, :, :], B_local_0)
@@ -373,7 +375,7 @@ def gemm_vanilla_v2(
                 matrix_load_b(B, bx * block_N, 0, B_shared_0[0, :, :])
                 matrix_load_b(B, bx * block_N + sub_block_N, 0, B_shared_1[0, :, :])
                 T.sched_barrier()
-                T.s_waitcnt(0)
+                T.ptx_wait_group(0)
                 T.sync_warp()
                 T.ds_read_format(A_shared[0, :, :], A_local_0)
                 T.ds_read_format(B_shared_0[0, :, :], B_local_0)
@@ -392,7 +394,7 @@ def gemm_vanilla_v2(
                     T.sched_barrier()
                     T.gemm(A_local_0, B_local_0, C_local_0, transpose_B=transpose_B)
                     T.sched_barrier()
-                    T.s_waitcnt(0)
+                    T.ptx_wait_group(0)
                     T.sync_warp()
                     T.matrix_load(A[by * block_M, base * block_K], A_shared[0, :, :])
                     matrix_load_b(B, bx * block_N, base * block_K, B_shared_0[0, :, :])
@@ -411,7 +413,7 @@ def gemm_vanilla_v2(
                     T.sched_barrier()
                     T.gemm(A_local_0_, B_local_0_, C_local_0, transpose_B=transpose_B)
                     T.sched_barrier()
-                    T.s_waitcnt(0)
+                    T.ptx_wait_group(0)
                     T.sync_warp()
                     T.matrix_load(A[by * block_M, (base + 1) * block_K], A_shared[1, :, :])
                     matrix_load_b(B, bx * block_N, (base + 1) * block_K, B_shared_0[1, :, :])
@@ -425,7 +427,7 @@ def gemm_vanilla_v2(
 
             if remain > 1:
                 T.gemm(A_local_0, B_local_0, C_local_0, transpose_B=transpose_B)
-                T.s_waitcnt(0)
+                T.ptx_wait_group(0)
                 T.sync_warp()
                 T.ds_read_format(A_shared[1, :, :], A_local_0_)
                 T.ds_read_format(B_shared_0[1, :, :], B_local_0_)

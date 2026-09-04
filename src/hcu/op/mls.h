@@ -15,7 +15,9 @@ using namespace ffi;
 
 /// Derive MLS warp division (warp_mn, warp_k) from block shape and num_warps.
 /// num_warps = block_size / TargetHcuGetWarpSize(target); warp_mn * warp_k =
-/// num_warps.
+/// num_warps. Pack along the storage-major axis first (K if trans, MN
+/// otherwise); leftover warps go to the non-major axis, and surplus warps
+/// repeat on the non-major axis.
 void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
                              int block_size, Target target, int elem_bits,
                              int &warp_mn, int &warp_k, int &mls_tile_mn,

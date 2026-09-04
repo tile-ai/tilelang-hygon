@@ -134,6 +134,13 @@ TL_DEVICE void hcu_cp_async_gs_via_direct_lds_with_resource(
         is_valid ? *(const uint4 *)global_thread_ptr : make_uint4(0, 0, 0, 0);
   }
 #undef TL_HCU_GLOBAL_TO_LDS_ASYNC_MULTIDWORD_RESOURCE
+  // Alternative builtin path:
+  // __attribute__((address_space(3))) int *const lds_ptr =
+  //     reinterpret_cast<__attribute__((address_space(3))) int *>(
+  //         reinterpret_cast<uintptr_t>(lds_base_ptr));
+  // __builtin_amdgcn_raw_buffer_load_async_lds(
+  //     src_resource, lds_ptr, NumUint32PerThread * sizeof(uint32_t),
+  //     static_cast<uint32_t>(byte_offset), 0, 0, 0);
 }
 
 // 与 codegen_hcu.cc 约定：全局/global 传入「本线程区域起点」，须折算为 wave
@@ -190,6 +197,7 @@ TL_DEVICE void hcu_cp_async_gs_via_direct_lds(void *lds_base_ptr,
 
 // AMDGPU automatically commit memory fence
 TL_DEVICE void cp_async_commit() {}
+// TL_DEVICE void cp_async_commit() { __builtin_amdgcn_asyncmark(); }
 
 // Global Memory only fence
 __device__ void async_gld_fence(index_t cnt) {
@@ -205,8 +213,9 @@ __device__ void wave_barrier() { asm volatile("s_barrier" : : : "memory"); }
 
 template <int N = 0> TL_DEVICE void cp_async_wait() {
   async_gld_fence(N);
-  // or
-  // async_gld_sld_fence(N);
+  // static_assert(N >= 0 && N <= 65535,
+  //               "async-copy group depth must fit unsigned short");
+  // __builtin_amdgcn_wait_asyncmark(static_cast<unsigned short>(N));
 }
 
 namespace detail {
@@ -242,6 +251,13 @@ TL_DEVICE void cp_async_gs_idxen_impl(uint32_t lds_base, int32x4_t src_resource,
         "v"(v_addr), "s"(src_resource), "n"(SmemOffset)
         : "memory");
   }
+  // Alternative builtin path:
+  // __attribute__((address_space(3))) int *lds_ptr =
+  //     reinterpret_cast<__attribute__((address_space(3))) int *>(
+  //         static_cast<uintptr_t>(lds_base + SmemOffset));
+  // __builtin_amdgcn_struct_buffer_load_async_lds(
+  //     src_resource, lds_ptr, N, static_cast<uint32_t>(idxen),
+  //     static_cast<uint32_t>(src_thread_byte_offset), 0, 0, 0);
 }
 
 template <int N> TL_DEVICE void clear_cp_async_lds(void *lds_lane_ptr) {
