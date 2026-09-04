@@ -67,7 +67,15 @@ private:
       if (call->op.as<OpNode>()) {
         Op tir_op = Downcast<Op>(call->op);
         if (tir_op == MatrixLoad::Get() || tir_op == DsReadFormat::Get() ||
-            tir_op == Gemm::Get()) {
+            tir_op == Gemm::Get() || tir_op == Copy::Get()) {
+          if (tir_op == Copy::Get()) {
+            auto copy =
+                Downcast<Copy>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
+            if (!IsMatrixLoadPreferredCopy(*copy.get())) {
+              StmtExprVisitor::VisitStmt_(op);
+              return;
+            }
+          }
           found_ = true;
           return;
         }
@@ -521,6 +529,27 @@ private:
     return true;
   }
 
+  bool HasOnlyGemmReadersAfterCall(const Buffer &buffer,
+                                   const CallNode *after_site_call) const {
+    if (collector_ == nullptr) {
+      return false;
+    }
+    const int after_order = after_site_call == nullptr
+                                ? -1
+                                : collector_->GetCallStmtOrder(after_site_call);
+    bool has_reader = false;
+    for (const ReaderCallRecord &reader : collector_->GetReaderCalls(buffer)) {
+      if (reader.call == nullptr || reader.stmt_order <= after_order) {
+        continue;
+      }
+      has_reader = true;
+      if (!IsGemmTileOpCall(reader.call)) {
+        return false;
+      }
+    }
+    return has_reader;
+  }
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
     auto call = op->value.as<CallNode>();
     if (call == nullptr || !call->op.as<OpNode>()) {
@@ -558,6 +587,19 @@ private:
 
     if (IsCopyLikeOp(tir_op)) {
       auto copy = Downcast<Copy>(ParseOperator(ffi::GetRef<Call>(call)));
+      if (IsMatrixLoadPreferredCopy(*copy.get())) {
+        ICHECK(HasOnlyGemmReadersAfterCall(copy->dst, call))
+            << "Explicit prefer_instruction=\"matrix_load\" requires every "
+               "downstream reader of buffer "
+            << copy->dst->name << " after this copy to be tl.tileop.gemm.";
+        bool trans = true;
+        LookupSharedMlsTrans(copy->dst, &trans);
+        auto annotations = call->annotations;
+        annotations.Set(attr::kMlsTrans,
+                        IntImm(DataType::Int(32), trans ? 1 : 0));
+        return Evaluate(
+            Call(call->dtype, call->op, call->args, annotations, call->span));
+      }
       auto consumer = PropagateToFindGemmConsumerOpWithInputAfterCall(
           copy->dst, collector_, call);
       if (consumer &&

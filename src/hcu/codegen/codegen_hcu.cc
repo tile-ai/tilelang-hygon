@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "hcu/target_utils.h"
+#include "hcu/utils/mls_boundary.h"
 #include "op/builtin.h"
 
 namespace tvm {
@@ -1257,8 +1258,7 @@ std::string MlsBaseTemplateFromLoadTile(const std::string &sym) {
       << "mls_load_tile expects at least 8 template args";
   std::ostringstream os;
   os << "tl::mls::tilelang_mls_base<";
-  const bool has_dst_bits_arg =
-      args.size() > 8 && args[8] != "true" && args[8] != "false";
+  const bool has_dst_bits_arg = ::tvm::tl::MlsLoadTileHasDstBits(args);
   const size_t base_arg_count = has_dst_bits_arg ? 9 : 8;
   for (size_t i = 0; i < base_arg_count; ++i) {
     if (i != 0)
@@ -1283,14 +1283,9 @@ MlsLastLoadTemplateArgs(const std::string &sym) {
   const std::string prefix = "tl::mls::mls_load_tile<";
   auto args = SplitTopLevelTemplateArgs(
       sym.substr(prefix.size(), sym.size() - prefix.size() - 1));
-  const bool has_dst_bits_arg =
-      args.size() > 8 && args[8] != "true" && args[8] != "false";
-  const size_t check_idx = has_dst_bits_arg ? 9 : 8;
-  const size_t last_idx = has_dst_bits_arg ? 10 : 9;
-  std::string check_last_load =
-      args.size() > check_idx ? args[check_idx] : "true";
-  std::string last_load = args.size() > last_idx ? args[last_idx] : "false";
-  return {check_last_load, last_load};
+  const auto modes = ::tvm::tl::MlsParseBoundaryArgs(args);
+  auto lit = ::tvm::tl::MlsKModeToLastLoadLiterals(modes.k);
+  return {lit.first, lit.second};
 }
 
 std::string MlsAsyncLoadTemplateArgs(const std::string &template_args) {

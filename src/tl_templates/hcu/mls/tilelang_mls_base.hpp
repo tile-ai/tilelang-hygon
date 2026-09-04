@@ -22,6 +22,8 @@
 
 #include <tl_templates/hcu/mls/tile_window_mls.h>
 
+#include <cstdint>
+
 namespace tl {
 namespace mls {
 
@@ -455,15 +457,15 @@ struct tilelang_mls_base {
  * Flow: construct(k_length_raw) -> set_window_origin(block_mn_base, 0) ->
  * move_base_to(block_k_base)
  *       -> async_mls_load_asm(smem, block_k_base).
- * check_last_load=true (default): compute last_load at runtime, may cause
- * branch. check_last_load=false: use last_load template param (compile-time),
- * no branch.
+ * check_last_load=true (default, K analyze): compute last_load at runtime.
+ * check_last_load=false: use last_load template param (K skip / refresh).
+ * TIR boundary=(mn, k) is encoded as int8 modes after DstBits on mls_load_tile.
  */
 template <typename BlockSize, typename MlsTileSize, ::tl::index_t WarpMN,
           ::tl::index_t WarpK, typename DataType, ::tl::index_t Alt, bool Trans,
           ::tl::hcu_target_enum HcuArch,
           ::tl::index_t DstBits = mls_elem_bits_v<DataType>,
-          bool check_last_load = true, bool last_load = false>
+          int8_t KBoundary = -1, int8_t MNBoundary = -1>
 TL_DEVICE void
 mls_load_tile(DataType *p_data, ::tl::index_t mls_stride,
               ::tl::index_t mn_length_raw, ::tl::index_t k_length_raw,
@@ -472,11 +474,12 @@ mls_load_tile(DataType *p_data, ::tl::index_t mls_stride,
   using MlsBase = tilelang_mls_base<BlockSize, MlsTileSize, WarpMN, WarpK,
                                     DataType, Alt, Trans, HcuArch, DstBits>;
   MlsBase mls(p_data, mls_stride, mn_length_raw, k_length_raw, warp_id_offset);
-  // mls.set_window_origin(::tl::make_array<::tl::index_t>(block_mn_base,
-  // ::tl::number<0>{})); mls.update_base(block_k_base);
   mls.set_window_origin(
       ::tl::make_array<::tl::index_t>(block_mn_base, block_k_base));
   auto *typed_smem = reinterpret_cast<TL_LDS_ADDR DataType *>(smem);
+  constexpr bool check_last_load = (KBoundary == -1);
+  constexpr bool last_load = (KBoundary == 1);
+  (void)MNBoundary;
   mls.template async_mls_load_asm<DataType, check_last_load, last_load>(
       typed_smem, block_k_base);
 }

@@ -44,6 +44,7 @@ public:
   Array<BufferRegion> GetWrites() const;
   bool GetGlobalCopyPattern() const;
   bool GetTmaCopyPattern() const;
+  bool HasMatrixLoadPreferredCopy() const;
   bool HasNonCopyTileOp() const;
 
 private:
@@ -62,6 +63,7 @@ private:
   bool is_global_read_ = false;
   bool is_global_copy_pattern_ = false;
   bool is_tma_copy_ = false;
+  bool has_matrix_load_preferred_copy_ = false;
   bool has_non_copy_tile_op_ = false;
   bool within_condition_expr_ = false;
 };
@@ -100,6 +102,10 @@ bool BufferRegionCollector::GetGlobalCopyPattern() const {
 
 bool BufferRegionCollector::GetTmaCopyPattern() const { return is_tma_copy_; }
 
+bool BufferRegionCollector::HasMatrixLoadPreferredCopy() const {
+  return has_matrix_load_preferred_copy_;
+}
+
 bool BufferRegionCollector::HasNonCopyTileOp() const {
   return has_non_copy_tile_op_;
 }
@@ -122,6 +128,8 @@ void BufferRegionCollector::HandleTileOp(const TileOperator &tile_op) {
     is_global_copy_pattern_ =
         is_global_copy_pattern_ || nested.GetGlobalCopyPattern();
     is_tma_copy_ = is_tma_copy_ || nested.GetTmaCopyPattern();
+    has_matrix_load_preferred_copy_ =
+        has_matrix_load_preferred_copy_ || nested.HasMatrixLoadPreferredCopy();
     has_non_copy_tile_op_ = has_non_copy_tile_op_ || nested.HasNonCopyTileOp();
     return;
   }
@@ -132,6 +140,8 @@ void BufferRegionCollector::HandleTileOp(const TileOperator &tile_op) {
     if (IsGlobalLikeBuffer(copy->src) && IsSharedBuffer(copy->dst)) {
       is_global_copy_pattern_ = true;
     }
+    has_matrix_load_preferred_copy_ =
+        has_matrix_load_preferred_copy_ || IsMatrixLoadPreferredCopy(*copy);
   }
   if (const auto *matrix_load = tile_op.as<MatrixLoadNode>()) {
     if (IsGlobalLikeBuffer(matrix_load->src) &&
@@ -415,6 +425,7 @@ struct PipelineStageInfo {
   int original_stmt_index{};
   int order = -1, stage = -1;
   bool copy_stage = false;
+  bool matrix_load_copy_stage = false;
   bool tma_copy = false; // true if this copy stage uses TMA (not cp.async)
   bool conditional_execution = false;
   bool producer_for_copy = false;
@@ -424,6 +435,7 @@ struct PipelineStageInfo {
 public:
   bool IsFirstStage() const { return copy_stage || producer_for_copy; }
   bool IsCopyStage() const { return copy_stage; }
+  bool IsMatrixLoadCopyStage() const { return matrix_load_copy_stage; }
   bool IsTmaCopy() const { return tma_copy; }
   bool IsProducerForCopy() const { return producer_for_copy; }
   bool IsLastUseStmtIndexValid() const { return last_use_stmt_index != -1; }
@@ -484,6 +496,9 @@ public:
     }
     if (pinfo.IsTmaCopy()) {
       return false;
+    }
+    if (pinfo.IsMatrixLoadCopyStage()) {
+      return true;
     }
     return pinfo.IsCopyStage();
   }
@@ -1056,6 +1071,8 @@ public:
     bool pure_copy_stage =
         collector.GetGlobalCopyPattern() && IsPureCopyStmt(block->body);
     pinfo.copy_stage = pure_copy_stage;
+    pinfo.matrix_load_copy_stage =
+        pure_copy_stage && collector.HasMatrixLoadPreferredCopy();
     pinfo.tma_copy = pure_copy_stage && !pinfo.conditional_execution &&
                      collector.GetTmaCopyPattern();
     ClassifyCopyLikeStage(block->body, &pinfo);

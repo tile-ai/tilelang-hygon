@@ -26,7 +26,18 @@ static bool IsMatrixLoadCall(const CallNode *call) {
   if (!call->op.as<OpNode>())
     return false;
   std::string name = call->op.as<OpNode>()->name;
-  return name == "tl.tileop.matrix_load";
+  if (name == "tl.tileop.matrix_load") {
+    return true;
+  }
+  if (name != "tl.tileop.copy") {
+    return false;
+  }
+  auto preferred = call->annotations.Get("prefer_instruction");
+  if (!preferred) {
+    return false;
+  }
+  const auto *value = preferred.value().as<StringImmNode>();
+  return value != nullptr && value->value == "matrix_load";
 }
 
 static bool IsDsReadFormatCall(const CallNode *call) {

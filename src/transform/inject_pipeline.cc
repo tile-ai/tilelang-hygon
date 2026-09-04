@@ -279,7 +279,14 @@ private:
 
   PrimExpr VisitExpr_(const CallNode *op) final {
     static const Op &copy_op = Op::Get("tl.tileop.copy");
+    static const Op &matrix_load_op = Op::Get("tl.tileop.matrix_load");
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    if (call->op.same_as(matrix_load_op)) {
+      auto annotations = call->annotations;
+      annotations.Set(attr::kAsyncCopyNoImplicitCommitWait,
+                      IntImm(DataType::Int(32), 1));
+      return Call(call->dtype, call->op, call->args, annotations, call->span);
+    }
     if (!call->op.same_as(copy_op) || !CanUsePipelineManagedCPAsyncCopy(call)) {
       return call;
     }

@@ -38,7 +38,7 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.InjectRegisterSoftwarePipeline()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)
     mod = tilelang.transform.Simplify()(mod)
-    mod = tilelang.transform.InsertMlsWaitcnt()(mod)
+    # MatrixLoad uses the pipeline async-group path for commit/wait.
     mod = tilelang.transform.InsertScaleBufferSync()(mod)
 
     mod = tilelang.transform.LayoutInference()(mod)

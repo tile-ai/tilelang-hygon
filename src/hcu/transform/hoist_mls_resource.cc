@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "hcu/utils/extern_call_checker.h"
+#include "hcu/utils/mls_boundary.h"
 #include "op/builtin.h"
 
 namespace tvm {
@@ -90,7 +91,7 @@ std::string MlsBaseTemplateFromLoadTile(const std::string &sym) {
       << "mls_load_tile expects at least 8 template args";
   std::ostringstream os;
   os << "tl::mls::tilelang_mls_base<";
-  const size_t base_arg_count = args.size() > 10 ? 9 : 8;
+  const size_t base_arg_count = MlsLoadTileHasDstBits(args) ? 9 : 8;
   for (size_t i = 0; i < base_arg_count; ++i) {
     if (i != 0)
       os << ", ";
@@ -109,17 +110,11 @@ std::string MlsDataTypeFromLoadTile(const std::string &sym) {
   return args[4];
 }
 
-std::pair<std::string, std::string>
-MlsLastLoadTemplateArgs(const std::string &sym) {
+MlsBoundaryModes MlsBoundaryFromLoadTile(const std::string &sym) {
   auto args = SplitTopLevelTemplateArgs(
       sym.substr(std::strlen(kMlsLoadTilePrefix),
                  sym.size() - std::strlen(kMlsLoadTilePrefix) - 1));
-  const size_t check_idx = args.size() > 10 ? 9 : 8;
-  const size_t last_idx = args.size() > 10 ? 10 : 9;
-  std::string check_last_load =
-      args.size() > check_idx ? args[check_idx] : "true";
-  std::string last_load = args.size() > last_idx ? args[last_idx] : "false";
-  return {check_last_load, last_load};
+  return MlsParseBoundaryArgs(args);
 }
 
 std::optional<std::pair<int64_t, int64_t>>
@@ -596,12 +591,17 @@ public:
 
       bool check_k_filter = true;
       bool check_mn_filter = true;
+      const auto modes = MlsBoundaryFromLoadTile(sym);
+      bool proved_mn = false;
+      bool proved_k = false;
       if (auto block_sizes = MlsBlockSizesFromLoadTile(sym)) {
-        check_mn_filter = !CanProveNoBoundary(call->args[5], call->args[3],
-                                              block_sizes->first);
-        check_k_filter = !CanProveNoBoundary(call->args[6], call->args[4],
-                                             block_sizes->second);
+        proved_mn = CanProveNoBoundary(call->args[5], call->args[3],
+                                       block_sizes->first);
+        proved_k = CanProveNoBoundary(call->args[6], call->args[4],
+                                      block_sizes->second);
       }
+      check_mn_filter = MlsShouldFilter(modes.mn, proved_mn);
+      check_k_filter = MlsShouldFilter(modes.k, proved_k);
 
       const std::string data_type = MlsDataTypeFromLoadTile(sym);
       std::ostringstream async_sym;
@@ -615,12 +615,15 @@ public:
       seq.push_back(MakeExternStmt("tl::mls::update_base",
                                    {StringImm(obj_name), call->args[6]}));
       const std::string data_type = MlsDataTypeFromLoadTile(sym);
-      auto [check_last_load, last_load] = MlsLastLoadTemplateArgs(sym);
-      if (auto block_sizes = MlsBlockSizesFromLoadTile(sym)) {
-        if (CanProveNoBoundary(call->args[6], call->args[4],
-                               block_sizes->second)) {
-          check_last_load = "false";
-          last_load = "false";
+      const auto modes = MlsBoundaryFromLoadTile(sym);
+      auto [check_last_load, last_load] = MlsKModeToLastLoadLiterals(modes.k);
+      if (modes.k == MlsBoundaryMode::kAnalyze) {
+        if (auto block_sizes = MlsBlockSizesFromLoadTile(sym)) {
+          if (CanProveNoBoundary(call->args[6], call->args[4],
+                                 block_sizes->second)) {
+            check_last_load = "false";
+            last_load = "false";
+          }
         }
       }
       std::ostringstream async_sym;

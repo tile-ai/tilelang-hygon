@@ -21,18 +21,47 @@ import tvm
 from tvm import ir, tirx
 
 
+def _encode_mls_boundary_dim(value: bool | None) -> int:
+    """Map one (MN or K) hint to a TIR int32 policy.
+
+    None  -> -1, compiler may prove in-range or check at runtime.
+    False ->  0, caller contract: in-range, skip filter.
+    True  ->  1, caller contract: always apply filter.
+    """
+    if value is None:
+        return -1
+    return 1 if value else 0
+
+
 def matrix_load(
     src: tirx.Buffer | tirx.BufferLoad | tirx.BufferRegion,
     dst: tirx.Buffer | tirx.BufferLoad | tirx.BufferRegion,
+    boundary: tuple[bool | None, bool | None] | None = None,
+    *,
     last_k_load: bool | None = None,
+    annotations: dict | None = None,
 ):
-    """MLS (Matrix Load Store) load from global memory to shared memory."""
-    if last_k_load is None:
-        check_last_k_load = True
-        last_k_load_val = False
+    """MLS (Matrix Load Store) load from global memory to shared memory.
+
+    ``boundary`` is ``(mn, k)`` over the last two logical tile axes.
+    Each entry is None (analyze), False (in-range), or True (partial).
+
+    ``last_k_load`` is the older K-only hint: None analyze, False skip, True refresh.
+    Ignored when ``boundary`` is set.
+
+    The operation commits its async group by default. Set
+    ``no_implicit_async_commit_wait`` in ``annotations`` to group multiple
+    MatrixLoad operations under an explicit ``T.ptx_commit_group()``.
+    """
+    if boundary is None:
+        mn_hint = None
+        k_hint = last_k_load
     else:
-        check_last_k_load = False
-        last_k_load_val = last_k_load
+        if len(boundary) != 2:
+            raise ValueError("matrix_load boundary must be (mn, k) over the last two tile axes")
+        mn_hint, k_hint = boundary
+    mn_mode = _encode_mls_boundary_dim(mn_hint)
+    k_mode = _encode_mls_boundary_dim(k_hint)
 
     def _get_extent(data):
         if isinstance(data, tirx.Var) and T.has_let_value(data):
@@ -98,8 +127,9 @@ def matrix_load(
         tirx.op.Op.get("tl.tileop.matrix_load"),
         src_region,
         dst_region,
-        tirx.IntImm("int32", 1 if check_last_k_load else 0),
-        tirx.IntImm("int32", 1 if last_k_load_val else 0),
+        tirx.IntImm("int32", mn_mode),
+        tirx.IntImm("int32", k_mode),
+        annotations=annotations,
     )
 
 
@@ -350,7 +380,7 @@ def copy(
             instruction category. For CUDA, recognized values include "tma", "cp_async", and
             "sync". For "tma", T.copy keeps synchronous copy semantics; global -> shared copies
             lower through TMA with an automatically allocated barrier and wait when constraints
-            are satisfied.
+            are satisfied. HCU additionally recognizes "matrix_load" for explicit MLS lowering.
         annotations (Optional[dict], keyword-only): Additional annotations dict. If provided,
             coalesced_width, disable_tma, enable_async, eviction_policy, and prefer_instruction
             can also be specified here.

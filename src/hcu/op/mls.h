@@ -13,6 +13,15 @@ namespace tl {
 using namespace tirx;
 using namespace ffi;
 
+class CopyNode;
+class MatrixLoad;
+
+/// Whether a Copy explicitly requests HCU MatrixLoad lowering.
+bool IsMatrixLoadPreferredCopy(const CopyNode &copy);
+
+/// Adapt a Copy to MatrixLoad while preserving its regions and annotations.
+MatrixLoad MakeMatrixLoadFromCopy(const CopyNode &copy);
+
 /// Derive MLS warp division (warp_mn, warp_k) from block shape and num_warps.
 /// num_warps = block_size / TargetHcuGetWarpSize(target); warp_mn * warp_k =
 /// num_warps. Pack along the storage-major axis first (K if trans, MN
@@ -45,8 +54,10 @@ public:
       src_ranges; // from src region, last 2 dims = MN,K (order from Gemm)
   Array<Range>
       dst_ranges; // leading dims select ping-pong slice; last 2 = MN,K tile
-  bool check_last_load;
-  bool last_load;
+  /// Per-axis policy: -1 analyze, 0 skip, 1 refresh (see MlsBoundaryMode).
+  int mn_boundary;
+  int k_boundary;
+  bool no_implicit_async_commit_wait_{false};
   /// Validated by AnnotateMlsGemmDep and stored as tl.mls_trans on the call.
   bool mls_trans_{true};
 
@@ -60,8 +71,10 @@ public:
         .def_ro("dst", &MatrixLoadNode::dst)
         .def_ro("src_ranges", &MatrixLoadNode::src_ranges)
         .def_ro("dst_ranges", &MatrixLoadNode::dst_ranges)
-        .def_ro("check_last_load", &MatrixLoadNode::check_last_load)
-        .def_ro("last_load", &MatrixLoadNode::last_load);
+        .def_ro("mn_boundary", &MatrixLoadNode::mn_boundary)
+        .def_ro("k_boundary", &MatrixLoadNode::k_boundary)
+        .def_ro("no_implicit_async_commit_wait",
+                &MatrixLoadNode::no_implicit_async_commit_wait_);
   }
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
