@@ -606,17 +606,17 @@ def _pack_s_waitcnt_imm(cnt: int, flag: str) -> int:
     if flag == "vmcnt":
         if not 0 <= cnt <= 63:
             raise ValueError(f"vmcnt must be in [0, 63], but got {cnt}.")
-        return (cnt & 0xF) | (7 << 4) | (1 << 7) | (15 << 8) | (3 << 12) | ((cnt & 0x30) << 10)
+        return (cnt & 0xF) | (7 << 4) | (15 << 8) | (3 << 12) | ((cnt & 0x30) << 10)
 
     if flag == "lgkmcnt":
         if not 0 <= cnt <= 15:
             raise ValueError(f"lgkmcnt must be in [0, 15], but got {cnt}.")
-        return 0xF | (7 << 4) | (1 << 7) | (cnt << 8) | (3 << 12) | (3 << 14)
+        return 0xF | (7 << 4) | (cnt << 8) | (3 << 12) | (3 << 14)
 
     if flag == "expcnt":
         if not 0 <= cnt <= 7:
             raise ValueError(f"expcnt must be in [0, 7], but got {cnt}.")
-        return 0xF | (cnt << 4) | (1 << 7) | (15 << 8) | (3 << 12) | (3 << 14)
+        return 0xF | (cnt << 4) | (15 << 8) | (3 << 12) | (3 << 14)
 
     raise ValueError(f"Unsupported s_waitcnt flag: {flag}. Expected one of vmcnt, lgkmcnt, expcnt.")
 
