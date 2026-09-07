@@ -170,8 +170,10 @@ def _gemm_async_copy_vanilla(
                     # Phase 0
                     T.copy(A_shared_1, A_local_1)
                     T.copy(B_shared_1, B_local_1)
+                    T.call_extern("tl::promote_prio", dtype="void")
                     async_copy_a(A, A_shared_0, by, k0 + 4)
                     async_copy_b(B, B_shared_0, bx, k0 + 4)
+                    T.call_extern("tl::restore_prio", dtype="void")
                     T.s_waitcnt(steady_wait, "lgkmcnt")
                     T.sched_barrier()
                     T.gemm(A_local_0, B_local_0, C_local, transpose_B=transpose_B, annotations={"trans_c": True})

@@ -69,6 +69,7 @@ def gemm_wasp_mls_4p4c4c(
     k_tiles = T.ceildiv(K, block_K)
     full_k_pairs = k_tiles // 2
     half_N = block_N // 2
+    mls_annotations = {"no_implicit_async_commit_wait": T.int32(1)}
 
     @T.prim_func
     def _gemm_wasp_mls_4p4c4c(
@@ -113,11 +114,13 @@ def gemm_wasp_mls_4p4c4c(
                         A[by * block_M, k_ping * block_K],
                         A_shared_ping,
                         boundary=(None, False),
+                        annotations=mls_annotations,
                     )
                     T.matrix_load(
                         B[bx * block_N, k_ping * block_K],
                         B_shared_ping,
                         boundary=(None, False),
+                        annotations=mls_annotations,
                     )
                     T.abarrier_arrive(READY_PING)
 
@@ -129,11 +132,13 @@ def gemm_wasp_mls_4p4c4c(
                         A[by * block_M, k_pong * block_K],
                         A_shared_pong,
                         boundary=(None, False),
+                        annotations=mls_annotations,
                     )
                     T.matrix_load(
                         B[bx * block_N, k_pong * block_K],
                         B_shared_pong,
                         boundary=(None, False),
+                        annotations=mls_annotations,
                     )
                     T.abarrier_arrive(READY_PONG)
 
@@ -146,10 +151,12 @@ def gemm_wasp_mls_4p4c4c(
                     T.matrix_load(
                         A[by * block_M, tail_k_ping * block_K],
                         A_shared_ping,
+                        annotations=mls_annotations,
                     )
                     T.matrix_load(
                         B[bx * block_N, tail_k_ping * block_K],
                         B_shared_ping,
+                        annotations=mls_annotations,
                     )
                     T.abarrier_arrive(READY_PING)
             elif tx < consumer0_tx:
@@ -302,6 +309,7 @@ def gemm_wasp_mls_4p4c4c_persistent(
     ping_uses_per_block = full_k_pairs + k_tiles % 2
     pong_uses_per_block = full_k_pairs
     half_N = block_N // 2
+    mls_annotations = {"no_implicit_async_commit_wait": T.int32(1)}
 
     @T.prim_func
     def _gemm_wasp_mls_4p4c4c_persistent(
@@ -360,11 +368,13 @@ def gemm_wasp_mls_4p4c4c_persistent(
                             A[by * block_M, k_ping * block_K],
                             A_shared_ping,
                             boundary=k_pair_boundary,
+                            annotations=mls_annotations,
                         )
                         T.matrix_load(
                             B[bx * block_N, k_ping * block_K],
                             B_shared_ping,
                             boundary=k_pair_boundary,
+                            annotations=mls_annotations,
                         )
                         T.abarrier_arrive(READY_PING)
                         T.sched_barrier(0)
@@ -374,11 +384,13 @@ def gemm_wasp_mls_4p4c4c_persistent(
                             A[by * block_M, k_pong * block_K],
                             A_shared_pong,
                             boundary=k_pair_boundary,
+                            annotations=mls_annotations,
                         )
                         T.matrix_load(
                             B[bx * block_N, k_pong * block_K],
                             B_shared_pong,
                             boundary=k_pair_boundary,
+                            annotations=mls_annotations,
                         )
                         T.abarrier_arrive(READY_PONG)
 
@@ -390,10 +402,12 @@ def gemm_wasp_mls_4p4c4c_persistent(
                         T.matrix_load(
                             A[by * block_M, tail_k_ping * block_K],
                             A_shared_ping,
+                            annotations=mls_annotations,
                         )
                         T.matrix_load(
                             B[bx * block_N, tail_k_ping * block_K],
                             B_shared_ping,
+                            annotations=mls_annotations,
                         )
                         T.abarrier_arrive(READY_PING)
             elif tx < consumer0_tx:

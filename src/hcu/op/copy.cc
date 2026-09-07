@@ -8,6 +8,7 @@
 #include <tvm/ir/cast.h>
 #include <tvm/runtime/logging.h>
 
+#include "hcu/op/mls.h"
 #include "hcu/target_utils.h"
 #include "hcu/transform/async_copy_injector.h"
 #include "hcu/utils/gemm_lds_strategy_utils.h"
@@ -64,20 +65,26 @@ Map<String, ObjectRef> GetHCUAsyncCopyAnnotations(const CopyNode &op) {
 enum class CopyInst : uint8_t {
   kNormal = 0,
   kCPAsync = 1,
+  kMatrixLoad = 2,
 };
 
 struct Copy {
   static LayoutMap InferLayout(const CopyNode &op,
                                const LayoutInferArgs &layout_args,
                                InferLevel level) {
-    SelectInst(op, layout_args.target, layout_args.layout_map,
-               layout_args.analyzer);
+    if (SelectInst(op, layout_args.target, layout_args.layout_map,
+                   layout_args.analyzer) == CopyInst::kMatrixLoad) {
+      return {};
+    }
     return op.InferSIMTLayout(layout_args, level);
   }
 
   static CopyInst SelectInst(const CopyNode &op, Target target,
                              const LayoutMap &layout_map,
                              arith::Analyzer *analyzer) {
+    if (IsMatrixLoadPreferredCopy(op)) {
+      return CopyInst::kMatrixLoad;
+    }
     if (GetIsAsyncCopy(op) || GetNoImplicitAsyncCommitWait(op)) {
       bool cp_async_supported =
           CheckCPAsyncCopy(op, target, layout_map, analyzer);
@@ -99,6 +106,9 @@ struct Copy {
         SelectInst(op, lower_args.target, lower_args.layout_map, analyzer);
     if (copy_inst == CopyInst::kCPAsync) {
       return LowerCPAsync(op, lower_args, analyzer);
+    }
+    if (copy_inst == CopyInst::kMatrixLoad) {
+      return MakeMatrixLoadFromCopy(op)->Lower(lower_args, analyzer);
     }
     if (copy_inst == CopyInst::kNormal) {
       return LowerNormalCopy(op, lower_args, analyzer);

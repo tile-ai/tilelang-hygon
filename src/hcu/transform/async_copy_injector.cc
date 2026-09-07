@@ -512,12 +512,13 @@ private:
                  IntImm(DataType::Int(32), rw_mask)});
   }
 
-  PrimExpr MakeGemmCommandDstAccessPtr(const Buffer &buffer, int num_elems,
-                                       int copy_bytes_per_lane,
+  PrimExpr MakeGemmCommandDstAccessPtr(const BufferLoad &dst_base_load,
+                                       int num_elems, int copy_bytes_per_lane,
                                        int copy_transaction_bytes,
                                        int block_threads, int inner_extent,
                                        const char *operand) {
     ICHECK(thread_var_.defined());
+    const Buffer &buffer = dst_base_load->buffer;
     const int element_bits = buffer->dtype.bits() * buffer->dtype.lanes();
     ICHECK_GT(element_bits, 0);
     ICHECK_EQ((copy_bytes_per_lane * 8) % element_bits, 0);
@@ -562,9 +563,6 @@ private:
     PrimExpr physical_offset = analyzer_.Simplify(
         (transaction * block_threads + thread_var_) * transaction_elements +
         intra_transaction);
-    Array<PrimExpr> physical_indices = {
-        floordiv(physical_offset, Integer(inner_extent)),
-        floormod(physical_offset, Integer(inner_extent))};
     // Address the remapped buffer directly so the enclosing layout lowering
     // does not apply the final LDS storage layout to this pre-wrap address.
     Optional<Buffer> physical_buffer = buffer_remap_.Get(buffer);
@@ -572,6 +570,25 @@ private:
         << "HCU GEMM " << operand
         << " strategy requires a remapped physical LDS buffer for "
         << buffer->name;
+    const size_t physical_rank = physical_buffer.value()->shape.size();
+    ICHECK_GE(physical_rank, 2U)
+        << "HCU GEMM " << operand
+        << " strategy requires an LDS buffer with at least two dimensions";
+    ICHECK_EQ(dst_base_load->indices.size(), physical_rank)
+        << "HCU GEMM " << operand
+        << " destination access rank must match the remapped LDS buffer rank";
+
+    // The strategy remaps the innermost matrix row/column dimensions. Preserve
+    // every outer index, including software-pipeline version dimensions.
+    Array<PrimExpr> physical_indices;
+    physical_indices.reserve(physical_rank);
+    for (size_t i = 0; i + 2 < physical_rank; ++i) {
+      physical_indices.push_back(dst_base_load->indices[i]);
+    }
+    physical_indices.push_back(
+        floordiv(physical_offset, Integer(inner_extent)));
+    physical_indices.push_back(
+        floormod(physical_offset, Integer(inner_extent)));
     return MakeAccessPtrFromLoad(
         BufferLoad(physical_buffer.value(), physical_indices), num_elems,
         /*rw_mask=*/2);
@@ -586,7 +603,7 @@ private:
     if (copy_strategy_.defined()) {
       const HcuGemmLdsCopyStrategy &strategy = copy_strategy_.value();
       dst_access_ptr = MakeGemmCommandDstAccessPtr(
-          store->buffer, num_elems, strategy->copy_bytes_per_lane,
+          dst_base_load, num_elems, strategy->copy_bytes_per_lane,
           strategy->copy_transaction_bytes, strategy->block_threads,
           strategy->inner_extent, "GEMM");
     } else {

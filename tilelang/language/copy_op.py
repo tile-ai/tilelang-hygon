@@ -37,11 +37,17 @@ def matrix_load(
     src: tirx.Buffer | tirx.BufferLoad | tirx.BufferRegion,
     dst: tirx.Buffer | tirx.BufferLoad | tirx.BufferRegion,
     boundary: tuple[bool | None, bool | None] | None = None,
+    *,
+    annotations: dict | None = None,
 ):
     """MLS load from global to shared.
 
     ``boundary`` is ``(mn, k)`` over the last two logical tile axes.
     Each entry is None (analyze), False (in-range), or True (partial).
+
+    The operation commits its async group by default. Set
+    ``no_implicit_async_commit_wait`` in ``annotations`` to group multiple
+    MatrixLoad operations under an explicit ``T.ptx_commit_group()``.
     """
     if boundary is None:
         mn_hint, k_hint = None, None
@@ -118,6 +124,7 @@ def matrix_load(
         dst_region,
         tirx.IntImm("int32", mn_mode),
         tirx.IntImm("int32", k_mode),
+        annotations=annotations,
     )
 
 
@@ -362,7 +369,7 @@ def copy(
             instruction category. For CUDA, recognized values include "tma", "cp_async", and
             "sync". For "tma", T.copy keeps synchronous copy semantics; global -> shared copies
             lower through TMA with an automatically allocated barrier and wait when constraints
-            are satisfied.
+            are satisfied. HCU additionally recognizes "matrix_load" for explicit MLS lowering.
         annotations (Optional[dict], keyword-only): Additional annotations dict. If provided,
             coalesced_width, disable_tma, eviction_policy, and prefer_instruction can also
             be specified here.

@@ -20,6 +20,7 @@
 #include "op/gemm.h"
 #include "op/operator.h"
 #include "op/utils.h"
+#include "transform/common/pipeline_utils.h"
 
 #include <tvm/ir/transform.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -36,6 +37,13 @@ namespace tl {
 using namespace tirx;
 
 namespace {
+
+constexpr const char *kPendingGemmLdsCopyStrategy =
+    "tl.hcu_pending_gemm_lds_copy_strategy";
+constexpr const char *kPendingGemmAtBnLdsStrategy =
+    "tl.hcu_pending_gemm_at_bn_lds_strategy";
+constexpr const char *kPendingGemmAnBtLdsStrategy =
+    "tl.hcu_pending_gemm_an_bt_lds_strategy";
 
 Map<Var, Buffer> BuildBufferMap(const PrimFunc &f) {
   Map<Var, Buffer> buffer_map;
@@ -84,6 +92,76 @@ bool ContainsMlsTileOps(const Stmt &body) {
   checker(body);
   return checker.found();
 }
+
+class PendingCopyCallCollector : public StmtExprVisitor {
+public:
+  void VisitExpr_(const CallNode *op) final {
+    if (op->annotations.count(kPendingGemmLdsCopyStrategy)) {
+      calls.insert(GetRef<Call>(op));
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  std::unordered_set<Call, ObjectPtrHash, ObjectPtrEqual> calls;
+};
+
+class PipelineAsyncProducerCollector : public StmtExprVisitor {
+public:
+  static std::unordered_set<Call, ObjectPtrHash, ObjectPtrEqual>
+  Collect(const Stmt &body) {
+    PipelineAsyncProducerCollector collector;
+    collector(body);
+    return std::move(collector.selected_calls_);
+  }
+
+private:
+  void VisitStmt_(const ForNode *op) final {
+    auto async_producers = op->annotations.Get(kPipelineAsyncProducers);
+    if (!async_producers) {
+      StmtExprVisitor::VisitStmt_(op);
+      return;
+    }
+
+    Array<Integer> flags = Downcast<Array<Integer>>(async_producers.value());
+    Optional<Array<Integer>> replayable_mask;
+    if (auto mask = op->annotations.Get(kPipelineReplayableScalarBinds)) {
+      replayable_mask = Downcast<Array<Integer>>(mask.value());
+    }
+
+    Array<Stmt> statements = NormalizePipelineBody(op->body);
+    size_t executable_index = 0;
+    size_t flag_index = 0;
+    for (const Stmt &stmt : statements) {
+      if (IsPipelineDeclarationStmt(stmt)) {
+        continue;
+      }
+      if (replayable_mask.defined()) {
+        ICHECK_LT(executable_index, replayable_mask.value().size());
+      }
+      bool replayable = replayable_mask.defined() &&
+                        !is_zero(replayable_mask.value()[executable_index]);
+      ++executable_index;
+      if (replayable) {
+        continue;
+      }
+      ICHECK_LT(flag_index, flags.size());
+      if (!is_zero(flags[flag_index])) {
+        PendingCopyCallCollector calls;
+        calls(stmt);
+        selected_calls_.insert(calls.calls.begin(), calls.calls.end());
+      }
+      ++flag_index;
+    }
+    ICHECK_EQ(flag_index, flags.size());
+    if (replayable_mask.defined()) {
+      ICHECK_EQ(executable_index, replayable_mask.value().size());
+    }
+
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  std::unordered_set<Call, ObjectPtrHash, ObjectPtrEqual> selected_calls_;
+};
 
 bool IsStaticMultipleOf(const PrimExpr &expr, int64_t value) {
   const auto *imm = expr.as<IntImmNode>();
@@ -237,14 +315,50 @@ bool IsAtBnAccess(const GemmWithInput &consumer) {
   return GetHcuGemmLdsAccessKind(*gemm, feeds_a) == HcuGemmLdsAccessKind::kAtBn;
 }
 
+bool IsGlobalLikeBuffer(const Buffer &buffer) {
+  return IsGlobalBuffer(buffer) || (buffer.defined() && buffer.scope().empty());
+}
+
+using BufferSet = std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>;
+
+std::optional<GemmWithInput> GemmWithInputFromReaderCall(const CallNode *call,
+                                                         const Buffer &input) {
+  if (!IsGemmTileOpCall(call)) {
+    return std::nullopt;
+  }
+  auto parsed = ParseOperator(tvm::ffi::GetRef<Call>(call));
+  if (!parsed.defined()) {
+    return std::nullopt;
+  }
+  auto gemm = parsed.as<GemmNode>();
+  if (gemm == nullptr) {
+    return std::nullopt;
+  }
+  const bool feeds_a = gemm->a_.same_as(input);
+  const bool feeds_b = gemm->b_.same_as(input);
+  if (!feeds_a && !feeds_b) {
+    return std::nullopt;
+  }
+  GemmWithInput result;
+  result.gemm = GetRef<Gemm>(gemm);
+  result.input = input;
+  return result;
+}
+
 } // namespace
 
 class AnnotateMlsGemmDepMutator : public StmtExprMutator {
 public:
-  AnnotateMlsGemmDepMutator(PropagationTirCollector *collector, Target target,
-                            int block_threads)
+  enum class Mode { kCollectCandidates, kMaterialize };
+
+  AnnotateMlsGemmDepMutator(
+      PropagationTirCollector *collector, Target target, int block_threads,
+      Mode mode,
+      std::unordered_set<Call, ObjectPtrHash, ObjectPtrEqual> selected_calls =
+          {})
       : collector_(collector), target_(std::move(target)),
-        block_threads_(block_threads) {}
+        block_threads_(block_threads), mode_(mode),
+        selected_calls_(std::move(selected_calls)) {}
 
   static PrimFunc Substitute(PrimFunc f) {
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
@@ -258,8 +372,27 @@ public:
     PropagationTirCollector collector(buffer_map);
     collector.Collect(f->body);
     int block_threads = ThreadExtentCollector::Collect(f->body);
-    AnnotateMlsGemmDepMutator mutator(&collector, target.value(),
-                                      block_threads);
+    AnnotateMlsGemmDepMutator mutator(&collector, target.value(), block_threads,
+                                      Mode::kCollectCandidates);
+    PrimFuncNode *fn = f.CopyOnWrite();
+    fn->body = mutator(f->body);
+    return f;
+  }
+
+  static PrimFunc Materialize(PrimFunc f) {
+    auto target = f->GetAttr<Target>(tvm::attr::kTarget);
+    if (!target.defined() || !TargetIsHCU(target.value()) ||
+        !ContainsMlsTileOps(f->body)) {
+      return f;
+    }
+    Map<Var, Buffer> buffer_map = BuildBufferMap(f);
+    PropagationTirCollector collector(buffer_map);
+    collector.Collect(f->body);
+    int block_threads = ThreadExtentCollector::Collect(f->body);
+    auto selected_calls = PipelineAsyncProducerCollector::Collect(f->body);
+    AnnotateMlsGemmDepMutator mutator(&collector, target.value(), block_threads,
+                                      Mode::kMaterialize,
+                                      std::move(selected_calls));
     PrimFuncNode *fn = f.CopyOnWrite();
     fn->body = mutator(f->body);
     mutator.ValidateAutoLayoutsAttached();
@@ -524,6 +657,148 @@ private:
     return true;
   }
 
+  bool CollectExclusiveGemmConsumersAfterCall(
+      const Buffer &buffer, int after_order, BufferSet *visited_buffers,
+      std::unordered_set<const CallNode *, CallNodePtrHash, CallNodePtrEqual>
+          *seen_calls,
+      std::vector<GemmWithInput> *result) const {
+    if (collector_ == nullptr || !visited_buffers->insert(buffer).second) {
+      return true;
+    }
+    bool has_reader = false;
+    for (const ReaderCallRecord &reader : collector_->GetReaderCalls(buffer)) {
+      if (reader.call == nullptr || reader.stmt_order <= after_order) {
+        continue;
+      }
+      has_reader = true;
+      if (auto gemm = GemmWithInputFromReaderCall(reader.call, buffer)) {
+        if (seen_calls->insert(reader.call).second) {
+          result->push_back(*gemm);
+        }
+        continue;
+      }
+      Optional<TileOperator> reader_op =
+          ParseOperator(ffi::GetRef<Call>(reader.call));
+      if (!reader_op.defined()) {
+        return false;
+      }
+      const auto *relay_copy = reader_op.as<CopyNode>();
+      if (relay_copy == nullptr || IsSharedBuffer(reader.write) ||
+          !reader.write.defined()) {
+        return false;
+      }
+      if (!CollectExclusiveGemmConsumersAfterCall(
+              reader.write, after_order, visited_buffers, seen_calls, result)) {
+        return false;
+      }
+    }
+    return has_reader;
+  }
+
+  std::optional<std::vector<GemmWithInput>>
+  GetExclusiveGemmConsumersAfterCall(const Buffer &buffer,
+                                     const CallNode *after_site_call) const {
+    int after_order = -1;
+    if (collector_ != nullptr && after_site_call != nullptr) {
+      after_order = collector_->GetCallStmtOrder(after_site_call);
+    }
+    BufferSet visited_buffers;
+    std::unordered_set<const CallNode *, CallNodePtrHash, CallNodePtrEqual>
+        seen_calls;
+    std::vector<GemmWithInput> result;
+    if (!CollectExclusiveGemmConsumersAfterCall(
+            buffer, after_order, &visited_buffers, &seen_calls, &result)) {
+      return std::nullopt;
+    }
+    return result;
+  }
+
+  Optional<Map<String, ObjectRef>> TryBuildPendingGemmCopyAnnotations(
+      const CopyNode &copy, const Map<String, ObjectRef> &base_annotations,
+      const std::vector<GemmWithInput> &consumers) {
+    auto [at_bn_strategy, an_bt_strategy] = SelectAutoStrategy(copy, consumers);
+    if (!at_bn_strategy.defined() && !an_bt_strategy.defined()) {
+      return std::nullopt;
+    }
+    auto annotations = base_annotations;
+    HcuGemmLdsCopyStrategy copy_strategy =
+        SelectCopyStrategy(copy, at_bn_strategy, an_bt_strategy);
+    if (at_bn_strategy.defined()) {
+      annotations.Set(kPendingGemmAtBnLdsStrategy, at_bn_strategy.value());
+    }
+    if (an_bt_strategy.defined()) {
+      annotations.Set(kPendingGemmAnBtLdsStrategy, an_bt_strategy.value());
+    }
+    annotations.Set(kPendingGemmLdsCopyStrategy, copy_strategy);
+    return annotations;
+  }
+
+  Map<String, ObjectRef>
+  MaterializeGemmCopyAnnotations(const CopyNode &copy,
+                                 Map<String, ObjectRef> annotations) {
+    auto pending_copy = annotations.Get(kPendingGemmLdsCopyStrategy);
+    ICHECK(pending_copy);
+    HcuGemmLdsCopyStrategy copy_strategy =
+        Downcast<HcuGemmLdsCopyStrategy>(pending_copy.value());
+    Optional<HcuGemmAtBnLdsStrategy> at_bn_strategy;
+    Optional<HcuGemmAnBtLdsStrategy> an_bt_strategy;
+    if (auto pending = annotations.Get(kPendingGemmAtBnLdsStrategy)) {
+      at_bn_strategy = Downcast<HcuGemmAtBnLdsStrategy>(pending.value());
+    }
+    if (auto pending = annotations.Get(kPendingGemmAnBtLdsStrategy)) {
+      an_bt_strategy = Downcast<HcuGemmAnBtLdsStrategy>(pending.value());
+    }
+
+    if (auto loop_layout = annotations.Get(attr::kParallelLoopLayout)) {
+      Fragment actual = Downcast<Fragment>(loop_layout.value());
+      if (an_bt_strategy.defined() &&
+          copy_strategy->copy_loop_layout.same_as(
+              an_bt_strategy.value()->copy_loop_layout)) {
+        ValidateHcuGemmAnBtCopyLayout(actual, an_bt_strategy.value());
+      } else {
+        ICHECK(at_bn_strategy.defined());
+        ValidateHcuGemmAtBnCopyLayout(actual, at_bn_strategy.value());
+      }
+    } else {
+      annotations.Set(attr::kParallelLoopLayout,
+                      copy_strategy->copy_loop_layout);
+    }
+    if (at_bn_strategy.defined()) {
+      annotations.Set(attr::kHcuGemmAtBnLdsStrategy, at_bn_strategy.value());
+      auto [it, inserted] = auto_at_bn_strategies_.emplace(
+          copy.dst->data, at_bn_strategy.value());
+      if (!inserted) {
+        ICHECK(
+            HaveSameAtBnStrategyParameters(it->second, at_bn_strategy.value()))
+            << "Conflicting HCU GEMM AT/BN strategies for shared buffer "
+            << copy.dst->name;
+      }
+    }
+    if (an_bt_strategy.defined()) {
+      annotations.Set(attr::kHcuGemmAnBtLdsStrategy, an_bt_strategy.value());
+      auto [it, inserted] = auto_an_bt_strategies_.emplace(
+          copy.dst->data, an_bt_strategy.value());
+      if (!inserted) {
+        ICHECK(
+            HaveSameAnBtStrategyParameters(it->second, an_bt_strategy.value()))
+            << "Conflicting HCU GEMM AN/BT strategies for shared buffer "
+            << copy.dst->name;
+      }
+    }
+    annotations.Set(attr::kHcuGemmLdsCopyStrategy, copy_strategy);
+    auto [copy_it, copy_inserted] =
+        auto_copy_strategies_.emplace(copy.dst->data, copy_strategy);
+    if (!copy_inserted) {
+      ICHECK(HaveSameCopyStrategyParameters(copy_it->second, copy_strategy))
+          << "Conflicting HCU GEMM copy strategies for shared buffer "
+          << copy.dst->name;
+    }
+    annotations.erase(kPendingGemmLdsCopyStrategy);
+    annotations.erase(kPendingGemmAtBnLdsStrategy);
+    annotations.erase(kPendingGemmAnBtLdsStrategy);
+    return annotations;
+  }
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
     auto call = op->value.as<CallNode>();
     if (call == nullptr || !call->op.as<OpNode>()) {
@@ -561,9 +836,39 @@ private:
 
     if (IsCopyLikeOp(tir_op)) {
       auto copy = Downcast<Copy>(ParseOperator(ffi::GetRef<Call>(call)));
+      if (mode_ == Mode::kMaterialize &&
+          call->annotations.count(kPendingGemmLdsCopyStrategy)) {
+        const bool selected =
+            IsAsyncCopyOp(tir_op) || selected_calls_.count(GetRef<Call>(call));
+        auto annotations = call->annotations;
+        if (selected) {
+          annotations =
+              MaterializeGemmCopyAnnotations(*copy.get(), annotations);
+        } else {
+          annotations.erase(kPendingGemmLdsCopyStrategy);
+          annotations.erase(kPendingGemmAtBnLdsStrategy);
+          annotations.erase(kPendingGemmAnBtLdsStrategy);
+        }
+        annotations.erase(attr::kHcuCopyAsyncPromotable);
+        return Evaluate(
+            Call(call->dtype, call->op, call->args, annotations, call->span));
+      }
+      if (IsMatrixLoadPreferredCopy(*copy.get())) {
+        bool trans = true;
+        LookupSharedMlsTrans(copy->dst, &trans);
+        auto annotations = call->annotations;
+        annotations.Set(attr::kMlsTrans,
+                        IntImm(DataType::Int(32), trans ? 1 : 0));
+        return Evaluate(
+            Call(call->dtype, call->op, call->args, annotations, call->span));
+      }
       auto consumer = PropagateToFindGemmConsumerOpWithInputAfterCall(
           copy->dst, collector_, call);
-      if (consumer &&
+      const bool can_materialize_ds_read =
+          mode_ == Mode::kMaterialize || HasAnnotatedLayout(copy->src) ||
+          auto_copy_strategies_.count(copy->src->data) ||
+          async_copy_linear_outputs_.count(copy->src->data);
+      if (can_materialize_ds_read && consumer &&
           IsAnBtLinearDsReadCopyCandidate(copy.get(), consumer.value())) {
         const GemmNode *consumer_gemm = consumer->gemm.get();
         const bool feeds_a = consumer->input.same_as(consumer_gemm->a_);
@@ -591,64 +896,32 @@ private:
         return Evaluate(Call(call->dtype, DsReadFormat::Get(), call->args,
                              annotations, call->span));
       }
-      if (IsAsyncCopyOp(tir_op) && consumer) {
+      if (mode_ == Mode::kCollectCandidates && IsAsyncCopyOp(tir_op) &&
+          consumer) {
         std::vector<GemmWithInput> consumers =
             PropagateToFindAllGemmConsumersAfterCall(copy->dst, collector_,
                                                      call);
-        auto [at_bn_strategy, an_bt_strategy] =
-            SelectAutoStrategy(*copy.get(), consumers);
-        if (at_bn_strategy.defined() || an_bt_strategy.defined()) {
-          auto annotations = call->annotations;
-          HcuGemmLdsCopyStrategy copy_strategy =
-              SelectCopyStrategy(*copy.get(), at_bn_strategy, an_bt_strategy);
-          if (auto loop_layout = annotations.Get(attr::kParallelLoopLayout)) {
-            Fragment actual = Downcast<Fragment>(loop_layout.value());
-            if (an_bt_strategy.defined() &&
-                copy_strategy->copy_loop_layout.same_as(
-                    an_bt_strategy.value()->copy_loop_layout)) {
-              ValidateHcuGemmAnBtCopyLayout(actual, an_bt_strategy.value());
-            } else {
-              ValidateHcuGemmAtBnCopyLayout(actual, at_bn_strategy.value());
-            }
-          } else {
-            annotations.Set(attr::kParallelLoopLayout,
-                            copy_strategy->copy_loop_layout);
+        if (auto annotations = TryBuildPendingGemmCopyAnnotations(
+                *copy.get(), call->annotations, consumers)) {
+          Map<String, ObjectRef> active_annotations =
+              MaterializeGemmCopyAnnotations(*copy.get(), annotations.value());
+          return Evaluate(Call(call->dtype, call->op, call->args,
+                               active_annotations, call->span));
+        }
+      }
+      if (mode_ == Mode::kCollectCandidates && !IsAsyncCopyOp(tir_op) &&
+          consumer && IsGlobalLikeBuffer(copy->src) &&
+          IsSharedBuffer(copy->dst)) {
+        if (auto consumers =
+                GetExclusiveGemmConsumersAfterCall(copy->dst, call)) {
+          if (auto annotations = TryBuildPendingGemmCopyAnnotations(
+                  *copy.get(), call->annotations, *consumers)) {
+            Map<String, ObjectRef> updated_annotations = annotations.value();
+            updated_annotations.Set(attr::kHcuCopyAsyncPromotable,
+                                    IntImm(DataType::Int(32), 1));
+            return Evaluate(Call(call->dtype, call->op, call->args,
+                                 updated_annotations, call->span));
           }
-          if (at_bn_strategy.defined()) {
-            annotations.Set(attr::kHcuGemmAtBnLdsStrategy,
-                            at_bn_strategy.value());
-            auto [it, inserted] = auto_at_bn_strategies_.emplace(
-                copy->dst->data, at_bn_strategy.value());
-            if (!inserted) {
-              ICHECK(HaveSameAtBnStrategyParameters(it->second,
-                                                    at_bn_strategy.value()))
-                  << "Conflicting HCU GEMM AT/BN strategies for shared buffer "
-                  << copy->dst->name;
-            }
-          }
-          if (an_bt_strategy.defined()) {
-            annotations.Set(attr::kHcuGemmAnBtLdsStrategy,
-                            an_bt_strategy.value());
-            auto [it, inserted] = auto_an_bt_strategies_.emplace(
-                copy->dst->data, an_bt_strategy.value());
-            if (!inserted) {
-              ICHECK(HaveSameAnBtStrategyParameters(it->second,
-                                                    an_bt_strategy.value()))
-                  << "Conflicting HCU GEMM AN/BT strategies for shared buffer "
-                  << copy->dst->name;
-            }
-          }
-          annotations.Set(attr::kHcuGemmLdsCopyStrategy, copy_strategy);
-          auto [copy_it, copy_inserted] =
-              auto_copy_strategies_.emplace(copy->dst->data, copy_strategy);
-          if (!copy_inserted) {
-            ICHECK(
-                HaveSameCopyStrategyParameters(copy_it->second, copy_strategy))
-                << "Conflicting HCU GEMM copy strategies for shared buffer "
-                << copy->dst->name;
-          }
-          return Evaluate(
-              Call(call->dtype, call->op, call->args, annotations, call->span));
         }
       }
       if (IsAsyncCopyOp(tir_op) && IsSharedBuffer(copy->dst) &&
@@ -719,6 +992,8 @@ private:
   PropagationTirCollector *collector_;
   Target target_;
   int block_threads_{-1};
+  Mode mode_;
+  std::unordered_set<Call, ObjectPtrHash, ObjectPtrEqual> selected_calls_;
   std::unordered_map<Buffer, bool, ObjectPtrHash, ObjectPtrEqual>
       shared_mls_trans_;
   std::vector<Map<Var, Layout>> annotated_layout_maps_stack_;
@@ -746,9 +1021,22 @@ tvm::transform::Pass AnnotateMlsGemmDep() {
   return CreatePrimFuncPass(pass_func, 0, "tl.AnnotateMlsGemmDep", {});
 }
 
+tvm::transform::Pass MaterializeHcuGemmLdsStrategy() {
+  using namespace tirx::transform;
+  auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
+    (void)m;
+    (void)ctx;
+    return AnnotateMlsGemmDepMutator::Materialize(std::move(f));
+  };
+  return CreatePrimFuncPass(pass_func, 0, "tl.MaterializeHcuGemmLdsStrategy",
+                            {});
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.transform.AnnotateMlsGemmDep", AnnotateMlsGemmDep);
+  refl::GlobalDef().def("tl.transform.MaterializeHcuGemmLdsStrategy",
+                        MaterializeHcuGemmLdsStrategy);
 }
 
 } // namespace tl

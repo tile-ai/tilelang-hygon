@@ -218,7 +218,8 @@ collect_first_nodeids_by_func() {
   done < <(
     PYTHONPATH="${TILELANG_REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
       TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR}" \
-      python -m pytest -p no:warnings --rootdir="${PYTEST_ROOTDIR}" \
+      PY_COLORS=0 \
+      python -m pytest -p no:warnings --color=no --rootdir="${PYTEST_ROOTDIR}" \
         --collect-only -q --confcutdir="${confcutdir}" \
         "${input_ref[@]}" 2>/dev/null || true
   )

@@ -31,7 +31,9 @@ def _gemm_async_copy_pingpong(
 
     sub_block_N = block_N // 2
     k_tiles = (K + block_K - 1) // block_K
-    async_copy_stage_requests = 4
+    # Each T.async_copy closes one async-copy group. Keep the two groups for
+    # the opposite LDS stage while consuming the current ping/pong stage.
+    async_copy_stage_groups = 2
 
     @T.macro
     def async_copy_a(A, A_shared, by, k_tile):
@@ -98,8 +100,8 @@ def _gemm_async_copy_pingpong(
             async_copy_a(A, A_shared_1, by, 1)
             async_copy_b(B, B_shared_1, bx, 1)
 
-            # A/B shared_0 ready
-            T.ptx_wait_group(async_copy_stage_requests)
+            # A0/B0 are the two oldest groups; retain the prefetched A1/B1.
+            T.ptx_wait_group(async_copy_stage_groups)
             T.sync_warp()
 
             T.copy(A_shared_0, A_local_0)
@@ -115,7 +117,8 @@ def _gemm_async_copy_pingpong(
 
                     # Phase 0: prepare pong A while the back warps compute ping.
                     async_copy_a(A, A_shared_0, by, base)
-                    T.ptx_wait_group(4)
+                    # Wait A1; retain B1 and the newly prefetched A0(base).
+                    T.ptx_wait_group(2)
                     T.sync_warp()
 
                     # Phase 1: compute ping n0 while the back warps prepare pong A.
@@ -135,7 +138,8 @@ def _gemm_async_copy_pingpong(
                     # Phase 2: prepare pong B while the back warps compute ping n1.
                     async_copy_b(B, B_shared_0, bx, base)
                     T.copy(A_shared_1, A_local_1)
-                    T.ptx_wait_group(4)
+                    # Wait B1; retain A0(base) and B0(base).
+                    T.ptx_wait_group(2)
                     T.sync_warp()
 
                     # Phase 3 also starts the next pong half-cycle.
@@ -156,7 +160,8 @@ def _gemm_async_copy_pingpong(
                     copy_b_half(B_shared_1, B_local_n0_1, 0)
                     copy_b_half(B_shared_1, B_local_n1_1, 1)
                     async_copy_a(A, A_shared_1, by, base + 1)
-                    T.ptx_wait_group(4)
+                    # Wait A0(base); retain B0(base) and A1(base + 1).
+                    T.ptx_wait_group(2)
                     T.sync_warp()
 
                     # Phase 5
@@ -176,7 +181,8 @@ def _gemm_async_copy_pingpong(
                     # Phase 6
                     T.copy(A_shared_0, A_local_0)
                     async_copy_b(B, B_shared_1, bx, base + 1)
-                    T.ptx_wait_group(4)
+                    # Wait B0(base); retain A1(base + 1) and B1(base + 1).
+                    T.ptx_wait_group(2)
                     T.sync_warp()
 
                     # Phase 7
@@ -211,7 +217,8 @@ def _gemm_async_copy_pingpong(
                         annotations={"trans_c": True},
                     )
                     T.sched_barrier()
-                    T.ptx_wait_group(2)
+                    # Consume A1 while retaining B1.
+                    T.ptx_wait_group(1)
                     T.sync_warp()  # A_shared_1 ready
 
                     # Phase 1: prepare pong A while the front warps compute ping.
@@ -233,7 +240,8 @@ def _gemm_async_copy_pingpong(
                         annotations={"trans_c": True},
                     )
                     T.sched_barrier()
-                    T.ptx_wait_group(2)
+                    # Consume B1 while retaining A0(base).
+                    T.ptx_wait_group(1)
                     T.sync_warp()  # B_shared_1 ready
 
                     # Phase 3 also starts the next pong half-cycle.
@@ -256,7 +264,8 @@ def _gemm_async_copy_pingpong(
                         annotations={"trans_c": True},
                     )
                     T.sched_barrier()
-                    T.ptx_wait_group(2)
+                    # Consume A0(base) while retaining B0(base).
+                    T.ptx_wait_group(1)
                     T.sync_warp()  # A_shared_0 ready
 
                     # Phase 5
@@ -278,7 +287,8 @@ def _gemm_async_copy_pingpong(
                         annotations={"trans_c": True},
                     )
                     T.sched_barrier()
-                    T.ptx_wait_group(2)
+                    # Consume B0(base) while retaining A1(base + 1).
+                    T.ptx_wait_group(1)
                     T.sync_warp()  # B_shared_0 ready
 
                     # Phase 7
