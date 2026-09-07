@@ -47,7 +47,7 @@ env:
   TORCH_VERSION: "2.10.0"
   CISMI_TIMEOUT: "3600"
   TILEKERNELS_REF: "staging"
-  TILEKERNELS_DIR: "/opt/TileKernels"
+  TILEKERNELS_DIR: ${{ github.workspace }}/TileKernels
   XDG_CACHE_HOME: ${{ github.workspace }}/.cache
   PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
 
