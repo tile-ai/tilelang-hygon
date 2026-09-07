@@ -139,8 +139,12 @@ HcuLdsWrapConfig TargetHcuGetLdsWrapConfig(Target target) {
     return {/*field_bits=*/5, /*field_shift=*/16,
             /*lds_offset_bits=*/16, HcuLdsWrapEncoding::kFourDword};
   }
-  if (arch == "gfx938" || arch == "gfx92a") {
+  if (arch == "gfx938") {
     return {/*field_bits=*/5, /*field_shift=*/16,
+            /*lds_offset_bits=*/16, HcuLdsWrapEncoding::kHybridFourAndOneDword};
+  }
+  if (arch == "gfx92a") {
+    return {/*field_bits=*/5, /*field_shift=*/24,
             /*lds_offset_bits=*/16, HcuLdsWrapEncoding::kHybridFourAndOneDword};
   }
   if (arch == "gfx946") {
