@@ -194,12 +194,8 @@ jobs:
       - name: Clone TileKernels
         run: |
           rm -rf "${TILEKERNELS_DIR}"
-          if [[ -z "${{ secrets.TILEKERNELS_GITHUB_TOKEN }}" ]]; then
-            echo "::error::TILEKERNELS_GITHUB_TOKEN secret is required to clone HYGON-AI/TileKernels-das"
-            exit 1
-          fi
           git clone -b "${TILEKERNELS_REF}" \
-            "https://x-access-token:${{ secrets.TILEKERNELS_GITHUB_TOKEN }}@github.com/HYGON-AI/TileKernels-das.git" \
+            "https://github.com/HYGON-AI/TileKernels-das.git" \
             "${TILEKERNELS_DIR}"
 
       - name: Acquire GPU
