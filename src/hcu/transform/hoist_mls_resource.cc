@@ -1068,14 +1068,15 @@ public:
     // absolute_rebase: set_window_origin lives on the outer window loop
     // (MN for K-inner, K for MN-inner).  Inner loads only update the moving
     // axis.
-    if (!initialized_scopes_.count(key)) {
+    const bool initialized_here = !initialized_scopes_.count(key);
+    if (initialized_here) {
       seq.push_back(
           MakeExternStmt("tl::mls::set_window_origin",
                          {StringImm(obj_name), call->args[5], call->args[6]}));
       initialized_scopes_[key] = scope_depth_;
     }
 
-    AppendAbsoluteAxisUpdates(call, sym, obj_name, key, &seq);
+    AppendAbsoluteAxisUpdates(call, sym, obj_name, key, initialized_here, &seq);
     AppendAsyncLoad(call, sym, obj_name, &seq);
     ICHECK(!seq.empty());
     return seq.size() == 1 ? seq[0] : Stmt(SeqStmt(seq));
@@ -1085,6 +1086,7 @@ private:
   void AppendAbsoluteAxisUpdates(const CallNode *call, const std::string &sym,
                                  const std::string &obj_name,
                                  const std::string &key,
+                                 bool initialized_here,
                                  std::vector<Stmt> *seq) {
     if (full_window_each_load_.count(key)) {
       return;
@@ -1093,14 +1095,20 @@ private:
       auto mn_filt = SpecializeAxisFilter(call, sym, /*is_mn=*/true);
       const std::string update_mn_sym =
           std::string("tl::mls::update_mn_base<") + mn_filt + ">";
-      seq->push_back(
-          MakeExternStmt(update_mn_sym, {StringImm(obj_name), call->args[5]}));
+      PrimExpr mn_base = initialized_here
+                             ? tirx::make_const(call->args[5].dtype(), 0)
+                             : call->args[5];
+      seq->push_back(MakeExternStmt(update_mn_sym,
+                                    {StringImm(obj_name), mn_base}));
     } else {
       auto k_filt = SpecializeAxisFilter(call, sym, /*is_mn=*/false);
       const std::string update_k_sym =
           std::string("tl::mls::update_k_base<") + k_filt + ">";
-      seq->push_back(
-          MakeExternStmt(update_k_sym, {StringImm(obj_name), call->args[6]}));
+      PrimExpr k_base = initialized_here
+                            ? tirx::make_const(call->args[6].dtype(), 0)
+                            : call->args[6];
+      seq->push_back(MakeExternStmt(update_k_sym,
+                                    {StringImm(obj_name), k_base}));
     }
   }
 
