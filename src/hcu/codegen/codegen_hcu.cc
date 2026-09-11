@@ -35,6 +35,106 @@ using namespace tirx;
 
 namespace {
 
+class BufferOffsetDependencyChecker : public StmtExprVisitor {
+public:
+  enum class Kind { kBlock, kThread };
+
+  BufferOffsetDependencyChecker(
+      Kind kind, const std::unordered_set<const VarNode *> &block_vars,
+      const std::unordered_set<const VarNode *> &thread_vars)
+      : kind_(kind), block_vars_(block_vars), thread_vars_(thread_vars) {}
+
+  bool Check(const PrimExpr &expr) {
+    found_ = false;
+    VisitExpr(expr);
+    return found_;
+  }
+
+private:
+  void VisitExpr_(const VarNode *op) final {
+    if (kind_ == Kind::kBlock)
+      found_ = found_ || block_vars_.count(op);
+    else
+      found_ = found_ || thread_vars_.count(op);
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    if (kind_ == Kind::kThread)
+      found_ = true;
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  Kind kind_;
+  const std::unordered_set<const VarNode *> &block_vars_;
+  const std::unordered_set<const VarNode *> &thread_vars_;
+  bool found_{false};
+};
+
+bool DependsOnBlockIdx(
+    const PrimExpr &expr,
+    const std::unordered_set<const VarNode *> &block_vars,
+    const std::unordered_set<const VarNode *> &thread_vars) {
+  return BufferOffsetDependencyChecker(
+             BufferOffsetDependencyChecker::Kind::kBlock, block_vars,
+             thread_vars)
+      .Check(expr);
+}
+
+bool DependsOnThreadIdx(
+    const PrimExpr &expr,
+    const std::unordered_set<const VarNode *> &block_vars,
+    const std::unordered_set<const VarNode *> &thread_vars) {
+  return BufferOffsetDependencyChecker(
+             BufferOffsetDependencyChecker::Kind::kThread, block_vars,
+             thread_vars)
+      .Check(expr);
+}
+
+struct BufferOffsetSplit {
+  PrimExpr block_base;
+  PrimExpr residual;
+};
+
+// Extract blockIdx-dependent, threadIdx-independent additive terms.  This is
+// intentionally syntax-directed: the surrounding buffer annotation is the
+// user's safety contract, so codegen does not attempt range proofs.
+BufferOffsetSplit SplitAnnotatedBufferOffset(
+    const PrimExpr &expr,
+    const std::unordered_set<const VarNode *> &block_vars,
+    const std::unordered_set<const VarNode *> &thread_vars) {
+  PrimExpr zero = make_zero(expr.dtype());
+  if (const auto *add = expr.as<AddNode>()) {
+    BufferOffsetSplit lhs =
+        SplitAnnotatedBufferOffset(add->a, block_vars, thread_vars);
+    BufferOffsetSplit rhs =
+        SplitAnnotatedBufferOffset(add->b, block_vars, thread_vars);
+    return {lhs.block_base + rhs.block_base, lhs.residual + rhs.residual};
+  }
+  if (const auto *sub = expr.as<SubNode>()) {
+    BufferOffsetSplit lhs =
+        SplitAnnotatedBufferOffset(sub->a, block_vars, thread_vars);
+    return {lhs.block_base, lhs.residual - sub->b};
+  }
+  if (const auto *mul = expr.as<MulNode>()) {
+    if (!DependsOnBlockIdx(mul->a, block_vars, thread_vars) &&
+        !DependsOnThreadIdx(mul->a, block_vars, thread_vars)) {
+      BufferOffsetSplit rhs =
+          SplitAnnotatedBufferOffset(mul->b, block_vars, thread_vars);
+      return {mul->a * rhs.block_base, mul->a * rhs.residual};
+    }
+    if (!DependsOnBlockIdx(mul->b, block_vars, thread_vars) &&
+        !DependsOnThreadIdx(mul->b, block_vars, thread_vars)) {
+      BufferOffsetSplit lhs =
+          SplitAnnotatedBufferOffset(mul->a, block_vars, thread_vars);
+      return {lhs.block_base * mul->b, lhs.residual * mul->b};
+    }
+  }
+  if (DependsOnBlockIdx(expr, block_vars, thread_vars) &&
+      !DependsOnThreadIdx(expr, block_vars, thread_vars))
+    return {expr, zero};
+  return {zero, expr};
+}
+
 class InlineIfThenElseAsSelect : public StmtExprMutator {
 public:
   PrimExpr Rewrite(PrimExpr expr) { return VisitExpr(expr); }
@@ -504,9 +604,9 @@ bool CodeGenTileLangHCU::TryToEmitLDSBufferOp(
 
   DataType value_dtype = buffer_store->value.dtype();
   auto store_desc = GetBufferDesc(value_dtype, buffer_store->buffer.get(),
-                                  buffer_store->indices[0]);
+                                  buffer_store->indices[0], false);
   auto load_desc = GetBufferDesc(buffer_load->dtype, buffer_load->buffer.get(),
-                                 buffer_load->indices[0]);
+                                 buffer_load->indices[0], false);
   std::string lds_base =
       HcuCkBufferDstPtrExpr(value_dtype, store_desc.wave_ptr);
   std::string global_base =
@@ -1924,7 +2024,7 @@ void CodeGenTileLangHCU::PrintVecBinaryOp(const std::string &op, DataType t,
 
 CodeGenTileLangHCU::BufferDesc
 CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer,
-                                  PrimExpr offset) {
+                                  PrimExpr offset, bool allow_address_rebase) {
   const VarNode *buffer_var = buffer->data.get();
   std::string scope;
 
@@ -1949,6 +2049,19 @@ CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer,
     ICHECK(offset.defined()) << "Non-contiguous ramp offset is not supported.";
   }
 
+  PrimExpr base_offset;
+  if (allow_address_rebase && !t.element_of().is_float4_e2m1fn()) {
+    if (buffer_ops_rebase_param_names_.count(buffer_var->name_hint)) {
+      BufferOffsetSplit split = SplitAnnotatedBufferOffset(
+          offset, block_index_vars_, thread_index_vars_);
+      arith::Analyzer analyzer;
+      base_offset = analyzer.Simplify(split.block_base);
+      offset = analyzer.Simplify(split.residual);
+      if (is_zero(base_offset))
+        base_offset = PrimExpr();
+    }
+  }
+
   std::string data_type = HcuCkTemplateElemType(t);
   int num_elements = t.lanes();
   if (t.element_of().is_float4_e2m1fn()) {
@@ -1971,6 +2084,11 @@ CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer,
 
   BufferDesc desc;
   desc.wave_ptr = GetVarID(buffer_var);
+  if (base_offset.defined()) {
+    desc.wave_ptr = "((" + desc.wave_ptr +
+                    ") + static_cast<uint64_t>(" + PrintExpr(base_offset) +
+                    "))";
+  }
   desc.offset = PrintExpr(offset);
   desc.element_space_size = element_space_size;
   desc.data_type = data_type;
@@ -1991,7 +2109,10 @@ std::string CodeGenTileLangHCU::GetVecLoadWithPredicate(
     DataType t, const BufferNode *buffer, PrimExpr base,
     const std::string &pred) {
   if (CanUseVMBufferOps(buffer, t.lanes())) {
-    auto desc = GetBufferDesc(t, buffer, base);
+    // Address-rebase annotations are store-only until ordinary VM loads have
+    // been validated independently.  Async/direct-to-LDS loads likewise pass
+    // false at their call sites.
+    auto desc = GetBufferDesc(t, buffer, base, false);
     std::string data_type = HcuCkTemplateElemType(t);
     std::ostringstream os;
     os << "*(";
@@ -3251,6 +3372,27 @@ void CodeGenTileLangHCU::VisitStmt_(const AttrStmtNode *op) {
         }
       }
     }
+  } else if (op->attr_key == tl::attr::kBufferOpsRebaseMap) {
+    const auto *var = op->node.as<VarNode>();
+    ICHECK(var) << tl::attr::kBufferOpsRebaseMap
+                << " expects the buffer data Var in AttrStmt.node";
+
+    const auto *enabled = op->value.as<IntImmNode>();
+    ICHECK(enabled) << tl::attr::kBufferOpsRebaseMap
+                    << " expects a constant boolean value";
+
+    const std::string name = var->name_hint;
+    const bool was_enabled = buffer_ops_rebase_param_names_.count(name);
+    if (enabled->value != 0)
+      buffer_ops_rebase_param_names_.insert(name);
+    else
+      buffer_ops_rebase_param_names_.erase(name);
+    this->VisitStmt(op->body);
+    if (was_enabled)
+      buffer_ops_rebase_param_names_.insert(name);
+    else
+      buffer_ops_rebase_param_names_.erase(name);
+    return;
   }
   CodeGenC::VisitStmt_(op);
 }
@@ -3662,6 +3804,22 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   // reserve keywords
   ReserveKeywordsAsUnique();
   buffer_ops_disable_param_names_.clear();
+  buffer_ops_rebase_param_names_.clear();
+  block_index_vars_.clear();
+  thread_index_vars_.clear();
+  PostOrderVisit(f->body, [&](const ObjectRef &object) {
+    const auto *attr = object.as<AttrStmtNode>();
+    if (!attr || attr->attr_key != tirx::attr::thread_extent)
+      return;
+    const auto *iter = attr->node.as<IterVarNode>();
+    if (!iter)
+      return;
+    const std::string thread_tag = iter->thread_tag;
+    if (thread_tag.rfind("blockIdx.", 0) == 0)
+      block_index_vars_.insert(iter->var.get());
+    else if (thread_tag.rfind("threadIdx.", 0) == 0)
+      thread_index_vars_.insert(iter->var.get());
+  });
   cp_async_resource_var_names_.clear();
   cp_async_idxen_resource_var_names_.clear();
   mls_resource_object_counter_ = 0;
