@@ -14,6 +14,7 @@ __all__ = [
     "annotate_safe_value",
     "annotate_l2_hit_ratio",
     "annotate_direct_to_lds",
+    "annotate_buffer_ops_rebase",
     "annotate_restrict_buffers",
     "annotate_min_blocks_per_sm",
 ]
@@ -72,6 +73,29 @@ def annotate_direct_to_lds(buffers):
     else:
         _direct_to_lds_map[buffers.data] = IntImm("int32", 1)
     return sblock_attr({"direct_to_lds": _direct_to_lds_map})
+
+
+def annotate_buffer_ops_rebase(buffers):
+    """Authorize blockIdx-based rebasing of ordinary HCU VM buffer stores.
+
+    Codegen moves blockIdx-dependent, threadIdx-independent additive address
+    terms into the resource's 64-bit base pointer.  The caller guarantees that
+    the resulting per-thread offsets are valid.  Loads, async copies, and
+    direct-to-LDS operations are unaffected.
+    """
+    if isinstance(buffers, dict):
+        rebase_map = {
+            buffer.data: IntImm("int32", 1 if enabled else 0)
+            for buffer, enabled in buffers.items()
+        }
+    elif isinstance(buffers, (list, tuple)):
+        rebase_map = {
+            buffer.data: IntImm("int32", 1)
+            for buffer in buffers
+        }
+    else:
+        rebase_map = {buffers.data: IntImm("int32", 1)}
+    return sblock_attr({"buffer_ops_rebase_map": rebase_map})
 
 
 def annotate_min_blocks_per_sm(n: int):

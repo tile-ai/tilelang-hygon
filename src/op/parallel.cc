@@ -10,6 +10,9 @@
 #include <tvm/runtime/logging.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <map>
+#include <tuple>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/op.h>
 
@@ -27,6 +30,30 @@ namespace tl {
 
 using namespace tirx;
 using namespace ffi;
+
+struct ParallelVectorizeSizeCacheKey {
+  uintptr_t analyzer{0};
+  uintptr_t target{0};
+  uintptr_t thread_min{0};
+  uintptr_t thread_extent{0};
+  std::vector<std::pair<uintptr_t, uintptr_t>> layouts;
+  std::vector<std::pair<uintptr_t, uintptr_t>> remaps;
+  // Retain every object represented by an identity in this key, preventing a
+  // released layout from being replaced by a different object at the same
+  // address during later free-mode attempts.
+  std::vector<ObjectRef> keep_alive;
+
+  bool operator<(const ParallelVectorizeSizeCacheKey &other) const {
+    return std::tie(analyzer, target, thread_min, thread_extent, layouts,
+                    remaps) <
+           std::tie(other.analyzer, other.target, other.thread_min,
+                    other.thread_extent, other.layouts, other.remaps);
+  }
+};
+
+struct ParallelVectorizeSizeCache {
+  std::map<ParallelVectorizeSizeCacheKey, int> entries;
+};
 
 namespace {
 
@@ -160,7 +187,9 @@ void ParallelLoopNestVisitor::VisitExpr_(const BufferLoadNode *op) {
   StmtExprVisitor::VisitExpr_(op);
 }
 
-ParallelOpNode::ParallelOpNode(For root) : root_(root), V(this) {
+ParallelOpNode::ParallelOpNode(For root)
+    : root_(root), V(this),
+      vectorize_size_cache_(std::make_shared<ParallelVectorizeSizeCache>()) {
   V.VisitStmt(root);
   // Cache any annotated layout/predicate on the outermost loop.
   using namespace attr;
@@ -762,12 +791,48 @@ Fragment ParallelOpNode::ComputeLoopLayoutFromBuffer(
 
 Fragment
 ParallelOpNode::ComputePlanCandidate(const LayoutInferArgs &layout_args) const {
+  ParallelVectorizeSizeCacheKey cache_key;
+  cache_key.analyzer = reinterpret_cast<uintptr_t>(layout_args.analyzer);
+  cache_key.target = reinterpret_cast<uintptr_t>(layout_args.target.get());
+  cache_key.thread_min =
+      reinterpret_cast<uintptr_t>(layout_args.thread_bounds->min.get());
+  cache_key.thread_extent =
+      reinterpret_cast<uintptr_t>(layout_args.thread_bounds->extent.get());
+  cache_key.layouts.reserve(layout_args.layout_map.size());
+  cache_key.keep_alive.reserve(3 + layout_args.layout_map.size() * 2 +
+                               layout_args.buffer_remap.size() * 2);
+  cache_key.keep_alive.push_back(layout_args.target);
+  cache_key.keep_alive.push_back(layout_args.thread_bounds->min);
+  cache_key.keep_alive.push_back(layout_args.thread_bounds->extent);
+  for (const auto &[buffer, layout] : layout_args.layout_map) {
+    cache_key.layouts.emplace_back(reinterpret_cast<uintptr_t>(buffer.get()),
+                                   reinterpret_cast<uintptr_t>(layout.get()));
+    cache_key.keep_alive.push_back(buffer);
+    cache_key.keep_alive.push_back(layout);
+  }
+  std::sort(cache_key.layouts.begin(), cache_key.layouts.end());
+  cache_key.remaps.reserve(layout_args.buffer_remap.size());
+  for (const auto &[src, dst] : layout_args.buffer_remap) {
+    cache_key.remaps.emplace_back(reinterpret_cast<uintptr_t>(src.get()),
+                                  reinterpret_cast<uintptr_t>(dst.get()));
+    cache_key.keep_alive.push_back(src);
+    cache_key.keep_alive.push_back(dst);
+  }
+  std::sort(cache_key.remaps.begin(), cache_key.remaps.end());
+
   // Vectorize Size must be aware of the buffer_remap
   // As the pass will do post processing to the layout
-  auto maybe_remapped_root_ = IfBufferRemapLoopGenerator::run(
-      root_, layout_args.buffer_remap, layout_args.layout_map);
-  int vector_size = GetVectorizeSize(maybe_remapped_root_, layout_args.analyzer,
-                                     layout_args.layout_map, reducer_info_map_);
+  int vector_size;
+  auto cached = vectorize_size_cache_->entries.find(cache_key);
+  if (cached != vectorize_size_cache_->entries.end()) {
+    vector_size = cached->second;
+  } else {
+    auto maybe_remapped_root_ = IfBufferRemapLoopGenerator::run(
+        root_, layout_args.buffer_remap, layout_args.layout_map);
+    vector_size = GetVectorizeSize(maybe_remapped_root_, layout_args.analyzer,
+                                   layout_args.layout_map, reducer_info_map_);
+    vectorize_size_cache_->entries.emplace(std::move(cache_key), vector_size);
+  }
   DLOG(INFO) << "[PlanLoopPartition] vector_size = " << vector_size << '\n';
 
   PrimExpr loop_total_size = 1;
