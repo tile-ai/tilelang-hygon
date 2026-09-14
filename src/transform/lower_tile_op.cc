@@ -26,6 +26,9 @@
 #include "cpu/target_utils.h"
 #include "cuda/target_utils.h"
 #include "cuda/transform/ptx_async_copy_injector.h"
+#include "hcu/target_utils.h"
+#include "hcu/transform/async_copy_injector.h"
+#include "hcu/utils/gemm_lds_strategy_utils.h"
 
 #include "arith/ir_mutator_with_analyzer.h"
 #include "common/mbarrier.h"
@@ -1518,6 +1521,29 @@ private:
       if (should_inject_async_copy) {
         auto inject_result = InjectPTXAsyncCopy(
             lowered, parallel_async_without_async_commit_wait);
+        lowered = inject_result.stmt;
+      }
+    } else if (TargetHcuHasAsyncCopy(target_)) {
+      tvm::transform::PassContext ctx = tvm::transform::PassContext::Current();
+      bool auto_async_copy_enabled =
+          ctx->GetConfig<Bool>(kEnableAsyncCopy, Bool(true)).value();
+      bool should_inject_async_copy =
+          parallel_prefer_async ||
+          (auto_async_copy_enabled && parallel_async_without_async_commit_wait);
+      if (should_inject_async_copy) {
+        Map<String, ObjectRef> async_annotations;
+        if (auto strategy =
+                op->annotations.Get(attr::kHcuGemmLdsCopyStrategy)) {
+          async_annotations.Set(
+              attr::kHcuGemmLdsCopyStrategy,
+              Downcast<HcuGemmLdsCopyStrategy>(strategy.value()));
+        }
+        auto inject_result = InjectHCUAsyncCopy(
+            lowered, parallel_async_without_async_commit_wait,
+            async_annotations, thread_var_->var, buffer_remap_);
+        ICHECK(inject_result.injected_hcu_async_copy || !parallel_prefer_async)
+            << "T.Parallel(prefer_async=True) did not contain an eligible "
+               "HCU global-to-shared copy";
         lowered = inject_result.stmt;
       }
     }

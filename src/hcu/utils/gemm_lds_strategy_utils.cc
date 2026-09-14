@@ -31,9 +31,13 @@ void HcuGemmLdsCopyStrategyNode::RegisterReflection() {
       .def_ro("copy_transaction_bytes",
               &HcuGemmLdsCopyStrategyNode::copy_transaction_bytes)
       .def_ro("block_threads", &HcuGemmLdsCopyStrategyNode::block_threads)
+      .def_ro("thread_offset", &HcuGemmLdsCopyStrategyNode::thread_offset)
       .def_ro("inner_extent", &HcuGemmLdsCopyStrategyNode::inner_extent)
+      .def_ro("warp_size", &HcuGemmLdsCopyStrategyNode::warp_size)
       .def_ro("wrap_offset", &HcuGemmLdsCopyStrategyNode::wrap_offset)
       .def_ro("wrap_idx_mask", &HcuGemmLdsCopyStrategyNode::wrap_idx_mask)
+      .def_ro("wrap_uses_copy_transaction",
+              &HcuGemmLdsCopyStrategyNode::wrap_uses_copy_transaction)
       .def_ro("storage_layout", &HcuGemmLdsCopyStrategyNode::storage_layout)
       .def_ro("copy_loop_layout",
               &HcuGemmLdsCopyStrategyNode::copy_loop_layout);
@@ -104,9 +108,11 @@ int GetHcuGemmLdsWrapOffsetDwords(int wrap_step_bytes) {
 }
 
 bool IsLegalHcuGemmLdsWrap(const HcuGemmLdsCopyGeometry &geometry,
-                           int wrap_step_bytes, int wrap_count) {
-  if (!IsPowerOfTwo(wrap_count) || wrap_count > geometry.num_copy_waves ||
-      geometry.num_copy_waves % wrap_count != 0) {
+                           int wrap_step_bytes, int wrap_count,
+                           int available_wrap_phases) {
+  if (!IsPowerOfTwo(wrap_count) || available_wrap_phases <= 0 ||
+      wrap_count > available_wrap_phases ||
+      available_wrap_phases % wrap_count != 0) {
     return false;
   }
   if (wrap_count == 1) {
@@ -121,19 +127,22 @@ bool IsLegalHcuGemmLdsWrap(const HcuGemmLdsCopyGeometry &geometry,
          geometry.max_wrap_offset_dwords;
 }
 
-HcuGemmLdsCopyStrategy
-MakeHcuGemmLdsCopyStrategy(bool use_idxen, int copy_bytes_per_lane,
-                           int copy_transaction_bytes, int block_threads,
-                           int inner_extent, int wrap_offset, int wrap_idx_mask,
-                           Layout storage_layout, Fragment copy_loop_layout) {
+HcuGemmLdsCopyStrategy MakeHcuGemmLdsCopyStrategy(
+    bool use_idxen, int copy_bytes_per_lane, int copy_transaction_bytes,
+    int block_threads, int thread_offset, int inner_extent, int warp_size,
+    int wrap_offset, int wrap_idx_mask, bool wrap_uses_copy_transaction,
+    Layout storage_layout, Fragment copy_loop_layout) {
   auto node = ffi::make_object<HcuGemmLdsCopyStrategyNode>();
   node->use_idxen = use_idxen;
   node->copy_bytes_per_lane = copy_bytes_per_lane;
   node->copy_transaction_bytes = copy_transaction_bytes;
   node->block_threads = block_threads;
+  node->thread_offset = thread_offset;
   node->inner_extent = inner_extent;
+  node->warp_size = warp_size;
   node->wrap_offset = wrap_offset;
   node->wrap_idx_mask = wrap_idx_mask;
+  node->wrap_uses_copy_transaction = wrap_uses_copy_transaction;
   node->storage_layout = std::move(storage_layout);
   node->copy_loop_layout = std::move(copy_loop_layout);
   return HcuGemmLdsCopyStrategy(std::move(node));
