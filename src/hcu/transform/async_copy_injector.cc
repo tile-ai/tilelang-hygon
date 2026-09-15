@@ -512,11 +512,11 @@ private:
                  IntImm(DataType::Int(32), rw_mask)});
   }
 
-  PrimExpr MakeGemmCommandDstAccessPtr(const BufferLoad &dst_base_load,
-                                       int num_elems, int copy_bytes_per_lane,
-                                       int copy_transaction_bytes,
-                                       int block_threads, int inner_extent,
-                                       const char *operand) {
+  PrimExpr MakeGemmCommandDstAccessPtr(
+      const BufferLoad &dst_base_load, int num_elems, int copy_bytes_per_lane,
+      int copy_transaction_bytes, int block_threads, int thread_offset,
+      int inner_extent, int warp_size, bool wrap_uses_copy_transaction,
+      PrimExpr *wrap_index, const char *operand) {
     ICHECK(thread_var_.defined());
     const Buffer &buffer = dst_base_load->buffer;
     const int element_bits = buffer->dtype.bits() * buffer->dtype.lanes();
@@ -558,14 +558,49 @@ private:
         floordiv(local_element, Integer(transaction_elements));
     PrimExpr intra_transaction =
         floormod(local_element, Integer(transaction_elements));
+    PrimExpr local_thread = thread_var_ - Integer(thread_offset);
+    ICHECK_GT(warp_size, 0);
+    ICHECK_EQ(block_threads % warp_size, 0);
+    if (wrap_index != nullptr) {
+      PrimExpr phase = floordiv(local_thread, Integer(warp_size));
+      if (wrap_uses_copy_transaction) {
+        phase += transaction * (block_threads / warp_size);
+      }
+      *wrap_index = analyzer_.Simplify(phase);
+    }
     // Each issued transaction is contiguous across lanes. Multiple
     // transactions owned by one thread are placed transaction-major.
     PrimExpr physical_offset = analyzer_.Simplify(
-        (transaction * block_threads + thread_var_) * transaction_elements +
+        (transaction * block_threads + local_thread) * transaction_elements +
         intra_transaction);
     // Address the remapped buffer directly so the enclosing layout lowering
     // does not apply the final LDS storage layout to this pre-wrap address.
     Optional<Buffer> physical_buffer = buffer_remap_.Get(buffer);
+    if (!physical_buffer.defined()) {
+      // Match LowerTileOpPass::FindRemapBuffer: layout lowering may rebuild a
+      // scoped/versioned access Buffer (for example k_stages[stage, :, :]),
+      // so Buffer object identity alone is insufficient even when every view
+      // uses the same LDS layout.
+      for (const auto &[logical, physical] : buffer_remap_) {
+        bool same_logical_signature =
+            logical->name == buffer->name && logical->dtype == buffer->dtype &&
+            logical.scope() == buffer.scope() &&
+            logical->shape.size() == buffer->shape.size();
+        if (same_logical_signature) {
+          for (size_t i = 0; i < logical->shape.size(); ++i) {
+            if (!analyzer_.CanProveEqual(logical->shape[i], buffer->shape[i])) {
+              same_logical_signature = false;
+              break;
+            }
+          }
+        }
+        if ((logical->data.same_as(buffer->data) || same_logical_signature) &&
+            physical->shape.size() == dst_base_load->indices.size()) {
+          physical_buffer = physical;
+          break;
+        }
+      }
+    }
     ICHECK(physical_buffer.defined())
         << "HCU GEMM " << operand
         << " strategy requires a remapped physical LDS buffer for "
@@ -600,12 +635,17 @@ private:
                                           int num_elems, bool predicated,
                                           const PrimExpr &predicate_value) {
     PrimExpr dst_access_ptr;
+    PrimExpr wrap_index;
     if (copy_strategy_.defined()) {
       const HcuGemmLdsCopyStrategy &strategy = copy_strategy_.value();
+      const bool needs_annotated_wrap_index =
+          strategy->wrap_uses_copy_transaction || strategy->thread_offset != 0;
       dst_access_ptr = MakeGemmCommandDstAccessPtr(
           dst_base_load, num_elems, strategy->copy_bytes_per_lane,
           strategy->copy_transaction_bytes, strategy->block_threads,
-          strategy->inner_extent, "GEMM");
+          strategy->thread_offset, strategy->inner_extent, strategy->warp_size,
+          strategy->wrap_uses_copy_transaction,
+          needs_annotated_wrap_index ? &wrap_index : nullptr, "GEMM");
     } else {
       dst_access_ptr =
           MakeAccessPtrFromLoad(dst_base_load, num_elems, /*rw_mask=*/2);
@@ -620,8 +660,12 @@ private:
     } else {
       cp_async_args = {dst_access_ptr, src_access_ptr, PrimExpr(num_elems)};
     }
+    Map<String, ObjectRef> annotations = call_annotations_;
+    if (wrap_index.defined()) {
+      annotations.Set(attr::kHcuLdsWrapIndex, wrap_index);
+    }
     return Evaluate(Call(store->buffer->dtype, tvm::tl::ptx_cp_async(),
-                         cp_async_args, call_annotations_));
+                         cp_async_args, annotations));
   }
 
   static Stmt MakeCommitGroupStmt() {
@@ -671,11 +715,16 @@ private:
     return copy_strategy_.defined() ? copy_strategy_.value()->block_threads : 0;
   }
 
+  int GetGemmStrategyThreadOffset() const {
+    return copy_strategy_.defined() ? copy_strategy_.value()->thread_offset : 0;
+  }
+
   bool HasUnitStrideForEveryThread(const PrimExpr &expr,
                                    const ActiveVectorizedLoop &loop,
-                                   int block_threads) {
+                                   int block_threads, int thread_offset) {
     ICHECK(thread_var_.defined());
-    for (int thread = 0; thread < block_threads; ++thread) {
+    for (int local_thread = 0; local_thread < block_threads; ++local_thread) {
+      const int thread = thread_offset + local_thread;
       PrimExpr prev = analyzer_.Simplify(
           Substitute(expr, {{thread_var_, IntImm(thread_var_->dtype, thread)},
                             {loop.loop_var, IntImm(loop.loop_var->dtype, 0)}}));
@@ -697,6 +746,7 @@ private:
   bool HasContiguousVectorizedOffsets(const PrimExpr &src_index,
                                       const PrimExpr &dst_index) {
     const int strategy_block_threads = GetGemmStrategyBlockThreads();
+    const int strategy_thread_offset = GetGemmStrategyThreadOffset();
     for (const auto &loop : active_vectorized_loops_) {
       bool src_contiguous = HasUnitStrideForVectorizedLoop(src_index, loop);
       bool dst_contiguous = HasUnitStrideForVectorizedLoop(dst_index, loop);
@@ -705,12 +755,12 @@ private:
       // threadIdx.x. Prove the same property over the finite thread domain.
       if (strategy_block_threads > 0) {
         if (!src_contiguous) {
-          src_contiguous = HasUnitStrideForEveryThread(src_index, loop,
-                                                       strategy_block_threads);
+          src_contiguous = HasUnitStrideForEveryThread(
+              src_index, loop, strategy_block_threads, strategy_thread_offset);
         }
         if (!dst_contiguous) {
-          dst_contiguous = HasUnitStrideForEveryThread(dst_index, loop,
-                                                       strategy_block_threads);
+          dst_contiguous = HasUnitStrideForEveryThread(
+              dst_index, loop, strategy_block_threads, strategy_thread_offset);
         }
       }
       if (!src_contiguous || !dst_contiguous) {

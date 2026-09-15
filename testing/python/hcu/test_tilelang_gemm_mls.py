@@ -94,14 +94,14 @@ def _assert_mls_ds_stage2_async_groups(source: str) -> None:
 
 
 def _assert_mls_copy_a_mls_b_ds_stage1_async_groups(source: str) -> None:
-    _assert_mls_async_group_pipeline(source, [0, 0], expected_loads=2, expected_commits=2)
+    _assert_mls_async_group_pipeline(source, [1, 1, 1, 0], expected_loads=2, expected_commits=4)
     assert "ds_read_format_tensor_b" in source
     assert "ds_read_format_tensor_a" not in source
     assert "__builtin_hcu_mmac" in source
 
 
 def _assert_mls_copy_a_mls_b_ds_stage2_async_groups(source: str) -> None:
-    _assert_mls_async_group_pipeline(source, [1, 1, 0], expected_loads=3, expected_commits=3)
+    _assert_mls_async_group_pipeline(source, [3, 3, 3, 2, 1, 0], expected_loads=3, expected_commits=6)
     assert "ds_read_format_tensor_b" in source
     assert "ds_read_format_tensor_a" not in source
     assert "__builtin_hcu_mmac" in source

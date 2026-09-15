@@ -30,7 +30,7 @@ using namespace tirx;
 
 namespace {
 
-constexpr int kStrategyVersion = 9;
+constexpr int kStrategyVersion = 10;
 // These are instruction semantics, not kernel tile parameters.
 constexpr int kLdsIssueBytes = 128;
 constexpr int kDsReadB128BytesPerLane = 16;
@@ -64,6 +64,7 @@ struct AtBnStrategyParams {
   int block_mn{0};
   int block_k{0};
   int block_threads{0};
+  int thread_offset{0};
   int warp_size{0};
   int warp_mn_count{0};
   int bank_num{0};
@@ -96,10 +97,43 @@ std::optional<int64_t> StaticExtent(const Array<Range> &ranges, size_t dim) {
   return *extent;
 }
 
+bool HasOnlyUnitLeadingExtents(const Array<Range> &ranges) {
+  if (ranges.size() < 2) {
+    return false;
+  }
+  for (size_t i = 0; i + 2 < ranges.size(); ++i) {
+    const int64_t *extent = as_const_int(ranges[i]->extent);
+    if (extent == nullptr || *extent != 1) {
+      return false;
+    }
+  }
+  return true;
+}
+
+Layout ExpandStorageLayout(const Layout &layout, const Buffer &buffer) {
+  Array<PrimExpr> leading_shape;
+  for (size_t i = 0; i + 2 < buffer->shape.size(); ++i) {
+    leading_shape.push_back(buffer->shape[i]);
+  }
+  return layout->Expand(leading_shape);
+}
+
 bool IsPowerOfTwo(int value) { return value > 0 && (value & (value - 1)) == 0; }
 
+int LargestPowerOfTwoDivisorAtMost(int value, int limit) {
+  if (value <= 0 || limit <= 0) {
+    return 0;
+  }
+  int result = 1;
+  while (result <= limit / 2 && value % (result * 2) == 0) {
+    result *= 2;
+  }
+  return result;
+}
+
 int SelectWrapOffset(const AtBnStrategyParams &params,
-                     const HcuGemmLdsCopyGeometry &geometry, int wrap_count) {
+                     const HcuGemmLdsCopyGeometry &geometry, int wrap_count,
+                     int available_wrap_phases) {
   if (geometry.max_wrap_offset_dwords <= 0) {
     return 0;
   }
@@ -121,7 +155,8 @@ int SelectWrapOffset(const AtBnStrategyParams &params,
     // transaction after layout lowering.
     if (wrap_step_bytes % params.read_bytes_per_lane != 0 ||
         wrap_step_bytes % params.copy_transaction_bytes != 0 ||
-        !IsLegalHcuGemmLdsWrap(geometry, wrap_step_bytes, wrap_count)) {
+        !IsLegalHcuGemmLdsWrap(geometry, wrap_step_bytes, wrap_count,
+                               available_wrap_phases)) {
       continue;
     }
     const int bank_shift = offset_dwords % params.bank_num;
@@ -149,6 +184,37 @@ PrimExpr AtBnRowPermute(const PrimExpr &row, const AtBnStrategyParams &params) {
       params.rows_per_copy_warp_transaction / params.row_period;
   PrimExpr row_group = floordiv(row, Integer(params.row_period));
   PrimExpr inner_row = floormod(row, Integer(params.row_period));
+  const int wrap_count = params.wrap_idx_mask + 1;
+  if (wrap_count > copy_warp_count) {
+    // A copy wave owns multiple statically unrolled transactions. Spread each
+    // run of `wrap_count` repeated-bank row groups across distinct physical
+    // copy slots, then cycle equal wrap phases through the remaining slots.
+    // This keeps the mapping bijective when wrap_count is smaller than the
+    // total number of (transaction, wave) pairs.
+    const int available_copy_slots =
+        copy_warp_count * params.copy_transactions_per_lane;
+    ICHECK_EQ(available_copy_slots % wrap_count, 0);
+    const int slots_per_wrap_phase = available_copy_slots / wrap_count;
+    PrimExpr phase = floormod(row_group, Integer(wrap_count));
+    PrimExpr group_round = floordiv(row_group, Integer(wrap_count));
+    PrimExpr slot_repeat =
+        floormod(floordiv(group_round, Integer(groups_per_copy_warp)),
+                 Integer(slots_per_wrap_phase));
+    PrimExpr physical_slot = slot_repeat * wrap_count + phase;
+    PrimExpr copy_transaction =
+        floordiv(physical_slot, Integer(copy_warp_count));
+    PrimExpr copy_warp = floormod(physical_slot, Integer(copy_warp_count));
+    PrimExpr transaction_span =
+        params.rows_per_copy_transaction * params.copy_transactions_per_lane;
+    return floordiv(group_round,
+                    Integer(groups_per_copy_warp * slots_per_wrap_phase)) *
+               transaction_span +
+           copy_transaction * params.rows_per_copy_transaction +
+           copy_warp * params.rows_per_copy_warp_transaction +
+           floormod(group_round, Integer(groups_per_copy_warp)) *
+               params.row_period +
+           inner_row;
+  }
   PrimExpr copy_warp = floormod(row_group, Integer(copy_warp_count));
   PrimExpr group_round = floordiv(row_group, Integer(copy_warp_count));
   // Distribute repeated-bank row groups across copy warps first. Additional
@@ -164,6 +230,7 @@ PrimExpr AtBnRowPermute(const PrimExpr &row, const AtBnStrategyParams &params) {
 Layout MakeStorageLayout(const AtBnStrategyParams &params) {
   PrimExpr row = InputPlaceholder(0);
   PrimExpr col = InputPlaceholder(1);
+  const int copy_warp_count = params.block_threads / params.warp_size;
   PrimExpr mapped_row = AtBnRowPermute(row, params);
   PrimExpr segment = mapped_row * params.copy_segments_per_row +
                      floordiv(col, Integer(params.copy_elements_per_lane));
@@ -175,8 +242,9 @@ Layout MakeStorageLayout(const AtBnStrategyParams &params) {
   // annotation and the physical LDS writes share the same mapping.
   ICHECK_EQ(4 % params.element_bytes, 0);
   const int elements_per_dword = 4 / params.element_bytes;
+  PrimExpr wrap_phase = transaction * copy_warp_count + copy_warp;
   PrimExpr wrap_offset_cur_dwords =
-      floormod(copy_warp, Integer(params.wrap_idx_mask + 1)) *
+      floormod(wrap_phase, Integer(params.wrap_idx_mask + 1)) *
       params.wrap_offset;
   PrimExpr wave_element = lane * params.copy_elements_per_lane +
                           floormod(col, Integer(params.copy_elements_per_lane));
@@ -204,26 +272,36 @@ Fragment MakeCopyLoopLayout(const AtBnStrategyParams &params) {
   PrimExpr thread = floormod(segment, Integer(params.block_threads));
   PrimExpr transaction = floordiv(segment, Integer(params.block_threads));
   PrimExpr intra = floormod(col, Integer(params.copy_elements_per_lane));
-  if (params.copy_transactions_per_lane == 1) {
-    return Fragment({Integer(params.block_mn), Integer(params.block_k)},
-                    {intra}, thread, Integer(1), std::nullopt);
-  }
-  return Fragment({Integer(params.block_mn), Integer(params.block_k)},
-                  {transaction, intra}, thread, Integer(1), std::nullopt);
+  Fragment layout =
+      params.copy_transactions_per_lane == 1
+          ? Fragment({Integer(params.block_mn), Integer(params.block_k)},
+                     {intra}, thread, Integer(1), std::nullopt)
+          : Fragment({Integer(params.block_mn), Integer(params.block_k)},
+                     {transaction, intra}, thread, Integer(1), std::nullopt);
+  return layout->BindThreadRange(Range::FromMinExtent(
+      Integer(params.thread_offset), Integer(params.block_threads)));
 }
 
 void ValidateSameLayout(const Layout &actual, const Layout &expected,
                         int block_mn, int block_k, const char *kind) {
   ICHECK(actual.defined()) << kind << " layout is undefined";
   ICHECK(expected.defined()) << "Expected " << kind << " layout is undefined";
+  ICHECK_GE(actual->InputDim(), 2U)
+      << kind << " layout must have at least two input dimensions";
   ICHECK_EQ(actual->InputDim(), expected->InputDim())
       << kind << " layout input rank mismatch: actual=" << actual->DebugOutput()
       << ", expected=" << expected->DebugOutput();
 
   arith::Analyzer analyzer;
+  const size_t leading_dims = actual->InputDim() - 2;
   for (int row = 0; row < block_mn; ++row) {
     for (int col = 0; col < block_k; ++col) {
-      Array<PrimExpr> logical = {Integer(row), Integer(col)};
+      Array<PrimExpr> logical;
+      for (size_t i = 0; i < leading_dims; ++i) {
+        logical.push_back(Integer(0));
+      }
+      logical.push_back(Integer(row));
+      logical.push_back(Integer(col));
       Array<PrimExpr> actual_index = actual->Forward(logical);
       Array<PrimExpr> expected_index = expected->Forward(logical);
       ICHECK_EQ(actual_index.size(), expected_index.size())
@@ -254,6 +332,7 @@ void HcuGemmAtBnLdsStrategyNode::RegisterReflection() {
       .def_ro("block_mn", &HcuGemmAtBnLdsStrategyNode::block_mn)
       .def_ro("block_k", &HcuGemmAtBnLdsStrategyNode::block_k)
       .def_ro("block_threads", &HcuGemmAtBnLdsStrategyNode::block_threads)
+      .def_ro("thread_offset", &HcuGemmAtBnLdsStrategyNode::thread_offset)
       .def_ro("warp_size", &HcuGemmAtBnLdsStrategyNode::warp_size)
       .def_ro("warp_mn_count", &HcuGemmAtBnLdsStrategyNode::warp_mn_count)
       .def_ro("bank_num", &HcuGemmAtBnLdsStrategyNode::bank_num)
@@ -280,7 +359,14 @@ void HcuGemmAtBnLdsStrategyNode::RegisterReflection() {
 
 Optional<HcuGemmAtBnLdsStrategy>
 DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
-                             bool feeds_a, int block_threads, Target target) {
+                             bool feeds_a, Range thread_bounds, Target target) {
+  const int64_t *thread_offset = as_const_int(thread_bounds->min);
+  const int64_t *thread_extent = as_const_int(thread_bounds->extent);
+  if (thread_offset == nullptr || thread_extent == nullptr ||
+      *thread_offset < 0 || *thread_extent <= 0) {
+    return std::nullopt;
+  }
+  const int block_threads = static_cast<int>(*thread_extent);
   if (!TargetIsHCU(target) || !TargetHcuHasAsyncCopy(target) ||
       block_threads <= 0) {
     return std::nullopt;
@@ -288,17 +374,17 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   if (!IsGlobalBuffer(copy.src) || !IsSharedBuffer(copy.dst) ||
       copy.src->dtype != copy.dst->dtype ||
       !(copy.dst->dtype.is_float16() || copy.dst->dtype.is_bfloat16()) ||
-      copy.src_range.size() < 2 || copy.dst_range.size() < 2) {
+      !HasOnlyUnitLeadingExtents(copy.dst_range)) {
     return std::nullopt;
   }
-  const size_t src_rank = copy.src_range.size();
+  // The shared destination is the canonical logical GEMM tile. A global
+  // source may be a higher-rank slice (for example, a BTHD slice with unit B
+  // and H extents); CopyNode already maps those unit dimensions onto the
+  // destination iteration domain.
   const size_t dst_rank = copy.dst_range.size();
-  std::optional<int64_t> src_m = StaticExtent(copy.src_range, src_rank - 2);
-  std::optional<int64_t> src_k = StaticExtent(copy.src_range, src_rank - 1);
   std::optional<int64_t> dst_m = StaticExtent(copy.dst_range, dst_rank - 2);
   std::optional<int64_t> dst_k = StaticExtent(copy.dst_range, dst_rank - 1);
-  if (!src_m || !src_k || !dst_m || !dst_k || *src_m != *dst_m ||
-      *src_k != *dst_k || *dst_m <= 0 || *dst_k <= 0) {
+  if (!dst_m || !dst_k || *dst_m <= 0 || *dst_k <= 0) {
     return std::nullopt;
   }
   const int block_mn = static_cast<int>(*dst_m);
@@ -350,7 +436,11 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   params.block_mn = block_mn;
   params.block_k = block_k;
   params.block_threads = block_threads;
+  params.thread_offset = static_cast<int>(*thread_offset);
   params.warp_size = warp_size;
+  if (params.thread_offset % params.warp_size != 0) {
+    return std::nullopt;
+  }
   params.warp_mn_count = warp_mn_count;
   params.element_bytes = element_bits / 8;
 
@@ -450,11 +540,16 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   }
   const bool uses_ds_read_b128 =
       params.read_bytes_per_lane == kDsReadB128BytesPerLane;
-  const int wrap_count =
-      uses_ds_read_b128 ? required_wrap_count
-                        : std::max(params.warp_mn_count, required_wrap_count);
   const int copy_warp_count = params.block_threads / params.warp_size;
-  if (!IsPowerOfTwo(wrap_count) || wrap_count > copy_warp_count) {
+  const int available_wrap_phases =
+      copy_warp_count * params.copy_transactions_per_lane;
+  // The bank model determines the ideal number of wrap phases, while the
+  // producer wave/transaction pairs determine how many distinct phases can
+  // be encoded. A wave can select a different hardware wrap for each of its
+  // statically unrolled copy transactions.
+  const int wrap_count = LargestPowerOfTwoDivisorAtMost(available_wrap_phases,
+                                                        required_wrap_count);
+  if (!IsPowerOfTwo(wrap_count) || wrap_count > available_wrap_phases) {
     return std::nullopt;
   }
   params.wrap_idx_mask = wrap_count - 1;
@@ -465,10 +560,12 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
         GetHcuGemmLdsWrapOffsetDwords(kDsReadB128WrapStepBytes);
   } else {
     // Select the smallest wrap that separates adjacent repeated-bank groups.
-    params.wrap_offset = SelectWrapOffset(params, *geometry, wrap_count);
+    params.wrap_offset =
+        SelectWrapOffset(params, *geometry, wrap_count, available_wrap_phases);
   }
   const int wrap_step_bytes = params.wrap_offset * 4;
-  if (!IsLegalHcuGemmLdsWrap(*geometry, wrap_step_bytes, wrap_count)) {
+  if (!IsLegalHcuGemmLdsWrap(*geometry, wrap_step_bytes, wrap_count,
+                             available_wrap_phases)) {
     return std::nullopt;
   }
   auto node = ffi::make_object<HcuGemmAtBnLdsStrategyNode>();
@@ -476,6 +573,7 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   node->block_mn = params.block_mn;
   node->block_k = params.block_k;
   node->block_threads = params.block_threads;
+  node->thread_offset = params.thread_offset;
   node->warp_size = params.warp_size;
   node->warp_mn_count = params.warp_mn_count;
   node->bank_num = params.bank_num;
@@ -491,7 +589,8 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   node->wrap_offset = params.wrap_offset;
   node->wrap_idx_mask = params.wrap_idx_mask;
   // Column segment shift/carry completes the conflict-free physical layout.
-  node->storage_layout = MakeStorageLayout(params);
+  node->storage_layout =
+      ExpandStorageLayout(MakeStorageLayout(params), copy.dst);
   node->copy_loop_layout = MakeCopyLoopLayout(params);
   return HcuGemmAtBnLdsStrategy(std::move(node));
 }
