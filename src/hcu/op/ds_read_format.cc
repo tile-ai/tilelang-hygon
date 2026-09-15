@@ -404,13 +404,12 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     }
 
     if (hcu_layout_ds_read_) {
-      ICHECK_EQ(sr, 2U)
-          << "layout-aware AN/BT ds_read requires rank-2 [K,MN] input";
       ICHECK(T.layout_map.count(src))
           << "layout-aware AN/BT ds_read requires annotate_layout";
       Layout layout = T.layout_map.at(src);
-      ICHECK_EQ(layout->InputDim(), 2U);
-      ICHECK_EQ(layout->OutputDim(), 2U);
+      ICHECK_EQ(layout->InputDim(), sr)
+          << "layout-aware AN/BT ds_read layout rank must match input rank";
+      ICHECK_GE(layout->OutputDim(), 2U);
 
       int warp_size = TargetHcuGetWarpSize(T.target);
       int total_warp = block_size / warp_size;
@@ -453,12 +452,26 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
               origin_dim1 + panel * make_const(panel.dtype(), 32) +
               FloorMod(lane, make_const(lane.dtype(), 4)) *
                   make_const(lane.dtype(), 8));
-          Array<PrimExpr> physical = layout->Forward({logical_k, logical_n});
-          Array<PrimExpr> physical_last = layout->Forward(
-              {logical_k, logical_n + make_const(logical_n.dtype(), 7)});
-          ICHECK(analyzer->CanProveEqual(physical[0], physical_last[0]) &&
-                 analyzer->CanProveEqual(physical[1] + 7, physical_last[1]))
-              << "each B ds_read 8-half segment must remain contiguous";
+          Array<PrimExpr> logical;
+          for (size_t i = 0; i + 2 < sr; ++i) {
+            logical.push_back(src_ranges[i]->min);
+          }
+          logical.push_back(logical_k);
+          logical.push_back(logical_n);
+          Array<PrimExpr> logical_last = logical;
+          logical_last.Set(logical_last.size() - 1,
+                           logical_n + make_const(logical_n.dtype(), 7));
+          Array<PrimExpr> physical = layout->Forward(logical);
+          Array<PrimExpr> physical_last = layout->Forward(logical_last);
+          ICHECK_EQ(physical.size(), physical_last.size());
+          for (size_t i = 0; i + 1 < physical.size(); ++i) {
+            ICHECK(analyzer->CanProveEqual(physical[i], physical_last[i]))
+                << "each AN/BT ds_read 8-half segment must remain in one "
+                   "physical row";
+          }
+          ICHECK(analyzer->CanProveEqual(physical.back() + 7,
+                                         physical_last.back()))
+              << "each AN/BT ds_read 8-half segment must remain contiguous";
           PrimExpr local_offset = analyzer->Simplify(
               dst_leading_offset +
               make_const(dst_leading_offset.dtype(),

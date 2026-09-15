@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "hcu/target_utils.h"
+#include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "hcu/utils/mls_boundary.h"
 #include "op/builtin.h"
 
@@ -606,7 +607,8 @@ int GetWrapAnnotation(const CallNode *call, const char *key) {
 }
 
 std::string ApplyCPAsyncLdsWrap(const CallNode *op, const Target &target,
-                                std::string dst) {
+                                std::string dst,
+                                std::string annotated_wrap_index = "") {
   const int wrap_offset = GetWrapAnnotation(op, "wrap_offset");
   const int wrap_idx_mask = GetWrapAnnotation(op, "wrap_idx_mask");
   ICHECK_EQ(wrap_offset != 0, wrap_idx_mask != 0)
@@ -619,8 +621,14 @@ std::string ApplyCPAsyncLdsWrap(const CallNode *op, const Target &target,
   ICHECK(wrap_config.encoding != tl::HcuLdsWrapEncoding::kNone)
       << "LDS wrap encoding is not defined for "
       << tl::GetHcuArchString(target);
-  std::string wrap_index =
-      "((((int)threadIdx.x) >> 6) & " + std::to_string(wrap_idx_mask) + ")";
+  std::string wrap_index;
+  if (annotated_wrap_index.empty()) {
+    wrap_index =
+        "((((int)threadIdx.x) >> 6) & " + std::to_string(wrap_idx_mask) + ")";
+  } else {
+    wrap_index = "((" + annotated_wrap_index + ") & " +
+                 std::to_string(wrap_idx_mask) + ")";
+  }
   std::string dword_offset =
       "(" + wrap_index + " * " + std::to_string(wrap_offset) + ")";
   std::string encoded_field;
@@ -725,6 +733,12 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
                                     "_cp_async_idxen_resource");
         idxen_sources.push_back(*source);
       }
+
+      // A transaction-dependent LDS wrap cannot be folded into one base
+      // pointer hoisted outside the copy loop. Keep the per-call pointer path;
+      // the idxen source resource remains hoisted as usual.
+      if (call->annotations.Get(tl::attr::kHcuLdsWrapIndex))
+        return;
 
       // Hoist only destinations where adjacent lanes write adjacent
       // transactions. More general pointer expressions keep the old path.
@@ -2507,8 +2521,12 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::ptx_cp_async()) ||
              op->op.same_as(tl::hcu_cp_async_idxen())) {
     int total_bytes = GetTileLangCPAsyncTransferBytes(op);
-    std::string dst =
-        ApplyCPAsyncLdsWrap(op, target_, this->PrintExpr(op->args[0]));
+    std::string annotated_wrap_index;
+    if (auto value = op->annotations.Get(tl::attr::kHcuLdsWrapIndex)) {
+      annotated_wrap_index = this->PrintExpr(Downcast<PrimExpr>(value.value()));
+    }
+    std::string dst = ApplyCPAsyncLdsWrap(
+        op, target_, this->PrintExpr(op->args[0]), annotated_wrap_index);
     std::string src = this->PrintExpr(op->args[1]);
     std::string size = std::to_string(total_bytes);
     bool use_idxen = op->op.same_as(tl::hcu_cp_async_idxen());

@@ -22,6 +22,8 @@
 #include "op/utils.h"
 #include "transform/common/pipeline_utils.h"
 
+#include "arith/ir_mutator_with_analyzer.h"
+
 #include <tvm/ir/transform.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
@@ -198,16 +200,21 @@ bool IsBLinearDirectGemmCandidate(const GemmNode *gemm) {
          (gemm->b_->dtype.is_float16() || gemm->b_->dtype.is_bfloat16());
 }
 
+struct ThreadExtentInfo {
+  int block_threads{-1};
+  IterVar thread_var;
+};
+
 class ThreadExtentCollector : public StmtExprVisitor {
 public:
-  static int Collect(const Stmt &body) {
+  static ThreadExtentInfo Collect(const Stmt &body) {
     ThreadExtentCollector collector;
     collector(body);
     if (collector.thread_x_extent_ <= 1 || collector.thread_y_extent_ != 1 ||
         collector.thread_z_extent_ != 1) {
-      return -1;
+      return {};
     }
-    return collector.thread_x_extent_;
+    return {collector.thread_x_extent_, collector.thread_x_var_};
   }
 
 private:
@@ -217,6 +224,7 @@ private:
         if (const int64_t *extent = as_const_int(op->value)) {
           if (iter_var->thread_tag == "threadIdx.x") {
             thread_x_extent_ = static_cast<int>(*extent);
+            thread_x_var_ = GetRef<IterVar>(iter_var);
           } else if (iter_var->thread_tag == "threadIdx.y") {
             thread_y_extent_ = static_cast<int>(*extent);
           } else if (iter_var->thread_tag == "threadIdx.z") {
@@ -231,6 +239,7 @@ private:
   int thread_x_extent_{-1};
   int thread_y_extent_{1};
   int thread_z_extent_{1};
+  IterVar thread_x_var_;
 };
 
 bool HaveSameAtBnStrategyParameters(const HcuGemmAtBnLdsStrategy &lhs,
@@ -238,6 +247,7 @@ bool HaveSameAtBnStrategyParameters(const HcuGemmAtBnLdsStrategy &lhs,
   return lhs->strategy_version == rhs->strategy_version &&
          lhs->block_mn == rhs->block_mn && lhs->block_k == rhs->block_k &&
          lhs->block_threads == rhs->block_threads &&
+         lhs->thread_offset == rhs->thread_offset &&
          lhs->warp_size == rhs->warp_size &&
          lhs->warp_mn_count == rhs->warp_mn_count &&
          lhs->bank_num == rhs->bank_num &&
@@ -259,6 +269,7 @@ bool HaveSameAnBtStrategyParameters(const HcuGemmAnBtLdsStrategy &lhs,
   return lhs->strategy_version == rhs->strategy_version &&
          lhs->block_k == rhs->block_k && lhs->block_mn == rhs->block_mn &&
          lhs->block_threads == rhs->block_threads &&
+         lhs->thread_offset == rhs->thread_offset &&
          lhs->warp_size == rhs->warp_size && lhs->bank_num == rhs->bank_num &&
          lhs->bank_width_bytes == rhs->bank_width_bytes &&
          lhs->element_bytes == rhs->element_bytes &&
@@ -279,9 +290,12 @@ bool HaveSameCopyStrategyParameters(const HcuGemmLdsCopyStrategy &lhs,
          lhs->copy_bytes_per_lane == rhs->copy_bytes_per_lane &&
          lhs->copy_transaction_bytes == rhs->copy_transaction_bytes &&
          lhs->block_threads == rhs->block_threads &&
+         lhs->thread_offset == rhs->thread_offset &&
          lhs->inner_extent == rhs->inner_extent &&
+         lhs->warp_size == rhs->warp_size &&
          lhs->wrap_offset == rhs->wrap_offset &&
          lhs->wrap_idx_mask == rhs->wrap_idx_mask &&
+         lhs->wrap_uses_copy_transaction == rhs->wrap_uses_copy_transaction &&
          lhs->storage_layout->IsEqual(rhs->storage_layout.get()) &&
          lhs->copy_loop_layout->IsEqual(rhs->copy_loop_layout.get());
 }
@@ -347,17 +361,18 @@ std::optional<GemmWithInput> GemmWithInputFromReaderCall(const CallNode *call,
 
 } // namespace
 
-class AnnotateMlsGemmDepMutator : public StmtExprMutator {
+class AnnotateMlsGemmDepMutator : public arith::IRMutatorWithAnalyzer {
 public:
   enum class Mode { kCollectCandidates, kMaterialize };
 
   AnnotateMlsGemmDepMutator(
       PropagationTirCollector *collector, Target target, int block_threads,
-      Mode mode,
+      IterVar thread_var, arith::Analyzer *analyzer, Mode mode,
       std::unordered_set<Call, ObjectPtrHash, ObjectPtrEqual> selected_calls =
           {})
-      : collector_(collector), target_(std::move(target)),
-        block_threads_(block_threads), mode_(mode),
+      : arith::IRMutatorWithAnalyzer(analyzer), collector_(collector),
+        target_(std::move(target)), block_threads_(block_threads),
+        thread_var_(std::move(thread_var)), mode_(mode),
         selected_calls_(std::move(selected_calls)) {}
 
   static PrimFunc Substitute(PrimFunc f) {
@@ -371,9 +386,11 @@ public:
     Map<Var, Buffer> buffer_map = BuildBufferMap(f);
     PropagationTirCollector collector(buffer_map);
     collector.Collect(f->body);
-    int block_threads = ThreadExtentCollector::Collect(f->body);
-    AnnotateMlsGemmDepMutator mutator(&collector, target.value(), block_threads,
-                                      Mode::kCollectCandidates);
+    ThreadExtentInfo thread = ThreadExtentCollector::Collect(f->body);
+    arith::Analyzer analyzer;
+    AnnotateMlsGemmDepMutator mutator(&collector, target.value(),
+                                      thread.block_threads, thread.thread_var,
+                                      &analyzer, Mode::kCollectCandidates);
     PrimFuncNode *fn = f.CopyOnWrite();
     fn->body = mutator(f->body);
     return f;
@@ -388,11 +405,12 @@ public:
     Map<Var, Buffer> buffer_map = BuildBufferMap(f);
     PropagationTirCollector collector(buffer_map);
     collector.Collect(f->body);
-    int block_threads = ThreadExtentCollector::Collect(f->body);
+    ThreadExtentInfo thread = ThreadExtentCollector::Collect(f->body);
+    arith::Analyzer analyzer;
     auto selected_calls = PipelineAsyncProducerCollector::Collect(f->body);
-    AnnotateMlsGemmDepMutator mutator(&collector, target.value(), block_threads,
-                                      Mode::kMaterialize,
-                                      std::move(selected_calls));
+    AnnotateMlsGemmDepMutator mutator(
+        &collector, target.value(), thread.block_threads, thread.thread_var,
+        &analyzer, Mode::kMaterialize, std::move(selected_calls));
     PrimFuncNode *fn = f.CopyOnWrite();
     fn->body = mutator(f->body);
     mutator.ValidateAutoLayoutsAttached();
@@ -400,6 +418,146 @@ public:
   }
 
 private:
+  struct ParallelGatherCopy {
+    Copy copy;
+  };
+
+  std::optional<ParallelGatherCopy>
+  MatchPreferredAsyncParallelGather(const ForNode *op) {
+    auto prefer_async = op->annotations.Get(attr::kLoopPreferAsync);
+    if (!prefer_async.has_value()) {
+      return std::nullopt;
+    }
+    auto prefer_async_bool = prefer_async.value().try_cast<Bool>();
+    if (!prefer_async_bool.has_value() || !prefer_async_bool.value()->value) {
+      return std::nullopt;
+    }
+
+    std::vector<Var> loop_vars;
+    std::vector<PrimExpr> loop_extents;
+    const ForNode *loop = op;
+    while (loop != nullptr && loop->kind == ForKind::kParallel) {
+      loop_vars.push_back(loop->loop_var);
+      loop_extents.push_back(loop->extent);
+      loop = loop->body.as<ForNode>();
+    }
+    if (loop_vars.empty()) {
+      return std::nullopt;
+    }
+
+    const BufferStoreNode *candidate_store = nullptr;
+    const BufferLoadNode *candidate_load = nullptr;
+    bool ambiguous = false;
+    PostOrderVisit(GetRef<For>(op), [&](const ObjectRef &obj) {
+      const auto *store = obj.as<BufferStoreNode>();
+      if (store == nullptr || !IsSharedBuffer(store->buffer)) {
+        return;
+      }
+      const auto *load = store->value.as<BufferLoadNode>();
+      if (load == nullptr || !IsGlobalBuffer(load->buffer) ||
+          load->buffer->dtype != store->buffer->dtype) {
+        ambiguous = true;
+        return;
+      }
+      if (candidate_store != nullptr) {
+        ambiguous = true;
+        return;
+      }
+      candidate_store = store;
+      candidate_load = load;
+    });
+    if (ambiguous || candidate_store == nullptr || candidate_load == nullptr) {
+      return std::nullopt;
+    }
+
+    Map<Var, PrimExpr> loop_zeros;
+    for (const Var &var : loop_vars) {
+      loop_zeros.Set(var, make_zero(var->dtype));
+    }
+    Array<Range> dst_range;
+    for (const PrimExpr &index : candidate_store->indices) {
+      PrimExpr min = analyzer_->Simplify(tirx::Substitute(index, loop_zeros));
+      PrimExpr residual = analyzer_->Simplify(index - min);
+      PrimExpr extent = Integer(1);
+      bool matched_loop = false;
+      for (size_t i = 0; i < loop_vars.size(); ++i) {
+        if (analyzer_->CanProveEqual(residual, loop_vars[i])) {
+          extent = loop_extents[i];
+          matched_loop = true;
+          break;
+        }
+      }
+      if (!matched_loop && UsesVar(index, [&](const VarNode *var) {
+            for (const Var &loop_var : loop_vars) {
+              if (var == loop_var.get()) {
+                return true;
+              }
+            }
+            return false;
+          })) {
+        return std::nullopt;
+      }
+      dst_range.push_back(Range::FromMinExtent(min, extent));
+    }
+
+    Array<Range> src_range;
+    for (const PrimExpr &index : candidate_load->indices) {
+      src_range.push_back(Range::FromMinExtent(index, Integer(1)));
+    }
+    auto copy_node = make_object<CopyNode>();
+    copy_node->src = candidate_load->buffer;
+    copy_node->dst = candidate_store->buffer;
+    copy_node->src_range = src_range;
+    copy_node->dst_range = dst_range;
+    copy_node->annotations = {};
+    return ParallelGatherCopy{Copy(copy_node)};
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    if (mode_ != Mode::kCollectCandidates) {
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
+    }
+    std::optional<ParallelGatherCopy> gather =
+        MatchPreferredAsyncParallelGather(op);
+    if (!gather.has_value()) {
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
+    }
+    const Copy &copy = gather.value().copy;
+    auto consumers = GetExclusiveGemmConsumersAfterCall(copy->dst, nullptr);
+    if (!consumers.has_value()) {
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
+    }
+    auto pending = TryBuildPendingGemmCopyAnnotations(
+        *copy.get(), Map<String, ObjectRef>(), *consumers);
+    if (!pending.defined()) {
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
+    }
+    Map<String, ObjectRef> strategy_annotations =
+        MaterializeGemmCopyAnnotations(*copy.get(), pending.value());
+    Map<String, Any> annotations = op->annotations;
+    for (const auto &[key, value] : strategy_annotations) {
+      annotations.Set(key, value);
+    }
+    For updated(op->loop_var, op->min, op->extent, op->kind, op->body,
+                op->thread_binding, annotations, op->step, op->span);
+    // Bypass this override for the newly annotated root.  Calling VisitStmt
+    // here dispatches back into VisitStmt_(ForNode*) and can materialize the
+    // same gather strategy repeatedly, duplicating surrounding declarations.
+    return IRMutatorWithAnalyzer::VisitStmt_(updated.get());
+  }
+
+  Range CurrentStrategyThreadBounds() const {
+    if (thread_var_.defined()) {
+      Range bounds = ComputeThreadBounds(thread_var_, *analyzer_);
+      if (const int64_t *extent = as_const_int(bounds->extent)) {
+        if (*extent > 1) {
+          return bounds;
+        }
+      }
+    }
+    return Range::FromMinExtent(Integer(0), Integer(block_threads_));
+  }
+
   bool IsCopyLikeOp(const Op &op) const {
     static const Op &async_copy = Op::Get("tl.tileop.async_copy");
     return op.same_as(Copy::Get()) || op.same_as(async_copy);
@@ -419,7 +577,7 @@ private:
     }
     annotated_layout_maps_stack_.push_back(block_layout_map);
 
-    SBlock block = Downcast<SBlock>(StmtExprMutator::VisitStmt_(op));
+    SBlock block = Downcast<SBlock>(IRMutatorWithAnalyzer::VisitStmt_(op));
     bool layout_map_changed = false;
     // Materialize auto layouts at the shared buffer's allocation scope, just
     // like an explicit T.annotate_layout entry.
@@ -430,7 +588,6 @@ private:
       }
       auto at_bn_strategy = auto_at_bn_strategies_.find(buffer->data);
       auto an_bt_strategy = auto_an_bt_strategies_.find(buffer->data);
-
       if (Optional<Layout> existing = FindAnnotatedLayout(buffer)) {
         if (an_bt_strategy != auto_an_bt_strategies_.end() &&
             copy_strategy->second->storage_layout.same_as(
@@ -492,8 +649,8 @@ private:
     }
     const bool feeds_a = consumer.input.same_as(gemm->a_);
     ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
-    return DeriveHcuGemmAtBnLdsStrategy(copy, *gemm, feeds_a, block_threads_,
-                                        target_);
+    return DeriveHcuGemmAtBnLdsStrategy(copy, *gemm, feeds_a,
+                                        CurrentStrategyThreadBounds(), target_);
   }
 
   Optional<HcuGemmAnBtLdsStrategy>
@@ -505,8 +662,8 @@ private:
     }
     const bool feeds_a = consumer.input.same_as(gemm->a_);
     ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
-    return DeriveHcuGemmAnBtLdsStrategy(copy, *gemm, feeds_a, block_threads_,
-                                        target_);
+    return DeriveHcuGemmAnBtLdsStrategy(copy, *gemm, feeds_a,
+                                        CurrentStrategyThreadBounds(), target_);
   }
 
   Optional<HcuGemmAnBtLdsStrategy>
@@ -520,7 +677,8 @@ private:
     const bool feeds_a = consumer.input.same_as(gemm->a_);
     ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
     return DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
-        copy, *gemm, feeds_a, block_threads_, target_, wrap_count);
+        copy, *gemm, feeds_a, CurrentStrategyThreadBounds(), target_,
+        wrap_count);
   }
 
   std::pair<Optional<HcuGemmAtBnLdsStrategy>, Optional<HcuGemmAnBtLdsStrategy>>
@@ -600,6 +758,7 @@ private:
         ICHECK_EQ(at_bn->block_mn, an_bt->block_k);
         ICHECK_EQ(at_bn->block_k, an_bt->block_mn);
         ICHECK_EQ(at_bn->block_threads, an_bt->block_threads);
+        ICHECK_EQ(at_bn->thread_offset, an_bt->thread_offset);
         ICHECK_EQ(at_bn->copy_bytes_per_lane, an_bt->copy_bytes_per_lane);
         ICHECK_EQ(at_bn->copy_transaction_bytes, an_bt->copy_transaction_bytes)
             << "Mixed HCU GEMM consumers of shared buffer `" << copy.dst->name
@@ -611,17 +770,23 @@ private:
       }
       return MakeHcuGemmLdsCopyStrategy(
           /*use_idxen=*/false, an_bt->copy_bytes_per_lane,
-          an_bt->copy_transaction_bytes, an_bt->block_threads, an_bt->block_mn,
-          an_bt->wrap_offset, an_bt->wrap_idx_mask, an_bt->storage_layout,
+          an_bt->copy_transaction_bytes, an_bt->block_threads,
+          an_bt->thread_offset, an_bt->block_mn, an_bt->warp_size,
+          an_bt->wrap_offset, an_bt->wrap_idx_mask,
+          /*wrap_uses_copy_transaction=*/false, an_bt->storage_layout,
           an_bt->copy_loop_layout);
     }
 
     const HcuGemmAtBnLdsStrategy &at_bn = at_bn_strategy.value();
+    const int copy_warp_count = at_bn->block_threads / at_bn->warp_size;
+    const bool wrap_uses_copy_transaction =
+        at_bn->wrap_idx_mask + 1 > copy_warp_count;
     return MakeHcuGemmLdsCopyStrategy(
         /*use_idxen=*/true, at_bn->copy_bytes_per_lane,
-        at_bn->copy_transaction_bytes, at_bn->block_threads, at_bn->block_k,
-        at_bn->wrap_offset, at_bn->wrap_idx_mask, at_bn->storage_layout,
-        at_bn->copy_loop_layout);
+        at_bn->copy_transaction_bytes, at_bn->block_threads,
+        at_bn->thread_offset, at_bn->block_k, at_bn->warp_size,
+        at_bn->wrap_offset, at_bn->wrap_idx_mask, wrap_uses_copy_transaction,
+        at_bn->storage_layout, at_bn->copy_loop_layout);
   }
 
   bool IsLinearDsReadGemmInput(const Gemm &gemm, const Buffer &input) const {
@@ -802,7 +967,7 @@ private:
   Stmt VisitStmt_(const EvaluateNode *op) final {
     auto call = op->value.as<CallNode>();
     if (call == nullptr || !call->op.as<OpNode>()) {
-      return StmtExprMutator::VisitStmt_(op);
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
     Op tir_op = Downcast<Op>(call->op);
 
@@ -821,6 +986,9 @@ private:
     if (tir_op == DsReadFormat::Get()) {
       auto ds =
           Downcast<DsReadFormat>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
+      if (ds->gemm_dep_.defined()) {
+        return IRMutatorWithAnalyzer::VisitStmt_(op);
+      }
       auto gemm_with_input = PropagateToFindGemmConsumerOpWithInputAfterCall(
           ds->dst, collector_, call);
       if (gemm_with_input) {
@@ -831,7 +999,7 @@ private:
                       call->span);
         return Evaluate(new_call);
       }
-      return StmtExprMutator::VisitStmt_(op);
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
 
     if (IsCopyLikeOp(tir_op)) {
@@ -877,7 +1045,7 @@ private:
         // The fallback template is B-specific. AN must have an explicit
         // logical-to-physical map before it can use the generic vector read.
         if (feeds_a && !has_layout) {
-          return StmtExprMutator::VisitStmt_(op);
+          return IRMutatorWithAnalyzer::VisitStmt_(op);
         }
         auto annotations = call->annotations;
         const Gemm &gemm = consumer->gemm;
@@ -928,7 +1096,7 @@ private:
           !HasAnnotatedLayout(copy->dst)) {
         async_copy_linear_outputs_.insert(copy->dst->data);
       }
-      return StmtExprMutator::VisitStmt_(op);
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
 
     if (tir_op.same_as(Gemm::Get())) {
@@ -986,12 +1154,13 @@ private:
       return Evaluate(new_call);
     }
 
-    return StmtExprMutator::VisitStmt_(op);
+    return IRMutatorWithAnalyzer::VisitStmt_(op);
   }
 
   PropagationTirCollector *collector_;
   Target target_;
   int block_threads_{-1};
+  IterVar thread_var_;
   Mode mode_;
   std::unordered_set<Call, ObjectPtrHash, ObjectPtrEqual> selected_calls_;
   std::unordered_map<Buffer, bool, ObjectPtrHash, ObjectPtrEqual>
