@@ -124,10 +124,8 @@ struct tilelang_mls_base
     return Detail::make_lds_desc();
   }
 
-  // HIP C++ clamp, no inline asm. Prefer `?:` over if/`v_med3`/bit-hacks:
-  // on this hipcc it stays SALU (`s_max_i32` then `s_min_u32`) with no
-  // EXEC branch. Input readfirstlane is dead (coord/tile/length already
-  // SGPR). `if` and signed bit min/max both InstCombine to v_med3.
+  // HIP C++ clamp, kept free of inline assembly so backend lowering remains
+  // responsible for selecting the target instructions.
   TL_DEVICE static ::tl::index_t clamp_filter_uniform(::tl::index_t coord,
                                                       ::tl::index_t tile,
                                                       ::tl::index_t length) {
@@ -471,10 +469,14 @@ struct tilelang_mls_base
   TL_DEVICE void update_k_base(const ::tl::index_t block_k_base) {
     static_assert(AddressMode == mls_address_mode::absolute_rebase,
                   "update_k_base requires absolute_rebase MLS address mode");
-    apply_k_addr_from_window(block_k_base);
+    // Keep the absolute descriptor rebase scalar even when a wave-uniform
+    // caller value happens to arrive in a VGPR after loop lowering.
+    const ::tl::index_t uniform_block_k_base =
+        __builtin_amdgcn_readfirstlane(block_k_base);
+    apply_k_addr_from_window(uniform_block_k_base);
     if constexpr (!ResourceAlongMN) {
       if constexpr (refresh_k)
-        refresh_k_filter(block_k_base);
+        refresh_k_filter(uniform_block_k_base);
       else
         ::tl::static_for<0, NumResourceAccess, 1>{}(
             [&](auto i) { set_k_filter(mls_res_(i), 0); });
@@ -485,10 +487,17 @@ struct tilelang_mls_base
   TL_DEVICE void update_mn_base(const ::tl::index_t block_mn_base) {
     static_assert(AddressMode == mls_address_mode::absolute_rebase,
                   "update_mn_base requires absolute_rebase MLS address mode");
-    apply_mn_addr_from_window(block_mn_base);
+    // Window origins are uniform within an MLS producer wave.  Scalarize at
+    // the API boundary so the widening/multiply and 64-bit descriptor rebase
+    // stay on the SALU path.  Otherwise LLVM can carry a uniform loop value in
+    // a VGPR, build every address with VALU, then emit several readfirstlane
+    // instructions immediately before matrix_load.
+    const ::tl::index_t uniform_block_mn_base =
+        __builtin_amdgcn_readfirstlane(block_mn_base);
+    apply_mn_addr_from_window(uniform_block_mn_base);
     if constexpr (ResourceAlongMN) {
       if constexpr (refresh_mn)
-        refresh_mn_filter(block_mn_base);
+        refresh_mn_filter(uniform_block_mn_base);
       else
         ::tl::static_for<0, NumResourceAccess, 1>{}(
             [&](auto i) { set_mn_filter(mls_res_(i), 0); });

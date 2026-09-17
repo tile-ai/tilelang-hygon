@@ -10,6 +10,7 @@
 #include <tvm/target/target.h>
 #include <tvm/tirx/stmt_functor.h>
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -31,6 +32,7 @@ using namespace tirx;
 using namespace ffi;
 
 class ParallelOpNode;
+struct ParallelVectorizeSizeCache;
 
 class ParallelLoopNestVisitor : public StmtExprVisitor {
 private:
@@ -101,6 +103,10 @@ public:
   // Infer the layout for this parallel operator.
   LayoutMap InferLayout(const LayoutInferArgs &layout_args,
                         InferLevel level) const override;
+  bool IsLayoutInferenceComplete(InferLevel level) const override {
+    (void)level;
+    return loop_layout_inferred_;
+  }
 
   // Copy constructor for ParallelOpNode.
   ParallelOpNode(const ParallelOpNode &other) : ParallelOpNode(other.root_) {
@@ -112,6 +118,7 @@ public:
     annotated_layout_unbound_ = other.annotated_layout_unbound_;
     annotated_predicate_ = other.annotated_predicate_;
     annotated_requires_padding_guard_ = other.annotated_requires_padding_guard_;
+    vectorize_size_cache_ = other.vectorize_size_cache_;
   }
 
   // Get the inferred loop layout.
@@ -211,6 +218,10 @@ private:
   std::vector<Buffer> store_shared_global_buffers_;
   // Fragment buffers that are stored to in the loop body.
   std::vector<Buffer> store_fragment_buffers_;
+  // Shared by all free-mode clones of this operator. The cache is scoped to
+  // the lifetime of one layout-inference operator family and only reuses an
+  // exact identity snapshot of every input that can affect vector planning.
+  mutable std::shared_ptr<ParallelVectorizeSizeCache> vectorize_size_cache_;
 };
 
 class ParallelOp : public TileOperator {

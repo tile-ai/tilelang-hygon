@@ -153,6 +153,17 @@ public:
   virtual LayoutMap InferLayout(const LayoutInferArgs &layout_args,
                                 InferLevel level) const = 0;
 
+  /*! \brief Whether layout inference is complete at this level.
+   *
+   * Returning true guarantees that future InferLayout calls at `level` return
+   * an empty LayoutMap without mutating operator state, validating layouts, or
+   * otherwise depending on later additions to the LayoutMap.
+   */
+  virtual bool IsLayoutInferenceComplete(InferLevel level) const {
+    (void)level;
+    return false;
+  }
+
   virtual TileOperator Clone() const = 0;
 
   virtual AccessRegions GetAccessRegions() const {

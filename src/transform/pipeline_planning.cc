@@ -53,6 +53,7 @@ private:
   static bool IsGlobalLikeBuffer(const Buffer &buffer);
 
   void HandleTileOp(const TileOperator &tile_op);
+  void VisitStmt_(const ForNode *op) final;
   void VisitStmt_(const BufferStoreNode *op) final;
   void VisitExpr_(const BufferLoadNode *op) final;
   void VisitExpr_(const CallNode *op) final;
@@ -119,6 +120,22 @@ bool BufferRegionCollector::HasNonCopyTileOp() const {
 
 bool BufferRegionCollector::IsGlobalLikeBuffer(const Buffer &buffer) {
   return IsGlobalBuffer(buffer) || (buffer.defined() && buffer.scope().empty());
+}
+
+void BufferRegionCollector::VisitStmt_(const ForNode *op) {
+  if (TargetIsHCU(target_)) {
+    if (auto prefer_async = op->annotations.Get(attr::kLoopPreferAsync)) {
+      if (auto value = prefer_async.value().try_cast<Bool>();
+          value && value.value()->value) {
+        // A preferred Parallel copy is lowered to HCU async-copy only after
+        // software-pipeline planning.  Record that late-lowering capability
+        // here so the outer pipeline owns its commit/wait placement, just as
+        // it does for a pipeline-managed T.copy.
+        has_hcu_async_promotable_copy_ = true;
+      }
+    }
+  }
+  StmtExprVisitor::VisitStmt_(op);
 }
 
 void BufferRegionCollector::HandleTileOp(const TileOperator &tile_op) {

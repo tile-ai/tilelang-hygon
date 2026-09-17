@@ -33,6 +33,7 @@ from tilelang.contrib.hcu import (
     get_hcu_arch,
     get_hcu_compiler,
     get_hcu_compile_flags,
+    get_hcu_device_compile_flags,
 )
 from tilelang.contrib.hip_resource_info import dump_to_file, load_from_file
 from tilelang import __version__
@@ -70,6 +71,7 @@ def _make_obj(
     else:
         return None
 
+    command += get_hcu_device_compile_flags(pass_configs)
     command += get_hcu_compile_flags(arch, pass_configs)
 
     try:

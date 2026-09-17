@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import warnings
@@ -183,6 +184,26 @@ def _pass_config_truthy(pass_configs: dict | None, key: PassConfigKey) -> bool:
     if v is None:
         v = pass_configs.get(key.value)
     return bool(v)
+
+
+def get_hcu_device_compile_flags(pass_configs: dict | None = None) -> list[str]:
+    """Return user-provided device flags in compiler argument form."""
+    cfg = pass_configs or {}
+    extra_flags = cfg.get(PassConfigKey.TL_DEVICE_COMPILE_FLAGS)
+    if extra_flags is None:
+        extra_flags = cfg.get(PassConfigKey.TL_DEVICE_COMPILE_FLAGS.value)
+    if not extra_flags:
+        return []
+    if isinstance(extra_flags, str):
+        return shlex.split(extra_flags)
+
+    tokens = []
+    for flag in extra_flags:
+        if isinstance(flag, str):
+            tokens.extend(shlex.split(flag))
+        else:
+            tokens.append(str(flag))
+    return tokens
 
 
 def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
@@ -394,6 +415,7 @@ def compile_hcu(
             raise ValueError("options must be str or list of str")
 
     cfg = pass_config or {}
+    cmd.extend(get_hcu_device_compile_flags(cfg))
     cmd.extend(get_hcu_compile_flags(arch, cfg))
 
     cmd += ["-o", file_target]
