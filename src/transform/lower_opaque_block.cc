@@ -139,8 +139,7 @@ private:
     // Keep buffer-address-rebase authorization as a lexical attribute rather
     // than promoting it to a function-wide flag.
     if (auto opt = new_block->annotations.Get(tl::attr::kBufferOpsRebaseMap)) {
-      Map<Var, PrimExpr> rebase_map =
-          Downcast<Map<Var, PrimExpr>>(opt.value());
+      Map<Var, PrimExpr> rebase_map = Downcast<Map<Var, PrimExpr>>(opt.value());
       for (const auto &[buffer_var, element_offset] : rebase_map) {
         body = AttrStmt(buffer_var, tl::attr::kBufferOpsRebaseMap,
                         element_offset, std::move(body));

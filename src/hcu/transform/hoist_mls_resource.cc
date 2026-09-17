@@ -1085,8 +1085,7 @@ public:
 private:
   void AppendAbsoluteAxisUpdates(const CallNode *call, const std::string &sym,
                                  const std::string &obj_name,
-                                 const std::string &key,
-                                 bool initialized_here,
+                                 const std::string &key, bool initialized_here,
                                  std::vector<Stmt> *seq) {
     if (full_window_each_load_.count(key)) {
       return;
@@ -1098,8 +1097,8 @@ private:
       PrimExpr mn_base = initialized_here
                              ? tirx::make_const(call->args[5].dtype(), 0)
                              : call->args[5];
-      seq->push_back(MakeExternStmt(update_mn_sym,
-                                    {StringImm(obj_name), mn_base}));
+      seq->push_back(
+          MakeExternStmt(update_mn_sym, {StringImm(obj_name), mn_base}));
     } else {
       auto k_filt = SpecializeAxisFilter(call, sym, /*is_mn=*/false);
       const std::string update_k_sym =
@@ -1107,8 +1106,8 @@ private:
       PrimExpr k_base = initialized_here
                             ? tirx::make_const(call->args[6].dtype(), 0)
                             : call->args[6];
-      seq->push_back(MakeExternStmt(update_k_sym,
-                                    {StringImm(obj_name), k_base}));
+      seq->push_back(
+          MakeExternStmt(update_k_sym, {StringImm(obj_name), k_base}));
     }
   }
 

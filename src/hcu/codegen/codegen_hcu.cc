@@ -71,10 +71,9 @@ private:
   bool found_{false};
 };
 
-bool DependsOnBlockIdx(
-    const PrimExpr &expr,
-    const std::unordered_set<const VarNode *> &block_vars,
-    const std::unordered_set<const VarNode *> &thread_vars) {
+bool DependsOnBlockIdx(const PrimExpr &expr,
+                       const std::unordered_set<const VarNode *> &block_vars,
+                       const std::unordered_set<const VarNode *> &thread_vars) {
   return BufferOffsetDependencyChecker(
              BufferOffsetDependencyChecker::Kind::kBlock, block_vars,
              thread_vars)
@@ -82,8 +81,7 @@ bool DependsOnBlockIdx(
 }
 
 bool DependsOnThreadIdx(
-    const PrimExpr &expr,
-    const std::unordered_set<const VarNode *> &block_vars,
+    const PrimExpr &expr, const std::unordered_set<const VarNode *> &block_vars,
     const std::unordered_set<const VarNode *> &thread_vars) {
   return BufferOffsetDependencyChecker(
              BufferOffsetDependencyChecker::Kind::kThread, block_vars,
@@ -100,8 +98,7 @@ struct BufferOffsetSplit {
 // intentionally syntax-directed: the surrounding buffer annotation is the
 // user's safety contract, so codegen does not attempt range proofs.
 BufferOffsetSplit SplitAnnotatedBufferOffset(
-    const PrimExpr &expr,
-    const std::unordered_set<const VarNode *> &block_vars,
+    const PrimExpr &expr, const std::unordered_set<const VarNode *> &block_vars,
     const std::unordered_set<const VarNode *> &thread_vars) {
   PrimExpr zero = make_zero(expr.dtype());
   if (const auto *add = expr.as<AddNode>()) {
@@ -2099,9 +2096,8 @@ CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer,
   BufferDesc desc;
   desc.wave_ptr = GetVarID(buffer_var);
   if (base_offset.defined()) {
-    desc.wave_ptr = "((" + desc.wave_ptr +
-                    ") + static_cast<uint64_t>(" + PrintExpr(base_offset) +
-                    "))";
+    desc.wave_ptr = "((" + desc.wave_ptr + ") + static_cast<uint64_t>(" +
+                    PrintExpr(base_offset) + "))";
   }
   desc.offset = PrintExpr(offset);
   desc.element_space_size = element_space_size;

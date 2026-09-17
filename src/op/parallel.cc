@@ -45,9 +45,9 @@ struct ParallelVectorizeSizeCacheKey {
 
   bool operator<(const ParallelVectorizeSizeCacheKey &other) const {
     return std::tie(analyzer, target, thread_min, thread_extent, layouts,
-                    remaps) <
-           std::tie(other.analyzer, other.target, other.thread_min,
-                    other.thread_extent, other.layouts, other.remaps);
+                    remaps) < std::tie(other.analyzer, other.target,
+                                       other.thread_min, other.thread_extent,
+                                       other.layouts, other.remaps);
   }
 };
 

@@ -84,15 +84,9 @@ def annotate_buffer_ops_rebase(buffers):
     direct-to-LDS operations are unaffected.
     """
     if isinstance(buffers, dict):
-        rebase_map = {
-            buffer.data: IntImm("int32", 1 if enabled else 0)
-            for buffer, enabled in buffers.items()
-        }
+        rebase_map = {buffer.data: IntImm("int32", 1 if enabled else 0) for buffer, enabled in buffers.items()}
     elif isinstance(buffers, (list, tuple)):
-        rebase_map = {
-            buffer.data: IntImm("int32", 1)
-            for buffer in buffers
-        }
+        rebase_map = {buffer.data: IntImm("int32", 1) for buffer in buffers}
     else:
         rebase_map = {buffers.data: IntImm("int32", 1)}
     return sblock_attr({"buffer_ops_rebase_map": rebase_map})

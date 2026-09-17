@@ -77,6 +77,8 @@ public:
     // is derived later from the access_ptr dtype, so subbyte dtypes such as
     // int4/fp4/int2/int1 remain representable here.
     int previous_vectorized_lanes = current_vectorized_lanes_;
+    const size_t injected_before = injected_hcu_async_copy_count_;
+    const size_t binding_depth = active_bindings_.size();
     bool pushed_vectorized_loop = false;
     const auto *extent_imm = op->extent.as<IntImmNode>();
     bool pushed_active_loop = false;
@@ -98,12 +100,22 @@ public:
       }
     }
     Stmt stmt = StmtMutator::VisitStmt_(op);
+    if (pushed_vectorized_loop && copy_strategy_.defined() &&
+        injected_hcu_async_copy_count_ > injected_before) {
+      const auto *loop = stmt.as<ForNode>();
+      ICHECK(loop);
+      Stmt transaction_body = Substitute(
+          loop->body, {{loop->loop_var, IntImm(loop->loop_var->dtype, 0)}});
+      stmt =
+          WidenStrategyCPAsyncTransactions(transaction_body, extent_imm->value);
+    }
     if (pushed_vectorized_loop) {
       active_vectorized_loops_.pop_back();
     }
     if (pushed_active_loop) {
       active_loops_.pop_back();
     }
+    active_bindings_.resize(binding_depth);
     current_vectorized_lanes_ = previous_vectorized_lanes;
     return stmt;
   }
@@ -122,10 +134,21 @@ public:
     }
 
     if (index_info->index_lanes == 1) {
-      if (current_vectorized_lanes_ > 1 &&
-          !HasContiguousVectorizedOffsets(index_info->src_index,
-                                          index_info->dst_index)) {
-        return Optional<Stmt>();
+      if (current_vectorized_lanes_ > 1) {
+        PrimExpr src_index = InlineActiveBindings(index_info->src_index);
+        PrimExpr dst_index = InlineActiveBindings(index_info->dst_index);
+        if (copy_strategy_.defined()) {
+          bool src_contiguous = HasContiguousVectorTransaction(src_index);
+          bool dst_contiguous = HasContiguousVectorTransaction(dst_index);
+          bool predicate_uniform =
+              !predicated || HasUniformVectorTransactionPredicate(
+                                 InlineActiveBindings(predicate_value));
+          if (!src_contiguous || !dst_contiguous || !predicate_uniform) {
+            return Optional<Stmt>();
+          }
+        } else if (!HasContiguousVectorizedOffsets(src_index, dst_index)) {
+          return Optional<Stmt>();
+        }
       }
       return MakeCPAsyncStmtFromLoads(
           store,
@@ -157,8 +180,11 @@ public:
   }
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {
+    const size_t binding_depth = active_bindings_.size();
     if (UseExplicitAsyncSemantics()) {
-      return StmtMutator::VisitStmt_(op);
+      Stmt result = StmtMutator::VisitStmt_(op);
+      active_bindings_.resize(binding_depth);
+      return result;
     }
 
     // Insert commit+wait at statement boundaries to preserve synchronous
@@ -222,12 +248,24 @@ public:
     uncommitted_sync_copies_ = sync_state.uncommitted_transfers;
 
     if (out.empty()) {
+      active_bindings_.resize(binding_depth);
       return Evaluate(0);
     }
     if (out.size() == 1) {
+      active_bindings_.resize(binding_depth);
       return out[0];
     }
+    active_bindings_.resize(binding_depth);
     return SeqStmt(out);
+  }
+
+  Stmt VisitStmt_(const BindNode *op) final {
+    PrimExpr value = VisitExpr(op->value);
+    active_bindings_.push_back({op->var, value});
+    if (value.same_as(op->value)) {
+      return GetRef<Stmt>(op);
+    }
+    return Bind(op->var, value);
   }
 
   Stmt VisitStmt_(const IfThenElseNode *op) final {
@@ -282,6 +320,7 @@ public:
           predicate.defined() ? predicate.value() : PrimExpr());
       if (injected.defined()) {
         injected_hcu_async_copy_ = true;
+        ++injected_hcu_async_copy_count_;
         if (!UseExplicitAsyncSemantics()) {
           pending_sync_copies_ = true;
           uncommitted_sync_copies_ = true;
@@ -336,6 +375,105 @@ private:
     Var loop_var;
     int extent;
   };
+
+  class StrategyTransactionWidener : public StmtExprMutator {
+  public:
+    explicit StrategyTransactionWidener(int lanes) : lanes_(lanes) {
+      ICHECK_GT(lanes_, 1);
+    }
+
+  private:
+    PrimExpr VisitExpr_(const CallNode *op) final {
+      PrimExpr visited = StmtExprMutator::VisitExpr_(op);
+      const auto *call = visited.as<CallNode>();
+      ICHECK(call);
+      if (!call->op.same_as(tl::ptx_cp_async()) ||
+          !call->annotations.count(attr::kHcuGemmLdsCopyStrategy)) {
+        return visited;
+      }
+
+      ICHECK(call->args.size() == 3 || call->args.size() == 4);
+      const auto *count = call->args[2].as<IntImmNode>();
+      ICHECK(count);
+      const int64_t widened_count = count->value * lanes_;
+      if (call->args.size() == 4) {
+        ICHECK_EQ(call->args[3].dtype().lanes(), 1)
+            << "A finalized HCU async-copy transaction requires one scalar "
+               "predicate per thread";
+      }
+
+      Array<PrimExpr> args = call->args;
+      args.Set(2, IntImm(call->args[2].dtype(), widened_count));
+      return Call(call->dtype, call->op, args, call->annotations, call->span);
+    }
+
+    int lanes_;
+  };
+
+  static Stmt WidenStrategyCPAsyncTransactions(Stmt body, int lanes) {
+    return StrategyTransactionWidener(lanes)(std::move(body));
+  }
+
+  PrimExpr InlineActiveBindings(PrimExpr expr) {
+    for (auto it = active_bindings_.rbegin(); it != active_bindings_.rend();
+         ++it) {
+      expr = Substitute(expr, {{it->first, it->second}});
+    }
+    return analyzer_.Simplify(expr);
+  }
+
+  PrimExpr EvaluateVectorTransactionLane(const PrimExpr &expr, int thread,
+                                         int linear_lane) {
+    Map<Var, PrimExpr> substitutions;
+    if (thread_var_.defined()) {
+      substitutions.Set(thread_var_, IntImm(thread_var_->dtype, thread));
+    }
+    int remaining = linear_lane;
+    for (auto it = active_vectorized_loops_.rbegin();
+         it != active_vectorized_loops_.rend(); ++it) {
+      substitutions.Set(it->loop_var,
+                        IntImm(it->loop_var->dtype, remaining % it->extent));
+      remaining /= it->extent;
+    }
+    ICHECK_EQ(remaining, 0);
+    return analyzer_.Simplify(Substitute(expr, substitutions));
+  }
+
+  bool HasContiguousVectorTransaction(const PrimExpr &expr) {
+    ICHECK(copy_strategy_.defined());
+    const int block_threads = copy_strategy_.value()->block_threads;
+    ICHECK_GT(block_threads, 0);
+    for (int thread = 0; thread < block_threads; ++thread) {
+      PrimExpr previous = EvaluateVectorTransactionLane(expr, thread, 0);
+      for (int lane = 1; lane < current_vectorized_lanes_; ++lane) {
+        PrimExpr current = EvaluateVectorTransactionLane(expr, thread, lane);
+        int64_t delta = 0;
+        if (!TryGetConstInt64(analyzer_.Simplify(current - previous), &delta) ||
+            delta != 1) {
+          return false;
+        }
+        previous = current;
+      }
+    }
+    return true;
+  }
+
+  bool HasUniformVectorTransactionPredicate(const PrimExpr &predicate) {
+    ICHECK(copy_strategy_.defined());
+    const int block_threads = copy_strategy_.value()->block_threads;
+    ICHECK_GT(block_threads, 0);
+    for (int thread = 0; thread < block_threads; ++thread) {
+      PrimExpr reference = EvaluateVectorTransactionLane(predicate, thread, 0);
+      for (int lane = 1; lane < current_vectorized_lanes_; ++lane) {
+        PrimExpr current =
+            EvaluateVectorTransactionLane(predicate, thread, lane);
+        if (!analyzer_.CanProveEqual(current, reference)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
 
   // ---- Copy candidate analysis helpers ----
   static bool IsZeroValue(const PrimExpr &expr) {
@@ -904,8 +1042,10 @@ private:
   int current_vectorized_lanes_{1};
   std::vector<ActiveVectorizedLoop> active_vectorized_loops_;
   std::vector<ActiveLoop> active_loops_;
+  std::vector<std::pair<Var, PrimExpr>> active_bindings_;
   arith::Analyzer analyzer_;
   bool injected_hcu_async_copy_{false};
+  size_t injected_hcu_async_copy_count_{0};
   bool pending_sync_copies_{false};
   bool uncommitted_sync_copies_{false};
 };
