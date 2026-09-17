@@ -1106,10 +1106,32 @@ private:
       int64_t min_reg_num = INT64_MAX;
       int min_reg_num_infer_root = -1;
 
-      // Try each member as the root of inference for this component
-      for (int attempt_infer_root : members) {
-        DLOG(INFO) << "----------------------- try root " << attempt_infer_root
+      // An operator with complete layout inference is guaranteed to be inert
+      // in free inference.  Making it the root is equivalent to starting from
+      // the first incomplete member in the original order, so it cannot
+      // produce an additional solution.  Keep completed operators in the
+      // component -- they may still bridge fragment-buffer users -- but do not
+      // enumerate them as roots.
+      std::vector<int> root_candidates;
+      root_candidates.reserve(members.size());
+      for (int member : members) {
+        if (!infer_list_[member]->IsLayoutInferenceComplete(
+                InferLevel::kFree)) {
+          root_candidates.push_back(member);
+        }
+      }
+      if (root_candidates.empty()) {
+        DLOG(INFO) << "[InferInFreeMode] skip completed component " << root
                    << " members " << members.size() << '\n';
+        continue;
+      }
+
+      // Try each incomplete member as the root of inference for this
+      // component.
+      for (int attempt_infer_root : root_candidates) {
+        DLOG(INFO) << "----------------------- try root " << attempt_infer_root
+                   << " candidates " << root_candidates.size() << " members "
+                   << members.size() << '\n';
         // Backup the current infer_list_ state
         auto back_infer_list = BackupInferList();
         // Copy the current layout_map for temporary use

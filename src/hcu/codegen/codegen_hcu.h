@@ -113,7 +113,8 @@ private:
   // Whether scope such as "__shared__" or "__constant__"  is part of type.
   bool IsScopePartOfType() const final { return false; }
 
-  BufferDesc GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr base);
+  BufferDesc GetBufferDesc(DataType t, const BufferNode *buffer, PrimExpr base,
+                           bool allow_address_rebase = true);
   std::string GetVecLoadWithPredicate(DataType t, const BufferNode *buffer,
                                       PrimExpr base, const std::string &pred);
   void PrintVecStoreWithPredicate(const BufferNode *buffer, DataType t,
@@ -202,6 +203,11 @@ private:
   const int barrier_alignment_bytes_ = 16;
   std::unordered_map<const VarNode *, bool> direct_to_lds_map_;
   std::unordered_set<std::string> buffer_ops_disable_param_names_;
+  // Buffers explicitly authorized for syntax-directed ordinary VM store
+  // address rebasing.  The set is lexical.
+  std::unordered_set<std::string> buffer_ops_rebase_param_names_;
+  std::unordered_set<const VarNode *> block_index_vars_;
+  std::unordered_set<const VarNode *> thread_index_vars_;
   std::vector<std::string> predicate_stack_;
   /// LetStmt RHS (PrimExpr); used only by IsProvablyZeroOrZeroBroadcast
   /// (IsZeroValue). Kept separate from var_idmap_ so we never alter SSA / name

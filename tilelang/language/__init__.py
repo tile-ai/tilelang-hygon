@@ -173,6 +173,7 @@ from .annotations import (  # noqa: F401
     annotate_safe_value,
     annotate_l2_hit_ratio,
     annotate_direct_to_lds,
+    annotate_buffer_ops_rebase,
     annotate_restrict_buffers,
     annotate_min_blocks_per_sm,
 )
