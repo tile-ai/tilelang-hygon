@@ -12,6 +12,7 @@ from typing import Any
 from collections.abc import Callable
 import sys
 import threading
+import re
 
 import torch
 from tilelang import tvm
@@ -119,6 +120,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         self._ipc_metadata_initializer = None
         self._ipc_allocator = None
         self._ipc_initialized_generation = None
+        self._ipc_remote_source_indices = self._get_ipc_remote_source_indices()
 
         self._post_init()
 
@@ -157,6 +159,23 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             raise RuntimeError("IPC kernel must be initialized before launch")
         if self._ipc_allocator.generation != self._ipc_initialized_generation:
             raise RuntimeError("IPC allocator generation changed; call kernel.initialize() before launch")
+
+    def _get_ipc_remote_source_indices(self) -> set[int]:
+        source = self.device_kernel_source or ""
+        names = set(re.findall(r"^// tilelang_ipc_remote_source: (.+)$", source, flags=re.MULTILINE))
+        if not names:
+            return set()
+        return {i for i, param in enumerate(self.prim_func.params) if param.name_hint in names}
+
+    def validate_ipc_remote_sources(self, tensor_list) -> None:
+        if not self._ipc_remote_source_indices:
+            return
+        for index in self._ipc_remote_source_indices:
+            tensor = tensor_list[index]
+            if not isinstance(tensor, torch.Tensor):
+                raise RuntimeError("IPC remote source must be a PyTorch tensor")
+            if not self._ipc_allocator.contains(tensor.data_ptr(), tensor.numel() * tensor.element_size()):
+                raise RuntimeError("IPC remote source tensor is outside the allocator arena")
 
     def _make_executable(self) -> tvm.runtime.Executable:
         if self.rt_mod is None:
@@ -324,6 +343,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
             executable = get_executable()
             self.validate_ipc_launch()
+            self.validate_ipc_remote_sources(tensor_list)
             executable(*tensor_list)
 
             # Return outputs in the requested form

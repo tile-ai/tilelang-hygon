@@ -661,6 +661,9 @@ std::string CodeGenTileLangHCU::Finish() {
     const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
     decl_stream << "#include <tl_templates/hcu/distributed/distributed.h>\n";
     decl_stream << backend.ModulePreamble();
+    for (const auto &name : ipc_remote_source_param_names_) {
+      decl_stream << "// tilelang_ipc_remote_source: " << name << "\n";
+    }
   }
 
   if (enable_fp8_) {
@@ -3329,6 +3332,11 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
                                 << " does not support block remote get";
     }
     ICHECK_EQ(op->args.size(), 4U);
+    if (const auto *source = op->args[0].as<VarNode>()) {
+      ipc_remote_source_param_names_.insert(source->name_hint);
+    } else {
+      TVM_FFI_THROW(ValueError) << "HCU IPC get_block source must be a kernel parameter";
+    }
     uses_distributed_metadata_ = true;
     os << backend.EmitBlockGetExpr(PrintExpr(op->args[0]), PrintExpr(op->args[1]),
                                    PrintExpr(op->args[2]), PrintExpr(op->args[3]));
