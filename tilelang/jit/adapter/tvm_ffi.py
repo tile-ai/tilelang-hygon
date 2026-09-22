@@ -116,8 +116,30 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         self.executable = None
         self._executables_by_device: dict[int | str, tvm.runtime.Executable] = {}
         self._executable_lock = threading.Lock()
+        self._ipc_metadata_initializer = None
 
         self._post_init()
+
+    def initialize_ipc_metadata(self, allocator, stream=None) -> bool:
+        """Initialize IPC metadata for this adapter's device module.
+
+        ``stream`` is accepted for the JITKernel backend-neutral API.  The
+        helper currently launches through TVM's ROCm current stream; the stream
+        bridge is installed by the HCU launch wrapper in a later unit.
+        """
+        del stream
+        if self.target.kind.name != "hcu" or str(self.target.attrs.get("dist_backend", "")) != "ipc":
+            return False
+        if self.rt_mod is None:
+            raise RuntimeError("IPC metadata initialization requires a runtime module")
+        if self._ipc_metadata_initializer is None:
+            from tilelang.distributed.backends.ipc import IpcMetadataInitializer
+
+            self._ipc_metadata_initializer = IpcMetadataInitializer()
+        for module in [self.rt_mod, *self.rt_mod.imports]:
+            if module.get_function("__tilelang_init_ipc_metadata", query_imports=False) is not None:
+                return self._ipc_metadata_initializer.initialize(module, allocator)
+        raise RuntimeError("compiled IPC kernel does not contain the metadata helper")
 
     def _make_executable(self) -> tvm.runtime.Executable:
         if self.rt_mod is None:

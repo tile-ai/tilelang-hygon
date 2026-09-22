@@ -202,6 +202,17 @@ class JITKernel(Generic[_P, _T]):
             raise RuntimeError("TILELANG_COMPILE_ONLY: kernel compiled; launch skipped")
         return self.torch_function(*args, **kwds)
 
+    def initialize(self, allocator, stream=None) -> bool:
+        """Initialize backend-private distributed state for this kernel.
+
+        Non-distributed kernels are intentionally a no-op.  IPC HCU kernels
+        delegate to their TVM FFI adapter, which tracks allocator generations.
+        """
+        initialize = getattr(self.adapter, "initialize_ipc_metadata", None)
+        if initialize is None:
+            return False
+        return bool(initialize(allocator, stream=stream))
+
     def _compile_and_create_adapter(self, tilelang_func: PrimFunc, out_idx: list[int]) -> BaseKernelAdapter:
         """
         Compiles the given TileLang PrimFunc using TVM and creates a kernel adapter.

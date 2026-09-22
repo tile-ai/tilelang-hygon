@@ -2,6 +2,7 @@ import pytest
 
 import tilelang
 from tilelang.distributed.backends.ipc import IpcAllocator, IpcMetadataInitializer
+from tilelang.jit.kernel import JITKernel
 
 
 class FakeRuntime:
@@ -55,3 +56,13 @@ def test_metadata_initializer_is_generation_aware():
     allocator._generation += 1
     assert initializer.initialize(module, allocator, metadata_tensor="replacement")
     assert module.calls == [("metadata", 3), ("replacement", 3)]
+
+
+def test_jit_kernel_initialize_delegates_to_distributed_adapter():
+    class Adapter:
+        def initialize_ipc_metadata(self, allocator, stream=None):
+            return allocator == "allocator" and stream == "stream"
+
+    kernel = JITKernel.__new__(JITKernel)
+    kernel.adapter = Adapter()
+    assert kernel.initialize("allocator", stream="stream")
