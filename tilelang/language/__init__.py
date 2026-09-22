@@ -204,7 +204,7 @@ from .cluster import (
     clc_get_first_ctaid_z,  # noqa: F401
 )
 
-from .distributed import get_num_ranks, get_rank  # noqa: F401
+from .distributed import get_block, get_num_ranks, get_rank  # noqa: F401
 
 from .meta import (
     inline,  # noqa: F401

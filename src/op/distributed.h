@@ -13,6 +13,7 @@ namespace tl {
 
 const Op &get_rank();
 const Op &get_num_ranks();
+const Op &get_block();
 
 } // namespace tl
 } // namespace tvm
