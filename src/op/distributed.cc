@@ -30,5 +30,10 @@ TIR_DEFINE_TL_DISTRIBUTED_BUILTIN(get_num_ranks)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_DISTRIBUTED_BUILTIN(get_block)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 } // namespace tl
 } // namespace tvm
