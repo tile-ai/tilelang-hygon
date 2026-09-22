@@ -8,6 +8,8 @@
 #include <tvm/ffi/string.h>
 #include <tvm/target/target.h>
 
+#include <string>
+
 namespace tvm {
 namespace tl {
 namespace hcu {
@@ -30,6 +32,9 @@ public:
   virtual ~HcuDistributedBackend() = default;
   virtual ffi::String name() const = 0;
   virtual bool Supports(DistributedCapability capability) const = 0;
+  virtual std::string EmitRankExpr() const = 0;
+  virtual std::string EmitNumRanksExpr() const = 0;
+  virtual std::string ModulePreamble() const = 0;
 };
 
 /*! \brief Returns true when an HCU target explicitly selects a backend. */

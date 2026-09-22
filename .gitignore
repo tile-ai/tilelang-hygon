@@ -29,6 +29,8 @@ dist*/
 !tilelang/language/distributed/**
 !src/hcu/distributed/
 !src/hcu/distributed/**
+!src/tl_templates/hcu/distributed/
+!src/tl_templates/hcu/distributed/**
 !testing/python/hcu/distributed/
 !testing/python/hcu/distributed/**
 wheelhouse/
