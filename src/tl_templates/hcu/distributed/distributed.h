@@ -26,19 +26,25 @@ __device__ __forceinline__ uint64_t ipc_get_peer_base(int32_t peer) {
 template <typename SrcT, typename DstT>
 __device__ __forceinline__ void ipc_get_block(const SrcT* local_src, DstT* dst,
                                               int64_t count, int32_t src_pe) {
-  const int64_t index = static_cast<int64_t>(threadIdx.x) +
-                        static_cast<int64_t>(blockDim.x) * threadIdx.y;
-  if (index >= count) return;
   const int32_t world_size = ipc_get_num_ranks();
+  const int64_t thread_id = static_cast<int64_t>(threadIdx.x) +
+      static_cast<int64_t>(blockDim.x) *
+          (static_cast<int64_t>(threadIdx.y) +
+           static_cast<int64_t>(blockDim.y) * threadIdx.z);
+  const int64_t thread_count = static_cast<int64_t>(blockDim.x) * blockDim.y * blockDim.z;
   if (src_pe < 0 || src_pe >= world_size) {
-    dst[index] = DstT{};
+    for (int64_t index = thread_id; index < count; index += thread_count) {
+      dst[index] = DstT{};
+    }
     return;
   }
   const uintptr_t local_base = static_cast<uintptr_t>(ipc_get_peer_base(ipc_get_rank()));
   const uintptr_t remote_base = static_cast<uintptr_t>(ipc_get_peer_base(src_pe));
   const uintptr_t offset = reinterpret_cast<uintptr_t>(local_src) - local_base;
   const SrcT* remote_src = reinterpret_cast<const SrcT*>(remote_base + offset);
-  dst[index] = static_cast<DstT>(remote_src[index]);
+  for (int64_t index = thread_id; index < count; index += thread_count) {
+    dst[index] = static_cast<DstT>(remote_src[index]);
+  }
 }
 
 } // namespace tl
