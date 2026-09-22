@@ -1,7 +1,7 @@
 import pytest
 
 import tilelang
-from tilelang.distributed.backends.ipc import IpcAllocator, IpcMetadataInitializer
+from tilelang.distributed.backends.ipc import IpcAllocator, IpcMetadataInitializer, tvm_hcu_stream
 from tilelang.jit.kernel import JITKernel
 
 
@@ -66,3 +66,14 @@ def test_jit_kernel_initialize_delegates_to_distributed_adapter():
     kernel = JITKernel.__new__(JITKernel)
     kernel.adapter = Adapter()
     assert kernel.initialize("allocator", stream="stream")
+
+
+def test_tvm_hcu_stream_restores_previous_stream():
+    calls = []
+    current = {0: 7}
+    def get_stream(device): return current[device]
+    def set_stream(device, stream): calls.append((device, stream)); current[device] = stream
+    with tvm_hcu_stream(0, 42, get_stream=get_stream, set_stream=set_stream):
+        assert current[0] == 42
+    assert current[0] == 7
+    assert calls == [(0, 42), (0, 7)]

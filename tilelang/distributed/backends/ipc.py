@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any, Protocol
 
 from ..allocator import Allocation, DistributedAllocator
@@ -14,6 +15,22 @@ class _IpcRuntime(Protocol):
     def open_handle(self, handle: bytes) -> int: ...
     def close_handle(self, ptr: int) -> None: ...
     def can_access_peer(self, device: int, peer_device: int) -> bool: ...
+
+
+@contextmanager
+def tvm_hcu_stream(device: int, stream: int, *, get_stream=None, set_stream=None):
+    """Temporarily bind TVM's ROCm device stream to a PyTorch HIP stream."""
+    if get_stream is None or set_stream is None:
+        from tilelang import tvm
+
+        get_stream = tvm.ffi.get_global_func("tl.hcu.ipc.get_tvm_stream")
+        set_stream = tvm.ffi.get_global_func("tl.hcu.ipc.set_tvm_stream")
+    previous = int(get_stream(device))
+    set_stream(device, int(stream))
+    try:
+        yield
+    finally:
+        set_stream(device, previous)
 
 
 class _FfiIpcRuntime:
