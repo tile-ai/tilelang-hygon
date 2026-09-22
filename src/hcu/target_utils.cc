@@ -193,6 +193,7 @@ int TargetHcuGetLdsWrapMaxOffsetDwords(Target target) {
 TVM_REGISTER_TARGET_KIND("hcu", kDLROCM)
     .add_attr_option<ffi::String>("mcpu")
     .add_attr_option<ffi::String>("mtriple")
+    .add_attr_option<ffi::String>("dist_backend")
     .add_attr_option<ffi::Array<ffi::String>>("mattr")
     .add_attr_option<int64_t>("max_num_threads",
                               refl::DefaultValue(int64_t{1024}))
