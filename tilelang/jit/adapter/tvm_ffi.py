@@ -117,6 +117,8 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         self._executables_by_device: dict[int | str, tvm.runtime.Executable] = {}
         self._executable_lock = threading.Lock()
         self._ipc_metadata_initializer = None
+        self._ipc_allocator = None
+        self._ipc_initialized_generation = None
 
         self._post_init()
 
@@ -141,8 +143,20 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         for module in [self.rt_mod, *self.rt_mod.imports]:
             if module.get_function("__tilelang_init_ipc_metadata", query_imports=False) is not None:
                 with tvm_hcu_stream(allocator.device, stream):
-                    return self._ipc_metadata_initializer.initialize(module, allocator)
+                    launched = self._ipc_metadata_initializer.initialize(module, allocator)
+                self._ipc_allocator = allocator
+                self._ipc_initialized_generation = allocator.generation
+                return launched
         raise RuntimeError("compiled IPC kernel does not contain the metadata helper")
+
+    def validate_ipc_launch(self) -> None:
+        """Reject IPC launches whose allocator mapping generation is stale."""
+        if self.target.kind.name != "hcu" or str(self.target.attrs.get("dist_backend", "")) != "ipc":
+            return
+        if self._ipc_allocator is None or self._ipc_initialized_generation is None:
+            raise RuntimeError("IPC kernel must be initialized before launch")
+        if self._ipc_allocator.generation != self._ipc_initialized_generation:
+            raise RuntimeError("IPC allocator generation changed; call kernel.initialize() before launch")
 
     def _make_executable(self) -> tvm.runtime.Executable:
         if self.rt_mod is None:
@@ -309,6 +323,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 tensor_list.append(tensor)
 
             executable = get_executable()
+            self.validate_ipc_launch()
             executable(*tensor_list)
 
             # Return outputs in the requested form
