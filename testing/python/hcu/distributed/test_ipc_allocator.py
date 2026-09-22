@@ -3,6 +3,7 @@ import pytest
 import tilelang
 from tilelang.distributed.backends.ipc import IpcAllocator, IpcMetadataInitializer, tvm_hcu_stream
 from tilelang.jit.kernel import JITKernel
+from tilelang.jit.adapter.tvm_ffi import TVMFFIKernelAdapter
 
 
 class FakeRuntime:
@@ -77,3 +78,16 @@ def test_tvm_hcu_stream_restores_previous_stream():
         assert current[0] == 42
     assert current[0] == 7
     assert calls == [(0, 42), (0, 7)]
+
+
+def test_ipc_launch_rejects_missing_or_stale_allocator_generation():
+    class Kind: name = "hcu"
+    class Target: kind = Kind(); attrs = {"dist_backend": "ipc"}
+    class Allocator: generation = 3
+    adapter = TVMFFIKernelAdapter.__new__(TVMFFIKernelAdapter)
+    adapter.target, adapter._ipc_allocator, adapter._ipc_initialized_generation = Target(), None, None
+    with pytest.raises(RuntimeError, match="must be initialized"):
+        adapter.validate_ipc_launch()
+    adapter._ipc_allocator, adapter._ipc_initialized_generation = Allocator(), 2
+    with pytest.raises(RuntimeError, match="generation changed"):
+        adapter.validate_ipc_launch()
