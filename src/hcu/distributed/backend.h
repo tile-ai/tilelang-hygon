@@ -34,6 +34,8 @@ public:
   virtual bool Supports(DistributedCapability capability) const = 0;
   virtual std::string EmitRankExpr() const = 0;
   virtual std::string EmitNumRanksExpr() const = 0;
+  virtual std::string EmitBlockGetExpr(const std::string& src, const std::string& dst,
+                                       const std::string& size, const std::string& src_pe) const = 0;
   virtual std::string ModulePreamble() const = 0;
 };
 
