@@ -97,6 +97,11 @@ class IpcAllocator(DistributedAllocator):
     def initialize(self, handles: list[bytes] | None = None, device_ids: list[int] | None = None) -> None:
         if self._base:
             return
+        # HIP IPC allocation and handle import are device-context sensitive.
+        # PyTorch uses the CUDA namespace for both CUDA and HIP builds.
+        import torch
+
+        torch.cuda.set_device(self.device)
         self._base = self._runtime.malloc(self.size)
         try:
             handles = handles or self._exchange(self._runtime.create_handle(self._base))
@@ -147,9 +152,15 @@ class IpcAllocator(DistributedAllocator):
     def _exchange(self, value: Any) -> list[Any]:
         if self.world_size == 1:
             return [value]
-        if self.group is None or not hasattr(self.group, "all_gather_object"):
-            raise RuntimeError("world_size > 1 requires a group with all_gather_object")
-        return list(self.group.all_gather_object(value))
+        if self.group is None:
+            raise RuntimeError("world_size > 1 requires an initialized process group")
+        if hasattr(self.group, "all_gather_object"):
+            return list(self.group.all_gather_object(value))
+        import torch.distributed as dist
+
+        values = [None] * self.world_size
+        dist.all_gather_object(values, value, group=self.group)
+        return values
 
     def _require_open(self) -> None:
         if self._closed or not self._base:

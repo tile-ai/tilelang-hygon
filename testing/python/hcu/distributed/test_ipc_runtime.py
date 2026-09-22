@@ -1,4 +1,7 @@
 import pytest
+import os
+import subprocess
+from pathlib import Path
 
 from tilelang import tvm
 
@@ -32,3 +35,20 @@ def test_ipc_runtime_rejects_invalid_arguments_without_a_device():
         open_handle(b"invalid")
     with pytest.raises(Exception, match="null HIP IPC mapping"):
         close_handle(0)
+
+
+@pytest.mark.skipif(os.environ.get("TILELANG_RUN_HCU_IPC_TESTS") != "1", reason="requires two P2P HCU devices")
+def test_ipc_two_rank_handle_exchange_smoke():
+    import torch
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two HCU devices")
+    script = Path(__file__).with_name("ipc_two_rank_smoke.py")
+    result = subprocess.run(
+        ["torchrun", "--standalone", "--nproc_per_node=2", str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
