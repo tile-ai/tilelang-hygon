@@ -1,7 +1,7 @@
 import pytest
 
 import tilelang
-from tilelang.distributed.backends.ipc import IpcAllocator
+from tilelang.distributed.backends.ipc import IpcAllocator, IpcMetadataInitializer
 
 
 class FakeRuntime:
@@ -38,3 +38,20 @@ def test_ipc_arena_rejects_bad_requests():
 def test_ipc_allocator_factory_is_exported_from_tilelang():
     with pytest.raises(ValueError, match="Unsupported"):
         tilelang.get_distributed_allocator("unknown")
+
+
+def test_metadata_initializer_is_generation_aware():
+    class Module:
+        def __init__(self): self.calls = []
+        def get_function(self, name, query_imports=False):
+            assert name == "__tilelang_init_ipc_metadata" and not query_imports
+            return lambda tensor, count: self.calls.append((tensor, count))
+
+    allocator = IpcAllocator(128, rank=0, world_size=1, device=0, runtime=FakeRuntime())
+    allocator.initialize()
+    module, initializer = Module(), IpcMetadataInitializer()
+    assert initializer.initialize(module, allocator, metadata_tensor="metadata")
+    assert not initializer.initialize(module, allocator, metadata_tensor="metadata")
+    allocator._generation += 1
+    assert initializer.initialize(module, allocator, metadata_tensor="replacement")
+    assert module.calls == [("metadata", 3), ("replacement", 3)]
