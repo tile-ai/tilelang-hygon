@@ -1,5 +1,6 @@
 import pytest
 
+import tilelang
 from tilelang.distributed.backends.ipc import IpcAllocator
 
 
@@ -32,3 +33,8 @@ def test_ipc_arena_rejects_bad_requests():
     allocator.initialize()
     with pytest.raises(ValueError, match="positive"): allocator.allocate(0)
     with pytest.raises(MemoryError, match="exhausted"): allocator.allocate(129)
+
+
+def test_ipc_allocator_factory_is_exported_from_tilelang():
+    with pytest.raises(ValueError, match="Unsupported"):
+        tilelang.get_distributed_allocator("unknown")
