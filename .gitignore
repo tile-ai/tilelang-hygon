@@ -27,6 +27,10 @@ dist*/
 !tilelang/distributed/**
 !tilelang/language/distributed/
 !tilelang/language/distributed/**
+!src/hcu/distributed/
+!src/hcu/distributed/**
+!testing/python/hcu/distributed/
+!testing/python/hcu/distributed/**
 wheelhouse/
 __pycache__
 nnfusion.tar.gz

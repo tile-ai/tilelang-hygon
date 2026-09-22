@@ -39,6 +39,8 @@ list(APPEND TILE_LANG_INCLUDES ${ROCM_INCLUDE_DIRS})
 
 file(GLOB TILE_LANG_HCU_ACTIVE_SRCS
   src/hcu/codegen/*.cc
+  src/hcu/distributed/*.cc
+  src/hcu/distributed/ipc/*.cc
   src/hcu/op/*.cc
   src/hcu/transform/*.cc
   src/hcu/utils/*.cc
