@@ -1,0 +1,47 @@
+import pytest
+
+import tilelang.language as T
+from tilelang.engine.lower import lower
+
+
+def _program():
+    @T.prim_func
+    def main(out: T.Tensor((1,), "int32")):
+        with T.Kernel(1, threads=1):
+            out[0] = T.get_rank() + T.get_num_ranks()
+
+    return main
+
+
+def test_ipc_metadata_source_is_emitted_only_for_distributed_hcu_module():
+    artifact = lower(
+        _program().with_attr("global_symbol", "main"),
+        target={"kind": "hcu", "mcpu": "gfx938", "dist_backend": "ipc"},
+    )
+
+    assert "tl_templates/hcu/distributed/distributed.h" in artifact.kernel_source
+    assert "__tilelang_ipc_metadata" in artifact.kernel_source
+    assert "__tilelang_init_ipc_metadata" in artifact.kernel_source
+    assert "tl::ipc_get_rank()" in artifact.kernel_source
+    assert "tl::ipc_get_num_ranks()" in artifact.kernel_source
+
+
+def test_rank_intrinsic_requires_explicit_distributed_backend():
+    with pytest.raises(Exception, match="requires a non-empty dist_backend"):
+        lower(
+            _program().with_attr("global_symbol", "main"),
+            target={"kind": "hcu", "mcpu": "gfx938"},
+        )
+
+
+def test_normal_hcu_module_does_not_emit_ipc_metadata():
+    @T.prim_func
+    def main(out: T.Tensor((1,), "int32")):
+        with T.Kernel(1, threads=1):
+            out[0] = 1
+
+    artifact = lower(
+        main.with_attr("global_symbol", "main"),
+        target={"kind": "hcu", "mcpu": "gfx938"},
+    )
+    assert "__tilelang_ipc_metadata" not in artifact.kernel_source

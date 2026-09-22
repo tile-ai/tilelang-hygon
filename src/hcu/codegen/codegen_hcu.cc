@@ -24,9 +24,11 @@
 #include <vector>
 
 #include "hcu/target_utils.h"
+#include "hcu/distributed/backend.h"
 #include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "hcu/utils/mls_boundary.h"
 #include "op/builtin.h"
+#include "op/distributed.h"
 
 namespace tvm {
 namespace codegen {
@@ -654,6 +656,12 @@ void CodeGenTileLangHCU::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
 
 std::string CodeGenTileLangHCU::Finish() {
   decl_stream << "#include <hip/hip_runtime.h>\n";
+
+  if (uses_distributed_metadata_) {
+    const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
+    decl_stream << "#include <tl_templates/hcu/distributed/distributed.h>\n";
+    decl_stream << backend.ModulePreamble();
+  }
 
   if (enable_fp8_) {
     decl_stream << "#include <tl_templates/hcu/hcu_fp8.h>\n";
@@ -3298,6 +3306,22 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << wmma_replacer.rewrite(call_wmma_code);
   } else if (op->op.same_as(builtin::thread_return())) {
     os << "return";
+  } else if (op->op.same_as(tl::get_rank())) {
+    const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
+    if (!backend.Supports(tl::hcu::DistributedCapability::kRankAndWorldSize)) {
+      TVM_FFI_THROW(ValueError) << "HCU distributed backend " << backend.name()
+                                << " does not support rank/world-size intrinsics";
+    }
+    uses_distributed_metadata_ = true;
+    os << backend.EmitRankExpr();
+  } else if (op->op.same_as(tl::get_num_ranks())) {
+    const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
+    if (!backend.Supports(tl::hcu::DistributedCapability::kRankAndWorldSize)) {
+      TVM_FFI_THROW(ValueError) << "HCU distributed backend " << backend.name()
+                                << " does not support rank/world-size intrinsics";
+    }
+    uses_distributed_metadata_ = true;
+    os << backend.EmitNumRanksExpr();
   } else if (op->op.same_as(tl::loop_break())) {
     this->PrintIndent();
     this->stream << "break;\n";
