@@ -3322,6 +3322,16 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     uses_distributed_metadata_ = true;
     os << backend.EmitNumRanksExpr();
+  } else if (op->op.same_as(tl::get_block())) {
+    const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
+    if (!backend.Supports(tl::hcu::DistributedCapability::kBlockRemoteGet)) {
+      TVM_FFI_THROW(ValueError) << "HCU distributed backend " << backend.name()
+                                << " does not support block remote get";
+    }
+    ICHECK_EQ(op->args.size(), 4U);
+    uses_distributed_metadata_ = true;
+    os << backend.EmitBlockGetExpr(PrintExpr(op->args[0]), PrintExpr(op->args[1]),
+                                   PrintExpr(op->args[2]), PrintExpr(op->args[3]));
   } else if (op->op.same_as(tl::loop_break())) {
     this->PrintIndent();
     this->stream << "break;\n";
