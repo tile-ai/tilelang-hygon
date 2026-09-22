@@ -217,6 +217,7 @@ if not env.is_light_import():
     from . import cpu as cpu  # noqa: F401
     from . import cuda as cuda  # noqa: F401
     from . import hcu as hcu  # noqa: F401
+    from .distributed import get_distributed_allocator  # noqa: F401
     from . import rocm as rocm  # noqa: F401
     from . import metal as metal  # noqa: F401
 
