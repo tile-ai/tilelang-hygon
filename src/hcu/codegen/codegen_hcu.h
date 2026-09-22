@@ -26,6 +26,7 @@ class CodeGenTileLangHCU final : public CodeGenC {
 public:
   CodeGenTileLangHCU();
   std::string Finish();
+  bool UsesDistributedMetadata() const { return uses_distributed_metadata_; }
   void SetTarget(Target target) { target_ = std::move(target); }
   // override behavior
   void PrintFuncPrefix(std::ostream &os) final;

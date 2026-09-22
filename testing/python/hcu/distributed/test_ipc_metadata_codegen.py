@@ -1,6 +1,7 @@
 import pytest
 
 import tilelang.language as T
+from tilelang import tvm
 from tilelang.engine.lower import lower
 
 
@@ -45,3 +46,14 @@ def test_normal_hcu_module_does_not_emit_ipc_metadata():
         target={"kind": "hcu", "mcpu": "gfx938"},
     )
     assert "__tilelang_ipc_metadata" not in artifact.kernel_source
+
+
+def test_ipc_metadata_helper_is_registered_in_module_function_map():
+    artifact = lower(
+        _program().with_attr("global_symbol", "main"),
+        target={"kind": "hcu", "mcpu": "gfx938", "dist_backend": "ipc"},
+    )
+    build = tvm.ffi.get_global_func("target.build.tilelang_hcu_without_compile")
+    module = build(artifact.device_mod, artifact.target)
+
+    assert module.get_function("__tilelang_init_ipc_metadata", query_imports=False) is not None
