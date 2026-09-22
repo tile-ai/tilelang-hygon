@@ -137,3 +137,31 @@ class IpcAllocator(DistributedAllocator):
     def _require_open(self) -> None:
         if self._closed or not self._base:
             raise RuntimeError("IPC allocator is not initialized or has been closed")
+
+
+class IpcMetadataInitializer:
+    """Initialize an IPC module's device metadata once per allocator generation."""
+
+    def __init__(self) -> None:
+        self._initialized: dict[tuple[int, int], int] = {}
+
+    def initialize(self, module: Any, allocator: IpcAllocator, *, metadata_tensor: Any = None) -> bool:
+        """Launch the module helper when its cached allocator generation is stale.
+
+        Returns ``True`` when a helper launch occurred and ``False`` when the
+        module/device pair was already initialized for this generation.
+        """
+        key = (id(module), allocator.device)
+        if self._initialized.get(key) == allocator.generation:
+            return False
+        helper = module.get_function("__tilelang_init_ipc_metadata", query_imports=False)
+        if helper is None:
+            raise RuntimeError("module does not contain the IPC metadata helper")
+        payload = allocator.metadata
+        if metadata_tensor is None:
+            import torch
+
+            metadata_tensor = torch.tensor(payload, dtype=torch.uint64, device=f"cuda:{allocator.device}")
+        helper(metadata_tensor, len(payload))
+        self._initialized[key] = allocator.generation
+        return True
