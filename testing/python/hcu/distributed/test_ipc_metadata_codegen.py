@@ -57,3 +57,13 @@ def test_ipc_metadata_helper_is_registered_in_module_function_map():
     module = build(artifact.device_mod, artifact.target)
 
     assert module.get_function("__tilelang_init_ipc_metadata", query_imports=False) is not None
+
+
+def test_ipc_template_handles_full_3d_block_and_invalid_peer_guard():
+    from pathlib import Path
+
+    template = (Path(__file__).parents[4] / "src/tl_templates/hcu/distributed/distributed.h").read_text()
+    assert "blockDim.y) * threadIdx.z" in template
+    assert "index += thread_count" in template
+    assert "src_pe < 0 || src_pe >= world_size" in template
+    assert "dst[index] = DstT{}" in template
