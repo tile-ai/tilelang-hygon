@@ -25,6 +25,10 @@ public:
   std::string EmitRankExpr() const final { return "tl::ipc_get_rank()"; }
 
   std::string EmitNumRanksExpr() const final { return "tl::ipc_get_num_ranks()"; }
+  std::string EmitBlockGetExpr(const std::string& src, const std::string& dst,
+                               const std::string& size, const std::string& src_pe) const final {
+    return "tl::ipc_get_block(" + src + ", " + dst + ", " + size + ", " + src_pe + ")";
+  }
 
   std::string ModulePreamble() const final {
     return R"(
