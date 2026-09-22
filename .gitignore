@@ -21,6 +21,12 @@ debug/
 build/
 *dist/
 dist*/
+# Source packages are intentionally named "distributed"; keep them versioned
+# despite the distribution-artifact glob above.
+!tilelang/distributed/
+!tilelang/distributed/**
+!tilelang/language/distributed/
+!tilelang/language/distributed/**
 wheelhouse/
 __pycache__
 nnfusion.tar.gz
