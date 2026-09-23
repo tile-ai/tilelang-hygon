@@ -278,6 +278,12 @@ Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
                               bool transposed = false,
                               const int min_n_per_warp = 16);
 
+Fragment makeGemmFragmentBHCUInterleave2(
+    const int block_m, const int block_n, const int block_k,
+    const int num_warp_m, const int num_warp_n, const int num_warp_k,
+    const int element_size, const int k_pack, bool transposed = false,
+    const int min_n_per_warp = 32);
+
 Fragment makeDsReadFormatFragmentHCU(const int block_mn, const int block_k,
                                      const int num_warp_mn,
                                      const int num_warp_k,

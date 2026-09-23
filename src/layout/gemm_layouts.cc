@@ -563,6 +563,46 @@ Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
   }
 }
 
+Fragment
+makeGemmFragmentBHCUInterleave2(const int block_m, const int block_n,
+                                const int block_k, const int num_warp_m,
+                                const int num_warp_n, const int num_warp_k,
+                                const int element_size, const int k_pack,
+                                bool transposed, const int min_n_per_warp) {
+  ICHECK_EQ(element_size, 16);
+  ICHECK_EQ(k_pack, 1);
+  ICHECK(transposed);
+  ICHECK_EQ(block_n % min_n_per_warp, 0);
+
+  const int warp_n_no_recompute =
+      std::min(num_warp_n, block_n / min_n_per_warp);
+  const int warp_n = block_n / warp_n_no_recompute;
+  const int n_recompute = num_warp_n / warp_n_no_recompute;
+  const int warp_k = block_k / num_warp_k;
+  ICHECK_EQ(warp_n % 32, 0);
+  ICHECK_EQ(warp_k % 16, 0);
+  if (num_warp_k > 1) {
+    ICHECK_EQ(n_recompute, 1);
+  }
+
+  IterVar n = MakeIterVar("n", 32);
+  IterVar k = MakeIterVar("k", 16);
+  IterVar rep = MakeIterVar("rep", 1);
+  PrimExpr forward_thread = 16 * FloorDiv(k->var, 4) + FloorDiv(n->var, 2);
+  PrimExpr forward_index = 4 * FloorMod(n->var, 2) + FloorMod(k->var, 4);
+  Fragment base_layout({n, k}, {forward_index}, forward_thread, rep);
+  base_layout = base_layout->Repeat({1, 1}, false, false);
+  Fragment warp_layout =
+      base_layout->Repeat({warp_n / 32, warp_k / 16}, false, false);
+  Fragment block_layout =
+      warp_layout->Replicate(num_warp_m)
+          ->Repeat({warp_n_no_recompute, num_warp_k}, true, false);
+  if (n_recompute > 1) {
+    block_layout = block_layout->Replicate(n_recompute);
+  }
+  return block_layout;
+}
+
 Fragment makeDsReadFormatFragmentHCU(const int block_mn, const int block_k,
                                      const int num_warp_mn,
                                      const int num_warp_k,

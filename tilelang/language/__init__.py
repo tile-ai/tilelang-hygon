@@ -60,6 +60,7 @@ from tvm.tirx.script.builder.ir import alloc_buffer as allocate  # noqa: F401
 from .copy_op import (  # noqa: F401
     copy,
     matrix_load,
+    matrix_store,
     ds_read_format,
     copy_scale,
     async_copy,

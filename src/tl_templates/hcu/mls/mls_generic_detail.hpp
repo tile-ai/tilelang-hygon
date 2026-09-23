@@ -622,10 +622,12 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_16x64_trans_b16, Alt,
   }
 };
 
-template <::tl::index_t BlockSizeMN, ::tl::index_t BlockSizeK>
-struct make_lds_desc_generic<tl::mls::gfx946_mls_32x32_trans_b16, 1,
+template <::tl::index_t Alt, ::tl::index_t BlockSizeMN,
+          ::tl::index_t BlockSizeK>
+struct make_lds_desc_generic<tl::mls::gfx946_mls_32x32_trans_b16, Alt,
                              BlockSizeMN, BlockSizeK, true> {
-  using MlsTraits = mls_traits<tl::mls::gfx946_mls_32x32_trans_b16, 1>;
+  static_assert(Alt == 1 || Alt == 2, "Unsupported interleave config");
+  using MlsTraits = mls_traits<tl::mls::gfx946_mls_32x32_trans_b16, Alt>;
   static constexpr ::tl::index_t MlsTileMN = 32;
   static constexpr ::tl::index_t MlsTileK = 32;
 
@@ -662,10 +664,12 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_32x32_trans_b16, 1,
   }
 };
 
-template <::tl::index_t BlockSizeMN, ::tl::index_t BlockSizeK>
-struct make_lds_desc_generic<tl::mls::gfx946_mls_16x32_trans_b16, 1,
+template <::tl::index_t Alt, ::tl::index_t BlockSizeMN,
+          ::tl::index_t BlockSizeK>
+struct make_lds_desc_generic<tl::mls::gfx946_mls_16x32_trans_b16, Alt,
                              BlockSizeMN, BlockSizeK, true> {
-  using MlsTraits = mls_traits<tl::mls::gfx946_mls_16x32_trans_b16, 1>;
+  static_assert(Alt == 1 || Alt == 2, "Unsupported interleave config");
+  using MlsTraits = mls_traits<tl::mls::gfx946_mls_16x32_trans_b16, Alt>;
   static constexpr ::tl::index_t MlsTileMN = 16;
   static constexpr ::tl::index_t MlsTileK = 32;
 

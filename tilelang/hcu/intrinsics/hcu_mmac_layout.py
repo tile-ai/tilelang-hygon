@@ -97,6 +97,18 @@ def shared_16x16_to_local_64x4_layout_C_hcu_lit_lts(i, j):
     return thread_id, local
 
 
+def shared_16x32_to_local_64x8_layout_C_hcu_alt2_lts(i, j):
+    thread_id = 16 * (i % 4) + j // 2
+    local = 4 * (j % 2) + i // 4
+    return thread_id, local
+
+
+def shared_32x16_to_local_64x8_layout_B_hcu_alt2(i, j):
+    thread_id = 16 * (j // 4) + i // 2
+    local = 4 * (i % 2) + j % 4
+    return thread_id, local
+
+
 def thread_id_shared_access_64x2_to_16x8_layout_A(thread_id, local_id):
     i = thread_id % 16
     j = (thread_id // 16) * 2 + local_id
@@ -365,6 +377,7 @@ def make_gemm_fragment_hcu(
     *,
     lit: bool = False,
     lts: bool = False,
+    b_interleave: int = 1,
 ) -> Fragment:
     if element_bits == 64:
         raise ValueError("float64 C fragment is not supported for HCU MMAC")
@@ -381,8 +394,19 @@ def make_gemm_fragment_hcu(
     if warp_m % 16 != 0 or warp_n % 16 != 0:
         raise ValueError(f"warp_m and warp_n must be multiples of 16, got ({warp_m}, {warp_n})")
 
-    base = _micro_c_fragment(lit=lit, lts=lts).repeat([1, 1], repeat_on_thread=False)
-    warp_layout = base.repeat([warp_m // 16, warp_n // 16], repeat_on_thread=False, lower_dim_first=True)
+    if b_interleave == 2:
+        if lit or not lts:
+            raise ValueError("B Alt2 C layout requires MMAC LIT=0 and LTS=1")
+        if warp_n % 32 != 0:
+            raise ValueError(f"B Alt2 C layout requires warp_n divisible by 32, got {warp_n}")
+        base = _fragment_from_layout_fn(shared_16x32_to_local_64x8_layout_C_hcu_alt2_lts, 16, 32).repeat([1, 1], repeat_on_thread=False)
+        warp_n_atoms = warp_n // 32
+    else:
+        if b_interleave != 1:
+            raise ValueError(f"unsupported B interleave={b_interleave}")
+        base = _micro_c_fragment(lit=lit, lts=lts).repeat([1, 1], repeat_on_thread=False)
+        warp_n_atoms = warp_n // 16
+    warp_layout = base.repeat([warp_m // 16, warp_n_atoms], repeat_on_thread=False, lower_dim_first=True)
     block_layout = warp_layout.repeat([block_m // warp_m, block_n // warp_n], repeat_on_thread=True, lower_dim_first=False)
     if n_recompute > 1 or num_warp_k > 1:
         block_layout = block_layout.replicate(n_recompute * num_warp_k)
@@ -444,6 +468,7 @@ def make_gemm_fragment_b_hcu(
     min_n_per_warp: int,
     *,
     mmac_k_dim: int | None = None,
+    interleave: int = 1,
 ) -> Fragment:
     if block_n % min_n_per_warp != 0:
         raise ValueError(f"block_n={block_n} must be divisible by min_n_per_warp={min_n_per_warp}")
@@ -462,12 +487,23 @@ def make_gemm_fragment_b_hcu(
         raise ValueError(f"warp_k={warp_k} must be divisible by mmac_micro_k={mk}")
 
     # gemm ``TransposeB``: spatial-leading micro-tile when ``transposed=True`` (``gemm_layouts.cc``).
-    spatial_leading = transposed
-    base = _micro_ab_fragment(element_bits, k_pack, spatial_leading=spatial_leading, mmac_k_dim=mmac_k_dim).repeat(
-        [1, 1], repeat_on_thread=False
-    )
+    if interleave == 2:
+        if element_bits != 16 or k_pack != 1 or not transposed or mk != 16:
+            raise ValueError("B Alt2 layout requires transposed b16 with k_pack=1")
+        if warp_n % 32 != 0:
+            raise ValueError(f"B Alt2 layout requires warp_n divisible by 32, got {warp_n}")
+        base = _fragment_from_layout_fn(shared_32x16_to_local_64x8_layout_B_hcu_alt2, 32, 16).repeat([1, 1], repeat_on_thread=False)
+        spatial_atom = 32
+    else:
+        if interleave != 1:
+            raise ValueError(f"unsupported B interleave={interleave}")
+        spatial_leading = transposed
+        base = _micro_ab_fragment(element_bits, k_pack, spatial_leading=spatial_leading, mmac_k_dim=mmac_k_dim).repeat(
+            [1, 1], repeat_on_thread=False
+        )
+        spatial_atom = 16
     if transposed:
-        warp_layout = base.repeat([warp_n // 16, warp_k // mk], repeat_on_thread=False, lower_dim_first=False)
+        warp_layout = base.repeat([warp_n // spatial_atom, warp_k // mk], repeat_on_thread=False, lower_dim_first=False)
         block_layout = warp_layout.replicate(num_warp_m).repeat(
             [warp_n_no_recompute, num_warp_k], repeat_on_thread=True, lower_dim_first=False
         )
