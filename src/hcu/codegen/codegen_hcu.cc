@@ -318,6 +318,22 @@ PrimExpr GetBufferLoadLinearizedOffset(const BufferLoadNode *load) {
   return offset;
 }
 
+// Normal TileLang programs express a buffer slice as
+// address_of(BufferLoad), while low-level callers may pass a parameter pointer
+// directly. Both forms refer to the same kernel parameter for IPC validation.
+const VarNode *GetIpcRemoteSourceParameter(const PrimExpr &expr) {
+  if (const auto *var = expr.as<VarNode>()) {
+    return var;
+  }
+  const auto *call = expr.as<CallNode>();
+  if (!call || !call->op.same_as(builtin::address_of()) ||
+      call->args.size() != 1) {
+    return nullptr;
+  }
+  const auto *load = call->args[0].as<BufferLoadNode>();
+  return load ? load->buffer->data.get() : nullptr;
+}
+
 struct CPAsyncSourceInfo {
   const VarNode *buffer_var{nullptr};
   DataType elem_type;
@@ -3332,10 +3348,13 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
                                 << " does not support block remote get";
     }
     ICHECK_EQ(op->args.size(), 4U);
-    if (const auto *source = op->args[0].as<VarNode>()) {
+    if (const auto *source = GetIpcRemoteSourceParameter(op->args[0]);
+        source && kernel_param_vars_.count(source)) {
       ipc_remote_source_param_names_.insert(source->name_hint);
     } else {
-      TVM_FFI_THROW(ValueError) << "HCU IPC get_block source must be a kernel parameter";
+      TVM_FFI_THROW(ValueError)
+          << "HCU IPC get_block source must be a kernel parameter or "
+             "T.address_of(kernel_parameter[...])";
     }
     uses_distributed_metadata_ = true;
     os << backend.EmitBlockGetExpr(PrintExpr(op->args[0]), PrintExpr(op->args[1]),
@@ -3976,6 +3995,12 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   buffer_ops_rebase_param_names_.clear();
   block_index_vars_.clear();
   thread_index_vars_.clear();
+  kernel_param_vars_.clear();
+  ipc_remote_source_param_names_.clear();
+  uses_distributed_metadata_ = false;
+  for (const tirx::Var &param : f->params) {
+    kernel_param_vars_.insert(param.get());
+  }
   PostOrderVisit(f->body, [&](const ObjectRef &object) {
     const auto *attr = object.as<AttrStmtNode>();
     if (!attr || attr->attr_key != tirx::attr::thread_extent)
