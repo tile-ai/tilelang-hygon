@@ -24,7 +24,7 @@ union mls_addr_union {
 };
 
 TL_DEVICE void move_mls_addr_base(int32x4_t &mls_res,
-                                  const index_t addr_byte_offset) {
+                                  const long_index_t addr_byte_offset) {
   mls_addr_union addr_union{{mls_res.x, mls_res.y}};
 
   addr_union.addr += addr_byte_offset;
@@ -35,7 +35,7 @@ TL_DEVICE void move_mls_addr_base(int32x4_t &mls_res,
 // Set mls_res addr to base_addr + addr_byte_offset (absolute, not add).
 // Used by move_base_to for LICM-friendly load pattern.
 TL_DEVICE void update_mls_addr_base(int32x4_t &mls_res, uintptr_t base_addr,
-                                    index_t addr_byte_offset) {
+                                    long_index_t addr_byte_offset) {
   mls_addr_union addr_union;
   addr_union.addr = base_addr + addr_byte_offset;
   mls_res.x = addr_union.addr_lo;

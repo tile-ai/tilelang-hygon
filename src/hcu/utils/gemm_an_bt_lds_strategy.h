@@ -29,6 +29,7 @@ public:
   int block_k{0};
   int block_mn{0};
   int block_threads{0};
+  int thread_offset{0};
   int warp_size{0};
   int bank_num{0};
   int bank_width_bytes{0};
@@ -63,11 +64,11 @@ public:
 
 Optional<HcuGemmAnBtLdsStrategy>
 DeriveHcuGemmAnBtLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
-                             bool feeds_a, int block_threads, Target target);
+                             bool feeds_a, Range thread_bounds, Target target);
 
 Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
-    const CopyNode &copy, const GemmNode &gemm, bool feeds_a, int block_threads,
-    Target target, int wrap_count);
+    const CopyNode &copy, const GemmNode &gemm, bool feeds_a,
+    Range thread_bounds, Target target, int wrap_count);
 
 void ValidateHcuGemmAnBtStorageLayout(const Layout &actual,
                                       const HcuGemmAnBtLdsStrategy &strategy);

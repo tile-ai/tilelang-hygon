@@ -23,6 +23,7 @@ static constexpr const char *kHcuGemmLdsCopyStrategy =
     "tl.hcu_gemm_lds_copy_strategy";
 static constexpr const char *kHcuCopyAsyncPromotable =
     "tl.hcu_copy_async_promotable";
+static constexpr const char *kHcuLdsWrapIndex = "tl.hcu_lds_wrap_index";
 } // namespace attr
 
 class HcuGemmLdsCopyStrategyNode : public ffi::Object {
@@ -32,10 +33,13 @@ public:
   int copy_bytes_per_lane{0};
   int copy_transaction_bytes{0};
   int block_threads{0};
+  int thread_offset{0};
   int inner_extent{0};
+  int warp_size{0};
   // Physical wrap shift in dwords before target-specific field encoding.
   int wrap_offset{0};
   int wrap_idx_mask{0};
+  bool wrap_uses_copy_transaction{false};
   Layout storage_layout;
   Fragment copy_loop_layout;
 
@@ -84,13 +88,14 @@ int SelectHcuGemmLdsCopyTransactionBytes(int bytes_per_row,
 int GetHcuGemmLdsWrapOffsetDwords(int wrap_step_bytes);
 
 bool IsLegalHcuGemmLdsWrap(const HcuGemmLdsCopyGeometry &geometry,
-                           int wrap_step_bytes, int wrap_count);
+                           int wrap_step_bytes, int wrap_count,
+                           int available_wrap_phases);
 
-HcuGemmLdsCopyStrategy
-MakeHcuGemmLdsCopyStrategy(bool use_idxen, int copy_bytes_per_lane,
-                           int copy_transaction_bytes, int block_threads,
-                           int inner_extent, int wrap_offset, int wrap_idx_mask,
-                           Layout storage_layout, Fragment copy_loop_layout);
+HcuGemmLdsCopyStrategy MakeHcuGemmLdsCopyStrategy(
+    bool use_idxen, int copy_bytes_per_lane, int copy_transaction_bytes,
+    int block_threads, int thread_offset, int inner_extent, int warp_size,
+    int wrap_offset, int wrap_idx_mask, bool wrap_uses_copy_transaction,
+    Layout storage_layout, Fragment copy_loop_layout);
 
 } // namespace tl
 } // namespace tvm

@@ -47,6 +47,11 @@ def AnnotateMlsGemmDep():
     return _ffi_api.AnnotateMlsGemmDep()  # type: ignore
 
 
+def MaterializeHcuGemmLdsStrategy():
+    """Activate compiler-derived HCU GEMM LDS strategies after pipeline planning."""
+    return _ffi_api.MaterializeHcuGemmLdsStrategy()  # type: ignore
+
+
 def InjectHcuCopyIdxen():
     """Rewrite annotated HCU async copies to idxen/wrap addressing."""
     return _ffi_api.InjectHcuCopyIdxen()  # type: ignore

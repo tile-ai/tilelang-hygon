@@ -171,6 +171,10 @@ public:
              arith::Analyzer *analyzer) const override;
   LayoutMap InferLayout(const LayoutInferArgs &layout_args,
                         InferLevel level) const override;
+  bool IsLayoutInferenceComplete(InferLevel level) const override {
+    (void)level;
+    return completed_;
+  }
   AccessRegions GetAccessRegions() const override;
 
   TileOperator Clone() const;

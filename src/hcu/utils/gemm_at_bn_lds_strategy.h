@@ -29,6 +29,7 @@ public:
   int block_mn{0};
   int block_k{0};
   int block_threads{0};
+  int thread_offset{0};
   int warp_size{0};
   int warp_mn_count{0};
   int bank_num{32};
@@ -65,7 +66,7 @@ public:
 
 Optional<HcuGemmAtBnLdsStrategy>
 DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
-                             bool feeds_a, int block_threads, Target target);
+                             bool feeds_a, Range thread_bounds, Target target);
 
 void ValidateHcuGemmAtBnStorageLayout(const Layout &actual,
                                       const HcuGemmAtBnLdsStrategy &strategy);

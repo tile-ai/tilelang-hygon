@@ -1,6 +1,7 @@
 """GEMM with MLS (Matrix Load Store) - both A and B from MLS LDS."""
 
 import re
+from functools import partial
 
 import pytest
 import tilelang as tl
@@ -24,7 +25,8 @@ pytestmark = [
     ),
 ]
 
-_WAITCNT_RE = r"__builtin_[A-Za-z0-9_]+_s_waitcnt"
+_ASYNC_COMMIT_RE = r"tl::cp_async_commit\(\);"
+_ASYNC_WAIT_RE = r"tl::cp_async_wait<(\d+)>\(\);"
 
 
 def _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2):
@@ -43,118 +45,78 @@ def _mls_dst_dtype(src_dtype):
     return src_dtype
 
 
-def _waitcnt_imms(source: str) -> list[int]:
-    return [int(x) for x in re.findall(rf"{_WAITCNT_RE}\((\d+)\)", source)]
-
-
-def _vmcnt_keep(imm: int) -> int:
-    return imm & 0xF
-
-
-def _assert_each_waitcnt_followed_by_sync(source: str) -> None:
-    waits = _waitcnt_imms(source)
+def _assert_mls_async_group_pipeline(
+    source: str,
+    expected_waits: list[int],
+    expected_loads: int,
+    expected_commits: int,
+) -> None:
+    """Check the exact MatrixLoad producer groups and consumer waits."""
+    waits = [int(value) for value in re.findall(_ASYNC_WAIT_RE, source)]
+    mls_loads = source.count("async_mls_load_asm<")
+    commits = len(re.findall(_ASYNC_COMMIT_RE, source))
+    assert mls_loads == expected_loads, f"expected {expected_loads} MatrixLoads, got {mls_loads}"
+    assert commits == expected_commits, f"expected {expected_commits} commits, got {commits}"
+    assert waits == expected_waits, f"expected async waits {expected_waits}, got {waits}"
     sync_after_waits = len(
         re.findall(
-            rf"{_WAITCNT_RE}\(\d+\);\s*\n\s*__syncthreads\(\);",
+            r"tl::cp_async_wait<\d+>\(\);\s*\n\s*(?:__syncthreads|tl::sync_warp)\(\);",
             source,
         )
     )
-    assert sync_after_waits == len(waits), f"expected waitcnt+sync pairs for all {len(waits)} waits, got {sync_after_waits}"
+    assert sync_after_waits == len(waits), "every async wait must be followed by LDS synchronization"
 
 
-def _assert_mls_direct_stage1_waitcnt(source: str) -> None:
-    """Stage1 direct LDS: wait all outstanding MLS before each gemm consumer."""
-    waits = _waitcnt_imms(source)
-    assert waits == [16368, 16368], f"unexpected direct stage1 waitcnt sequence: {waits}"
+def _assert_mls_direct_stage1_async_groups(source: str) -> None:
+    _assert_mls_async_group_pipeline(source, [0, 0], expected_loads=4, expected_commits=2)
     assert source.count("ds_read_format_tensor_a") >= 2
     assert source.count("ds_read_format_tensor_b") >= 2
     assert "__builtin_hcu_mmac" in source
-    _assert_each_waitcnt_followed_by_sync(source)
 
 
-def _assert_mls_ds_stage1_waitcnt(source: str) -> None:
-    """Stage1 ds_read: A consumer keep=1; B consumer keep=1 after in-loop A reload."""
-    waits = _waitcnt_imms(source)
-    keeps = [_vmcnt_keep(w) for w in waits]
-    assert keeps == [1, 1, 1, 0], f"unexpected ds stage1 vmcnt keep sequence: {keeps}"
-    assert source.count("ds_read_format_tensor_a") >= 2
-    assert source.count("ds_read_format_tensor_b") >= 2
-    _assert_each_waitcnt_followed_by_sync(source)
-    ds_waits = len(
-        re.findall(
-            rf"{_WAITCNT_RE}\(\d+\);\s*\n\s*__syncthreads\(\);\s*\n\s*"
-            r"tl::mls::ds_read_format",
-            source,
-        )
-    )
-    assert ds_waits == 4, f"expected wait+sync before 4 ds_read consumers, got {ds_waits}"
-
-
-def _assert_mls_direct_stage2_waitcnt(source: str) -> None:
-    """Stage2 direct LDS: merged wait before loop gemm (keep=2) and epilogue gemm (keep=0)."""
-    waits = _waitcnt_imms(source)
-    keeps = [_vmcnt_keep(w) for w in waits]
-    assert keeps == [2, 0], f"unexpected direct stage2 vmcnt keep sequence: {keeps}"
+def _assert_mls_direct_stage2_async_groups(source: str) -> None:
+    _assert_mls_async_group_pipeline(source, [1, 0], expected_loads=4, expected_commits=2)
     assert source.count("ds_read_format_tensor_a") >= 2
     assert source.count("ds_read_format_tensor_b") >= 2
     assert "__builtin_hcu_mmac" in source
-    _assert_each_waitcnt_followed_by_sync(source)
 
 
-def _assert_mls_ds_stage2_waitcnt(source: str) -> None:
-    """Stage2 ds_read: pipelined loop + epilogue drain keeps [3,3,3,2,1,0]."""
-    waits = _waitcnt_imms(source)
-    keeps = [_vmcnt_keep(w) for w in waits]
-    assert keeps == [3, 3, 3, 2, 1, 0], f"unexpected ds stage2 vmcnt keep sequence: {keeps}"
+def _assert_mls_ds_stage1_async_groups(source: str) -> None:
+    _assert_mls_async_group_pipeline(source, [1, 1, 1, 0], expected_loads=4, expected_commits=4)
+    assert source.count("ds_read_format_tensor_a") >= 2
+    assert source.count("ds_read_format_tensor_b") >= 2
+
+
+def _assert_mls_ds_stage2_async_groups(source: str) -> None:
+    _assert_mls_async_group_pipeline(source, [3, 3, 3, 2, 1, 0], expected_loads=6, expected_commits=6)
     assert source.count("ds_read_format_tensor_a") >= 3
     assert source.count("ds_read_format_tensor_b") >= 3
-    _assert_each_waitcnt_followed_by_sync(source)
-    ds_waits = len(
-        re.findall(
-            rf"{_WAITCNT_RE}\(\d+\);\s*\n\s*__syncthreads\(\);\s*\n\s*"
-            r"tl::mls::ds_read_format",
-            source,
-        )
-    )
-    assert ds_waits == 6, f"expected wait+sync before 6 ds_read consumers, got {ds_waits}"
 
 
-def _assert_mls_copy_a_mls_b_ds_stage1_waitcnt(source: str) -> None:
-    """Mixed copy-A + MLS-B ds_read stage1: B-only MLS, no in-loop A reload -> keep=0."""
-    waits = _waitcnt_imms(source)
-    keeps = [_vmcnt_keep(w) for w in waits]
-    assert keeps == [0, 0], f"unexpected mixed ds stage1 vmcnt keep sequence: {keeps}"
+def _assert_mls_copy_a_mls_b_ds_stage1_async_groups(source: str) -> None:
+    _assert_mls_async_group_pipeline(source, [1, 1, 1, 0], expected_loads=2, expected_commits=4)
     assert "ds_read_format_tensor_b" in source
     assert "ds_read_format_tensor_a" not in source
     assert "__builtin_hcu_mmac" in source
-    _assert_each_waitcnt_followed_by_sync(source)
-    ds_waits = len(
-        re.findall(
-            rf"{_WAITCNT_RE}\(\d+\);\s*\n\s*__syncthreads\(\);\s*\n\s*"
-            r"tl::mls::ds_read_format_tensor_b",
-            source,
-        )
-    )
-    assert ds_waits == 2, f"expected wait+sync before 2 B ds_read consumers, got {ds_waits}"
 
 
-def _assert_mls_copy_a_mls_b_ds_stage2_waitcnt(source: str) -> None:
-    """Mixed copy-A + MLS-B ds_read stage2: pipelined B-only MLS keeps [1,1,0]."""
-    waits = _waitcnt_imms(source)
-    keeps = [_vmcnt_keep(w) for w in waits]
-    assert keeps == [1, 1, 0], f"unexpected mixed ds stage2 vmcnt keep sequence: {keeps}"
+def _assert_mls_copy_a_mls_b_ds_stage2_async_groups(source: str) -> None:
+    _assert_mls_async_group_pipeline(source, [3, 3, 3, 2, 1, 0], expected_loads=3, expected_commits=6)
     assert "ds_read_format_tensor_b" in source
     assert "ds_read_format_tensor_a" not in source
     assert "__builtin_hcu_mmac" in source
-    _assert_each_waitcnt_followed_by_sync(source)
-    ds_waits = len(
-        re.findall(
-            rf"{_WAITCNT_RE}\(\d+\);\s*\n\s*__syncthreads\(\);\s*\n\s*"
-            r"tl::mls::ds_read_format_tensor_b",
-            source,
-        )
-    )
-    assert ds_waits == 3, f"expected wait+sync before 3 B ds_read consumers, got {ds_waits}"
+
+
+def _assert_copy_selected_mls_stage0(source: str) -> None:
+    """Stage 0 commits each selected MatrixLoad and drains before GEMM."""
+    _assert_mls_async_group_pipeline(source, [0], expected_loads=2, expected_commits=2)
+    assert "__builtin_hcu_mmac" in source
+
+
+def _assert_explicit_mls_stage0(source: str, grouped: bool) -> None:
+    """Explicit MatrixLoads either commit separately or share one group."""
+    expected_commits = 1 if grouped else 2
+    _assert_mls_async_group_pipeline(source, [0], expected_loads=2, expected_commits=expected_commits)
 
 
 def matmul_mls(
@@ -173,6 +135,8 @@ def matmul_mls(
     k_pack=1,
     num_stages=0,
     use_tf32=False,
+    copy_selects_mls=False,
+    group_explicit_mls=False,
 ):
     """GEMM with both A and B loaded via matrix_load (MLS)."""
     A_shape = (K, M) if trans_A else (M, K)
@@ -180,6 +144,7 @@ def matmul_mls(
     A_shared_shape = (block_K, block_M) if trans_A else (block_M, block_K)
     B_shared_shape = (block_N, block_K) if trans_B else (block_K, block_N)
     mls_dtype = _mls_dst_dtype(in_dtype)
+    mls_annotations = {"no_implicit_async_commit_wait": T.int32(1)} if group_explicit_mls else None
 
     @T.prim_func
     def main(
@@ -193,14 +158,61 @@ def matmul_mls(
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
-                if trans_A:
-                    T.matrix_load(A[k * block_K, by * block_M], A_shared)
+                if copy_selects_mls:
+                    if trans_A:
+                        T.copy(
+                            A[k * block_K, by * block_M],
+                            A_shared,
+                            prefer_instruction="matrix_load",
+                        )
+                    else:
+                        T.copy(
+                            A[by * block_M, k * block_K],
+                            A_shared,
+                            prefer_instruction="matrix_load",
+                        )
+                    if trans_B:
+                        T.copy(
+                            B[bx * block_N, k * block_K],
+                            B_shared,
+                            prefer_instruction="matrix_load",
+                        )
+                    else:
+                        T.copy(
+                            B[k * block_K, bx * block_N],
+                            B_shared,
+                            prefer_instruction="matrix_load",
+                        )
                 else:
-                    T.matrix_load(A[by * block_M, k * block_K], A_shared)
-                if trans_B:
-                    T.matrix_load(B[bx * block_N, k * block_K], B_shared)
-                else:
-                    T.matrix_load(B[k * block_K, bx * block_N], B_shared)
+                    if trans_A:
+                        T.matrix_load(
+                            A[k * block_K, by * block_M],
+                            A_shared,
+                            annotations=mls_annotations,
+                        )
+                    else:
+                        T.matrix_load(
+                            A[by * block_M, k * block_K],
+                            A_shared,
+                            annotations=mls_annotations,
+                        )
+                    if trans_B:
+                        T.matrix_load(
+                            B[bx * block_N, k * block_K],
+                            B_shared,
+                            annotations=mls_annotations,
+                        )
+                    else:
+                        T.matrix_load(
+                            B[k * block_K, bx * block_N],
+                            B_shared,
+                            annotations=mls_annotations,
+                        )
+                    if group_explicit_mls:
+                        T.ptx_commit_group()
+                if num_stages == 0:
+                    T.ptx_wait_group(0)
+                    T.sync_warp()
                 T.gemm(A_shared, B_shared, C_local, trans_A, trans_B, k_pack=k_pack, use_tf32=use_tf32)
             T.copy(C_local, C[by * block_M, bx * block_N])
 
@@ -224,6 +236,7 @@ def matmul_mls_ds_read_format(
     k_pack=1,
     mls_dtype=None,
     use_tf32=False,
+    copy_selects_mls=False,
 ):
     """GEMM with both A and B: matrix_load -> ds_read_format -> gemm."""
     A_shape = (K, M) if trans_A else (M, K)
@@ -246,14 +259,42 @@ def matmul_mls_ds_read_format(
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
-                if trans_A:
-                    T.matrix_load(A[k * block_K, by * block_M], A_shared)
+                if copy_selects_mls:
+                    if trans_A:
+                        T.copy(
+                            A[k * block_K, by * block_M],
+                            A_shared,
+                            prefer_instruction="matrix_load",
+                        )
+                    else:
+                        T.copy(
+                            A[by * block_M, k * block_K],
+                            A_shared,
+                            prefer_instruction="matrix_load",
+                        )
+                    if trans_B:
+                        T.copy(
+                            B[bx * block_N, k * block_K],
+                            B_shared,
+                            prefer_instruction="matrix_load",
+                        )
+                    else:
+                        T.copy(
+                            B[k * block_K, bx * block_N],
+                            B_shared,
+                            prefer_instruction="matrix_load",
+                        )
                 else:
-                    T.matrix_load(A[by * block_M, k * block_K], A_shared)
-                if trans_B:
-                    T.matrix_load(B[bx * block_N, k * block_K], B_shared)
-                else:
-                    T.matrix_load(B[k * block_K, bx * block_N], B_shared)
+                    if trans_A:
+                        T.matrix_load(A[k * block_K, by * block_M], A_shared)
+                    else:
+                        T.matrix_load(A[by * block_M, k * block_K], A_shared)
+                    if trans_B:
+                        T.matrix_load(B[bx * block_N, k * block_K], B_shared)
+                    else:
+                        T.matrix_load(B[k * block_K, bx * block_N], B_shared)
+                    T.ptx_wait_group(0)
+                    T.sync_warp()
                 T.ds_read_format(A_shared, A_fragment)
                 T.ds_read_format(B_shared, B_fragment)
                 T.gemm(A_fragment, B_fragment, C_local, trans_A, trans_B, k_pack=k_pack, use_tf32=use_tf32)
@@ -305,6 +346,8 @@ def matmul_mls_ds_read_format_mixed(
                     T.matrix_load(B[bx * block_N, k * block_K], B_shared)
                 else:
                     T.matrix_load(B[k * block_K, bx * block_N], B_shared)
+                T.ptx_wait_group(0)
+                T.sync_warp()
                 T.gemm(A_shared, B_shared, C_local, trans_A, trans_B)
             T.copy(C_local, C[by * block_M, bx * block_N])
 
@@ -357,6 +400,8 @@ def matmul_mls_ds_read_format_mul_scale(
                     T.matrix_load(B[bx * block_N, k * block_K], B_shared)
                 else:
                     T.matrix_load(B[k * block_K, bx * block_N], B_shared)
+                T.ptx_wait_group(0)
+                T.sync_warp()
                 T.ds_read_format(A_shared, A_fragment)
                 T.ds_read_format(B_shared, B_fragment)
                 for i, j in T.Parallel(A_shared_shape[0], A_shared_shape[1]):
@@ -384,6 +429,7 @@ def matmul_mls_copy_a_mls_b_ds(
     threads,
     num_stages=0,
     k_pack=1,
+    copy_selects_mls=False,
 ):
     """GEMM with A via T.copy -> shared -> fragment, B via matrix_load -> ds_read_format -> gemm."""
     A_shape = (K, M) if trans_A else (M, K)
@@ -411,10 +457,26 @@ def matmul_mls_copy_a_mls_b_ds(
                 else:
                     T.copy(A[by * block_M, k * block_K], A_shared, coalesced_width=vec_size)
                 T.copy(A_shared, A_fragment)
-                if trans_B:
-                    T.matrix_load(B[bx * block_N, k * block_K], B_shared)
+                if copy_selects_mls:
+                    if trans_B:
+                        T.copy(
+                            B[bx * block_N, k * block_K],
+                            B_shared,
+                            prefer_instruction="matrix_load",
+                        )
+                    else:
+                        T.copy(
+                            B[k * block_K, bx * block_N],
+                            B_shared,
+                            prefer_instruction="matrix_load",
+                        )
                 else:
-                    T.matrix_load(B[k * block_K, bx * block_N], B_shared)
+                    if trans_B:
+                        T.matrix_load(B[bx * block_N, k * block_K], B_shared)
+                    else:
+                        T.matrix_load(B[k * block_K, bx * block_N], B_shared)
+                    T.ptx_wait_group(0)
+                    T.sync_warp()
                 T.ds_read_format(B_shared, B_fragment)
                 T.gemm(A_fragment, B_fragment, C_local, trans_A, trans_B, k_pack=k_pack)
             T.copy(C_local, C[by * block_M, bx * block_N])
@@ -466,6 +528,9 @@ def matmul_mls_b_shared_a(
                     T.matrix_load(B[bx * block_N, k * block_K], B_shared)
                 else:
                     T.matrix_load(B[k * block_K, bx * block_N], B_shared)
+                if num_stages == 0:
+                    T.ptx_wait_group(0)
+                    T.sync_warp()
                 T.gemm(A_shared, B_shared, C_local, trans_A, trans_B, k_pack=k_pack)
             T.copy(C_local, C[by * block_M, bx * block_N])
 
@@ -542,6 +607,8 @@ def run_gemm_mls(
     use_tf32=False,
     atol=1e-2,
     rtol=1e-2,
+    copy_selects_mls=False,
+    group_explicit_mls=False,
 ):
     program = matmul_mls(
         M,
@@ -559,6 +626,8 @@ def run_gemm_mls(
         k_pack=k_pack,
         num_stages=num_stages,
         use_tf32=use_tf32,
+        copy_selects_mls=copy_selects_mls,
+        group_explicit_mls=group_explicit_mls,
     )
     kernel = tl.compile(program, out_idx=[2])
     if verify_source is not None:
@@ -600,6 +669,7 @@ def run_gemm_mls_ds_read_format(
     use_tf32=False,
     atol=1e-2,
     rtol=1e-2,
+    copy_selects_mls=False,
 ):
     """Run GEMM with matrix_load + ds_read_format for both A and B."""
     program = matmul_mls_ds_read_format(
@@ -618,6 +688,7 @@ def run_gemm_mls_ds_read_format(
         num_stages=num_stages,
         k_pack=k_pack,
         use_tf32=use_tf32,
+        copy_selects_mls=copy_selects_mls,
     )
     kernel = tl.compile(program, out_idx=[2])
     if verify_source is not None:
@@ -656,6 +727,7 @@ def run_gemm_mls_copy_a_mls_b_ds(
     num_stages=0,
     k_pack=1,
     verify_source=None,
+    copy_selects_mls=False,
 ):
     """Run GEMM with A via T.copy->fragment, B via matrix_load->ds_read_format->gemm."""
     program = matmul_mls_copy_a_mls_b_ds(
@@ -673,6 +745,7 @@ def run_gemm_mls_copy_a_mls_b_ds(
         num_threads,
         num_stages=num_stages,
         k_pack=k_pack,
+        copy_selects_mls=copy_selects_mls,
     )
     kernel = tl.compile(program, out_idx=[2])
     if verify_source is not None:
@@ -837,13 +910,13 @@ def test_gemm_mls_f16(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_
 @pytest.mark.parametrize(
     "num_stages, verify_source",
     [
-        pytest.param(0, None, id="stage0"),
-        pytest.param(1, _assert_mls_direct_stage1_waitcnt, id="stage1"),
-        pytest.param(2, _assert_mls_direct_stage2_waitcnt, id="stage2"),
+        pytest.param(0, _assert_copy_selected_mls_stage0, id="stage0"),
+        pytest.param(1, _assert_mls_direct_stage1_async_groups, id="stage1"),
+        pytest.param(2, _assert_mls_direct_stage2_async_groups, id="stage2"),
     ],
 )
 def test_gemm_mls_f16_pipeline(num_stages, verify_source):
-    """Float16 direct MLS GEMM with explicit pipeline-stage waitcnt checks."""
+    """T.copy-selected MatrixLoad with stage-specific async-group checks."""
     run_gemm_mls(
         M=64,
         N=64,
@@ -859,6 +932,29 @@ def test_gemm_mls_f16_pipeline(num_stages, verify_source):
         num_threads=128,
         num_stages=num_stages,
         verify_source=verify_source,
+        copy_selects_mls=True,
+    )
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["per-op-commit", "grouped-commit"])
+def test_gemm_mls_f16_explicit_stage0(grouped):
+    """Explicit MatrixLoad follows the same user-managed wait semantics as async copy."""
+    run_gemm_mls(
+        M=64,
+        N=64,
+        K=256,
+        trans_A=False,
+        trans_B=True,
+        in_dtype="float16",
+        out_dtype="float32",
+        dtypeAccum="float32",
+        block_M=32,
+        block_N=32,
+        block_K=32,
+        num_threads=128,
+        num_stages=0,
+        verify_source=partial(_assert_explicit_mls_stage0, grouped=grouped),
+        group_explicit_mls=grouped,
     )
 
 
@@ -975,12 +1071,12 @@ def test_gemm_mls_b32_tf32(M, N, K, trans_A, trans_B, block_M, block_N, block_K,
 @pytest.mark.parametrize(
     "num_stages, verify_source",
     [
-        pytest.param(1, _assert_mls_ds_stage1_waitcnt, id="stage1"),
-        pytest.param(2, _assert_mls_ds_stage2_waitcnt, id="stage2"),
+        pytest.param(1, _assert_mls_ds_stage1_async_groups, id="stage1"),
+        pytest.param(2, _assert_mls_ds_stage2_async_groups, id="stage2"),
     ],
 )
 def test_gemm_mls_ds_read_format_f16_pipeline(num_stages, verify_source):
-    """Float16 matrix_load -> ds_read_format -> GEMM with pipeline waitcnt checks."""
+    """Compiler-selected MatrixLoad -> ds_read_format pipeline."""
     run_gemm_mls_ds_read_format(
         M=32,
         N=32,
@@ -996,18 +1092,19 @@ def test_gemm_mls_ds_read_format_f16_pipeline(num_stages, verify_source):
         num_threads=128,
         num_stages=num_stages,
         verify_source=verify_source,
+        copy_selects_mls=True,
     )
 
 
 @pytest.mark.parametrize(
     "num_stages, verify_source",
     [
-        pytest.param(1, _assert_mls_copy_a_mls_b_ds_stage1_waitcnt, id="stage1"),
-        pytest.param(2, _assert_mls_copy_a_mls_b_ds_stage2_waitcnt, id="stage2"),
+        pytest.param(1, _assert_mls_copy_a_mls_b_ds_stage1_async_groups, id="stage1"),
+        pytest.param(2, _assert_mls_copy_a_mls_b_ds_stage2_async_groups, id="stage2"),
     ],
 )
 def test_gemm_mls_copy_a_mls_b_ds_f16_pipeline(num_stages, verify_source):
-    """A via T.copy and B via matrix_load -> ds_read_format with pipeline waitcnt checks."""
+    """A copy and compiler-selected MatrixLoad B pipeline."""
     run_gemm_mls_copy_a_mls_b_ds(
         M=32,
         N=32,
@@ -1023,6 +1120,7 @@ def test_gemm_mls_copy_a_mls_b_ds_f16_pipeline(num_stages, verify_source):
         num_threads=128,
         num_stages=num_stages,
         verify_source=verify_source,
+        copy_selects_mls=True,
     )
 
 
@@ -1102,6 +1200,8 @@ def mls_ds_read_format_copy_to_global(
             A_shared = T.alloc_shared(shared_shape, in_dtype)
             A_fragment = T.alloc_fragment(shared_shape, in_dtype)
             T.matrix_load(A[bm * block_M, bk * block_K], A_shared)
+            T.ptx_wait_group(0)
+            T.sync_warp()
             T.ds_read_format(A_shared, A_fragment)
             T.copy(A_fragment, C[bm * block_M, bk * block_K])
 
@@ -1159,6 +1259,8 @@ def mls_ds_read_format_b4_copy_to_global(
             A_shared = T.alloc_shared(shared_shape, in_dtype)
             A_fragment = T.alloc_fragment(shared_shape, in_dtype)
             T.matrix_load(A[bm * block_M, bk * block_K], A_shared)
+            T.ptx_wait_group(0)
+            T.sync_warp()
             T.ds_read_format(A_shared, A_fragment)
             T.copy(A_fragment, C[bm * block_M, bk * block_K])
 
@@ -1328,21 +1430,6 @@ def run_gemm_mls_ds_read_format_b4_pad(
         mls_dtype=T.float4_e2m1_unpacked,
     )
     kernel = tl.compile(program, out_idx=[2])
-    source = kernel.get_kernel_source()
-    arch = current_hcu_arch_string()
-    expected_mls_tile = "tl::sequence<64, 16>" if trans_A and not trans_B else "tl::sequence<16, 64>"
-    assert expected_mls_tile in source
-    assert f"tl::hcu_target_enum::{arch}, 8>" in source
-    assert "ds_read_format_tensor_a" in source
-    assert "ds_read_format_tensor_b" in source
-    assert "uint8_t, 8, 8>" in source
-    if arch == "gfx946":
-        assert "__builtin_hcu_mmac_f32_16x16x32_f8f6f4_lit_lts" in source
-        assert ", 24, 1, 0)" in source
-        assert "__builtin_hcu_mmac_f32_16x16x64_fp4_lit_lts" not in source
-    else:
-        assert "__builtin_hcu_mmac_f32_16x16x32_f8f6f4(" in source
-        assert ", 24)" in source
     profiler = kernel.get_profiler()
 
     A_shape = (K, M) if trans_A else (M, K)
@@ -1462,6 +1549,8 @@ def matmul_mls_n_loop(
                 for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=0):
                     T.matrix_load(A[by * block_M, k * block_K], A_shared)
                     T.matrix_load(B[k * block_K, n * block_N], B_shared)
+                    T.ptx_wait_group(0)
+                    T.sync_warp()
                     T.gemm(A_shared, B_shared, C_local, False, False, k_pack=k_pack)
                 T.copy(C_local, C[by * block_M, n * block_N])
 
@@ -1480,6 +1569,7 @@ def run_gemm_mls_n_loop(
     block_K,
     num_threads=128,
     k_pack=1,
+    verify_source=None,
 ):
     program = matmul_mls_n_loop(
         M,
@@ -1495,6 +1585,8 @@ def run_gemm_mls_n_loop(
         k_pack=k_pack,
     )
     kernel = tl.compile(program, out_idx=[2])
+    if verify_source is not None:
+        verify_source(kernel.get_kernel_source())
     profiler = kernel.get_profiler()
 
     def ref_program(A, B):
@@ -1688,35 +1780,256 @@ def test_gemm_mls_mix_f4f6f8(M, N, K, trans_A, trans_B, block_M, block_N, block_
     )
 
 
+def _assert_mls_boundary_filter_live(source: str) -> None:
+    has_k_filter = "async_mls_load_asm<half_t, true" in source
+    has_mn_filter = (
+        "update_mn_base<true" in source
+        or "async_mls_load_asm<half_t, false, true" in source
+        or "async_mls_load_asm<half_t, true, true" in source
+    )
+    assert has_k_filter or has_mn_filter, source
+
+
+def _assert_mls_reverse_k_rebase(source: str) -> None:
+    assert "update_k_base" in source
+    _assert_mls_boundary_filter_live(source)
+
+
+def _assert_mls_k_outer_update_mn(source: str) -> None:
+    assert "update_mn_base" in source
+    _assert_mls_boundary_filter_live(source)
+
+
 def test_gemm_mls_n_loop_resource_hoist():
-    """N loop outside K loop: MLS object should be reusable while the MN window changes."""
+    """N-outer / K-inner GEMM with a partial tail; MLS reuses the MN window."""
     run_gemm_mls_n_loop(
-        M=32,
-        N=64,
-        K=64,
+        M=96,
+        N=96,
+        K=184,
         in_dtype="float16",
         out_dtype="float32",
         dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=32,
+        block_M=64,
+        block_N=64,
+        block_K=64,
         num_threads=128,
+        verify_source=_assert_mls_boundary_filter_live,
     )
 
 
 def test_gemm_mls_n_loop_resource_hoist_fixed_k():
-    """N loop with a single K tile: MLS should update only the MN window in the loop."""
+    """N-outer GEMM with a single K tile; only the MN window updates in the loop."""
     run_gemm_mls_n_loop(
-        M=32,
-        N=64,
-        K=32,
+        M=96,
+        N=96,
+        K=64,
         in_dtype="float16",
         out_dtype="float32",
         dtypeAccum="float32",
-        block_M=32,
-        block_N=32,
-        block_K=32,
+        block_M=64,
+        block_N=64,
+        block_K=64,
         num_threads=128,
+        verify_source=_assert_mls_boundary_filter_live,
+    )
+
+
+def matmul_mls_reverse_k(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K,
+    in_dtype,
+    out_dtype,
+    accum_dtype,
+    threads,
+    k_pack=1,
+):
+    """GEMM that walks K tiles high-to-low so hoist cannot use forward_delta."""
+    num_k = T.ceildiv(K, block_K)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), in_dtype),
+        B: T.Tensor((K, N), in_dtype),
+        C: T.Tensor((M, N), out_dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), in_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), in_dtype)
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            T.clear(C_local)
+            for k in T.serial(num_k):
+                k_tile = (num_k - 1 - k) * block_K
+                T.matrix_load(A[by * block_M, k_tile], A_shared)
+                T.matrix_load(B[k_tile, bx * block_N], B_shared)
+                T.ptx_wait_group(0)
+                T.sync_warp()
+                T.gemm(A_shared, B_shared, C_local, False, False, k_pack=k_pack)
+            T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return main
+
+
+def matmul_mls_k_outer_n_inner(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K,
+    in_dtype,
+    out_dtype,
+    accum_dtype,
+    threads,
+    k_pack=1,
+):
+    """GEMM that walks N tiles inside a stable K tile."""
+    n_tiles = T.ceildiv(N, block_N)
+    k_tiles = T.ceildiv(K, block_K)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), in_dtype),
+        B: T.Tensor((K, N), in_dtype),
+        C: T.Tensor((M, N), out_dtype),
+    ):
+        with T.Kernel(T.ceildiv(M, block_M), threads=threads) as by:
+            A_shared = T.alloc_shared((block_M, block_K), in_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), in_dtype)
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            for k in T.serial(k_tiles):
+                T.matrix_load(A[by * block_M, k * block_K], A_shared)
+                for n in T.serial(n_tiles):
+                    if k == 0:
+                        T.clear(C_local)
+                    else:
+                        T.copy(C[by * block_M, n * block_N], C_local)
+                    T.matrix_load(B[k * block_K, n * block_N], B_shared)
+                    T.ptx_wait_group(0)
+                    T.sync_warp()
+                    T.gemm(A_shared, B_shared, C_local, False, False, k_pack=k_pack)
+                    T.copy(C_local, C[by * block_M, n * block_N])
+
+    return main
+
+
+def _run_gemm_mls_program(program, verify_source=None):
+    kernel = tl.compile(program, out_idx=[2])
+    if verify_source is not None:
+        verify_source(kernel.get_kernel_source())
+    profiler = kernel.get_profiler()
+
+    def ref_program(A, B):
+        return (A.cpu() @ B.cpu()).to(torch.float32)
+
+    _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2)
+
+
+def test_gemm_mls_reverse_k_absolute_rebase():
+    """Non-monotonic K uses update_k_base."""
+    _run_gemm_mls_program(
+        matmul_mls_reverse_k(
+            M=96,
+            N=96,
+            K=184,
+            block_M=64,
+            block_N=64,
+            block_K=64,
+            in_dtype="float16",
+            out_dtype="float32",
+            accum_dtype="float32",
+            threads=128,
+        ),
+        verify_source=_assert_mls_reverse_k_rebase,
+    )
+
+
+def matmul_mls_k_prefetch_then_loop(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K,
+    in_dtype,
+    out_dtype,
+    accum_dtype,
+    threads,
+    k_pack=1,
+):
+    """Prefetch K=0 then Serial(k); hoist must still treat K as the inner axis."""
+    num_k = T.ceildiv(K, block_K)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), in_dtype),
+        B: T.Tensor((K, N), in_dtype),
+        C: T.Tensor((M, N), out_dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), in_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), in_dtype)
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            T.clear(C_local)
+            T.matrix_load(A[by * block_M, 0], A_shared)
+            T.matrix_load(B[0, bx * block_N], B_shared)
+            T.ptx_wait_group(0)
+            T.sync_warp()
+            T.gemm(A_shared, B_shared, C_local, False, False, k_pack=k_pack)
+            for k in T.serial(num_k - 1):
+                T.matrix_load(A[by * block_M, (k + 1) * block_K], A_shared)
+                T.matrix_load(B[(k + 1) * block_K, bx * block_N], B_shared)
+                T.ptx_wait_group(0)
+                T.sync_warp()
+                T.gemm(A_shared, B_shared, C_local, False, False, k_pack=k_pack)
+            T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return main
+
+
+def _assert_mls_k_inner_despite_prefetch(source: str) -> None:
+    # Prefetch K=0 must not flip the inner axis to MN.
+    assert "update_k_base" in source, source
+    assert "mls_resource_axis::k" not in source, source
+
+
+def test_gemm_mls_k_prefetch_then_loop_k_inner():
+    _run_gemm_mls_program(
+        matmul_mls_k_prefetch_then_loop(
+            M=96,
+            N=96,
+            K=184,
+            block_M=64,
+            block_N=64,
+            block_K=64,
+            in_dtype="float16",
+            out_dtype="float32",
+            accum_dtype="float32",
+            threads=128,
+        ),
+        verify_source=_assert_mls_k_inner_despite_prefetch,
+    )
+
+
+def test_gemm_mls_k_outer_n_inner_update_mn():
+    """K-outer / N-inner B loads use update_mn_base."""
+    _run_gemm_mls_program(
+        matmul_mls_k_outer_n_inner(
+            M=96,
+            N=96,
+            K=184,
+            block_M=64,
+            block_N=64,
+            block_K=64,
+            in_dtype="float16",
+            out_dtype="float32",
+            accum_dtype="float32",
+            threads=128,
+        ),
+        verify_source=_assert_mls_k_outer_update_mn,
     )
 
 

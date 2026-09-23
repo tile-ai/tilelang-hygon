@@ -1487,7 +1487,8 @@ struct mls_generic_detail {
   static constexpr auto TileLoadWGPerIssue = WarpCluster * TileLoadWarpPerIssue;
 
   // When TileLoadWGPerIssue > TileShape in a dim, warps repeat load (same
-  // data). WarpMlsIssueSeq_i = 1 when repetition, else TileShape_i /
+  // data). Surplus warps from ComputeMlsWarpPartition land on the non-major
+  // axis. WarpMlsIssueSeq_i = 1 when repetition, else TileShape_i /
   // TileLoadWGPerIssue_i.
   static constexpr ::tl::index_t TileLoadWGPerIssueMN =
       TileLoadWGPerIssue.at(::tl::number<0>{});

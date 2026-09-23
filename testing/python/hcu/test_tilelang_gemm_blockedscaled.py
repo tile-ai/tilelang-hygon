@@ -390,6 +390,9 @@ def matmul_blockscaled(
                     )
                 T.copy_scale(ScaleA_view[k_pad:, mn_pad:], ScaleA_sbuf, op_ctrl=op_ctrl)
                 T.copy_scale(ScaleB_view[k_pad:, mn_pad:], ScaleB_sbuf, op_ctrl=op_ctrl)
+                if use_mls:
+                    T.ptx_wait_group(0)
+                    T.sync_warp()
                 if unpack_a:
                     T.ds_read_format(A_shared, A_fragment)
                 if unpack_b:

@@ -42,6 +42,10 @@ public:
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
   LayoutMap InferLayout(const LayoutInferArgs &T,
                         InferLevel level) const override;
+  bool IsLayoutInferenceComplete(InferLevel level) const override {
+    (void)level;
+    return completed_;
+  }
   TileOperator Clone() const override;
 };
 

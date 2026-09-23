@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import warnings
@@ -185,6 +186,26 @@ def _pass_config_truthy(pass_configs: dict | None, key: PassConfigKey) -> bool:
     return bool(v)
 
 
+def get_hcu_device_compile_flags(pass_configs: dict | None = None) -> list[str]:
+    """Return user-provided device flags in compiler argument form."""
+    cfg = pass_configs or {}
+    extra_flags = cfg.get(PassConfigKey.TL_DEVICE_COMPILE_FLAGS)
+    if extra_flags is None:
+        extra_flags = cfg.get(PassConfigKey.TL_DEVICE_COMPILE_FLAGS.value)
+    if not extra_flags:
+        return []
+    if isinstance(extra_flags, str):
+        return shlex.split(extra_flags)
+
+    tokens = []
+    for flag in extra_flags:
+        if isinstance(flag, str):
+            tokens.extend(shlex.split(flag))
+        else:
+            tokens.append(str(flag))
+    return tokens
+
+
 def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
     # DTK toolchain (e.g. ROCM_PATH=/opt/dtk/...) uses its own defaults; do not inject LLVM hacks.
     # If get_hcu_compiler() resolves to aicc (on PATH), still apply the LLVM tuning flags below.
@@ -210,7 +231,7 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
         if arch in ["gfx938", "gfx92a", "gfx946"]:
             flags.append("-mllvm=-hcu-update-wait-by-reverse-search=true")
             flags.append("-mllvm=-hcu-pre-emit-load-store-opt=false")
-            flags.append("-mllvm=-hcu-trust-special-waitcnt-for-lds-dma=true")
+            # flags.append("-mllvm=-hcu-trust-special-waitcnt-for-lds-dma=true")
         return flags
     else:
         raise ValueError(f"Unsupported architecture: {arch}")
@@ -394,6 +415,7 @@ def compile_hcu(
             raise ValueError("options must be str or list of str")
 
     cfg = pass_config or {}
+    cmd.extend(get_hcu_device_compile_flags(cfg))
     cmd.extend(get_hcu_compile_flags(arch, cfg))
 
     cmd += ["-o", file_target]

@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "hcu/target_utils.h"
+#include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "hcu/utils/mls_boundary.h"
 #include "op/builtin.h"
 
@@ -34,6 +35,103 @@ using namespace ffi;
 using namespace tirx;
 
 namespace {
+
+class BufferOffsetDependencyChecker : public StmtExprVisitor {
+public:
+  enum class Kind { kBlock, kThread };
+
+  BufferOffsetDependencyChecker(
+      Kind kind, const std::unordered_set<const VarNode *> &block_vars,
+      const std::unordered_set<const VarNode *> &thread_vars)
+      : kind_(kind), block_vars_(block_vars), thread_vars_(thread_vars) {}
+
+  bool Check(const PrimExpr &expr) {
+    found_ = false;
+    VisitExpr(expr);
+    return found_;
+  }
+
+private:
+  void VisitExpr_(const VarNode *op) final {
+    if (kind_ == Kind::kBlock)
+      found_ = found_ || block_vars_.count(op);
+    else
+      found_ = found_ || thread_vars_.count(op);
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    if (kind_ == Kind::kThread)
+      found_ = true;
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  Kind kind_;
+  const std::unordered_set<const VarNode *> &block_vars_;
+  const std::unordered_set<const VarNode *> &thread_vars_;
+  bool found_{false};
+};
+
+bool DependsOnBlockIdx(const PrimExpr &expr,
+                       const std::unordered_set<const VarNode *> &block_vars,
+                       const std::unordered_set<const VarNode *> &thread_vars) {
+  return BufferOffsetDependencyChecker(
+             BufferOffsetDependencyChecker::Kind::kBlock, block_vars,
+             thread_vars)
+      .Check(expr);
+}
+
+bool DependsOnThreadIdx(
+    const PrimExpr &expr, const std::unordered_set<const VarNode *> &block_vars,
+    const std::unordered_set<const VarNode *> &thread_vars) {
+  return BufferOffsetDependencyChecker(
+             BufferOffsetDependencyChecker::Kind::kThread, block_vars,
+             thread_vars)
+      .Check(expr);
+}
+
+struct BufferOffsetSplit {
+  PrimExpr block_base;
+  PrimExpr residual;
+};
+
+// Extract blockIdx-dependent, threadIdx-independent additive terms.  This is
+// intentionally syntax-directed: the surrounding buffer annotation is the
+// user's safety contract, so codegen does not attempt range proofs.
+BufferOffsetSplit SplitAnnotatedBufferOffset(
+    const PrimExpr &expr, const std::unordered_set<const VarNode *> &block_vars,
+    const std::unordered_set<const VarNode *> &thread_vars) {
+  PrimExpr zero = make_zero(expr.dtype());
+  if (const auto *add = expr.as<AddNode>()) {
+    BufferOffsetSplit lhs =
+        SplitAnnotatedBufferOffset(add->a, block_vars, thread_vars);
+    BufferOffsetSplit rhs =
+        SplitAnnotatedBufferOffset(add->b, block_vars, thread_vars);
+    return {lhs.block_base + rhs.block_base, lhs.residual + rhs.residual};
+  }
+  if (const auto *sub = expr.as<SubNode>()) {
+    BufferOffsetSplit lhs =
+        SplitAnnotatedBufferOffset(sub->a, block_vars, thread_vars);
+    return {lhs.block_base, lhs.residual - sub->b};
+  }
+  if (const auto *mul = expr.as<MulNode>()) {
+    if (!DependsOnBlockIdx(mul->a, block_vars, thread_vars) &&
+        !DependsOnThreadIdx(mul->a, block_vars, thread_vars)) {
+      BufferOffsetSplit rhs =
+          SplitAnnotatedBufferOffset(mul->b, block_vars, thread_vars);
+      return {mul->a * rhs.block_base, mul->a * rhs.residual};
+    }
+    if (!DependsOnBlockIdx(mul->b, block_vars, thread_vars) &&
+        !DependsOnThreadIdx(mul->b, block_vars, thread_vars)) {
+      BufferOffsetSplit lhs =
+          SplitAnnotatedBufferOffset(mul->a, block_vars, thread_vars);
+      return {lhs.block_base * mul->b, lhs.residual * mul->b};
+    }
+  }
+  if (DependsOnBlockIdx(expr, block_vars, thread_vars) &&
+      !DependsOnThreadIdx(expr, block_vars, thread_vars))
+    return {expr, zero};
+  return {zero, expr};
+}
 
 class InlineIfThenElseAsSelect : public StmtExprMutator {
 public:
@@ -570,9 +668,9 @@ bool CodeGenTileLangHCU::TryToEmitLDSBufferOp(
 
   DataType value_dtype = buffer_store->value.dtype();
   auto store_desc = GetBufferDesc(value_dtype, buffer_store->buffer.get(),
-                                  buffer_store->indices[0]);
+                                  buffer_store->indices[0], false);
   auto load_desc = GetBufferDesc(buffer_load->dtype, buffer_load->buffer.get(),
-                                 buffer_load->indices[0]);
+                                 buffer_load->indices[0], false);
   std::string lds_base =
       HcuCkBufferDstPtrExpr(value_dtype, store_desc.wave_ptr);
   std::string global_base =
@@ -672,7 +770,8 @@ int GetWrapAnnotation(const CallNode *call, const char *key) {
 }
 
 std::string ApplyCPAsyncLdsWrap(const CallNode *op, const Target &target,
-                                std::string dst) {
+                                std::string dst,
+                                std::string annotated_wrap_index = "") {
   const int wrap_offset = GetWrapAnnotation(op, "wrap_offset");
   const int wrap_idx_mask = GetWrapAnnotation(op, "wrap_idx_mask");
   ICHECK_EQ(wrap_offset != 0, wrap_idx_mask != 0)
@@ -685,8 +784,14 @@ std::string ApplyCPAsyncLdsWrap(const CallNode *op, const Target &target,
   ICHECK(wrap_config.encoding != tl::HcuLdsWrapEncoding::kNone)
       << "LDS wrap encoding is not defined for "
       << tl::GetHcuArchString(target);
-  std::string wrap_index =
-      "((((int)threadIdx.x) >> 6) & " + std::to_string(wrap_idx_mask) + ")";
+  std::string wrap_index;
+  if (annotated_wrap_index.empty()) {
+    wrap_index =
+        "((((int)threadIdx.x) >> 6) & " + std::to_string(wrap_idx_mask) + ")";
+  } else {
+    wrap_index = "((" + annotated_wrap_index + ") & " +
+                 std::to_string(wrap_idx_mask) + ")";
+  }
   std::string dword_offset =
       "(" + wrap_index + " * " + std::to_string(wrap_offset) + ")";
   std::string encoded_field;
@@ -791,6 +896,12 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
                                     "_cp_async_idxen_resource");
         idxen_sources.push_back(*source);
       }
+
+      // A transaction-dependent LDS wrap cannot be folded into one base
+      // pointer hoisted outside the copy loop. Keep the per-call pointer path;
+      // the idxen source resource remains hoisted as usual.
+      if (call->annotations.Get(tl::attr::kHcuLdsWrapIndex))
+        return;
 
       // Hoist only destinations where adjacent lanes write adjacent
       // transactions. More general pointer expressions keep the old path.
@@ -1278,31 +1389,24 @@ std::string MlsDataTypeFromLoadTile(const std::string &sym) {
   return args[4];
 }
 
-std::pair<std::string, std::string>
-MlsLastLoadTemplateArgs(const std::string &sym) {
+::tvm::tl::MlsBoundaryModes MlsBoundaryFromLoadTile(const std::string &sym) {
   const std::string prefix = "tl::mls::mls_load_tile<";
   auto args = SplitTopLevelTemplateArgs(
       sym.substr(prefix.size(), sym.size() - prefix.size() - 1));
-  const auto modes = ::tvm::tl::MlsParseBoundaryArgs(args);
-  auto lit = ::tvm::tl::MlsKModeToLastLoadLiterals(modes.k);
-  return {lit.first, lit.second};
+  return ::tvm::tl::MlsParseBoundaryArgs(args);
+  // auto lit = ::tvm::tl::MlsKModeToLastLoadLiterals(modes.k);
+  // return {lit.first, lit.second};
 }
 
 std::string MlsAsyncLoadTemplateArgs(const std::string &template_args) {
   auto args = SplitTopLevelTemplateArgs(template_args);
   ICHECK_GE(args.size(), 1U)
       << "MLS async_load expects at least DataType template arg";
-  const bool has_dst_bits_arg =
-      args.size() > 1 && args[1] != "true" && args[1] != "false";
-  const size_t check_idx = has_dst_bits_arg ? 2 : 1;
-  const size_t last_idx = has_dst_bits_arg ? 3 : 2;
-  const std::string check_last_load =
-      args.size() > check_idx ? args[check_idx] : "true";
-  const std::string last_load =
-      args.size() > last_idx ? args[last_idx] : "false";
-
+  // Hoist emits async_load<dtype, refresh_k, refresh_mn>.
+  const std::string refresh_k = args.size() > 1 ? args[1] : "true";
+  const std::string refresh_mn = args.size() > 2 ? args[2] : "true";
   std::ostringstream os;
-  os << args[0] << ", " << check_last_load << ", " << last_load;
+  os << args[0] << ", " << refresh_k << ", " << refresh_mn;
   return os.str();
 }
 
@@ -1373,7 +1477,10 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
       }
       const std::string resource_init_prefix = "tl::mls::resource_init<";
       const std::string async_load_prefix = "tl::mls::async_load<";
-      const std::string async_load_mn_prefix = "tl::mls::async_load_mn<";
+      const std::string update_k_base_prefix = "tl::mls::update_k_base<";
+      const std::string update_mn_base_prefix = "tl::mls::update_mn_base<";
+      const std::string move_k_base_prefix = "tl::mls::move_k_base<";
+      const std::string move_mn_base_prefix = "tl::mls::move_mn_base<";
 
       if (sym.find(resource_init_prefix) == 0) {
         ICHECK(call->args.size() == 6U || call->args.size() == 7U)
@@ -1412,33 +1519,71 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         return;
       }
 
-      if (sym == "tl::mls::update_base") {
+      if (sym.find(update_k_base_prefix) == 0) {
         ICHECK_EQ(call->args.size(), 3U)
-            << "MLS update_base expects symbol, name, k_base";
+            << "MLS update_k_base expects symbol, name, k_base";
         enable_gemm_mls_ = true;
         const auto *name = call->args[1].as<StringImmNode>();
-        ICHECK(name) << "MLS update_base expects a string resource name";
+        ICHECK(name) << "MLS update_k_base expects a string resource name";
         PrintIndent();
-        stream << name->value << ".update_base(" << PrintExpr(call->args[2])
+        const std::string refresh_k =
+            sym.substr(update_k_base_prefix.size(),
+                       sym.size() - update_k_base_prefix.size() - 1);
+        stream << name->value << ".template update_k_base<" << refresh_k << ">("
+               << PrintExpr(call->args[2]) << ");\n";
+        return;
+      }
+
+      if (sym.find(move_k_base_prefix) == 0) {
+        ICHECK_EQ(call->args.size(), 4U)
+            << "MLS move_k_base expects symbol, name, k_delta, next_k_base";
+        enable_gemm_mls_ = true;
+        const auto *name = call->args[1].as<StringImmNode>();
+        ICHECK(name) << "MLS move_k_base expects a string resource name";
+        const std::string filter_args =
+            sym.substr(move_k_base_prefix.size(),
+                       sym.size() - move_k_base_prefix.size() - 1);
+        PrintIndent();
+        stream << name->value << ".template move_k_base<" << filter_args << ">("
+               << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3])
                << ");\n";
         return;
       }
 
-      if (sym == "tl::mls::update_mn_base") {
+      if (sym.find(move_mn_base_prefix) == 0) {
+        ICHECK_EQ(call->args.size(), 4U)
+            << "MLS move_mn_base expects symbol, name, mn_delta, next_mn_base";
+        enable_gemm_mls_ = true;
+        const auto *name = call->args[1].as<StringImmNode>();
+        ICHECK(name) << "MLS move_mn_base expects a string resource name";
+        const std::string filter_args =
+            sym.substr(move_mn_base_prefix.size(),
+                       sym.size() - move_mn_base_prefix.size() - 1);
+        PrintIndent();
+        stream << name->value << ".template move_mn_base<" << filter_args
+               << ">(" << PrintExpr(call->args[2]) << ", "
+               << PrintExpr(call->args[3]) << ");\n";
+        return;
+      }
+
+      if (sym.find(update_mn_base_prefix) == 0) {
         ICHECK_EQ(call->args.size(), 3U)
             << "MLS update_mn_base expects symbol, name, mn_base";
         enable_gemm_mls_ = true;
         const auto *name = call->args[1].as<StringImmNode>();
         ICHECK(name) << "MLS update_mn_base expects a string resource name";
         PrintIndent();
-        stream << name->value << ".update_mn_base(" << PrintExpr(call->args[2])
-               << ");\n";
+        const std::string refresh_mn =
+            sym.substr(update_mn_base_prefix.size(),
+                       sym.size() - update_mn_base_prefix.size() - 1);
+        stream << name->value << ".template update_mn_base<" << refresh_mn
+               << ">(" << PrintExpr(call->args[2]) << ");\n";
         return;
       }
 
       if (sym.find(async_load_prefix) == 0) {
-        ICHECK_EQ(call->args.size(), 4U)
-            << "MLS async_load expects symbol, name, dst, k_base";
+        ICHECK(call->args.size() == 4U || call->args.size() == 5U)
+            << "MLS async_load expects symbol, name, dst, k_base[, mn_base]";
         enable_gemm_mls_ = true;
         const auto *name = call->args[1].as<StringImmNode>();
         ICHECK(name) << "MLS async_load expects a string resource name";
@@ -1448,24 +1593,10 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         PrintIndent();
         stream << name->value << ".template async_mls_load_asm<"
                << MlsAsyncLoadTemplateArgs(template_args) << ">("
-               << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3])
-               << ");\n";
-        return;
-      }
-
-      if (sym.find(async_load_mn_prefix) == 0) {
-        ICHECK_EQ(call->args.size(), 4U)
-            << "MLS async_load_mn expects symbol, name, dst, mn_base";
-        enable_gemm_mls_ = true;
-        const auto *name = call->args[1].as<StringImmNode>();
-        ICHECK(name) << "MLS async_load_mn expects a string resource name";
-        const std::string template_args =
-            sym.substr(async_load_mn_prefix.size(),
-                       sym.size() - async_load_mn_prefix.size() - 1);
-        PrintIndent();
-        stream << name->value << ".template async_mls_load_asm_mn<"
-               << template_args << ">(" << PrintExpr(call->args[2]) << ", "
-               << PrintExpr(call->args[3]) << ");\n";
+               << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3]);
+        if (call->args.size() == 5U)
+          stream << ", " << PrintExpr(call->args[4]);
+        stream << ");\n";
         return;
       }
     }
@@ -1480,7 +1611,9 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
 
     const std::string base_template = MlsBaseTemplateFromLoadTile(sym);
     const std::string data_type = MlsDataTypeFromLoadTile(sym);
-    const auto [check_last_load, last_load] = MlsLastLoadTemplateArgs(sym);
+    const auto modes = MlsBoundaryFromLoadTile(sym);
+    const std::string refresh_k = ::tvm::tl::MlsRefreshLiteral(modes.k);
+    const std::string refresh_mn = ::tvm::tl::MlsRefreshLiteral(modes.mn);
     const std::string src_ptr = PrintExpr(call->args[1]);
     const std::string stride = PrintExpr(call->args[2]);
     const std::string mn_len = PrintExpr(call->args[3]);
@@ -1501,13 +1634,11 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
            << ");\n";
     PrintIndent();
     stream << obj_name << ".set_window_origin(tl::make_array<tl::index_t>("
-           << mn_base << ", 0));\n";
-    PrintIndent();
-    stream << obj_name << ".update_base(" << k_base << ");\n";
+           << mn_base << ", " << k_base << "));\n";
     PrintIndent();
     stream << obj_name << ".template async_mls_load_asm<" << data_type << ", "
-           << check_last_load << ", " << last_load << ">(" << dst_ptr << ", "
-           << k_base << ");\n";
+           << refresh_k << ", " << refresh_mn << ">(" << dst_ptr << ", "
+           << k_base << ", " << mn_base << ");\n";
     return;
   }
 
@@ -1518,6 +1649,10 @@ void CodeGenTileLangHCU::VisitStmt_(const tirx::ForNode *op) {
   if (op->kind == tirx::ForKind::kUnrolled) {
     PrintIndent();
     stream << "#pragma unroll\n";
+  } else if (op->annotations.find("tl.hcu_loop_unroll_disable") !=
+             op->annotations.end()) {
+    PrintIndent();
+    stream << "#pragma clang loop unroll(disable)\n";
   }
   std::string extent =
       PrintExpr(arith::Analyzer().Simplify(op->extent + op->min));
@@ -1973,7 +2108,7 @@ void CodeGenTileLangHCU::PrintVecBinaryOp(const std::string &op, DataType t,
 
 CodeGenTileLangHCU::BufferDesc
 CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer,
-                                  PrimExpr offset) {
+                                  PrimExpr offset, bool allow_address_rebase) {
   const VarNode *buffer_var = buffer->data.get();
   std::string scope;
 
@@ -1998,6 +2133,19 @@ CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer,
     ICHECK(offset.defined()) << "Non-contiguous ramp offset is not supported.";
   }
 
+  PrimExpr base_offset;
+  if (allow_address_rebase && !t.element_of().is_float4_e2m1fn()) {
+    if (buffer_ops_rebase_param_names_.count(buffer_var->name_hint)) {
+      BufferOffsetSplit split = SplitAnnotatedBufferOffset(
+          offset, block_index_vars_, thread_index_vars_);
+      arith::Analyzer analyzer;
+      base_offset = analyzer.Simplify(split.block_base);
+      offset = analyzer.Simplify(split.residual);
+      if (is_zero(base_offset))
+        base_offset = PrimExpr();
+    }
+  }
+
   std::string data_type = HcuCkTemplateElemType(t);
   int num_elements = t.lanes();
   if (t.element_of().is_float4_e2m1fn()) {
@@ -2020,6 +2168,10 @@ CodeGenTileLangHCU::GetBufferDesc(DataType t, const BufferNode *buffer,
 
   BufferDesc desc;
   desc.wave_ptr = GetVarID(buffer_var);
+  if (base_offset.defined()) {
+    desc.wave_ptr = "((" + desc.wave_ptr + ") + static_cast<uint64_t>(" +
+                    PrintExpr(base_offset) + "))";
+  }
   desc.offset = PrintExpr(offset);
   desc.element_space_size = element_space_size;
   desc.data_type = data_type;
@@ -2040,7 +2192,10 @@ std::string CodeGenTileLangHCU::GetVecLoadWithPredicate(
     DataType t, const BufferNode *buffer, PrimExpr base,
     const std::string &pred) {
   if (CanUseVMBufferOps(buffer, t.lanes())) {
-    auto desc = GetBufferDesc(t, buffer, base);
+    // Address-rebase annotations are store-only until ordinary VM loads have
+    // been validated independently.  Async/direct-to-LDS loads likewise pass
+    // false at their call sites.
+    auto desc = GetBufferDesc(t, buffer, base, false);
     std::string data_type = HcuCkTemplateElemType(t);
     std::ostringstream os;
     os << "*(";
@@ -2555,8 +2710,12 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::ptx_cp_async()) ||
              op->op.same_as(tl::hcu_cp_async_idxen())) {
     int total_bytes = GetTileLangCPAsyncTransferBytes(op);
-    std::string dst =
-        ApplyCPAsyncLdsWrap(op, target_, this->PrintExpr(op->args[0]));
+    std::string annotated_wrap_index;
+    if (auto value = op->annotations.Get(tl::attr::kHcuLdsWrapIndex)) {
+      annotated_wrap_index = this->PrintExpr(Downcast<PrimExpr>(value.value()));
+    }
+    std::string dst = ApplyCPAsyncLdsWrap(
+        op, target_, this->PrintExpr(op->args[0]), annotated_wrap_index);
     std::string src = this->PrintExpr(op->args[1]);
     std::string size = std::to_string(total_bytes);
     bool use_idxen = op->op.same_as(tl::hcu_cp_async_idxen());
@@ -3322,6 +3481,27 @@ void CodeGenTileLangHCU::VisitStmt_(const AttrStmtNode *op) {
         }
       }
     }
+  } else if (op->attr_key == tl::attr::kBufferOpsRebaseMap) {
+    const auto *var = op->node.as<VarNode>();
+    ICHECK(var) << tl::attr::kBufferOpsRebaseMap
+                << " expects the buffer data Var in AttrStmt.node";
+
+    const auto *enabled = op->value.as<IntImmNode>();
+    ICHECK(enabled) << tl::attr::kBufferOpsRebaseMap
+                    << " expects a constant boolean value";
+
+    const std::string name = var->name_hint;
+    const bool was_enabled = buffer_ops_rebase_param_names_.count(name);
+    if (enabled->value != 0)
+      buffer_ops_rebase_param_names_.insert(name);
+    else
+      buffer_ops_rebase_param_names_.erase(name);
+    this->VisitStmt(op->body);
+    if (was_enabled)
+      buffer_ops_rebase_param_names_.insert(name);
+    else
+      buffer_ops_rebase_param_names_.erase(name);
+    return;
   }
   CodeGenC::VisitStmt_(op);
 }
@@ -3733,6 +3913,22 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   // reserve keywords
   ReserveKeywordsAsUnique();
   buffer_ops_disable_param_names_.clear();
+  buffer_ops_rebase_param_names_.clear();
+  block_index_vars_.clear();
+  thread_index_vars_.clear();
+  PostOrderVisit(f->body, [&](const ObjectRef &object) {
+    const auto *attr = object.as<AttrStmtNode>();
+    if (!attr || attr->attr_key != tirx::attr::thread_extent)
+      return;
+    const auto *iter = attr->node.as<IterVarNode>();
+    if (!iter)
+      return;
+    const std::string thread_tag = iter->thread_tag;
+    if (thread_tag.rfind("blockIdx.", 0) == 0)
+      block_index_vars_.insert(iter->var.get());
+    else if (thread_tag.rfind("threadIdx.", 0) == 0)
+      thread_index_vars_.insert(iter->var.get());
+  });
   cp_async_resource_var_names_.clear();
   cp_async_idxen_resource_var_names_.clear();
   mls_resource_object_counter_ = 0;

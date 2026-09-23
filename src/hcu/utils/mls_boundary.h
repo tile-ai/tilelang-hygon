@@ -52,16 +52,12 @@ inline MlsBoundaryMode MlsParseModeToken(const std::string &s) {
   return MlsBoundaryMode::kAnalyze;
 }
 
-inline const char *MlsModeLiteral(MlsBoundaryMode m) {
-  switch (m) {
-  case MlsBoundaryMode::kAnalyze:
-    return "-1";
-  case MlsBoundaryMode::kSkip:
-    return "0";
-  case MlsBoundaryMode::kRefresh:
-    return "1";
-  }
-  return "-1";
+inline bool MlsOneShotRefresh(MlsBoundaryMode m) {
+  return m != MlsBoundaryMode::kSkip;
+}
+
+inline const char *MlsRefreshLiteral(MlsBoundaryMode m) {
+  return MlsOneShotRefresh(m) ? "true" : "false";
 }
 
 inline MlsBoundaryMode MlsModeFromInt(int64_t value) {

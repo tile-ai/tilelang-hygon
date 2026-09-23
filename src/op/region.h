@@ -57,6 +57,10 @@ public:
              arith::Analyzer *analyzer) const override;
   LayoutMap InferLayout(const LayoutInferArgs &layout_args,
                         InferLevel level) const override;
+  bool IsLayoutInferenceComplete(InferLevel level) const override {
+    (void)level;
+    return true;
+  }
 
   const Buffer &GetBuffer() const { return buffer_; }
   const Array<Range> &GetRanges() const { return ranges_; }

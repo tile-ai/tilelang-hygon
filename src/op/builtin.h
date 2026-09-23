@@ -32,6 +32,9 @@ static constexpr const char *kCustomWarpSpecialization =
     "kCustomWarpSpecialization";
 static constexpr const char *kDirectToLDSMap = "direct_to_lds_map";
 static constexpr const char *kDisableBufferOpsMap = "disable_buffer_ops_map";
+// Lexical map authorizing HCU codegen to move blockIdx-dependent terms from
+// ordinary VM buffer-store offsets into the 64-bit resource base.
+static constexpr const char *kBufferOpsRebaseMap = "buffer_ops_rebase_map";
 // Loop annotation key controlling whether PTX async-copy rewriting is enabled
 // in the annotated loop subtree. Value should be Bool (False/True).
 static constexpr const char *kLoopPreferAsync = "parallel_prefer_async";
