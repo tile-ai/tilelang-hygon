@@ -1,4 +1,4 @@
-"""Run with: torchrun --standalone --nproc_per_node=2 ipc_two_rank_smoke.py."""
+"""Run with torchrun or the MPI command in test_ipc_runtime.py."""
 
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ from tilelang.distributed.backends.ipc import IpcAllocator
 
 
 def main() -> None:
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ.get("RANK") or os.environ["OMPI_COMM_WORLD_RANK"])
+    world_size = int(os.environ.get("WORLD_SIZE") or os.environ["OMPI_COMM_WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK") or os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
     if world_size != 2:
         raise RuntimeError(f"IPC smoke requires exactly 2 ranks, got {world_size}")
     if torch.cuda.device_count() < world_size:
@@ -22,7 +22,10 @@ def main() -> None:
 
     torch.cuda.set_device(local_rank)
     print(f"ipc-smoke rank={rank} stage=set-device device={local_rank}", flush=True)
-    dist.init_process_group("gloo")
+    # torchrun exports RANK/WORLD_SIZE, whereas Open MPI exposes its rank
+    # variables under OMPI_COMM_WORLD_*. Pass normalized values rather than
+    # depending on env:// to find torchrun-specific variable names.
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
     print(f"ipc-smoke rank={rank} stage=process-group", flush=True)
     allocator = None
     try:

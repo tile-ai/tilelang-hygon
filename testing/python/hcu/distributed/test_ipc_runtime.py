@@ -2,6 +2,7 @@ import pytest
 import os
 import subprocess
 from pathlib import Path
+import sys
 
 from tilelang import tvm
 
@@ -44,11 +45,13 @@ def test_ipc_two_rank_handle_exchange_smoke():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two HCU devices")
     script = Path(__file__).with_name("ipc_two_rank_smoke.py")
+    env = os.environ.copy()
+    env.setdefault("MASTER_ADDR", "127.0.0.1")
+    env.setdefault("MASTER_PORT", "29641")
     result = subprocess.run(
-        ["torchrun", "--standalone", "--nproc_per_node=2", str(script)],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=120,
+        ["mpirun", "--allow-run-as-root", "-np", "2", "-x", "PYTHONPATH", "-x", "LD_LIBRARY_PATH",
+         "-x", "HSA_USE_SVM", "-x", "HSA_FORCE_FINE_GRAIN_PCIE", "-x", "MASTER_ADDR", "-x", "MASTER_PORT",
+         sys.executable, str(script)],
+        check=False, capture_output=True, text=True, timeout=120, env=env,
     )
     assert result.returncode == 0, result.stdout + result.stderr
