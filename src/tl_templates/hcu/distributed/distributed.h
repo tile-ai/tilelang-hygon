@@ -7,7 +7,7 @@
 
 #include <stdint.h>
 
-extern "C" __device__ uint64_t __tilelang_ipc_metadata[1024];
+extern "C" __device__ volatile uint64_t __tilelang_ipc_metadata[1024];
 
 namespace tl {
 

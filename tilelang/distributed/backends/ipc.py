@@ -172,6 +172,9 @@ class IpcMetadataInitializer:
 
     def __init__(self) -> None:
         self._initialized: dict[tuple[int, int], int] = {}
+        # Keep both the PyTorch owner and its TVM DLPack view alive until this
+        # module/device pair is initialized again for a newer generation.
+        self._metadata_payloads: dict[tuple[int, int], tuple[Any, Any]] = {}
 
     def initialize(self, module: Any, allocator: IpcAllocator, *, metadata_tensor: Any = None) -> bool:
         """Launch the module helper when its cached allocator generation is stale.
@@ -190,6 +193,18 @@ class IpcMetadataInitializer:
             import torch
 
             metadata_tensor = torch.tensor(payload, dtype=torch.uint64, device=f"cuda:{allocator.device}")
-        helper(metadata_tensor, len(payload))
+        import torch
+
+        if not isinstance(metadata_tensor, torch.Tensor):
+            helper_arg = metadata_tensor
+        else:
+            import ctypes
+
+            # ROCm Module FunctionInfo declares an opaque handle.  A ctypes
+            # void pointer maps to HANDLE_TO_HANDLE; passing a Tensor/NDArray
+            # would instead pass a host-side descriptor address.
+            helper_arg = ctypes.c_void_p(metadata_tensor.data_ptr())
+        helper(helper_arg, len(payload))
+        self._metadata_payloads[key] = (metadata_tensor, helper_arg)
         self._initialized[key] = allocator.generation
         return True
