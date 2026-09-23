@@ -91,10 +91,10 @@ def main(M=4096, N=4096, K=4096):
     total_flops = 2 * M * N * K
 
     BLOCK_M = 128
-    BLOCK_N = 256
+    BLOCK_N = 128
     BLOCK_K = 64
     threads = 256
-    num_stages = 3
+    num_stages = 0
 
     persistent_kernel = matmul_persistent.compile(
         M=M, N=N, K=K, block_M=BLOCK_M, block_N=BLOCK_N, block_K=BLOCK_K, threads=threads, num_stages=num_stages
