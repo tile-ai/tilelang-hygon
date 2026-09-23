@@ -67,3 +67,23 @@ def test_ipc_template_handles_full_3d_block_and_invalid_peer_guard():
     assert "index += thread_count" in template
     assert "src_pe < 0 || src_pe >= world_size" in template
     assert "dst[index] = DstT{}" in template
+
+
+def test_ipc_get_block_accepts_buffer_address_expressions():
+    @T.prim_func
+    def main(out: T.Tensor((16,), "float32"), src: T.Tensor((16,), "float32")):
+        with T.Kernel(1, threads=32):
+            peer_tile = T.alloc_shared((16,), "float32")
+            T.get_block(
+                T.address_of(src[0]),
+                T.address_of(peer_tile[0]),
+                16,
+                T.get_rank() ^ 1,
+            )
+
+    artifact = lower(
+        main.with_attr("global_symbol", "main"),
+        target={"kind": "hcu", "mcpu": "gfx938", "dist_backend": "ipc"},
+    )
+    assert "// tilelang_ipc_remote_source: src" in artifact.kernel_source
+    assert "tl::ipc_get_block" in artifact.kernel_source
