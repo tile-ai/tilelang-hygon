@@ -24,23 +24,20 @@ _configure_torch_extensions_dir()
 
 random.seed(0)
 
-try:
-    import torch
-except ImportError:
-    pass
-else:
-    torch.manual_seed(0)
-    # Workaround: hipBLASLt on ROCm 7.1 nightly has a bug with certain matmul shapes.
-    # Prefer hipblas first, then fall back to hipblaslt if PyTorch rejects "hipblas".
-    # if hasattr(torch.version, "hip") and torch.version.hip:
-    #     _blas = getattr(torch.backends.cuda, "preferred_blas_library", None)
-    #     if callable(_blas):
-    #         for _name in ("hipblas", "hipblaslt"):
-    #             try:
-    #                 _blas(_name)
-    #                 break
-    #             except RuntimeError:
-    #                 continue
+# This opt-in test launches two independent HCU processes through MPI.  Do not
+# import torch in the pytest parent: on this platform the import initializes
+# HIP state, and the driver can terminate pytest while IPC children tear down.
+_ipc_mpi_test = (
+    os.environ.get("TILELANG_RUN_HCU_IPC_TESTS") == "1"
+    and any("hcu/distributed" in arg.replace("\\", "/") for arg in sys.argv)
+)
+if not _ipc_mpi_test:
+    try:
+        import torch
+    except ImportError:
+        pass
+    else:
+        torch.manual_seed(0)
 
 try:
     import numpy as np
