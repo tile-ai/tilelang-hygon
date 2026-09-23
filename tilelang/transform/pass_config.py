@@ -68,6 +68,9 @@ class PassConfigKey(str, Enum):
     """The PTXAS register usage level in [0, 10], which controls the
     aggressiveness of optimizations that affect register usage. Default: None"""
 
+    TL_Z3_RLIMIT = "tl.z3_rlimit"
+    """Resource limit for Z3 arithmetic proofs. Default: 10000."""
+
     TL_DEVICE_COMPILE_FLAGS = "tl.device_compile_flags"
     """Additional device compiler flags passed to nvcc/NVRTC.
 

@@ -9,8 +9,8 @@ import example_gqa_decode_varlen_logits
 _is_cutedsl = os.environ.get("TILELANG_TARGET", "").lower() == "cutedsl"
 
 
-@tilelang.testing.requires_cuda
-@tilelang.testing.requires_cuda_compute_version_le(8, 9)
+# @tilelang.testing.requires_cuda
+# @tilelang.testing.requires_cuda_compute_version_le(8, 9)
 @pytest.mark.skipif(_is_cutedsl, reason="CuTeDSL backend does not support alloc_global yet")
 def test_example_example_gqa_decode():
     example_gqa_decode.main()
