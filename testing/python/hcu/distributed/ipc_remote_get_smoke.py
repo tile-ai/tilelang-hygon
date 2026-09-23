@@ -12,6 +12,9 @@ from tilelang.distributed.backends.ipc import IpcAllocator
 
 
 N = 128
+GEMM_M = 64
+GEMM_N = 64
+GEMM_K = 64
 
 
 def allreduce_kernel():
@@ -47,6 +50,52 @@ def remote_get_kernel():
     return main
 
 
+def gemm_kernel():
+    """Local GEMM writing directly into an IPC-arena partial-C buffer."""
+
+    @T.prim_func
+    def main(
+        a: T.Tensor((GEMM_M, GEMM_K), "float32"),
+        b: T.Tensor((GEMM_K, GEMM_N), "float32"),
+        c: T.Tensor((GEMM_M, GEMM_N), "float32"),
+    ):
+        with T.Kernel(1, 1, threads=128):
+            a_shared = T.alloc_shared((GEMM_M, 32), "float32")
+            b_shared = T.alloc_shared((32, GEMM_N), "float32")
+            c_local = T.alloc_fragment((GEMM_M, GEMM_N), "float32")
+            T.clear(c_local)
+            for k in T.Pipelined(2, num_stages=0):
+                T.copy(a[0, k * 32], a_shared)
+                T.copy(b[k * 32, 0], b_shared)
+                T.gemm(a_shared, b_shared, c_local)
+            T.copy(c_local, c)
+
+    return main
+
+
+def gemm_allreduce_kernel():
+    """IPC pull AllReduce of two rank-local GEMM partial-C buffers."""
+
+    @T.prim_func
+    def main(
+        out: T.Tensor((GEMM_M, GEMM_N), "float32"),
+        src: T.Tensor((GEMM_M, GEMM_N), "float32"),
+    ):
+        with T.Kernel(1, threads=128):
+            peer = T.alloc_shared((GEMM_M, GEMM_N), "float32")
+            T.get_block(
+                T.address_of(src[0, 0]),
+                T.address_of(peer[0, 0]),
+                GEMM_M * GEMM_N,
+                T.get_rank() ^ 1,
+            )
+            T.sync_threads()
+            for i, j in T.Parallel(GEMM_M, GEMM_N):
+                out[i, j] = src[i, j] + peer[i, j]
+
+    return main
+
+
 def main() -> None:
     rank = int(os.environ.get("RANK") or os.environ["OMPI_COMM_WORLD_RANK"])
     world_size = int(os.environ.get("WORLD_SIZE") or os.environ["OMPI_COMM_WORLD_SIZE"])
@@ -56,7 +105,7 @@ def main() -> None:
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
-    allocator = IpcAllocator(4096, rank=rank, world_size=world_size, device=local_rank, group=dist.group.WORLD)
+    allocator = IpcAllocator(32768, rank=rank, world_size=world_size, device=local_rank, group=dist.group.WORLD)
     try:
         allocator.initialize()
         arch = torch.cuda.get_device_properties(local_rank).gcnArchName.split(":", 1)[0]
@@ -92,6 +141,45 @@ def main() -> None:
         if not torch.all(reduced == 3.0):
             raise RuntimeError(f"rank {rank}: allreduce result {reduced.cpu().tolist()} != 3.0")
         print(f"ipc-allreduce rank={rank} value={reduced[0].item()}", flush=True)
+        dist.barrier()
+
+        # The GEMM output is supplied as an input (out_idx=[]), so the first
+        # kernel writes into the same IPC arena consumed by the second kernel.
+        a = torch.full((GEMM_M, GEMM_K), float(rank + 1), device=f"cuda:{local_rank}")
+        b = torch.full((GEMM_K, GEMM_N), 2.0, device=f"cuda:{local_rank}")
+        partial = tilelang.tensor((GEMM_M, GEMM_N), torch.float32, allocator=allocator)
+        gemm = tilelang.compile(
+            gemm_kernel(), out_idx=[], target={"kind": "hcu", "mcpu": arch}
+        )
+        gemm(a, b, partial)
+        torch.cuda.synchronize(local_rank)
+        expected_partial = torch.full_like(partial, float((rank + 1) * 2 * GEMM_K))
+        if not torch.allclose(partial, expected_partial, atol=1e-3, rtol=1e-3):
+            raise RuntimeError(f"rank {rank}: GEMM partial-C is incorrect")
+        dist.barrier()
+
+        gemm_allreduce = tilelang.compile(
+            gemm_allreduce_kernel(),
+            out_idx=[0],
+            target={"kind": "hcu", "mcpu": arch, "dist_backend": "ipc"},
+        )
+        gemm_allreduce.initialize(allocator)
+        result = gemm_allreduce(partial)
+        torch.cuda.synchronize(local_rank)
+        expected = torch.full_like(result, float(6 * GEMM_K))
+        if not torch.allclose(result, expected, atol=1e-3, rtol=1e-3):
+            raise RuntimeError(f"rank {rank}: GEMM+AllReduce result is incorrect")
+        print(f"ipc-gemm-allreduce rank={rank} value={result[0, 0].item()}", flush=True)
+        dist.barrier()
+
+        # tilelang.tensor creates non-owning views. Drop every view before
+        # closing the backing IPC arena; otherwise HCU cleanup can dereference
+        # an already-unmapped HIP allocation during process teardown.
+        del result, expected, gemm_allreduce, partial, expected_partial, gemm, a, b
+        del reduced, allreduce, out, kernel, src
+        import gc
+        gc.collect()
+        torch.cuda.synchronize(local_rank)
         dist.barrier()
     finally:
         allocator.close()
