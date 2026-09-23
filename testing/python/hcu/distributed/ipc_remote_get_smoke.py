@@ -14,6 +14,24 @@ from tilelang.distributed.backends.ipc import IpcAllocator
 N = 128
 
 
+def allreduce_kernel():
+    @T.prim_func
+    def main(out: T.Tensor((N,), "float32"), src: T.Tensor((N,), "float32")):
+        with T.Kernel(1, threads=64):
+            peer = T.alloc_shared((N,), "float32")
+            T.get_block(
+                T.address_of(src[0]),
+                T.address_of(peer[0]),
+                N,
+                T.get_rank() ^ 1,
+            )
+            T.sync_threads()
+            for i in T.Parallel(N):
+                out[i] = src[i] + peer[i]
+
+    return main
+
+
 def remote_get_kernel():
     @T.prim_func
     def main(out: T.Tensor((N,), "float32"), src: T.Tensor((N,), "float32")):
@@ -63,6 +81,17 @@ def main() -> None:
         if not torch.all(out == expected):
             raise RuntimeError(f"rank {rank}: remote get result {out.cpu().tolist()} != {expected}")
         print(f"ipc-remote-get rank={rank} value={out[0].item()}", flush=True)
+        allreduce = tilelang.compile(
+            allreduce_kernel(),
+            out_idx=[0],
+            target={"kind": "hcu", "mcpu": arch, "dist_backend": "ipc"},
+        )
+        allreduce.initialize(allocator)
+        reduced = allreduce(src)
+        torch.cuda.synchronize(local_rank)
+        if not torch.all(reduced == 3.0):
+            raise RuntimeError(f"rank {rank}: allreduce result {reduced.cpu().tolist()} != 3.0")
+        print(f"ipc-allreduce rank={rank} value={reduced[0].item()}", flush=True)
         dist.barrier()
     finally:
         allocator.close()
