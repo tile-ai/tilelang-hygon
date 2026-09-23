@@ -32,7 +32,7 @@ public:
 
   std::string ModulePreamble() const final {
     return R"(
-extern "C" __device__ uint64_t __tilelang_ipc_metadata[1024];
+extern "C" __device__ volatile uint64_t __tilelang_ipc_metadata[1024] = {};
 
 extern "C" __global__ void __tilelang_init_ipc_metadata(
     const uint64_t* source, int64_t count) {
