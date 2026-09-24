@@ -18,7 +18,6 @@ def get_configs():
     out_idx=[3],
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-        tilelang.PassConfigKey.TIR_USE_ASYNC_COPY: False,
     },
 )
 def flashattn(batch, heads, seq_len, dim, is_causal, block_M=64, block_N=64, num_stages=1, threads=128):

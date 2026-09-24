@@ -547,8 +547,8 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   // producer wave/transaction pairs determine how many distinct phases can
   // be encoded. A wave can select a different hardware wrap for each of its
   // statically unrolled copy transactions.
-  const int wrap_count = LargestPowerOfTwoDivisorAtMost(available_wrap_phases,
-                                                        required_wrap_count);
+  int wrap_count = LargestPowerOfTwoDivisorAtMost(available_wrap_phases,
+                                                  required_wrap_count);
   if (!IsPowerOfTwo(wrap_count) || wrap_count > available_wrap_phases) {
     return std::nullopt;
   }
@@ -562,6 +562,16 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
     // Select the smallest wrap that separates adjacent repeated-bank groups.
     params.wrap_offset =
         SelectWrapOffset(params, *geometry, wrap_count, available_wrap_phases);
+    if (params.wrap_offset > 0) {
+      // Limit the selected phases to the distinct bank rotations produced by
+      // this wrap offset on the current target.
+      const int bank_shift = params.wrap_offset % params.bank_num;
+      const int bank_wrap_capacity =
+          params.bank_num / std::gcd(params.bank_num, bank_shift);
+      wrap_count = LargestPowerOfTwoDivisorAtMost(
+          available_wrap_phases, std::min(wrap_count, bank_wrap_capacity));
+      params.wrap_idx_mask = wrap_count - 1;
+    }
   }
   const int wrap_step_bytes = params.wrap_offset * 4;
   if (!IsLegalHcuGemmLdsWrap(*geometry, wrap_step_bytes, wrap_count,
