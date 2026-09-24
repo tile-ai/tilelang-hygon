@@ -74,6 +74,11 @@ static constexpr const char *kLexicalAllocScope = "lexical_alloc_scope";
 static constexpr const char *kHcuWdra = "tl.hcu_wdra";
 static constexpr const char *kHcuWdraWavesPerTg = "tl.hcu_wdra_waves_per_tg";
 static constexpr const char *kHcuScaleBufferSize = "tl.hcu_scale_buffer_size";
+// AttrStmt/call annotation value is the cache-swizzle stride in bytes. HCU
+// codegen uses it for enclosed VMEM copies; address and resource range stay
+// unchanged.
+static constexpr const char *kHcuBufferCacheSwizzleStride =
+    "tl.hcu_buffer_cache_swizzle_stride";
 // AttrStmt key carrying Map<String, PrimExpr> from MLS destination buffer data
 // Var name to the byte size required by the backend LDS layout.
 static constexpr const char *kMlsActualSizeBytesMap =
