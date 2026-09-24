@@ -55,6 +55,41 @@ def test_ipc_collective_close_orders_sync_barrier_unmap_and_free():
     assert events == ["sync", "barrier", "close:0x2000", "free:0x1000"]
 
 
+@pytest.mark.parametrize(
+    "failed_stage, expected_closed",
+    [
+        ("allocation", []),
+        ("handle creation", []),
+        ("peer mapping", [0x2000]),
+    ],
+)
+def test_ipc_collective_initialization_propagates_remote_failure_and_cleans_up(
+    failed_stage, expected_closed
+):
+    class Group:
+        def all_gather_object(self, value):
+            if isinstance(value, tuple):
+                rank, stage, error = value
+                peer_error = f"injected {stage} failure" if stage == failed_stage else None
+                return [value, (1, stage, peer_error)]
+            if isinstance(value, bytes):
+                return [value, b"peer"]
+            if isinstance(value, int):
+                return [value, 1]
+            raise AssertionError(f"unexpected exchange value: {value!r}")
+
+    runtime = FakeRuntime()
+    allocator = IpcAllocator(
+        1024, rank=0, world_size=2, device=0, group=Group(), runtime=runtime
+    )
+    with pytest.raises(RuntimeError, match=rf"IPC {failed_stage} failed across ranks"):
+        allocator.initialize()
+    assert runtime.closed == expected_closed
+    assert runtime.freed == [0x1000]
+    assert allocator._base == 0
+    assert allocator._peer_bases == []
+
+
 def test_ipc_arena_rejects_bad_requests():
     allocator = IpcAllocator(128, rank=0, world_size=1, device=0, runtime=FakeRuntime())
     allocator.initialize()
