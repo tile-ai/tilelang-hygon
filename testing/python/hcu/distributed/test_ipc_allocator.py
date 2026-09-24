@@ -18,7 +18,7 @@ class FakeRuntime:
 
 def test_ipc_arena_offsets_metadata_generation_and_close():
     runtime = FakeRuntime()
-    allocator = IpcAllocator(1024, rank=0, world_size=2, device=0, runtime=runtime)
+    allocator = IpcAllocator(1024, rank=0, world_size=2, device=0, runtime=runtime, synchronize=lambda: None)
     allocator.initialize(handles=[b"local", b"peer"], device_ids=[0, 1])
     first, second = allocator.allocate(3), allocator.allocate(5)
     assert (first.offset, second.offset) == (0, 256)
@@ -28,6 +28,31 @@ def test_ipc_arena_offsets_metadata_generation_and_close():
     allocator.close(); allocator.close()
     assert runtime.closed == [0x2000] and runtime.freed == [0x1000]
     assert allocator.generation == generation + 1
+
+
+def test_ipc_collective_close_orders_sync_barrier_unmap_and_free():
+    events = []
+
+    class Runtime(FakeRuntime):
+        def close_handle(self, ptr):
+            events.append(f"close:{ptr:#x}")
+            super().close_handle(ptr)
+
+        def free(self, ptr):
+            events.append(f"free:{ptr:#x}")
+            super().free(ptr)
+
+    class Group:
+        def barrier(self):
+            events.append("barrier")
+
+    allocator = IpcAllocator(
+        1024, rank=0, world_size=2, device=0, group=Group(), runtime=Runtime(),
+        synchronize=lambda: events.append("sync"),
+    )
+    allocator.initialize(handles=[b"local", b"peer"], device_ids=[0, 1])
+    allocator.close()
+    assert events == ["sync", "barrier", "close:0x2000", "free:0x1000"]
 
 
 def test_ipc_arena_rejects_bad_requests():
