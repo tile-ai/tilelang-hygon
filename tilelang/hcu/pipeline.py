@@ -34,6 +34,11 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.IfStmtBinding()(mod)
     mod = tilelang.transform.PipelinePlanning()(mod)
+    # Two-phase HCU GEMM LDS strategy: AnnotateMlsGemmDep only parks pending
+    # layouts on plain T.copy. This pass must run after PipelinePlanning so
+    # async-producer selection is known, then rewrite AN/BT S2R copies to
+    # ds_read_m32x16. Dropped in the gcy_develop/main merge.
+    mod = tilelang.transform.MaterializeHcuGemmLdsStrategy()(mod)
     mod = tilelang.transform.RegisterPipelinePlanning()(mod)
     mod = tilelang.transform.InjectRegisterSoftwarePipeline()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)
