@@ -1,10 +1,9 @@
 import pytest
 import os
-import subprocess
 from pathlib import Path
-import sys
 
 from tilelang import tvm
+from testing.python.hcu.distributed._utils import run_hcu_script
 
 
 IPC_FFI_NAMES = (
@@ -38,20 +37,11 @@ def test_ipc_runtime_rejects_invalid_arguments_without_a_device():
         close_handle(0)
 
 
-@pytest.mark.skipif(os.environ.get("TILELANG_RUN_HCU_IPC_TESTS") != "1", reason="requires two P2P HCU devices")
-def test_ipc_two_rank_handle_exchange_smoke():
-    import torch
-
-    if torch.cuda.device_count() < 2:
-        pytest.skip("requires two HCU devices")
+@pytest.mark.skipif(
+    os.environ.get("TILELANG_RUN_HCU_IPC_TESTS") != "1",
+    reason="requires two P2P HCU devices",
+)
+@pytest.mark.parametrize("launcher,port", [("mpi", 29641), ("torchrun", 29646)])
+def test_ipc_two_rank_handle_exchange_smoke(launcher, port):
     script = Path(__file__).with_name("ipc_two_rank_smoke.py")
-    env = os.environ.copy()
-    env.setdefault("MASTER_ADDR", "127.0.0.1")
-    env.setdefault("MASTER_PORT", "29641")
-    result = subprocess.run(
-        ["mpirun", "--allow-run-as-root", "-np", "2", "-x", "PYTHONPATH", "-x", "LD_LIBRARY_PATH",
-         "-x", "HSA_USE_SVM", "-x", "HSA_FORCE_FINE_GRAIN_PCIE", "-x", "MASTER_ADDR", "-x", "MASTER_PORT",
-         sys.executable, str(script)],
-        check=False, capture_output=True, text=True, timeout=120, env=env,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+    run_hcu_script(script, world_size=2, port=port, launcher=launcher, timeout=180)
