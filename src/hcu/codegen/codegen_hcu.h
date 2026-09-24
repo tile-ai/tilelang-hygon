@@ -11,6 +11,7 @@
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/op.h>
 
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -106,6 +107,16 @@ private:
     int smem_offset;
   };
 
+  struct HoistedCPAsyncResource {
+    std::string name;
+    std::optional<int64_t> cache_swizzle_stride;
+  };
+
+  struct HoistedCPAsyncIdxenResource {
+    std::string name;
+    int struct_stride_byte_bit;
+  };
+
   // Handle volatile loads
   void HandleVolatileLoads(const std::string &value, const BufferLoadNode *op,
                            std::ostream &os) final;
@@ -171,6 +182,10 @@ private:
 
   bool TryToEmitLDSBufferOp(const BufferStoreNode *op);
   void EmitHoistedCPAsyncResources(const PrimFunc &f);
+  void EmitCPAsyncResource(const VarNode *source_var,
+                           const HoistedCPAsyncResource &resource);
+  void EmitCPAsyncIdxenResource(const VarNode *source_var,
+                                const HoistedCPAsyncIdxenResource &resource);
 
   friend void PrintConst(const FloatImmNode *op, std::ostream &os,
                          CodeGenTileLangHCU *p);
@@ -217,6 +232,12 @@ private:
   std::unordered_map<const VarNode *, std::string> cp_async_resource_var_names_;
   std::unordered_map<const VarNode *, std::string>
       cp_async_idxen_resource_var_names_;
+  std::unordered_map<Var, HoistedCPAsyncResource, ffi::ObjectPtrHash,
+                     ffi::ObjectPtrEqual>
+      cp_async_resources_to_emit_;
+  std::unordered_map<Var, HoistedCPAsyncIdxenResource, ffi::ObjectPtrHash,
+                     ffi::ObjectPtrEqual>
+      cp_async_idxen_resources_to_emit_;
   std::unordered_map<Var, std::vector<HoistedCPAsyncLdsBase>,
                      ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
       cp_async_idxen_lds_bases_to_emit_;
@@ -225,6 +246,7 @@ private:
       cp_async_idxen_lds_base_uses_;
   int mls_resource_object_counter_{0};
   bool wdra_init_emitted_{false};
+  std::optional<int64_t> buffer_cache_swizzle_stride_bytes_;
   Target target_;
 };
 
