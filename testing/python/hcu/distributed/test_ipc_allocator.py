@@ -84,6 +84,28 @@ def test_metadata_initializer_is_generation_aware():
     assert module.calls == [("metadata", 3), ("replacement", 3)]
 
 
+@pytest.mark.parametrize(
+    "metadata, message",
+    [
+        ((0, 1), "count"),
+        ((1, 1, 0x1000), "rank/world_size"),
+        ((0, 2, 0x1000), "count"),
+        ((0, 1023, *(0x1000 for _ in range(1023))), "capacity"),
+    ],
+)
+def test_metadata_initializer_rejects_inconsistent_payload(metadata, message):
+    class Module:
+        def get_function(self, name, query_imports=False):
+            return lambda tensor, count: pytest.fail("invalid metadata must not launch the helper")
+
+    allocator = IpcAllocator(128, rank=0, world_size=1, device=0, runtime=FakeRuntime())
+    allocator.initialize()
+    allocator._peer_bases = list(metadata[2:])
+    allocator.rank, allocator.world_size = metadata[:2]
+    with pytest.raises(RuntimeError, match=message):
+        IpcMetadataInitializer().initialize(Module(), allocator, metadata_tensor="metadata")
+
+
 def test_jit_kernel_initialize_delegates_to_distributed_adapter():
     class Adapter:
         def initialize_ipc_metadata(self, allocator, stream=None):
@@ -103,6 +125,29 @@ def test_tvm_hcu_stream_restores_previous_stream():
         assert current[0] == 42
     assert current[0] == 7
     assert calls == [(0, 42), (0, 7)]
+
+
+def test_ipc_adapter_initialization_is_idempotent_per_allocator_generation():
+    class Kind:
+        name = "hcu"
+
+    class Target:
+        kind = Kind()
+        attrs = {"dist_backend": "ipc"}
+
+    class Allocator:
+        device = 0
+        generation = 3
+
+    allocator = Allocator()
+    adapter = TVMFFIKernelAdapter.__new__(TVMFFIKernelAdapter)
+    adapter.target = Target()
+    adapter._ipc_allocator = allocator
+    adapter._ipc_initialized_generation = allocator.generation
+    adapter.rt_mod = None
+    adapter.executable = None
+
+    assert not adapter.initialize_ipc_metadata(allocator)
 
 
 def test_ipc_launch_rejects_missing_or_stale_allocator_generation():
