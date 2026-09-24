@@ -37,6 +37,31 @@ def allreduce_kernel():
     return main
 
 
+def allreduce_bf16_kernel():
+    """All-peer BF16 pull with FP32 accumulation."""
+
+    @T.prim_func
+    def main(out: T.Tensor((N,), "float32"), src: T.Tensor((N,), "bfloat16")):
+        with T.Kernel(1, threads=64):
+            peer = T.alloc_shared((N,), "bfloat16")
+            for i in T.Parallel(N):
+                out[i] = 0.0
+            T.sync_threads()
+            for src_pe in T.serial(T.get_num_ranks()):
+                T.get_block(
+                    T.address_of(src[0]),
+                    T.address_of(peer[0]),
+                    N,
+                    src_pe,
+                )
+                T.sync_threads()
+                for i in T.Parallel(N):
+                    out[i] += T.Cast("float32", peer[i])
+                T.sync_threads()
+
+    return main
+
+
 def _rank_env(name: str) -> int:
     mpi_name = {
         "RANK": "OMPI_COMM_WORLD_RANK",
@@ -76,7 +101,23 @@ def main() -> None:
         print(f"ipc-allpeer-allreduce rank={rank} world_size={world_size} value={out[0].item()}", flush=True)
         dist.barrier()
 
-        del out, allreduce, src
+        src_bf16 = tilelang.tensor((N,), torch.bfloat16, allocator=allocator)
+        src_bf16.fill_(float(rank + 1))
+        torch.cuda.synchronize(local_rank)
+        bf16_allreduce = tilelang.compile(
+            allreduce_bf16_kernel(),
+            out_idx=[0],
+            target={"kind": "hcu", "mcpu": arch, "dist_backend": "ipc"},
+        )
+        bf16_allreduce.initialize(allocator)
+        bf16_out = bf16_allreduce(src_bf16)
+        torch.cuda.synchronize(local_rank)
+        if not torch.all(bf16_out == expected):
+            raise RuntimeError(f"rank {rank}: BF16 all-peer result {bf16_out.cpu().tolist()} != {expected}")
+        print(f"ipc-allpeer-bf16 rank={rank} world_size={world_size} value={bf16_out[0].item()}", flush=True)
+        dist.barrier()
+
+        del bf16_out, bf16_allreduce, src_bf16, out, allreduce, src
         gc.collect()
         torch.cuda.synchronize(local_rank)
         dist.barrier()
