@@ -1,24 +1,12 @@
 import os
-import sys
 from pathlib import Path
 
 import pytest
+
+from testing.python.hcu.distributed._utils import run_hcu_script
 
 
 @pytest.mark.skipif(os.environ.get("TILELANG_RUN_HCU_IPC_TESTS") != "1", reason="requires two P2P HCU devices")
 def test_ipc_remote_get_and_gemm_allreduce():
     script = Path(__file__).with_name("ipc_remote_get_smoke.py")
-    env = os.environ.copy()
-    env.setdefault("MASTER_ADDR", "127.0.0.1")
-    env.setdefault("MASTER_PORT", "29642")
-    # HCU runtime processes must not be started through subprocess.Popen's
-    # fork path: the parent can be terminated during IPC cleanup. posix_spawn
-    # keeps the pytest process out of that fork/driver interaction.
-    command = [
-        "mpirun", "--allow-run-as-root", "-np", "2", "-x", "PYTHONPATH", "-x", "LD_LIBRARY_PATH",
-        "-x", "HSA_USE_SVM", "-x", "HSA_FORCE_FINE_GRAIN_PCIE", "-x", "MASTER_ADDR", "-x", "MASTER_PORT",
-        sys.executable, str(script),
-    ]
-    pid = os.posix_spawnp(command[0], command, env)
-    _, status = os.waitpid(pid, 0)
-    assert os.waitstatus_to_exitcode(status) == 0
+    run_hcu_script(script, world_size=2, port=29642)

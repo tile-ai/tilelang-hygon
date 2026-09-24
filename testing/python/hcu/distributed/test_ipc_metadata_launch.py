@@ -1,8 +1,9 @@
 import os
-import sys
 from pathlib import Path
 
 import pytest
+
+from testing.python.hcu.distributed._utils import run_hcu_script
 
 
 @pytest.mark.skipif(
@@ -11,7 +12,4 @@ import pytest
 )
 def test_ipc_metadata_helper_device_launch():
     script = Path(__file__).with_name("ipc_metadata_launch_smoke.py")
-    command = [sys.executable, str(script)]
-    pid = os.posix_spawn(command[0], command, os.environ.copy())
-    _, status = os.waitpid(pid, 0)
-    assert os.waitstatus_to_exitcode(status) == 0
+    run_hcu_script(script, world_size=1, port=29645, launcher="direct")
