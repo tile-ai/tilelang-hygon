@@ -99,25 +99,51 @@ class IpcAllocator(DistributedAllocator):
     def initialize(self, handles: list[bytes] | None = None, device_ids: list[int] | None = None) -> None:
         if self._base:
             return
-        # HIP IPC allocation and handle import are device-context sensitive.
-        # PyTorch uses the CUDA namespace for both CUDA and HIP builds.
-        import torch
-
-        torch.cuda.set_device(self.device)
-        self._base = self._runtime.malloc(self.size)
+        # Explicit handle/device lists are useful for local tests and callers
+        # that perform their own exchange.  Otherwise every local stage reports
+        # success or failure before ranks advance to the next collective.
+        collective = self.world_size > 1 and (handles is None or device_ids is None)
         try:
-            handles = handles or self._exchange(self._runtime.create_handle(self._base))
-            device_ids = device_ids or self._exchange(self.device)
-            if len(handles) != self.world_size or len(device_ids) != self.world_size:
-                raise RuntimeError("IPC collective exchange returned an unexpected world size")
-            self._peer_bases = [0] * self.world_size
-            for peer, (handle, peer_device) in enumerate(zip(handles, device_ids)):
-                if peer == self.rank:
-                    self._peer_bases[peer] = self._base
-                else:
-                    if not self._runtime.can_access_peer(self.device, int(peer_device)):
-                        raise RuntimeError(f"HCU device {self.device} cannot access peer rank {peer} device {peer_device}")
-                    self._peer_bases[peer] = self._runtime.open_handle(handle)
+            # HIP IPC allocation and handle import are device-context sensitive.
+            # PyTorch uses the CUDA namespace for both CUDA and HIP builds.
+            import torch
+
+            self._run_initialization_stage(
+                "device selection", lambda: torch.cuda.set_device(self.device), collective
+            )
+
+            def allocate_local() -> None:
+                self._base = self._runtime.malloc(self.size)
+
+            self._run_initialization_stage("allocation", allocate_local, collective)
+
+            if handles is None:
+                local_handle = self._run_initialization_stage(
+                    "handle creation", lambda: self._runtime.create_handle(self._base), collective
+                )
+                handles = self._run_initialization_stage(
+                    "handle exchange", lambda: self._exchange(local_handle), collective
+                )
+            if device_ids is None:
+                device_ids = self._run_initialization_stage(
+                    "device exchange", lambda: self._exchange(self.device), collective
+                )
+
+            def map_peers() -> None:
+                if len(handles) != self.world_size or len(device_ids) != self.world_size:
+                    raise RuntimeError("IPC collective exchange returned an unexpected world size")
+                self._peer_bases = [0] * self.world_size
+                for peer, (handle, peer_device) in enumerate(zip(handles, device_ids)):
+                    if peer == self.rank:
+                        self._peer_bases[peer] = self._base
+                    else:
+                        if not self._runtime.can_access_peer(self.device, int(peer_device)):
+                            raise RuntimeError(
+                                f"HCU device {self.device} cannot access peer rank {peer} device {peer_device}"
+                            )
+                        self._peer_bases[peer] = self._runtime.open_handle(handle)
+
+            self._run_initialization_stage("peer mapping", map_peers, collective)
             self._generation += 1
         except Exception:
             self.close(collective=False)
@@ -156,6 +182,33 @@ class IpcAllocator(DistributedAllocator):
                 try: self._runtime.free(self._base)
                 finally: self._base = 0
             self._generation += 1
+
+    def _run_initialization_stage(
+        self, stage: str, operation: Callable[[], Any], collective: bool
+    ) -> Any:
+        value, error = None, None
+        try:
+            value = operation()
+        except Exception as exc:
+            error = exc
+        if not collective:
+            if error is not None:
+                raise error
+            return value
+
+        status = (self.rank, stage, None if error is None else f"{type(error).__name__}: {error}")
+        statuses = self._exchange(status)
+        if len(statuses) != self.world_size:
+            raise RuntimeError(f"IPC {stage} status exchange returned an unexpected world size")
+        failures = []
+        for item in statuses:
+            if not isinstance(item, (tuple, list)) or len(item) != 3 or item[1] != stage:
+                raise RuntimeError(f"IPC {stage} status exchange returned an invalid status")
+            if item[2] is not None:
+                failures.append(f"rank {item[0]}: {item[2]}")
+        if failures:
+            raise RuntimeError(f"IPC {stage} failed across ranks: {'; '.join(failures)}") from error
+        return value
 
     def _synchronize_device(self) -> None:
         import torch
