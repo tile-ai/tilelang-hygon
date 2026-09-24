@@ -43,6 +43,9 @@ def test_ipc_collective_close_orders_sync_barrier_unmap_and_free():
             super().free(ptr)
 
     class Group:
+        def all_gather_object(self, value):
+            return [value, (1, value[1], None)]
+
         def barrier(self):
             events.append("barrier")
 
@@ -85,6 +88,87 @@ def test_ipc_collective_initialization_propagates_remote_failure_and_cleans_up(
     with pytest.raises(RuntimeError, match=rf"IPC {failed_stage} failed across ranks"):
         allocator.initialize()
     assert runtime.closed == expected_closed
+    assert runtime.freed == [0x1000]
+    assert allocator._base == 0
+    assert allocator._peer_bases == []
+
+
+@pytest.mark.parametrize(
+    "failed_stage",
+    ["close synchronization", "close resource cleanup"],
+)
+def test_ipc_collective_close_propagates_failure_after_cleanup(failed_stage):
+    class Group:
+        def all_gather_object(self, value):
+            peer_error = f"injected {value[1]} failure" if value[1] == failed_stage else None
+            return [value, (1, value[1], peer_error)]
+
+        def barrier(self):
+            pass
+
+    runtime = FakeRuntime()
+    allocator = IpcAllocator(
+        1024, rank=0, world_size=2, device=0, group=Group(), runtime=runtime,
+        synchronize=lambda: None,
+    )
+    allocator.initialize(handles=[b"local", b"peer"], device_ids=[0, 1])
+    with pytest.raises(RuntimeError, match=rf"IPC {failed_stage} failed across ranks"):
+        allocator.close()
+    assert runtime.closed == [0x2000]
+    assert runtime.freed == [0x1000]
+    assert allocator._base == 0
+    assert allocator._peer_bases == []
+
+
+def test_ipc_collective_close_reports_local_unmap_failure_and_still_frees():
+    class Runtime(FakeRuntime):
+        def close_handle(self, ptr):
+            raise RuntimeError("injected unmap failure")
+
+    class Group:
+        def all_gather_object(self, value):
+            return [value, (1, value[1], None)]
+
+        def barrier(self):
+            pass
+
+    runtime = Runtime()
+    allocator = IpcAllocator(
+        1024, rank=0, world_size=2, device=0, group=Group(), runtime=runtime,
+        synchronize=lambda: None,
+    )
+    allocator.initialize(handles=[b"local", b"peer"], device_ids=[0, 1])
+    with pytest.raises(RuntimeError, match="injected unmap failure"):
+        allocator.close()
+    assert runtime.freed == [0x1000]
+    assert allocator._base == 0
+    assert allocator._peer_bases == []
+
+
+def test_ipc_failed_initialization_propagates_secondary_cleanup_failure():
+    class Runtime(FakeRuntime):
+        def close_handle(self, ptr):
+            raise RuntimeError("injected cleanup failure")
+
+    class Group:
+        def all_gather_object(self, value):
+            if isinstance(value, tuple):
+                stage = value[1]
+                if stage == "peer mapping":
+                    return [value, (1, stage, "injected mapping failure")]
+                return [value, (1, stage, None)]
+            if isinstance(value, bytes):
+                return [value, b"peer"]
+            if isinstance(value, int):
+                return [value, 1]
+            raise AssertionError(f"unexpected exchange value: {value!r}")
+
+    runtime = Runtime()
+    allocator = IpcAllocator(
+        1024, rank=0, world_size=2, device=0, group=Group(), runtime=runtime
+    )
+    with pytest.raises(RuntimeError, match="cleanup failed.*injected cleanup failure"):
+        allocator.initialize()
     assert runtime.freed == [0x1000]
     assert allocator._base == 0
     assert allocator._peer_bases == []

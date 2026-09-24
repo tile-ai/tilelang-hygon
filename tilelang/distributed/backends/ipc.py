@@ -145,8 +145,21 @@ class IpcAllocator(DistributedAllocator):
 
             self._run_initialization_stage("peer mapping", map_peers, collective)
             self._generation += 1
-        except Exception:
-            self.close(collective=False)
+        except Exception as initialization_error:
+            self._closed = True
+            cleanup_error = None
+            try:
+                self._run_initialization_stage(
+                    "failed initialization cleanup", self._release_local_resources, collective
+                )
+            except Exception as exc:
+                cleanup_error = exc
+            finally:
+                self._generation += 1
+            if cleanup_error is not None:
+                raise RuntimeError(
+                    f"{initialization_error}; cleanup failed: {cleanup_error}"
+                ) from initialization_error
             raise
 
     def allocate(self, nbytes: int, alignment: int | None = None) -> Allocation:
@@ -168,20 +181,51 @@ class IpcAllocator(DistributedAllocator):
         if self._closed:
             return
         self._closed = True
+        coordinate = collective and self._base != 0 and self.world_size > 1 and self.group is not None
+        failures = []
+
+        if collective and self._base:
+            try:
+                self._run_initialization_stage(
+                    "close synchronization", self._synchronize, coordinate
+                )
+            except Exception as exc:
+                failures.append(str(exc))
+            if not failures:
+                try:
+                    self._run_initialization_stage("close barrier", self._barrier, coordinate)
+                except Exception as exc:
+                    failures.append(str(exc))
+
         try:
-            if collective and self._base:
-                self._synchronize()
-                self._barrier()
+            self._run_initialization_stage(
+                "close resource cleanup", self._release_local_resources, coordinate
+            )
+        except Exception as exc:
+            failures.append(str(exc))
         finally:
-            for peer, ptr in enumerate(self._peer_bases):
-                if peer != self.rank and ptr:
-                    try: self._runtime.close_handle(ptr)
-                    except Exception: pass
-            self._peer_bases = []
-            if self._base:
-                try: self._runtime.free(self._base)
-                finally: self._base = 0
             self._generation += 1
+        if failures:
+            raise RuntimeError("IPC collective close failed: " + "; ".join(failures))
+
+    def _release_local_resources(self) -> None:
+        cleanup_errors = []
+        for peer, ptr in enumerate(self._peer_bases):
+            if peer != self.rank and ptr:
+                try:
+                    self._runtime.close_handle(ptr)
+                except Exception as exc:
+                    cleanup_errors.append(f"peer rank {peer} unmap: {type(exc).__name__}: {exc}")
+        self._peer_bases = []
+        if self._base:
+            try:
+                self._runtime.free(self._base)
+            except Exception as exc:
+                cleanup_errors.append(f"local free: {type(exc).__name__}: {exc}")
+            finally:
+                self._base = 0
+        if cleanup_errors:
+            raise RuntimeError("; ".join(cleanup_errors))
 
     def _run_initialization_stage(
         self, stage: str, operation: Callable[[], Any], collective: bool
