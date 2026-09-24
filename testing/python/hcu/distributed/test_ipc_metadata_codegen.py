@@ -23,6 +23,9 @@ def test_ipc_metadata_source_is_emitted_only_for_distributed_hcu_module():
     assert "tl_templates/hcu/distributed/distributed.h" in artifact.kernel_source
     assert "__tilelang_ipc_metadata" in artifact.kernel_source
     assert "__tilelang_init_ipc_metadata" in artifact.kernel_source
+    assert "source == nullptr || count < 3 || count > 1024" in artifact.kernel_source
+    assert "count != static_cast<int64_t>(world_size + 2)" in artifact.kernel_source
+    assert "rank >= world_size" in artifact.kernel_source
     assert "tl::ipc_get_rank()" in artifact.kernel_source
     assert "tl::ipc_get_num_ranks()" in artifact.kernel_source
 

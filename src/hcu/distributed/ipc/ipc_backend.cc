@@ -38,8 +38,16 @@ extern "C" __global__ void __tilelang_init_ipc_metadata(
     const uint64_t* source, int64_t count) {
   if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
       threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
-    const int64_t bounded_count = count < 1024 ? count : 1024;
-    for (int64_t i = 0; i < bounded_count; ++i) {
+    if (source == nullptr || count < 3 || count > 1024) {
+      return;
+    }
+    const uint64_t rank = source[0];
+    const uint64_t world_size = source[1];
+    if (world_size == 0 || world_size > 1022 ||
+        count != static_cast<int64_t>(world_size + 2) || rank >= world_size) {
+      return;
+    }
+    for (int64_t i = 0; i < count; ++i) {
       __tilelang_ipc_metadata[i] = source[i];
     }
   }

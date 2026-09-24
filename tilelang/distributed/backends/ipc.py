@@ -212,6 +212,12 @@ class IpcMetadataInitializer:
         if helper is None:
             raise RuntimeError("module does not contain the IPC metadata helper")
         payload = allocator.metadata
+        if len(payload) != allocator.world_size + 2:
+            raise RuntimeError("IPC metadata count must equal world_size + 2")
+        if not 0 <= payload[0] < payload[1] or payload[1] != allocator.world_size:
+            raise RuntimeError("IPC metadata rank/world_size is inconsistent with the allocator")
+        if len(payload) > 1024:
+            raise RuntimeError("IPC metadata exceeds the device metadata capacity")
         if metadata_tensor is None:
             import torch
 

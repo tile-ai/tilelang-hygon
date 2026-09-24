@@ -133,6 +133,8 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         """
         if self.target.kind.name != "hcu" or str(self.target.attrs.get("dist_backend", "")) != "ipc":
             return False
+        if self._ipc_allocator is allocator and self._ipc_initialized_generation == allocator.generation:
+            return False
         if self.rt_mod is None and self.executable is None:
             raise RuntimeError("IPC metadata initialization requires a runtime module")
         if self._ipc_metadata_initializer is None:
