@@ -94,6 +94,34 @@ def main() -> None:
             raise RuntimeError(f"ranks observed inconsistent propagated errors: {errors}")
         print(f"ipc-smoke rank={rank} stage=failure-propagated", flush=True)
         dist.barrier()
+
+        closing = IpcAllocator(
+            4096, rank=rank, world_size=world_size, device=local_rank, group=dist.group.WORLD
+        )
+        closing.initialize()
+        if rank == 1:
+            def fail_synchronize():
+                raise RuntimeError("injected close synchronization failure")
+
+            closing._synchronize = fail_synchronize
+        close_error = None
+        try:
+            closing.close()
+        except RuntimeError as exc:
+            close_error = str(exc)
+        if close_error is None or "IPC close synchronization failed across ranks" not in close_error:
+            raise RuntimeError(f"rank {rank}: close failure was not propagated: {close_error!r}")
+        if closing._base != 0 or closing._peer_bases:
+            raise RuntimeError(f"rank {rank}: failed collective close leaked IPC resources")
+        close_errors = [None] * world_size
+        dist.all_gather_object(close_errors, close_error)
+        if not all(
+            "rank 1: RuntimeError: injected close synchronization failure" in item
+            for item in close_errors
+        ):
+            raise RuntimeError(f"ranks observed inconsistent close errors: {close_errors}")
+        print(f"ipc-smoke rank={rank} stage=close-failure-propagated", flush=True)
+        dist.barrier()
     finally:
         if allocator is not None:
             allocator.close()
