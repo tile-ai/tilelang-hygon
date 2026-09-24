@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
-#include <optional>
 #include <vector>
 
 #include "hcu/transform/async_copy_injector.h"
@@ -77,7 +76,6 @@ public:
     // is derived later from the access_ptr dtype, so subbyte dtypes such as
     // int4/fp4/int2/int1 remain representable here.
     int previous_vectorized_lanes = current_vectorized_lanes_;
-    const size_t injected_before = injected_hcu_async_copy_count_;
     const size_t binding_depth = active_bindings_.size();
     bool pushed_vectorized_loop = false;
     const auto *extent_imm = op->extent.as<IntImmNode>();
@@ -100,15 +98,6 @@ public:
       }
     }
     Stmt stmt = StmtMutator::VisitStmt_(op);
-    if (pushed_vectorized_loop && copy_strategy_.defined() &&
-        injected_hcu_async_copy_count_ > injected_before) {
-      const auto *loop = stmt.as<ForNode>();
-      ICHECK(loop);
-      Stmt transaction_body = Substitute(
-          loop->body, {{loop->loop_var, IntImm(loop->loop_var->dtype, 0)}});
-      stmt =
-          WidenStrategyCPAsyncTransactions(transaction_body, extent_imm->value);
-    }
     if (pushed_vectorized_loop) {
       active_vectorized_loops_.pop_back();
     }
@@ -133,29 +122,27 @@ public:
       return Optional<Stmt>();
     }
 
+    // Widening stays in LegalizeVectorizedLoop. A predicate that already names
+    // page_id stays that way. Only a predicate that itself mentions the
+    // vectorized loop variable is rewritten, and only to lane 0.
+    PrimExpr emitted_predicate = predicate_value;
+    if (predicated && current_vectorized_lanes_ > 1) {
+      emitted_predicate = ScalarizePredicateIfUniformPerThread(predicate_value);
+    }
+
     if (index_info->index_lanes == 1) {
-      if (current_vectorized_lanes_ > 1) {
-        PrimExpr src_index = InlineActiveBindings(index_info->src_index);
-        PrimExpr dst_index = InlineActiveBindings(index_info->dst_index);
-        if (copy_strategy_.defined()) {
-          bool src_contiguous = HasContiguousVectorTransaction(src_index);
-          bool dst_contiguous = HasContiguousVectorTransaction(dst_index);
-          bool predicate_uniform =
-              !predicated || HasUniformVectorTransactionPredicate(
-                                 InlineActiveBindings(predicate_value));
-          if (!src_contiguous || !dst_contiguous || !predicate_uniform) {
-            return Optional<Stmt>();
-          }
-        } else if (!HasContiguousVectorizedOffsets(src_index, dst_index)) {
-          return Optional<Stmt>();
-        }
+      if (current_vectorized_lanes_ > 1 &&
+          !HasContiguousVectorizedOffsets(
+              InlineActiveBindings(index_info->src_index),
+              InlineActiveBindings(index_info->dst_index))) {
+        return Optional<Stmt>();
       }
       return MakeCPAsyncStmtFromLoads(
           store,
           /*dst_base_load=*/BufferLoad(store->buffer, store->indices),
           /*src_base_load=*/BufferLoad(load->buffer, load->indices),
           /*num_elems=*/index_info->per_access_num_elems, predicated,
-          predicate_value);
+          emitted_predicate);
     }
 
     Optional<Array<PrimExpr>> src_base_indices =
@@ -176,7 +163,7 @@ public:
         /*dst_base_load=*/BufferLoad(store->buffer, dst_base_indices.value()),
         /*src_base_load=*/BufferLoad(load->buffer, src_base_indices.value()),
         /*num_elems=*/index_info->per_access_num_elems, predicated,
-        predicate_value);
+        emitted_predicate);
   }
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {
@@ -261,6 +248,14 @@ public:
 
   Stmt VisitStmt_(const BindNode *op) final {
     PrimExpr value = VisitExpr(op->value);
+    // A page id (or any binding) that is the same on every lane of this thread
+    // must not keep the vectorized loop variable. Later vectorization would
+    // widen FloorDiv into a vector binding and desync cp.async's scalar
+    // address.
+    if (current_vectorized_lanes_ > 1 && UsesVectorizedLoopVar(value) &&
+        ExprInvariantAcrossLanes(value)) {
+      value = EvaluateSymbolicVectorLane(value, 0);
+    }
     active_bindings_.push_back({op->var, value});
     if (value.same_as(op->value)) {
       return GetRef<Stmt>(op);
@@ -320,7 +315,6 @@ public:
           predicate.defined() ? predicate.value() : PrimExpr());
       if (injected.defined()) {
         injected_hcu_async_copy_ = true;
-        ++injected_hcu_async_copy_count_;
         if (!UseExplicitAsyncSemantics()) {
           pending_sync_copies_ = true;
           uncommitted_sync_copies_ = true;
@@ -376,44 +370,6 @@ private:
     int extent;
   };
 
-  class StrategyTransactionWidener : public StmtExprMutator {
-  public:
-    explicit StrategyTransactionWidener(int lanes) : lanes_(lanes) {
-      ICHECK_GT(lanes_, 1);
-    }
-
-  private:
-    PrimExpr VisitExpr_(const CallNode *op) final {
-      PrimExpr visited = StmtExprMutator::VisitExpr_(op);
-      const auto *call = visited.as<CallNode>();
-      ICHECK(call);
-      if (!call->op.same_as(tl::ptx_cp_async()) ||
-          !call->annotations.count(attr::kHcuGemmLdsCopyStrategy)) {
-        return visited;
-      }
-
-      ICHECK(call->args.size() == 3 || call->args.size() == 4);
-      const auto *count = call->args[2].as<IntImmNode>();
-      ICHECK(count);
-      const int64_t widened_count = count->value * lanes_;
-      if (call->args.size() == 4) {
-        ICHECK_EQ(call->args[3].dtype().lanes(), 1)
-            << "A finalized HCU async-copy transaction requires one scalar "
-               "predicate per thread";
-      }
-
-      Array<PrimExpr> args = call->args;
-      args.Set(2, IntImm(call->args[2].dtype(), widened_count));
-      return Call(call->dtype, call->op, args, call->annotations, call->span);
-    }
-
-    int lanes_;
-  };
-
-  static Stmt WidenStrategyCPAsyncTransactions(Stmt body, int lanes) {
-    return StrategyTransactionWidener(lanes)(std::move(body));
-  }
-
   PrimExpr InlineActiveBindings(PrimExpr expr) {
     for (auto it = active_bindings_.rbegin(); it != active_bindings_.rend();
          ++it) {
@@ -422,12 +378,8 @@ private:
     return analyzer_.Simplify(expr);
   }
 
-  PrimExpr EvaluateVectorTransactionLane(const PrimExpr &expr, int thread,
-                                         int linear_lane) {
+  PrimExpr EvaluateSymbolicVectorLane(const PrimExpr &expr, int linear_lane) {
     Map<Var, PrimExpr> substitutions;
-    if (thread_var_.defined()) {
-      substitutions.Set(thread_var_, IntImm(thread_var_->dtype, thread));
-    }
     int remaining = linear_lane;
     for (auto it = active_vectorized_loops_.rbegin();
          it != active_vectorized_loops_.rend(); ++it) {
@@ -439,40 +391,61 @@ private:
     return analyzer_.Simplify(Substitute(expr, substitutions));
   }
 
-  bool HasContiguousVectorTransaction(const PrimExpr &expr) {
-    ICHECK(copy_strategy_.defined());
-    const int block_threads = copy_strategy_.value()->block_threads;
-    ICHECK_GT(block_threads, 0);
-    for (int thread = 0; thread < block_threads; ++thread) {
-      PrimExpr previous = EvaluateVectorTransactionLane(expr, thread, 0);
-      for (int lane = 1; lane < current_vectorized_lanes_; ++lane) {
-        PrimExpr current = EvaluateVectorTransactionLane(expr, thread, lane);
-        int64_t delta = 0;
-        if (!TryGetConstInt64(analyzer_.Simplify(current - previous), &delta) ||
-            delta != 1) {
-          return false;
+  bool UsesVectorizedLoopVar(const PrimExpr &expr) const {
+    for (const auto &loop : active_vectorized_loops_) {
+      if (UsesVar(expr, [var = loop.loop_var](const VarNode *node) {
+            return var.get() == node;
+          })) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // True when every lane of one thread reads the same page. Strategy copies
+  // enumerate the concrete thread domain because the index still contains
+  // threadIdx. The binding keeps its BufferLoad; only the loop variable is
+  // replaced by lane 0.
+  bool ExprInvariantAcrossLanes(const PrimExpr &expr) {
+    const int block_threads = GetGemmStrategyBlockThreads();
+    const int thread_offset = GetGemmStrategyThreadOffset();
+    if (block_threads > 0) {
+      ICHECK(thread_var_.defined());
+      for (int local_thread = 0; local_thread < block_threads; ++local_thread) {
+        const int thread = thread_offset + local_thread;
+        PrimExpr reference = analyzer_.Simplify(Substitute(
+            expr, {{thread_var_, IntImm(thread_var_->dtype, thread)}}));
+        reference = EvaluateSymbolicVectorLane(reference, 0);
+        for (int lane = 1; lane < current_vectorized_lanes_; ++lane) {
+          PrimExpr current = analyzer_.Simplify(Substitute(
+              expr, {{thread_var_, IntImm(thread_var_->dtype, thread)}}));
+          current = EvaluateSymbolicVectorLane(current, lane);
+          if (!analyzer_.CanProveEqual(current, reference)) {
+            return false;
+          }
         }
-        previous = current;
+      }
+      return true;
+    }
+    PrimExpr reference = EvaluateSymbolicVectorLane(expr, 0);
+    for (int lane = 1; lane < current_vectorized_lanes_; ++lane) {
+      if (!analyzer_.CanProveEqual(EvaluateSymbolicVectorLane(expr, lane),
+                                   reference)) {
+        return false;
       }
     }
     return true;
   }
 
-  bool HasUniformVectorTransactionPredicate(const PrimExpr &predicate) {
-    ICHECK(copy_strategy_.defined());
-    const int block_threads = copy_strategy_.value()->block_threads;
-    ICHECK_GT(block_threads, 0);
-    for (int thread = 0; thread < block_threads; ++thread) {
-      PrimExpr reference = EvaluateVectorTransactionLane(predicate, thread, 0);
-      for (int lane = 1; lane < current_vectorized_lanes_; ++lane) {
-        PrimExpr current =
-            EvaluateVectorTransactionLane(predicate, thread, lane);
-        if (!analyzer_.CanProveEqual(current, reference)) {
-          return false;
-        }
-      }
+  // Leave page_id < pages untouched. If the predicate expression itself
+  // mentions the vectorized loop variable and every lane agrees, replace that
+  // variable with lane 0. Do not substitute the page_id binding.
+  PrimExpr ScalarizePredicateIfUniformPerThread(const PrimExpr &predicate) {
+    if (!UsesVectorizedLoopVar(predicate) ||
+        !ExprInvariantAcrossLanes(predicate)) {
+      return predicate;
     }
-    return true;
+    return EvaluateSymbolicVectorLane(predicate, 0);
   }
 
   // ---- Copy candidate analysis helpers ----
@@ -1045,7 +1018,6 @@ private:
   std::vector<std::pair<Var, PrimExpr>> active_bindings_;
   arith::Analyzer analyzer_;
   bool injected_hcu_async_copy_{false};
-  size_t injected_hcu_async_copy_count_{0};
   bool pending_sync_copies_{false};
   bool uncommitted_sync_copies_{false};
 };
