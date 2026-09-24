@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from ..allocator import Allocation, DistributedAllocator
 
@@ -67,7 +67,8 @@ class IpcAllocator(DistributedAllocator):
     """
 
     def __init__(self, size: int, *, rank: int, world_size: int, device: int,
-                 group: Any = None, alignment: int = 256, runtime: _IpcRuntime | None = None) -> None:
+                 group: Any = None, alignment: int = 256, runtime: _IpcRuntime | None = None,
+                 synchronize: Callable[[], None] | None = None) -> None:
         if size <= 0 or alignment <= 0:
             raise ValueError("size and alignment must be positive")
         if not 0 <= rank < world_size:
@@ -75,6 +76,7 @@ class IpcAllocator(DistributedAllocator):
         self.size, self.rank, self.world_size, self.device = int(size), int(rank), int(world_size), int(device)
         self.group, self.alignment = group, int(alignment)
         self._runtime = runtime or _FfiIpcRuntime()
+        self._synchronize = synchronize or self._synchronize_device
         self._base = 0
         self._peer_bases: list[int] = []
         self._offset = 0
@@ -118,7 +120,7 @@ class IpcAllocator(DistributedAllocator):
                     self._peer_bases[peer] = self._runtime.open_handle(handle)
             self._generation += 1
         except Exception:
-            self.close()
+            self.close(collective=False)
             raise
 
     def allocate(self, nbytes: int, alignment: int | None = None) -> Allocation:
@@ -135,19 +137,40 @@ class IpcAllocator(DistributedAllocator):
     def contains(self, ptr: int, nbytes: int) -> bool:
         return self._base <= ptr and nbytes >= 0 and ptr + nbytes <= self._base + self.size
 
-    def close(self) -> None:
+    def close(self, *, collective: bool = True) -> None:
+        """Release an IPC arena after all ranks stopped using its mappings."""
         if self._closed:
             return
         self._closed = True
-        for peer, ptr in enumerate(self._peer_bases):
-            if peer != self.rank and ptr:
-                try: self._runtime.close_handle(ptr)
-                except Exception: pass
-        self._peer_bases = []
-        if self._base:
-            try: self._runtime.free(self._base)
-            finally: self._base = 0
-        self._generation += 1
+        try:
+            if collective and self._base:
+                self._synchronize()
+                self._barrier()
+        finally:
+            for peer, ptr in enumerate(self._peer_bases):
+                if peer != self.rank and ptr:
+                    try: self._runtime.close_handle(ptr)
+                    except Exception: pass
+            self._peer_bases = []
+            if self._base:
+                try: self._runtime.free(self._base)
+                finally: self._base = 0
+            self._generation += 1
+
+    def _synchronize_device(self) -> None:
+        import torch
+
+        torch.cuda.synchronize(self.device)
+
+    def _barrier(self) -> None:
+        if self.world_size == 1 or self.group is None:
+            return
+        if hasattr(self.group, "barrier"):
+            self.group.barrier()
+            return
+        import torch.distributed as dist
+
+        dist.barrier(group=self.group)
 
     def _exchange(self, value: Any) -> list[Any]:
         if self.world_size == 1:
