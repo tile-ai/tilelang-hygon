@@ -373,7 +373,6 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   }
   if (!IsGlobalBuffer(copy.src) || !IsSharedBuffer(copy.dst) ||
       copy.src->dtype != copy.dst->dtype ||
-      !(copy.dst->dtype.is_float16() || copy.dst->dtype.is_bfloat16()) ||
       !HasOnlyUnitLeadingExtents(copy.dst_range)) {
     return std::nullopt;
   }
