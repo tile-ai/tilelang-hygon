@@ -206,6 +206,22 @@ def get_hcu_device_compile_flags(pass_configs: dict | None = None) -> list[str]:
     return tokens
 
 
+def _hcu_amdgcn_bitcode_dir() -> str | None:
+    """Return DTK amdgcn bitcode dir if it exists."""
+    try:
+        root = find_hcu_path()
+    except RuntimeError:
+        root = os.environ.get("ROCM_PATH", "/opt/dtk")
+    bitcode = os.path.join(root, "amdgcn", "bitcode")
+    return bitcode if os.path.isdir(bitcode) else None
+
+
+def _hcu_has_abi6_device_lib(bitcode_dir: str | None) -> bool:
+    if not bitcode_dir:
+        return False
+    return os.path.isfile(os.path.join(bitcode_dir, "oclc_abi_version_6.bc"))
+
+
 def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
     # DTK toolchain (e.g. ROCM_PATH=/opt/dtk/...) uses its own defaults; do not inject LLVM hacks.
     # If get_hcu_compiler() resolves to aicc (on PATH), still apply the LLVM tuning flags below.
@@ -232,6 +248,17 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
             flags.append("-mllvm=-hcu-update-wait-by-reverse-search=true")
             flags.append("-mllvm=-hcu-pre-emit-load-store-opt=false")
             # flags.append("-mllvm=-hcu-trust-special-waitcnt-for-lds-dma=true")
+        # New aicc (clang 22) defaults to code-object ABI 6. DTK bitcode on this
+        # machine still only ships oclc_abi_version_{400,500}.bc, so pin COV 5
+        # and point at /opt/dtk/amdgcn/bitcode.
+        bitcode_dir = _hcu_amdgcn_bitcode_dir()
+        if bitcode_dir:
+            flags.append(f"--rocm-device-lib-path={bitcode_dir}")
+            if not _hcu_has_abi6_device_lib(bitcode_dir):
+                flags.append("-mcode-object-version=5")
+        # Clang 22 aicc no longer predefines __AMDGCN_WAVEFRONT_SIZE, but DTK
+        # HIP 6.2 headers still require it. gfx9 HCU is wave64.
+        flags.append("-D__AMDGCN_WAVEFRONT_SIZE=64")
         return flags
     else:
         raise ValueError(f"Unsupported architecture: {arch}")

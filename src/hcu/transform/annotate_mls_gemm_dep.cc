@@ -572,9 +572,8 @@ private:
     return op.same_as(Copy::Get()) || op.same_as(async_copy);
   }
 
-  bool IsAsyncCopyOp(const Op &op) const {
-    static const Op &async_copy = Op::Get("tl.tileop.async_copy");
-    return op.same_as(async_copy);
+  bool IsExplicitAsyncCopy(const CallNode *call) const {
+    return HasExplicitAsyncCopySemantics(GetRef<Call>(call));
   }
 
   Stmt VisitStmt_(const SBlockNode *op) final {
@@ -1036,8 +1035,8 @@ private:
       auto copy = Downcast<Copy>(ParseOperator(ffi::GetRef<Call>(call)));
       if (mode_ == Mode::kMaterialize &&
           call->annotations.count(kPendingGemmLdsCopyStrategy)) {
-        const bool selected =
-            IsAsyncCopyOp(tir_op) || selected_calls_.count(GetRef<Call>(call));
+        const bool selected = IsExplicitAsyncCopy(call) ||
+                              selected_calls_.count(GetRef<Call>(call));
         auto annotations = call->annotations;
         if (selected) {
           annotations =
@@ -1098,7 +1097,7 @@ private:
         return Evaluate(Call(call->dtype, DsReadFormat::Get(), call->args,
                              annotations, call->span));
       }
-      if (mode_ == Mode::kCollectCandidates && IsAsyncCopyOp(tir_op) &&
+      if (mode_ == Mode::kCollectCandidates && IsExplicitAsyncCopy(call) &&
           consumer) {
         std::vector<GemmWithInput> consumers =
             PropagateToFindAllGemmConsumersAfterCall(copy->dst, collector_,
@@ -1111,7 +1110,7 @@ private:
                                active_annotations, call->span));
         }
       }
-      if (mode_ == Mode::kCollectCandidates && !IsAsyncCopyOp(tir_op) &&
+      if (mode_ == Mode::kCollectCandidates && !IsExplicitAsyncCopy(call) &&
           consumer && IsGlobalLikeBuffer(copy->src) &&
           IsSharedBuffer(copy->dst)) {
         if (auto consumers =
@@ -1126,7 +1125,7 @@ private:
           }
         }
       }
-      if (IsAsyncCopyOp(tir_op) && IsSharedBuffer(copy->dst) &&
+      if (IsExplicitAsyncCopy(call) && IsSharedBuffer(copy->dst) &&
           !HasAnnotatedLayout(copy->dst)) {
         async_copy_linear_outputs_.insert(copy->dst->data);
       }

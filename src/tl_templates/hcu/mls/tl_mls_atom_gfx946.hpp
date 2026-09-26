@@ -23,7 +23,7 @@ struct gfx946_mls_32x16_b16 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
-    __builtin_hcu_matrix_load_32X16_b16(rsrc,
+    __builtin_hcu_matrix_load_32x16_b16(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, false, r, false, false, bps);
   }
@@ -37,7 +37,7 @@ struct gfx946_mls_16x32_trans_b16 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
-    __builtin_hcu_matrix_load_32X16_b16(rsrc,
+    __builtin_hcu_matrix_load_32x16_b16(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, true, r, false, false, bps);
   }
@@ -51,7 +51,7 @@ struct gfx946_mls_32x32_b16 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
-    __builtin_hcu_matrix_load_32X32_b16(rsrc,
+    __builtin_hcu_matrix_load_32x32_b16(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, false, r, false, false, bps);
   }
@@ -65,7 +65,7 @@ struct gfx946_mls_32x32_trans_b16 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
-    __builtin_hcu_matrix_load_32X32_b16(rsrc,
+    __builtin_hcu_matrix_load_32x32_b16(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, true, r, false, false, bps);
   }
@@ -79,7 +79,7 @@ struct gfx946_mls_64x16_b16 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
-    __builtin_hcu_matrix_load_64X16_b16(rsrc,
+    __builtin_hcu_matrix_load_64x16_b16(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, false, r, false, false, bps);
   }
@@ -93,7 +93,7 @@ struct gfx946_mls_16x64_trans_b16 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
-    __builtin_hcu_matrix_load_64X16_b16(rsrc,
+    __builtin_hcu_matrix_load_64x16_b16(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, true, r, false, false, bps);
   }
@@ -107,7 +107,7 @@ struct gfx946_mls_16x16_b32 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
-    __builtin_hcu_matrix_load_16X16_b32(rsrc,
+    __builtin_hcu_matrix_load_16x16_b32(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, false, r, false, false, bps);
   }
@@ -121,7 +121,7 @@ struct gfx946_mls_16x16_trans_b32 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
-    __builtin_hcu_matrix_load_16X16_b32(rsrc,
+    __builtin_hcu_matrix_load_16x16_b32(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, true, r, false, false, bps);
   }
@@ -139,7 +139,7 @@ struct gfx946_mls_64x16_b8 {
       gfx938_mls_64x16_b8::load(lds_addr, rsrc, ::tl::number<moffset>{},
                                 ::tl::bool_constant<r>{});
     } else {
-      __builtin_hcu_matrix_load_64X16_b8(rsrc,
+      __builtin_hcu_matrix_load_64x16_b8(rsrc,
                                          reinterpret_cast<uint32_t *>(lds_addr),
                                          moffset, false, r, false, false, bps);
     }
@@ -158,7 +158,7 @@ struct gfx946_mls_16x64_trans_b8 {
       gfx938_mls_16x64_trans_b8::load(lds_addr, rsrc, ::tl::number<moffset>{},
                                       ::tl::bool_constant<r>{});
     } else {
-      __builtin_hcu_matrix_load_64X16_b8(rsrc,
+      __builtin_hcu_matrix_load_64x16_b8(rsrc,
                                          reinterpret_cast<uint32_t *>(lds_addr),
                                          moffset, true, r, false, false, bps);
     }
@@ -173,7 +173,7 @@ struct gfx946_mls_64x16_fp4 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
-    __builtin_hcu_matrix_load_64X16_fp4(rsrc,
+    __builtin_hcu_matrix_load_64x16_fp4(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, false, r, false, false, bps);
   }
@@ -187,7 +187,7 @@ struct gfx946_mls_16x64_trans_fp4 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
-    __builtin_hcu_matrix_load_64X16_fp4(rsrc,
+    __builtin_hcu_matrix_load_64x16_fp4(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, true, r, false, false, bps);
   }
@@ -205,7 +205,7 @@ struct gfx946_mls_64x32_b8 {
       gfx938_mls_64x32_b8::load(lds_addr, rsrc, ::tl::number<moffset>{},
                                 ::tl::bool_constant<r>{});
     } else {
-      __builtin_hcu_matrix_load_64X32_b8(rsrc,
+      __builtin_hcu_matrix_load_64x32_b8(rsrc,
                                          reinterpret_cast<uint32_t *>(lds_addr),
                                          moffset, false, r, false, false, bps);
     }
@@ -224,7 +224,7 @@ struct gfx946_mls_32x64_trans_b8 {
       gfx938_mls_32x64_trans_b8::load(lds_addr, rsrc, ::tl::number<moffset>{},
                                       ::tl::bool_constant<r>{});
     } else {
-      __builtin_hcu_matrix_load_64X32_b8(rsrc,
+      __builtin_hcu_matrix_load_64x32_b8(rsrc,
                                          reinterpret_cast<uint32_t *>(lds_addr),
                                          moffset, true, r, false, false, bps);
     }
@@ -243,7 +243,7 @@ struct gfx946_mls_128x16_b8 {
       gfx938_mls_128x16_b8::load(lds_addr, rsrc, ::tl::number<moffset>{},
                                  ::tl::bool_constant<r>{});
     } else {
-      __builtin_hcu_matrix_load_128X16_b8(
+      __builtin_hcu_matrix_load_128x16_b8(
           rsrc, reinterpret_cast<uint32_t *>(lds_addr), moffset, false, r,
           false, false, bps);
     }
@@ -262,7 +262,7 @@ struct gfx946_mls_16x128_trans_b8 {
       gfx938_mls_16x128_trans_b8::load(lds_addr, rsrc, ::tl::number<moffset>{},
                                        ::tl::bool_constant<r>{});
     } else {
-      __builtin_hcu_matrix_load_128X16_b8(
+      __builtin_hcu_matrix_load_128x16_b8(
           rsrc, reinterpret_cast<uint32_t *>(lds_addr), moffset, true, r, false,
           false, bps);
     }
@@ -277,7 +277,7 @@ struct gfx946_mls_128x16_b4 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
-    __builtin_hcu_matrix_load_128X16_b4(rsrc,
+    __builtin_hcu_matrix_load_128x16_b4(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, false, r, false, false, bps);
   }
@@ -291,7 +291,7 @@ struct gfx946_mls_16x128_trans_b4 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
-    __builtin_hcu_matrix_load_128X16_b4(rsrc,
+    __builtin_hcu_matrix_load_128x16_b4(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, true, r, false, false, bps);
   }
@@ -305,7 +305,7 @@ struct gfx946_mls_256x16_b4 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
-    __builtin_hcu_matrix_load_256X16_b4(rsrc,
+    __builtin_hcu_matrix_load_256x16_b4(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, false, r, false, false, bps);
   }
@@ -319,7 +319,7 @@ struct gfx946_mls_16x256_trans_b4 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
-    __builtin_hcu_matrix_load_256X16_b4(rsrc,
+    __builtin_hcu_matrix_load_256x16_b4(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, true, r, false, false, bps);
   }

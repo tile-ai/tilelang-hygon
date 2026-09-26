@@ -304,7 +304,7 @@ def gemm_async_copy_n_major(
 
 def main():
     """Correctness check and latency benchmark for ``gemm_async_copy_n_major``."""
-    M, N, K = 19200, 5120, 5120
+    M, N, K = 10240, 10240, 10240
     block_M, block_N, block_K = 256, 256, 16
 
     kernel = gemm_async_copy_n_major(
@@ -332,6 +332,8 @@ def main():
     print(c)
     print("ref_c:")
     print(ref_c)
+
+    print(kernel.get_kernel_source())
 
     torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
     print("All check passed.")

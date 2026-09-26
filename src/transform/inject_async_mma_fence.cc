@@ -108,6 +108,59 @@ bool IsAsyncWaitScopeStmt(const Stmt &stmt) {
          op->attr_key == "async_wait_inflight_count";
 }
 
+bool CallProvidesLgkmcntWait(const CallNode *call, int *lgkmcnt) {
+  if (call == nullptr) {
+    return false;
+  }
+  if (call->op.same_as(async_gld_sld_fence())) {
+    if (call->args.empty()) {
+      return false;
+    }
+    const auto *imm = call->args[0].as<IntImmNode>();
+    if (imm == nullptr) {
+      return false;
+    }
+    *lgkmcnt = static_cast<int>(imm->value);
+    return true;
+  }
+  if (!call->op.same_as(builtin::call_extern()) || call->args.size() < 2) {
+    return false;
+  }
+  const auto *name = call->args[0].as<StringImmNode>();
+  if (name == nullptr || name->value != "__builtin_amdgcn_s_waitcnt") {
+    return false;
+  }
+  const auto *imm = call->args[1].as<IntImmNode>();
+  if (imm == nullptr) {
+    return false;
+  }
+  // s_waitcnt immediate: lgkmcnt lives in bits [11:8]. 15 means "do not wait
+  // on lgkmcnt" (vmcnt/expcnt-only waits from T.s_waitcnt).
+  constexpr int kIdleLgkmcnt = 15;
+  const int cnt = (static_cast<int>(imm->value) >> 8) & 0xF;
+  if (cnt == kIdleLgkmcnt) {
+    return false;
+  }
+  *lgkmcnt = cnt;
+  return true;
+}
+
+// True if `stmt` already waits on lgkmcnt (T.s_waitcnt / async_gld_sld_fence).
+// Any such wait is treated as the MMA LDS barrier; do not insert another
+// async_gld_sld_fence(0) on top of it.
+bool StmtProvidesLgkmcntWait(const Stmt &stmt) {
+  bool found = false;
+  PostOrderVisit(stmt, [&found](const ObjectRef &node) {
+    if (const auto *call = node.as<CallNode>()) {
+      int lgkmcnt = 0;
+      if (CallProvidesLgkmcntWait(call, &lgkmcnt)) {
+        found = true;
+      }
+    }
+  });
+  return found;
+}
+
 bool StmtContainsAsyncCopy(const Stmt &stmt) {
   bool found = false;
   PostOrderVisit(stmt, [&found](const ObjectRef &node) {
@@ -178,6 +231,9 @@ EpilogueMmaCounts CountEpilogueMmas(const Stmt &root) {
           } else {
             pending_load_count += counter.total_loads;
           }
+          if (StmtProvidesLgkmcntWait(s)) {
+            pending_load_count = 0;
+          }
         }
         VisitStmt(s);
       }
@@ -225,6 +281,19 @@ public:
 
     Array<Stmt> new_seq;
     int pending_load_count = 0;
+    bool user_lds_wait_since_loads = false;
+    auto insert_conservative_sld_sync = [&]() {
+      new_seq.push_back(MakeSldFenceStmt(0));
+      if (phase_ != PipelinePhase::kAfterMainLoop) {
+        new_seq.push_back(MakeWaveBarrierStmt());
+      }
+    };
+    auto insert_warp_align_barrier = [&]() {
+      if (!register_pipeline_ &&
+          phase_ != PipelinePhase::kAfterMainLoop) {
+        new_seq.push_back(MakeWaveBarrierStmt());
+      }
+    };
     for (const Stmt &stmt : seq_op->seq) {
       if (IsMmaCluster(stmt)) {
         if (in_mma_stmt_ > 0) {
@@ -247,12 +316,13 @@ public:
             AppendRegisterPipelineLdsWait(new_seq, wait_n);
             last_sld_fence_val_ = wait_n;
           } else {
-            new_seq.push_back(MakeSldFenceStmt(0));
-            if (phase_ != PipelinePhase::kAfterMainLoop) {
-              new_seq.push_back(MakeWaveBarrierStmt());
-            }
+            insert_conservative_sld_sync();
           }
           pending_load_count = 0;
+          user_lds_wait_since_loads = false;
+        } else if (user_lds_wait_since_loads) {
+          insert_warp_align_barrier();
+          user_lds_wait_since_loads = false;
         } else if (register_pipeline_ && last_epilogue_mma) {
           AppendRegisterPipelineLdsWait(new_seq, 0);
         }
@@ -264,12 +334,13 @@ public:
             AppendRegisterPipelineLdsWait(new_seq, 0);
             last_sld_fence_val_ = 0;
           } else {
-            new_seq.push_back(MakeSldFenceStmt(0));
-            if (phase_ != PipelinePhase::kAfterMainLoop) {
-              new_seq.push_back(MakeWaveBarrierStmt());
-            }
+            insert_conservative_sld_sync();
           }
           pending_load_count = 0;
+          user_lds_wait_since_loads = false;
+        } else if (user_lds_wait_since_loads) {
+          insert_warp_align_barrier();
+          user_lds_wait_since_loads = false;
         }
         new_seq.push_back(VisitStmt(stmt));
       } else {
@@ -277,8 +348,18 @@ public:
         counter(stmt);
         if (IsAsyncWaitScopeStmt(stmt) && counter.total_loads > 0) {
           pending_load_count = counter.total_loads;
+          user_lds_wait_since_loads = false;
         } else {
           pending_load_count += counter.total_loads;
+          if (counter.total_loads > 0) {
+            user_lds_wait_since_loads = false;
+          }
+        }
+        if (StmtProvidesLgkmcntWait(stmt)) {
+          if (pending_load_count > 0) {
+            user_lds_wait_since_loads = true;
+          }
+          pending_load_count = 0;
         }
         new_seq.push_back(VisitStmt(stmt));
       }

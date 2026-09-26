@@ -577,6 +577,10 @@ mls_load_tile(DataType *p_data, ::tl::index_t mls_stride,
   mls.set_window_origin(
       ::tl::make_array<::tl::index_t>(block_mn_base, block_k_base));
   auto *typed_smem = reinterpret_cast<TL_LDS_ADDR DataType *>(smem);
+  // KBoundary/MNBoundary: -1 analyze, 0 skip, 1 refresh. One-shot load
+  // refreshes unless the axis is skip (matches MlsOneShotRefresh).
+  constexpr bool refresh_k = KBoundary != 0;
+  constexpr bool refresh_mn = MNBoundary != 0;
   mls.template async_mls_load_asm<DataType, refresh_k, refresh_mn>(
       typed_smem, block_k_base, block_mn_base);
 }
