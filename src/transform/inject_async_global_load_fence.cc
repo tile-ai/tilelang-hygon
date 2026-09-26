@@ -1,6 +1,10 @@
 /*!
  * \file inject_async_global_load_fence.cc
- * \brief Lower async wait scopes and insert warp barriers after G2S waits.
+ * \brief Lower async wait scopes and insert G2S barriers.
+ *
+ * On HCU, tl::wave_barrier and tl::sync_warp both lower to s_barrier. Prefetch
+ * (prologue) inserts run only when T.Pipelined depth is >= 2, so handwritten
+ * K loops that already have T.sync_warp are left alone.
  */
 
 #include "common/gemm_k_loop_utils.h"
@@ -81,6 +85,11 @@ bool IsSyncWarpStmt(const Stmt &stmt) {
   return false;
 }
 
+// HCU: wave_barrier is asm s_barrier; sync_warp is __builtin_amdgcn_s_barrier.
+bool IsSBarrierStmt(const Stmt &stmt) {
+  return IsWaveBarrierStmt(stmt) || IsSyncWarpStmt(stmt);
+}
+
 Stmt MakeAsyncGldFenceStmt(int wait_count) {
   if (wait_count < 0) {
     wait_count = 0;
@@ -106,14 +115,25 @@ Stmt MakeSyncWarpStmt() {
 }
 
 void AppendWaveBarrierIfNeeded(Array<Stmt> &result) {
-  if (result.empty() || !IsWaveBarrierStmt(result.back())) {
+  if (result.empty() || !IsSBarrierStmt(result.back())) {
     result.push_back(MakeWaveBarrierStmt());
   }
 }
 
+void DropTrailingWaveBarrier(Array<Stmt> &result) {
+  if (result.empty() || !IsWaveBarrierStmt(result.back())) {
+    return;
+  }
+  Array<Stmt> trimmed;
+  trimmed.reserve(result.size() - 1);
+  for (size_t i = 0; i + 1 < result.size(); ++i) {
+    trimmed.push_back(result[i]);
+  }
+  result = trimmed;
+}
+
 void AppendGldWaitSync(Array<Stmt> &result) {
-  if (result.empty() ||
-      (!IsSyncWarpStmt(result.back()) && !IsWaveBarrierStmt(result.back()))) {
+  if (result.empty() || !IsSBarrierStmt(result.back())) {
     result.push_back(MakeSyncWarpStmt());
   }
 }
@@ -253,7 +273,10 @@ int CountOutermostCommitsBeforeLds(const Stmt &body, bool stop_at_lds) {
 struct SharedPipelineWaitPlan {
   int commits_per_tile{0};
   int main_wait{0};
+  int num_stages{0};
   bool register_pipeline{false};
+  // T.Pipelined / InjectSoftwarePipeline with depth >= 2, or register pipeline.
+  bool compiler_pipeline{false};
   std::vector<int> epilogue_gld_fence_values;
 };
 
@@ -407,15 +430,16 @@ SharedPipelineWaitPlan MakeWaitPlan(const Stmt &root) {
   int cpt = CountOutermostCommitsBeforeLds(k_loop->body, /*stop_at_lds=*/true);
   plan.commits_per_tile = cpt;
 
-  int num_stages = 0;
-  if (auto ns = GetPipelineNumStages(k_loop)) {
-    num_stages = static_cast<int>(ns.value().IntValue());
+  if (auto ns = GetExplicitPipelinedNumStages(k_loop)) {
+    plan.num_stages = static_cast<int>(ns.value().IntValue());
   }
-  if (num_stages >= 2 && cpt > 0) {
+  plan.compiler_pipeline =
+      plan.register_pipeline || plan.num_stages >= 2;
+  if (plan.num_stages >= 2 && cpt > 0) {
     if (plan.register_pipeline) {
-      plan.main_wait = (num_stages - 2) * cpt;
+      plan.main_wait = (plan.num_stages - 2) * cpt;
     } else {
-      plan.main_wait = (num_stages - 1) * cpt;
+      plan.main_wait = (plan.num_stages - 1) * cpt;
     }
   } else {
     plan.main_wait = CountPrologueOutermostCommits(root);
@@ -443,7 +467,8 @@ public:
 
   Stmt VisitStmt_(const AttrStmtNode *op) override {
     if (IsWaitAttr(op)) {
-      if (phase_ == PipelinePhase::kPrologue && !plan_.register_pipeline) {
+      if (!plan_.compiler_pipeline ||
+          (phase_ == PipelinePhase::kPrologue && !plan_.register_pipeline)) {
         return StmtMutator::VisitStmt_(op);
       }
       const auto *inner = op->body.as<AttrStmtNode>();
@@ -499,18 +524,22 @@ public:
       }
     };
 
-    for (const Stmt &s : seq_op->seq) {
+    for (size_t i = 0; i < seq_op->seq.size(); ++i) {
+      const Stmt &s = seq_op->seq[i];
       Stmt cur = UnwrapWaitAttrs(s);
-      if (IsAsyncGldFenceStmt(cur) || IsPtxWaitGroupStmt(cur)) {
-        if (plan_.register_pipeline ||
-            phase_ != PipelinePhase::kPrologue || IsAsyncGldFenceStmt(cur)) {
-          continue;
-        }
+      if (plan_.register_pipeline &&
+          (IsAsyncGldFenceStmt(cur) || IsPtxWaitGroupStmt(cur))) {
+        continue;
       }
 
       if (cur.as<SeqStmtNode>()) {
         in_lds_cluster = false;
         append_stmt(VisitStmt(cur));
+        if (plan_.num_stages >= 2 && phase_ == PipelinePhase::kPrologue &&
+            i + 1 < seq_op->seq.size() &&
+            IsSBarrierStmt(UnwrapWaitAttrs(seq_op->seq[i + 1]))) {
+          DropTrailingWaveBarrier(result);
+        }
         continue;
       }
 
@@ -539,11 +568,18 @@ public:
         in_lds_cluster = false;
       }
       append_stmt(VisitStmt(cur));
-      if (phase_ == PipelinePhase::kPrologue &&
+      if (plan_.num_stages >= 2 && phase_ == PipelinePhase::kPrologue &&
           plan_.commits_per_tile > 0 && IsOutermostCommitStmt(cur)) {
         prologue_stage_commits += 1;
         if (prologue_stage_commits >= plan_.commits_per_tile) {
-          AppendWaveBarrierIfNeeded(result);
+          bool next_is_sbarrier = false;
+          if (i + 1 < seq_op->seq.size()) {
+            next_is_sbarrier =
+                IsSBarrierStmt(UnwrapWaitAttrs(seq_op->seq[i + 1]));
+          }
+          if (!next_is_sbarrier) {
+            AppendWaveBarrierIfNeeded(result);
+          }
           prologue_stage_commits = 0;
         }
       }
@@ -584,6 +620,9 @@ private:
   }
 
   void MaybeInsertGldFence(Array<Stmt> &result) {
+    if (!plan_.compiler_pipeline) {
+      return;
+    }
     if (suppress_inner_lds_insert_ > 0) {
       return;
     }

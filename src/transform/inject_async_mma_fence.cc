@@ -1,6 +1,11 @@
 /*!
  * \file inject_async_mma_fence.cc
  * \brief Insert LDS waits before MMA.
+ *
+ * If the user already issued an lgkmcnt wait after shared loads, do not insert
+ * another wave_barrier in front of MMA. T.Pipelined kernels (better.log) go
+ * waitcnt → MMA directly; the extra s_barrier is redundant and, inside
+ * warp-divergent `if (warp_idx < 4)`, races G2S/LDS.
  */
 
 #include "common/gemm_k_loop_utils.h"
@@ -281,16 +286,9 @@ public:
 
     Array<Stmt> new_seq;
     int pending_load_count = 0;
-    bool user_lds_wait_since_loads = false;
     auto insert_conservative_sld_sync = [&]() {
       new_seq.push_back(MakeSldFenceStmt(0));
       if (phase_ != PipelinePhase::kAfterMainLoop) {
-        new_seq.push_back(MakeWaveBarrierStmt());
-      }
-    };
-    auto insert_warp_align_barrier = [&]() {
-      if (!register_pipeline_ &&
-          phase_ != PipelinePhase::kAfterMainLoop) {
         new_seq.push_back(MakeWaveBarrierStmt());
       }
     };
@@ -319,10 +317,6 @@ public:
             insert_conservative_sld_sync();
           }
           pending_load_count = 0;
-          user_lds_wait_since_loads = false;
-        } else if (user_lds_wait_since_loads) {
-          insert_warp_align_barrier();
-          user_lds_wait_since_loads = false;
         } else if (register_pipeline_ && last_epilogue_mma) {
           AppendRegisterPipelineLdsWait(new_seq, 0);
         }
@@ -337,10 +331,6 @@ public:
             insert_conservative_sld_sync();
           }
           pending_load_count = 0;
-          user_lds_wait_since_loads = false;
-        } else if (user_lds_wait_since_loads) {
-          insert_warp_align_barrier();
-          user_lds_wait_since_loads = false;
         }
         new_seq.push_back(VisitStmt(stmt));
       } else {
@@ -348,17 +338,10 @@ public:
         counter(stmt);
         if (IsAsyncWaitScopeStmt(stmt) && counter.total_loads > 0) {
           pending_load_count = counter.total_loads;
-          user_lds_wait_since_loads = false;
         } else {
           pending_load_count += counter.total_loads;
-          if (counter.total_loads > 0) {
-            user_lds_wait_since_loads = false;
-          }
         }
         if (StmtProvidesLgkmcntWait(stmt)) {
-          if (pending_load_count > 0) {
-            user_lds_wait_since_loads = true;
-          }
           pending_load_count = 0;
         }
         new_seq.push_back(VisitStmt(stmt));

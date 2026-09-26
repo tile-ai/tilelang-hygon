@@ -166,6 +166,27 @@ inline ffi::Optional<Integer> GetPipelineNumStages(const ForNode *loop) {
   return ffi::Optional<Integer>();
 }
 
+/*!
+ * \brief Stage count from T.Pipelined / InjectSoftwarePipeline only.
+ *
+ * Ignores software_pipeline_stage so handwritten K loops that happen to
+ * carry that annotation are not treated as compiler-managed pipelines.
+ */
+inline ffi::Optional<Integer>
+GetExplicitPipelinedNumStages(const ForNode *loop) {
+  if (auto num_stages = loop->annotations.Get("num_stages")) {
+    if (const auto *imm = num_stages->as<IntImmNode>()) {
+      return Integer(static_cast<int>(imm->value));
+    }
+  }
+  if (auto num_stages = loop->annotations.Get("tl_pipelined_num_stages")) {
+    if (const auto *imm = num_stages->as<IntImmNode>()) {
+      return Integer(static_cast<int>(imm->value));
+    }
+  }
+  return ffi::Optional<Integer>();
+}
+
 // ---------------------------------------------------------------------------
 // ComputeThreadBounds
 // ---------------------------------------------------------------------------

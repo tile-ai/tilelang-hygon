@@ -212,10 +212,7 @@ __device__ void async_gld_sld_fence(index_t cnt) {
 __device__ void wave_barrier() { asm volatile("s_barrier" : : : "memory"); }
 
 template <int N = 0> TL_DEVICE void cp_async_wait() {
-  // async_gld_fence(N);
-  static_assert(N >= 0 && N <= 65535,
-                "async-copy group depth must fit unsigned short");
-  __builtin_amdgcn_wait_asyncmark(static_cast<unsigned short>(N));
+  async_gld_fence(N);
 }
 
 namespace detail {

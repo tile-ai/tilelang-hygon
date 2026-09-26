@@ -167,9 +167,10 @@ TL_DEVICE int get_warp_idx(int warp_size = detail::default_warp_size()) {
 
 TL_DEVICE void sync_warp(unsigned long long mask = ~0ull) {
   (void)mask;
-#if defined(__HIP_DEVICE_COMPILE__)
-  __builtin_amdgcn_s_barrier();
-#endif
+  // Same instruction as tl::wave_barrier: workgroup s_barrier. Do not hide it
+  // behind __HIP_DEVICE_COMPILE__; host-path empty body would drop the sync
+  // when this header is parsed without that macro.
+  asm volatile("s_barrier" : : : "memory");
 }
 
 TL_DEVICE unsigned long long activemask() {
