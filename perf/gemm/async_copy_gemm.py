@@ -333,8 +333,6 @@ def main():
     print("ref_c:")
     print(ref_c)
 
-    print(kernel.get_kernel_source())
-
     torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
     print("All check passed.")
 
