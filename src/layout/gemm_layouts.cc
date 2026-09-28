@@ -571,7 +571,6 @@ makeGemmFragmentBHCUInterleave2(const int block_m, const int block_n,
                                 bool transposed, const int min_n_per_warp) {
   ICHECK_EQ(element_size, 16);
   ICHECK_EQ(k_pack, 1);
-  ICHECK(transposed);
   ICHECK_EQ(block_n % min_n_per_warp, 0);
 
   const int warp_n_no_recompute =
@@ -590,13 +589,18 @@ makeGemmFragmentBHCUInterleave2(const int block_m, const int block_n,
   IterVar rep = MakeIterVar("rep", 1);
   PrimExpr forward_thread = 16 * FloorDiv(k->var, 4) + FloorDiv(n->var, 2);
   PrimExpr forward_index = 4 * FloorMod(n->var, 2) + FloorMod(k->var, 4);
-  Fragment base_layout({n, k}, {forward_index}, forward_thread, rep);
+  Fragment base_layout(transposed ? ffi::Array<IterVar>{n, k}
+                                  : ffi::Array<IterVar>{k, n},
+                       {forward_index}, forward_thread, rep);
   base_layout = base_layout->Repeat({1, 1}, false, false);
   Fragment warp_layout =
-      base_layout->Repeat({warp_n / 32, warp_k / 16}, false, false);
+      transposed ? base_layout->Repeat({warp_n / 32, warp_k / 16}, false, false)
+                 : base_layout->Repeat({warp_k / 16, warp_n / 32}, false, true);
   Fragment block_layout =
-      warp_layout->Replicate(num_warp_m)
-          ->Repeat({warp_n_no_recompute, num_warp_k}, true, false);
+      transposed ? warp_layout->Replicate(num_warp_m)
+                       ->Repeat({warp_n_no_recompute, num_warp_k}, true, false)
+                 : warp_layout->Replicate(num_warp_m)
+                       ->Repeat({num_warp_k, warp_n_no_recompute}, true, true);
   if (n_recompute > 1) {
     block_layout = block_layout->Replicate(n_recompute);
   }

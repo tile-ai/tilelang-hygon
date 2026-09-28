@@ -190,7 +190,11 @@ HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
     }
   } else if (policy.IsSquare()) {
     int max_m_warps = M / kMPerWarp;
-    float ideal_ratio = N > 0 ? static_cast<float>(M) / N : 1.0f;
+    // Compare per-wave work in units of the legal MLS atoms.  Using the raw
+    // M/N ratio here biases the partition when the M/N atom floors differ
+    // (for example 16x32 for an N-major B operand).
+    float ideal_ratio =
+        N > 0 ? static_cast<float>(M / kMPerWarp) / (N / kNPerWarp) : 1.0f;
 
     int best_m = 1;
     int best_n = 1;

@@ -2246,5 +2246,76 @@ def test_gemm_mls_ds_read_alt2_packed_b16_matrix_store_b32(
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.skipif(
+    current_hcu_arch_string() != "gfx946",
+    reason="matrix_store VGPR path is supported only on gfx946",
+)
+@pytest.mark.parametrize(
+    "dtype,torch_dtype,block_m,block_n,k,threads,num_n_tiles",
+    [
+        pytest.param("float16", torch.float16, 16, 32, 32, 64, 1, id="f16_single_atom"),
+        pytest.param("bfloat16", torch.bfloat16, 16, 32, 32, 64, 1, id="bf16_single_atom"),
+        pytest.param("float16", torch.float16, 16, 32, 64, 64, 1, id="f16_two_k_tiles"),
+        pytest.param("float16", torch.float16, 64, 64, 64, 256, 1, id="f16_multi_warp"),
+        pytest.param("float16", torch.float16, 64, 64, 64, 256, 2, id="f16_two_output_tiles"),
+    ],
+)
+def test_gemm_mls_n_major_b_ds_read_alt2_packed_b16_matrix_store_b32(
+    dtype,
+    torch_dtype,
+    block_m,
+    block_n,
+    k,
+    threads,
+    num_n_tiles,
+):
+    """N-major B: MLS b16 -> ds_read Alt2 -> MMAC f32 -> packed-f16 MatrixStore."""
+    block_k = 32
+    n = block_n * num_n_tiles
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((block_m, k), dtype),
+        B: T.Tensor((k, n), dtype),
+        C: T.Tensor((block_m, n), dtype),
+    ):
+        with T.Kernel(1, threads=threads):
+            C_packed = T.view(C, (block_m, n // 2), dtype="uint32")
+            A_shared = T.alloc_shared((block_m, block_k), dtype)
+            B_shared = T.alloc_shared((block_k, block_n), dtype)
+            A_fragment = T.alloc_fragment((block_m, block_k), dtype)
+            B_fragment = T.alloc_fragment((block_k, block_n), dtype)
+            C_local = T.alloc_fragment((block_m, block_n), "float32")
+            C_local_b16 = T.alloc_fragment((block_m, block_n), dtype)
+            for tile_n in T.serial(num_n_tiles):
+                T.clear(C_local)
+                for ko in T.serial(T.ceildiv(k, block_k)):
+                    T.matrix_load(A[0, ko * block_k], A_shared)
+                    T.matrix_load(B[ko * block_k, tile_n * block_n], B_shared)
+                    T.ptx_wait_group(0)
+                    T.ds_read_format(A_shared, A_fragment)
+                    T.ds_read_format(B_shared, B_fragment, alt=2)
+                    T.gemm(
+                        A_fragment,
+                        B_fragment,
+                        C_local,
+                        False,
+                        False,
+                        annotations={"tl.hcu_mmac_lit": 0, "trans_c": 1},
+                    )
+                T.copy(C_local, C_local_b16)
+                T.matrix_store(C_local_b16, C_packed[0, tile_n * block_n // 2])
+
+    rt_mod = tl.compile(kernel, target="auto")
+    torch.manual_seed(0)
+    a = torch.randn((block_m, k), dtype=torch_dtype)
+    b = torch.randn((k, n), dtype=torch_dtype)
+    output = torch.empty((block_m, n), device="cuda", dtype=torch_dtype)
+    rt_mod(a.cuda(), b.cuda(), output)
+    actual = output.cpu()
+    expected = (a.float() @ b.float()).to(torch_dtype)
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

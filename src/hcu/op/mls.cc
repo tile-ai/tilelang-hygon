@@ -20,6 +20,7 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
+#include <vector>
 
 namespace tvm {
 namespace tl {
@@ -816,17 +817,17 @@ const MatrixStoreTileConfig *GetMatrixStoreTileConfig(DataType dtype) {
   return nullptr;
 }
 
-bool IsPackedF16MatrixStore(const Buffer &src, const Buffer &dst) {
-  return src->dtype.is_float16() && dst->dtype.is_uint() &&
-         dst->dtype.bits() == 32;
+bool IsPackedB16MatrixStore(const Buffer &src, const Buffer &dst) {
+  return (src->dtype.is_float16() || src->dtype.is_bfloat16()) &&
+         dst->dtype.is_uint() && dst->dtype.bits() == 32;
 }
 
 std::pair<int64_t, int64_t> GetMatrixStoreBlockDims(const Buffer &src,
-                                                    bool packed_f16) {
+                                                    bool packed_b16) {
   auto [block_mn, block_k] = MlsBlockDims(src, true);
-  if (packed_f16) {
+  if (packed_b16) {
     ICHECK_EQ(block_k % 2, 0)
-        << "packed-F16 matrix_store requires an even innermost extent";
+        << "packed-B16 matrix_store requires an even innermost extent";
     block_k /= 2;
   }
   return {block_mn, block_k};
@@ -836,7 +837,7 @@ Fragment MakeMatrixStoreFragment(int64_t block_mn, int64_t block_k, int warp_mn,
                                  int warp_k,
                                  const MatrixStoreTileConfig &config,
                                  const Range &thread_bounds,
-                                 bool packed_f16 = false) {
+                                 bool packed_b16 = false) {
   const int64_t warp_tile_mn = static_cast<int64_t>(warp_mn) * config.tile_mn;
   const int64_t warp_tile_k = static_cast<int64_t>(warp_k) * config.tile_k;
   ICHECK_EQ(block_mn % warp_tile_mn, 0);
@@ -844,8 +845,8 @@ Fragment MakeMatrixStoreFragment(int64_t block_mn, int64_t block_k, int warp_mn,
   ICHECK_EQ(32 % config.elem_bits, 0);
 
   const int elements_per_lane = 32 / config.elem_bits;
-  ICHECK(!packed_f16 || config.elem_bits == 32);
-  const int source_pack_factor = packed_f16 ? 2 : 1;
+  ICHECK(!packed_b16 || config.elem_bits == 32);
+  const int source_pack_factor = packed_b16 ? 2 : 1;
   IterVar i = MakeIterVar("i", config.tile_mn);
   IterVar j = MakeIterVar("j", config.tile_k * source_pack_factor);
   IterVar rep = MakeIterVar("rep", 1);
@@ -853,8 +854,8 @@ Fragment MakeMatrixStoreFragment(int64_t block_mn, int64_t block_k, int warp_mn,
       FloorDiv(j->var, Integer(elements_per_lane * source_pack_factor));
   forward_thread += 16 * FloorMod(i->var, 4);
   Array<PrimExpr> forward_index;
-  if (packed_f16) {
-    // Keep each pair of logical F16 values adjacent in per-thread storage so
+  if (packed_b16) {
+    // Keep each pair of logical B16 values adjacent in per-thread storage so
     // T.copy can emit pk_cvt and the B32 store can consume the pair as uint32.
     forward_index = {2 * FloorDiv(i->var, 4) + FloorMod(j->var, 2)};
   } else {
@@ -872,18 +873,31 @@ Fragment MakeMatrixStoreFragment(int64_t block_mn, int64_t block_k, int warp_mn,
 std::optional<std::pair<int, int>> FindMatrixStoreWarpPartition(
     int64_t block_mn, int64_t block_k, int num_warps,
     const MatrixStoreTileConfig &config, const Range &thread_bounds,
-    const Optional<Layout> &expected_layout, bool packed_f16 = false) {
+    const Optional<Layout> &expected_layout, bool packed_b16 = false) {
+  std::vector<int> warp_mn_candidates;
   for (int warp_mn = 1; warp_mn <= num_warps; ++warp_mn) {
-    if (num_warps % warp_mn != 0) {
-      continue;
+    if (num_warps % warp_mn == 0) {
+      warp_mn_candidates.push_back(warp_mn);
     }
+  }
+  if (packed_b16) {
+    // MMAC C policies commonly distribute consumer waves over both output
+    // axes. Prefer the most balanced partition until an upstream layout is
+    // available to select an exact match.
+    std::stable_sort(warp_mn_candidates.begin(), warp_mn_candidates.end(),
+                     [num_warps](int lhs, int rhs) {
+                       return std::abs(lhs - num_warps / lhs) <
+                              std::abs(rhs - num_warps / rhs);
+                     });
+  }
+  for (int warp_mn : warp_mn_candidates) {
     const int warp_k = num_warps / warp_mn;
     if (block_mn % (warp_mn * config.tile_mn) != 0 ||
         block_k % (warp_k * config.tile_k) != 0) {
       continue;
     }
     Fragment candidate = MakeMatrixStoreFragment(
-        block_mn, block_k, warp_mn, warp_k, config, thread_bounds, packed_f16);
+        block_mn, block_k, warp_mn, warp_k, config, thread_bounds, packed_b16);
     if (!expected_layout.defined() ||
         StructuralEqual()(candidate, expected_layout.value())) {
       return std::make_pair(warp_mn, warp_k);
@@ -904,16 +918,16 @@ LayoutMap MatrixStoreNode::InferLayout(const LayoutInferArgs &T,
     return {};
   }
 
-  const bool packed_f16 = IsPackedF16MatrixStore(src, dst);
-  if (!packed_f16 && src->dtype != dst->dtype) {
+  const bool packed_b16 = IsPackedB16MatrixStore(src, dst);
+  if (!packed_b16 && src->dtype != dst->dtype) {
     return {};
   }
   const MatrixStoreTileConfig *config =
-      GetMatrixStoreTileConfig(packed_f16 ? dst->dtype : src->dtype);
+      GetMatrixStoreTileConfig(packed_b16 ? dst->dtype : src->dtype);
   if (config == nullptr) {
     return {};
   }
-  const auto [block_mn, block_k] = GetMatrixStoreBlockDims(src, packed_f16);
+  const auto [block_mn, block_k] = GetMatrixStoreBlockDims(src, packed_b16);
   const int64_t *thread_extent = as_const_int(T.thread_bounds->extent);
   if (thread_extent == nullptr) {
     return {};
@@ -927,14 +941,14 @@ LayoutMap MatrixStoreNode::InferLayout(const LayoutInferArgs &T,
   }
   auto partition = FindMatrixStoreWarpPartition(block_mn, block_k, num_warps,
                                                 *config, T.thread_bounds,
-                                                expected_layout, packed_f16);
+                                                expected_layout, packed_b16);
   ICHECK(partition.has_value())
       << "matrix_store source layout does not match any legal gfx946 "
       << "matrix_store_" << config->tile_mn << "x" << config->tile_k << "_b"
       << config->elem_bits << " warp partition";
   Layout layout = MakeMatrixStoreFragment(block_mn, block_k, partition->first,
                                           partition->second, *config,
-                                          T.thread_bounds, packed_f16);
+                                          T.thread_bounds, packed_b16);
   LayoutMap result;
   if (!expected_layout.defined()) {
     result.Set(src, layout);
@@ -955,13 +969,13 @@ Stmt MatrixStoreNode::Lower(const LowerArgs &T,
       << src.scope();
   ICHECK(IsGlobalBuffer(dst))
       << "matrix_store dst must be global memory, got scope=" << dst.scope();
-  const bool packed_f16 = IsPackedF16MatrixStore(src, dst);
-  ICHECK(packed_f16 || src->dtype == dst->dtype)
+  const bool packed_b16 = IsPackedB16MatrixStore(src, dst);
+  ICHECK(packed_b16 || src->dtype == dst->dtype)
       << "matrix_store requires matching src/dst dtype, except for packed "
-         "float16-to-uint32 B32 store, got src="
+         "float16/bfloat16-to-uint32 B32 store, got src="
       << src->dtype << " dst=" << dst->dtype;
   const MatrixStoreTileConfig *config =
-      GetMatrixStoreTileConfig(packed_f16 ? dst->dtype : src->dtype);
+      GetMatrixStoreTileConfig(packed_b16 ? dst->dtype : src->dtype);
   ICHECK(config != nullptr)
       << "gfx946 matrix_store with LTS=1 supports only f16/bf16 Alt=4 or "
          "f32/packed-u32 Alt=1, got dtype="
@@ -987,7 +1001,7 @@ Stmt MatrixStoreNode::Lower(const LowerArgs &T,
         << "matrix_store requires full source fragment last-2 dims, dim=" << i;
   }
 
-  const auto [block_mn, block_k] = GetMatrixStoreBlockDims(src, packed_f16);
+  const auto [block_mn, block_k] = GetMatrixStoreBlockDims(src, packed_b16);
   int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
   int warp_id_offset = MlsScopedWarpIdOffset(T.thread_bounds, T.target);
   Optional<Layout> expected_layout;
@@ -997,7 +1011,7 @@ Stmt MatrixStoreNode::Lower(const LowerArgs &T,
   const int num_warps = block_size / TargetHcuGetWarpSize(T.target);
   auto partition = FindMatrixStoreWarpPartition(block_mn, block_k, num_warps,
                                                 *config, T.thread_bounds,
-                                                expected_layout, packed_f16);
+                                                expected_layout, packed_b16);
   ICHECK(partition.has_value())
       << "matrix_store block/layout cannot be uniformly partitioned into "
       << config->tile_mn << "x" << config->tile_k << " atoms across "
