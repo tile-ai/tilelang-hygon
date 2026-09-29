@@ -975,6 +975,8 @@ def test_gemm_mls_f16_explicit_stage0(grouped):
         pytest.param(16, 16, 128, False, True, 16, 16, 128, 64, id="at_bn_16x128_single"),
         pytest.param(32, 32, 256, False, True, 16, 16, 128, 64, id="at_bn_16x128_multi_block"),
         pytest.param(32, 32, 256, False, True, 32, 32, 128, 64, id="at_bn_16x128_multi_tile"),
+        pytest.param(64, 64, 128, False, True, 64, 64, 128, 64, id="at_bn_64x128_multi_block"),
+        pytest.param(64, 64, 256, False, True, 64, 64, 256, 64, id="at_bn_64x128_multi_k"),
     ],
 )
 def test_gemm_mls_fp8(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
@@ -1001,7 +1003,14 @@ def test_gemm_mls_fp8(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_
         pytest.param(32, 32, 64, True, True, 32, 32, 64, 128, id="at_bt_single_block"),
         pytest.param(64, 64, 64, True, True, 32, 32, 64, 128, id="at_bt_multi_block"),
         pytest.param(64, 64, 32, True, False, 64, 64, 32, 128, id="an_bt_single_block"),
+        pytest.param(128, 32, 64, True, False, 128, 32, 64, 128, id="an_bt_64x16_slot_fallback"),
+        pytest.param(128, 64, 128, True, False, 128, 64, 128, 128, id="an_bt_64x16_multi_k"),
+        pytest.param(256, 64, 128, True, False, 256, 64, 128, 128, id="an_bt_64x16_full_slots_multi_k"),
         pytest.param(32, 32, 64, False, True, 32, 32, 64, 128, id="at_bn_single_block"),
+        pytest.param(32, 32, 128, False, True, 32, 32, 128, 128, id="at_bn_16x64_compact_multi_k"),
+        pytest.param(32, 64, 128, False, True, 32, 64, 128, 128, id="at_bn_16x64_slot_multi_k"),
+        pytest.param(96, 64, 64, True, True, 96, 64, 64, 128, id="an_bn_32x32_integral_warp_atoms"),
+        pytest.param(16, 96, 96, False, True, 16, 96, 96, 128, id="at_bn_16x32_k_remainder"),
     ],
 )
 def test_gemm_mls_ds_read_format_f16(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
@@ -1130,6 +1139,9 @@ def test_gemm_mls_copy_a_mls_b_ds_f16_pipeline(num_stages, verify_source):
     [
         pytest.param(64, 64, 32, True, False, 64, 64, 32, 64, id="an_bt_64x32_single"),
         pytest.param(128, 128, 32, True, False, 128, 128, 32, 64, id="an_bt_128x16_single"),
+        pytest.param(256, 128, 64, True, False, 256, 128, 64, 128, id="an_bt_128x16_slot_fallback"),
+        pytest.param(256, 64, 128, True, False, 256, 64, 128, 128, id="an_bt_128x16_multi_k"),
+        pytest.param(512, 64, 128, True, False, 512, 64, 128, 128, id="an_bt_128x16_full_slots_multi_k"),
         pytest.param(16, 16, 64, False, True, 16, 16, 64, 64, id="at_bn_16x64_single"),
         pytest.param(32, 32, 64, False, True, 32, 32, 64, 64, id="at_bn_32x64_single"),
         pytest.param(16, 16, 128, False, True, 16, 16, 128, 64, id="at_bn_16x128_single"),
@@ -1150,6 +1162,35 @@ def test_gemm_mls_ds_read_format_fp8(M, N, K, trans_A, trans_B, block_M, block_N
         block_N=block_N,
         block_K=block_K,
         num_threads=num_threads,
+    )
+
+
+@pytest.mark.skipif(
+    current_hcu_arch_string() != "gfx946",
+    reason="partial 4K-slot K groups are specific to gfx946 matrix_load",
+)
+@pytest.mark.parametrize(
+    "in_dtype, N, K",
+    [
+        pytest.param("float16", 128, 80, id="b16_k5"),
+        pytest.param("float8_e4m3fn", 256, 96, id="b8_k6"),
+    ],
+)
+def test_gemm_mls_nontrans_partial_k_slot_group(in_dtype, N, K):
+    """Cover a non-trans b16/b8 K slot group that is not a multiple of four."""
+    run_gemm_mls_copy_a_mls_b_ds(
+        M=32,
+        N=N,
+        K=K,
+        trans_A=False,
+        trans_B=False,
+        in_dtype=in_dtype,
+        out_dtype="float32",
+        dtypeAccum="float32",
+        block_M=32,
+        block_N=N,
+        block_K=K,
+        num_threads=64,
     )
 
 
@@ -1404,6 +1445,54 @@ def run_gemm_mls_ds_read_format_b4(
     torch.testing.assert_close(lib_out.cpu(), ref, rtol=1e-2, atol=1e-1)
 
 
+def run_gemm_mls_b4_partial_k_slot_group():
+    """Check that a partial K slot group does not overlap the next MN issue."""
+    M, N, read_n = 128, 512, 256
+    gemm_k, load_k, n_offset = 64, 80, 256
+    in_dtype = "float4_e2m1fn"
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((gemm_k, M), in_dtype),
+        B: T.Tensor((load_k, N), in_dtype),
+        C: T.Tensor((M, read_n), "float32"),
+    ):
+        with T.Kernel(1, threads=64):
+            A_shared = T.alloc_shared((gemm_k, M), in_dtype)
+            B_shared = T.alloc_shared((load_k, N), in_dtype)
+            A_fragment = T.alloc_fragment((gemm_k, M), in_dtype)
+            B_fragment = T.alloc_fragment((gemm_k, read_n), in_dtype)
+            C_local = T.alloc_fragment((M, read_n), "float32")
+            T.clear(C_local)
+            T.matrix_load(A, A_shared)
+            T.matrix_load(B, B_shared)
+            T.ptx_wait_group(0)
+            T.sync_warp()
+            T.ds_read_format(A_shared, A_fragment)
+            T.ds_read_format(B_shared[0:gemm_k, n_offset:N], B_fragment)
+            T.gemm(A_fragment, B_fragment, C_local, True, False)
+            T.copy(C_local, C)
+
+    kernel = tl.compile(main, out_idx=[2])
+    profiler = kernel.get_profiler()
+    a_rows = torch.arange(gemm_k, device="cuda", dtype=torch.uint8)[:, None]
+    a_cols = torch.arange(M, device="cuda", dtype=torch.uint8)[None, :]
+    b_rows = torch.arange(load_k, device="cuda", dtype=torch.uint8)[:, None]
+    b_cols = torch.arange(N, device="cuda", dtype=torch.uint8)[None, :]
+    A_logical = (a_rows * 3 + a_cols * 5 + a_rows // 7 + a_cols // 11) & 0x0F
+    B_logical = (b_rows * 7 + b_cols * 2 + b_rows // 5 + b_cols // 13) & 0x0F
+    A = _pack_fp4_last_dim(A_logical)
+    B = _pack_fp4_last_dim(B_logical)
+
+    torch.cuda.synchronize()
+    lib_out = profiler.func(A, B)
+    torch.cuda.synchronize()
+
+    A_ref = _fp4_e2m1fn_decode(A_logical.cpu()).T
+    B_ref = _fp4_e2m1fn_decode(B_logical.cpu())[0:gemm_k, n_offset:N]
+    torch.testing.assert_close(lib_out.cpu(), A_ref @ B_ref, rtol=1e-2, atol=1e-1)
+
+
 def run_gemm_mls_ds_read_format_b4_pad(
     M=16,
     N=16,
@@ -1652,6 +1741,8 @@ def test_mls_ds_read_format_b32_copy_to_global():
         pytest.param(32, 128, 32, 128, 128, id="b4_format_32x128_t128"),
         pytest.param(64, 256, 32, 128, 128, id="b4_format_64x256_mktiles_t128"),
         pytest.param(32, 256, 32, 256, 64, id="b4_format_32x256_trans_t64"),
+        pytest.param(64, 256, 64, 256, 128, id="b4_format_64x256_trans_slot_boundary"),
+        pytest.param(64, 512, 64, 512, 128, id="b4_format_64x512_trans_multi_k"),
     ],
 )
 def test_mls_ds_read_format_b4_copy_to_global(M, K, block_M, block_K, num_threads):
@@ -1678,7 +1769,13 @@ def test_mls_ds_read_format_b4_copy_to_global(M, K, block_M, block_K, num_thread
         pytest.param(64, 32, 256, False, True, 32, 32, 256, 64, id="at_bn_m64_n32_k256_t64"),
         pytest.param(128, 128, 64, True, False, 128, 128, 64, 64, id="an_bt_m128_n128_k64_t64"),
         pytest.param(128, 128, 64, True, False, 128, 128, 64, 128, id="an_bt_m128_n128_k64_t128"),
+        pytest.param(256, 128, 64, True, False, 256, 128, 64, 64, id="an_bt_m256_n128_k64_t64"),
+        pytest.param(256, 128, 128, True, False, 256, 128, 128, 128, id="an_bt_256x16_single_mn_multi_k"),
+        pytest.param(512, 128, 64, True, False, 512, 128, 64, 128, id="an_bt_256x16_slot_fallback"),
+        pytest.param(512, 128, 128, True, False, 512, 128, 128, 128, id="an_bt_256x16_multi_k"),
         pytest.param(256, 256, 128, True, False, 128, 128, 64, 128, id="an_bt_m256_n256_k128_t128"),
+        pytest.param(32, 64, 256, False, True, 32, 64, 256, 128, id="at_bn_16x256_slot_fallback"),
+        pytest.param(32, 64, 512, False, True, 32, 64, 512, 128, id="at_bn_16x256_multi_k"),
     ],
 )
 def test_gemm_mls_b4_nopad(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
@@ -1714,6 +1811,14 @@ def test_gemm_mls_b4_shared_k32_auto_expand():
         num_threads=64,
         direct_shared=True,
     )
+
+
+@pytest.mark.skipif(
+    current_hcu_arch_string() != "gfx946",
+    reason="partial 4K-slot K groups are specific to gfx946 matrix_load",
+)
+def test_gemm_mls_b4_nontrans_partial_k_slot_group():
+    run_gemm_mls_b4_partial_k_slot_group()
 
 
 @pytest.mark.skipif(

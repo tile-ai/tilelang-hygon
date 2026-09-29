@@ -212,6 +212,13 @@ HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
       if (m * n != max_no_recompute_warps) {
         continue;
       }
+      // Each warp must own an integral number of the resolved MLS/MMAC MN
+      // atoms.  A fractional atom can pass the minimum-size checks above but
+      // cannot be consumed by ds_read_format (for example, 96 / 2 = 48 rows
+      // with a 32-row read atom).
+      if (M % (m * kMPerWarp) != 0 || N % (n * kNPerWarp) != 0) {
+        continue;
+      }
 
       float balance = std::abs(m_per_warp / n_per_warp - ideal_ratio);
       if (balance < best_balance) {

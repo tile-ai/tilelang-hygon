@@ -353,9 +353,11 @@ template <::tl::index_t Alt>
 struct mls_traits<tl::mls::gfx946_mls_256x16_b4, Alt> {
   static_assert(Alt == 1 || Alt == 2 || Alt == 4,
                 "Unsupported interleave config");
-  static constexpr auto kMN0 = ::tl::number<4>{};
+  // The two 128-row halves are 4KB apart.  Each half keeps the same layout as
+  // matrix_load_128x16_b4, with the slot dimension placed between halves.
+  static constexpr auto kMN0 = ::tl::number<2>{};
   static constexpr auto kK = ::tl::number<16>{};
-  static constexpr auto kMN1 = ::tl::number<64>{};
+  static constexpr auto kMN1 = ::tl::number<128>{};
   static constexpr auto kSlots = ::tl::number<4>{};
   static constexpr auto PackedShape = ::tl::make_tuple(kMN0, kSlots, kK, kMN1);
 };
@@ -365,8 +367,8 @@ struct mls_traits<tl::mls::gfx946_mls_16x256_trans_b4, Alt> {
   static_assert(Alt == 1 || Alt == 2 || Alt == 4,
                 "Unsupported interleave config");
   static constexpr auto kMN = ::tl::number<16>{};
-  static constexpr auto kK0 = ::tl::number<4>{};
-  static constexpr auto kK1 = ::tl::number<64>{};
+  static constexpr auto kK0 = ::tl::number<2>{};
+  static constexpr auto kK1 = ::tl::number<128>{};
   static constexpr auto kSlots = ::tl::number<4>{};
   static constexpr auto PackedShape = ::tl::make_tuple(kK0, kSlots, kMN, kK1);
 };

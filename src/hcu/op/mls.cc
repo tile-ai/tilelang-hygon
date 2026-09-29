@@ -122,17 +122,10 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
   const int64_t tile_issue_mn = block_mn / mls_tile_mn;
   const int64_t tile_issue_k = block_k / mls_tile_k;
   const int64_t logical_elements = block_mn * block_k;
-  int64_t packed_elements = logical_elements;
   const int64_t bits_per_elem = DTypeStorageBits(dst->dtype);
   const int64_t physical_bits_per_elem =
       lds_physical_bits > 0 ? lds_physical_bits : bits_per_elem;
   int64_t packed_bytes = -1;
-
-  auto bytes_to_elements = [&](int64_t bytes) {
-    ICHECK_EQ((bytes * 8) % bits_per_elem, 0)
-        << "MLS packed byte size must be divisible by element storage bits";
-    return (bytes * 8) / bits_per_elem;
-  };
 
   auto elements_to_bytes = [&](int64_t elements) {
     return CeilDiv(elements * physical_bits_per_elem, 8);
@@ -152,6 +145,14 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
            kSlotStrideBytes + last_group_tiles * payload_bytes;
   };
 
+  auto packed_bytes_for_padded_k_slot_groups = [&](int64_t payload_bytes) {
+    constexpr int64_t kSlotStrideBytes = 4096;
+    constexpr int64_t kSlotsPerGroup = 4;
+    const int64_t groups_per_mn = CeilDiv(tile_issue_k, kSlotsPerGroup);
+    return tile_issue_mn * groups_per_mn *
+           (kSlotStrideBytes + kSlotsPerGroup * payload_bytes);
+  };
+
   if (dst->dtype.bits() == 4 && physical_bits_per_elem == 8) {
     packed_bytes = elements_to_bytes(logical_elements);
   } else if (dst->dtype.bits() == 16 && trans && mls_tile_mn == 16 &&
@@ -161,14 +162,20 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
         elements_to_bytes(mls_tile_mn * (mls_tile_k / 2)));
   } else if (dst->dtype.bits() == 16 && !trans && mls_tile_mn == 64 &&
              mls_tile_k == 16) {
-    packed_bytes = packed_bytes_for_4k_slots(
-        tile_issue_mn * tile_issue_k,
-        elements_to_bytes((mls_tile_mn / 2) * mls_tile_k));
+    const int64_t payload_bytes =
+        elements_to_bytes((mls_tile_mn / 2) * mls_tile_k);
+    packed_bytes = tile_issue_k > 4
+                       ? packed_bytes_for_padded_k_slot_groups(payload_bytes)
+                       : packed_bytes_for_4k_slots(tile_issue_mn * tile_issue_k,
+                                                   payload_bytes);
   } else if (dst->dtype.bits() == 8 && !trans && mls_tile_mn == 128 &&
              mls_tile_k == 16) {
-    packed_bytes = packed_bytes_for_4k_slots(
-        tile_issue_mn * tile_issue_k,
-        elements_to_bytes((mls_tile_mn / 2) * mls_tile_k));
+    const int64_t payload_bytes =
+        elements_to_bytes((mls_tile_mn / 2) * mls_tile_k);
+    packed_bytes = tile_issue_k > 4
+                       ? packed_bytes_for_padded_k_slot_groups(payload_bytes)
+                       : packed_bytes_for_4k_slots(tile_issue_mn * tile_issue_k,
+                                                   payload_bytes);
   } else if (dst->dtype.bits() == 8 && trans && mls_tile_mn == 16 &&
              mls_tile_k == 128) {
     packed_bytes = packed_bytes_for_4k_slots(
@@ -176,21 +183,31 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
         elements_to_bytes(mls_tile_mn * (mls_tile_k / 2)));
   } else if (dst->dtype.bits() == 4 && !trans && mls_tile_mn == 256 &&
              mls_tile_k == 16) {
-    packed_bytes = packed_bytes_for_4k_slots(
-        tile_issue_mn * tile_issue_k,
-        elements_to_bytes((mls_tile_mn / 2) * mls_tile_k));
+    const int64_t payload_bytes =
+        elements_to_bytes((mls_tile_mn / 2) * mls_tile_k);
+    packed_bytes = tile_issue_k > 4
+                       ? packed_bytes_for_padded_k_slot_groups(payload_bytes)
+                       : packed_bytes_for_4k_slots(tile_issue_mn * tile_issue_k,
+                                                   payload_bytes);
   } else if (dst->dtype.bits() == 4 && trans && mls_tile_mn == 16 &&
              mls_tile_k == 256) {
     packed_bytes = packed_bytes_for_4k_slots(
         tile_issue_mn * tile_issue_k,
         elements_to_bytes(mls_tile_mn * (mls_tile_k / 2)));
+  } else if (dst->dtype.bits() == 4 && physical_bits_per_elem == 4) {
+    packed_bytes = elements_to_bytes(logical_elements);
   }
 
-  if (packed_bytes > 0) {
-    packed_elements = bytes_to_elements(packed_bytes);
+  if (packed_bytes <= 0) {
+    return std::nullopt;
   }
 
-  if (packed_elements <= logical_elements) {
+  // MergeSharedMemoryAllocations uses dtype.bytes(), which rounds packed b4
+  // storage up to one byte per logical element. Override both expansions for
+  // 4K slot holes and contractions for genuinely packed 4-bit LDS storage.
+  const int64_t default_bytes =
+      logical_elements * dst->dtype.bytes() * dst->dtype.lanes();
+  if (packed_bytes == default_bytes) {
     return std::nullopt;
   }
   return Integer(leading_count * packed_bytes);
@@ -530,6 +547,15 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
           continue;
         if (wk * tile_k > block_k || block_k % (wk * tile_k) != 0)
           continue;
+      } else {
+        // Fallback atoms may repeat work when an axis has more warps than
+        // tiles.  When there are fewer warps than tiles, however, every warp
+        // must receive an integral number of atoms; otherwise the generic MLS
+        // iteration count truncates and leaves the remainder unloaded.
+        if ((wm <= slots_mn && slots_mn % wm != 0) ||
+            (wk <= slots_k && slots_k % wk != 0)) {
+          continue;
+        }
       }
       warp_mn = wm;
       warp_k = wk;
