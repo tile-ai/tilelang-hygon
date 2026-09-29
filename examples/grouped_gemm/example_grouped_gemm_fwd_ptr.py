@@ -136,7 +136,7 @@ def run_tilelang_grouped_gemm_ptr(
         program,
         target="auto",
         execution_backend="auto",
-        pass_configs={"tl.disable_warp_specialized": True, tl.PassConfigKey.TIR_USE_ASYNC_COPY: False},
+        pass_configs={"tl.disable_warp_specialized": True},
     )
     a_list, b_list, c_list, a_ptrs, b_ptrs, c_ptrs, batch_tile_offsets = construct_inputs(batch_sizes_list, K, N, block_M, device, dtype)
     refs = torch_grouped_gemm_ptr([a[:size] for a, size in zip(a_list, batch_sizes_list)], b_list)

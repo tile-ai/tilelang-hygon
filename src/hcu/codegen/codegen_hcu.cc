@@ -751,13 +751,51 @@ std::string ApplyCPAsyncLdsWrap(const CallNode *op, const Target &target,
          std::to_string(wrap_config.field_shift) + "))";
 }
 
+void CodeGenTileLangHCU::EmitCPAsyncResource(
+    const VarNode *source_var, const HoistedCPAsyncResource &resource) {
+  PrintIndent();
+  stream << "const int32x4_t " << resource.name << " = tl::";
+  if (resource.cache_swizzle_stride.has_value()) {
+    stream << "make_wave_buffer_resource_cache_swizzle("
+           << "reinterpret_cast<const void *>(" << GetVarID(source_var)
+           << "), 0xfffffffcu, " << resource.cache_swizzle_stride.value()
+           << ");\n";
+  } else {
+    stream << "make_wave_buffer_resource("
+           << "reinterpret_cast<const void *>(" << GetVarID(source_var)
+           << "), 0xfffffffcu);\n";
+  }
+}
+
+void CodeGenTileLangHCU::EmitCPAsyncIdxenResource(
+    const VarNode *source_var, const HoistedCPAsyncIdxenResource &resource) {
+  PrintIndent();
+  stream << "const int32x4_t " << resource.name
+         << " = tl::make_wave_buffer_resource<"
+         << resource.struct_stride_byte_bit
+         << ">(reinterpret_cast<const void *>(" << GetVarID(source_var)
+         << "), 0xfffffffcu);\n";
+}
+
 void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
   cp_async_resource_var_names_.clear();
   cp_async_idxen_resource_var_names_.clear();
+  cp_async_resources_to_emit_.clear();
+  cp_async_idxen_resources_to_emit_.clear();
   cp_async_idxen_lds_bases_to_emit_.clear();
   cp_async_idxen_lds_base_uses_.clear();
   std::vector<CPAsyncSourceInfo> normal_sources;
   std::vector<CPAsyncSourceInfo> idxen_sources;
+  std::unordered_map<const VarNode *, int64_t> cache_swizzle_strides;
+  std::unordered_set<const VarNode *> function_params;
+  for (const Var &param : func->params)
+    function_params.insert(param.get());
+
+  auto resource_base_name = [&](const VarNode *source_var) {
+    if (function_params.count(source_var))
+      return GetVarID(source_var);
+    return static_cast<std::string>(source_var->name_hint);
+  };
 
   struct SharedAliasInfo {
     Var root;
@@ -818,6 +856,15 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
       return;
     auto source = GetCPAsyncSourceInfo(call->args[1]);
     ICHECK(source.has_value()) << "Unable to identify HCU async-copy source";
+    if (auto value =
+            call->annotations.Get(tl::attr::kHcuBufferCacheSwizzleStride)) {
+      const auto *stride = value.value().as<IntImmNode>();
+      ICHECK(stride && stride->value > 0);
+      auto [it, inserted] =
+          cache_swizzle_strides.emplace(source->buffer_var, stride->value);
+      ICHECK(inserted || it->second == stride->value)
+          << "Conflicting cache-swizzle strides for one async-copy source";
+    }
     if (call->op.same_as(tl::hcu_cp_async_idxen())) {
       ICHECK_EQ(call->args.size(), 6U);
       const auto *struct_stride_byte_bit = call->args[5].as<IntImmNode>();
@@ -826,7 +873,7 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
         source->struct_stride_byte_bit =
             static_cast<int>(struct_stride_byte_bit->value);
         cp_async_idxen_resource_var_names_[source->buffer_var] =
-            name_supply_->FreshName(GetVarID(source->buffer_var) +
+            name_supply_->FreshName(resource_base_name(source->buffer_var) +
                                     "_cp_async_idxen_resource");
         idxen_sources.push_back(*source);
       }
@@ -900,7 +947,7 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
     if (cp_async_resource_var_names_.count(source->buffer_var))
       return;
     cp_async_resource_var_names_[source->buffer_var] = name_supply_->FreshName(
-        GetVarID(source->buffer_var) + "_cp_async_resource");
+        resource_base_name(source->buffer_var) + "_cp_async_resource");
     normal_sources.push_back(*source);
   });
 
@@ -919,21 +966,26 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
   }
 
   for (const auto &source : normal_sources) {
-    PrintIndent();
-    stream << "const int32x4_t "
-           << cp_async_resource_var_names_.at(source.buffer_var)
-           << " = tl::make_wave_buffer_resource("
-           << "reinterpret_cast<const void *>(" << GetVarID(source.buffer_var)
-           << "), 0xfffffffcu);\n";
+    HoistedCPAsyncResource resource{
+        cp_async_resource_var_names_.at(source.buffer_var), std::nullopt};
+    auto cache_swizzle = cache_swizzle_strides.find(source.buffer_var);
+    if (cache_swizzle != cache_swizzle_strides.end())
+      resource.cache_swizzle_stride = cache_swizzle->second;
+    if (function_params.count(source.buffer_var))
+      EmitCPAsyncResource(source.buffer_var, resource);
+    else
+      cp_async_resources_to_emit_.emplace(GetRef<Var>(source.buffer_var),
+                                          std::move(resource));
   }
   for (const auto &source : idxen_sources) {
-    PrintIndent();
-    stream << "const int32x4_t "
-           << cp_async_idxen_resource_var_names_.at(source.buffer_var)
-           << " = tl::make_wave_buffer_resource<"
-           << source.struct_stride_byte_bit.value()
-           << ">(reinterpret_cast<const void *>(" << GetVarID(source.buffer_var)
-           << "), 0xfffffffcu);\n";
+    HoistedCPAsyncIdxenResource resource{
+        cp_async_idxen_resource_var_names_.at(source.buffer_var),
+        source.struct_stride_byte_bit.value()};
+    if (function_params.count(source.buffer_var))
+      EmitCPAsyncIdxenResource(source.buffer_var, resource);
+    else
+      cp_async_idxen_resources_to_emit_.emplace(GetRef<Var>(source.buffer_var),
+                                                std::move(resource));
   }
 }
 
@@ -1228,6 +1280,16 @@ void CodeGenTileLangHCU::VisitStmt_(const BindNode *op) {
   // var_idmap_.
   let_initializer_expr_for_predicate_[op->var.get()] = op->value;
   CodeGenC::VisitStmt_(op);
+  auto resource = cp_async_resources_to_emit_.find(op->var);
+  if (resource != cp_async_resources_to_emit_.end()) {
+    EmitCPAsyncResource(op->var.get(), resource->second);
+    cp_async_resources_to_emit_.erase(resource);
+  }
+  auto idxen_resource = cp_async_idxen_resources_to_emit_.find(op->var);
+  if (idxen_resource != cp_async_idxen_resources_to_emit_.end()) {
+    EmitCPAsyncIdxenResource(op->var.get(), idxen_resource->second);
+    cp_async_idxen_resources_to_emit_.erase(idxen_resource);
+  }
   auto lds_bases = cp_async_idxen_lds_bases_to_emit_.find(op->var);
   if (lds_bases != cp_async_idxen_lds_bases_to_emit_.end()) {
     for (const HoistedCPAsyncLdsBase &base : lds_bases->second) {
@@ -1657,10 +1719,18 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
 
       std::string pred = GetCurrentPredicate();
       PrintIndent();
-      stream << "tl::hcu_buffer_store<" << data_type << ", "
-             << desc.num_elements << ", " << (pred == "true" ? "false" : "true")
-             << ">(" << src_thread_buffer << ", reinterpret_cast<" << data_type
-             << "*>(" << desc.wave_ptr << ")"
+      if (buffer_cache_swizzle_stride_bytes_.has_value()) {
+        stream << "tl::hcu_buffer_store_cache_swizzle<"
+               << buffer_cache_swizzle_stride_bytes_.value() << ", "
+               << data_type << ", " << desc.num_elements << ", "
+               << (pred == "true" ? "false" : "true") << ">(";
+      } else {
+        stream << "tl::hcu_buffer_store<" << data_type << ", "
+               << desc.num_elements << ", "
+               << (pred == "true" ? "false" : "true") << ">(";
+      }
+      stream << src_thread_buffer << ", reinterpret_cast<" << data_type << "*>("
+             << desc.wave_ptr << ")"
              << ", " << desc.offset << ", " << pred << ", "
              << desc.element_space_size << ");\n";
 
@@ -2127,11 +2197,17 @@ std::string CodeGenTileLangHCU::GetVecLoadWithPredicate(
     std::ostringstream os;
     os << "*(";
     PrintType(t, os);
-    os << "*)&(tl::hcu_buffer_load<" << data_type << ", " << desc.num_elements
-       << ", " << (pred == "true" ? "false" : "true")
-       << ">(reinterpret_cast<const " << data_type << "*>(" << desc.wave_ptr
-       << "), " << desc.offset << ", " << pred << ", "
-       << desc.element_space_size << ").get())";
+    os << "*)&(tl::";
+    if (buffer_cache_swizzle_stride_bytes_.has_value()) {
+      os << "hcu_buffer_load_cache_swizzle<"
+         << buffer_cache_swizzle_stride_bytes_.value() << ", ";
+    } else {
+      os << "hcu_buffer_load<";
+    }
+    os << data_type << ", " << desc.num_elements << ", "
+       << (pred == "true" ? "false" : "true") << ">(reinterpret_cast<const "
+       << data_type << "*>(" << desc.wave_ptr << "), " << desc.offset << ", "
+       << pred << ", " << desc.element_space_size << ").get())";
 
     return os.str();
   }
@@ -2162,12 +2238,18 @@ void CodeGenTileLangHCU::PrintVecStoreWithPredicate(const BufferNode *buffer,
   std::string src_thread_buffer =
       "tl::bit_cast<tl::thread_buffer<" + data_type + ", " +
       std::to_string(desc.num_elements) + ">>(" + value + ")";
-
   this->PrintIndent();
-  this->stream << "tl::hcu_buffer_store<" << data_type << ", "
-               << desc.num_elements << ", "
-               << (pred == "true" ? "false" : "true") << ">("
-               << src_thread_buffer << ", "
+  if (buffer_cache_swizzle_stride_bytes_.has_value()) {
+    this->stream << "tl::hcu_buffer_store_cache_swizzle<"
+                 << buffer_cache_swizzle_stride_bytes_.value() << ", "
+                 << data_type << ", " << desc.num_elements << ", "
+                 << (pred == "true" ? "false" : "true") << ">(";
+  } else {
+    this->stream << "tl::hcu_buffer_store<" << data_type << ", "
+                 << desc.num_elements << ", "
+                 << (pred == "true" ? "false" : "true") << ">(";
+  }
+  this->stream << src_thread_buffer << ", "
                << "reinterpret_cast<" << data_type << "*>(" << desc.wave_ptr
                << "), " << desc.offset << ", " << pred << ", "
                << desc.element_space_size << ");\n";
@@ -3323,6 +3405,16 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
 }
 
 void CodeGenTileLangHCU::VisitStmt_(const AttrStmtNode *op) {
+  if (op->attr_key == tl::attr::kHcuBufferCacheSwizzleStride) {
+    const auto *stride = op->value.as<IntImmNode>();
+    ICHECK(stride && stride->value > 0)
+        << "HCU buffer cache-swizzle stride must be a positive integer";
+    auto previous = buffer_cache_swizzle_stride_bytes_;
+    buffer_cache_swizzle_stride_bytes_ = stride->value;
+    VisitStmt(op->body);
+    buffer_cache_swizzle_stride_bytes_ = previous;
+    return;
+  }
   if (op->attr_key == tl::attr::kLexicalAllocScope) {
     PrintIndent();
     stream << "{\n";
