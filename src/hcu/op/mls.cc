@@ -91,7 +91,8 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
                                               bool trans, Target target,
                                               int lds_physical_bits) {
   const auto hcu_arch = TargetIsHCU(target) ? GetHcuArchString(target) : "";
-  if (!TargetIsHCU(target) || (hcu_arch != "gfx946" && hcu_arch != "gfx92a") ||
+  if (!TargetIsHCU(target) ||
+      (hcu_arch != "gfx946" && hcu_arch != "gfx938" && hcu_arch != "gfx92a") ||
       dst->shape.size() < 2) {
     return std::nullopt;
   }
