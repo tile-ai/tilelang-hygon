@@ -21,7 +21,7 @@ from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
 from tilelang.env import TILELANG_TEMPLATE_PATH
 from tilelang.contrib.hip_resource_info import filter_and_record
 
-from .utils import is_cpu_target, is_cuda_target, is_hip_target
+from .utils import is_cpu_target, is_cuda_target, is_hip_target, is_hcu_target
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +118,30 @@ class LibraryGenerator:
                 "-I" + CUTLASS_INCLUDE_DIR,
             ]
 
+        elif is_hcu_target(target):
+            from tilelang.contrib.hcu import (
+                find_hcu_path,
+                get_hcu_arch,
+                get_hcu_compiler,
+                get_hcu_compile_flags,
+                get_hcu_device_compile_flags,
+            )
+            from tilelang.hcu.target import target_get_mcpu
+
+            src = tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False)  # noqa: SIM115
+            libpath = src.name.replace(".cpp", ".so")
+            arch = target_get_mcpu(target) or get_hcu_arch(find_hcu_path())
+            command = [
+                get_hcu_compiler(),
+                "-O3",
+                "-std=c++17",
+                "-fPIC",
+                f"--offload-arch={arch}",
+                "--shared",
+                src.name,
+            ]
+            command += get_hcu_device_compile_flags(self.pass_configs)
+            command += get_hcu_compile_flags(arch, self.pass_configs)
         elif is_hip_target(target):
             from tilelang.rocm.target import target_get_mcpu
 
@@ -180,7 +204,7 @@ class LibraryGenerator:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
-        if is_hip_target(target):
+        if is_hip_target(target) or is_hcu_target(target):
             run_kwargs.setdefault("stdout", subprocess.PIPE)
             run_kwargs.setdefault("stderr", subprocess.STDOUT)
 
@@ -195,7 +219,7 @@ class LibraryGenerator:
             captured = ret.stdout.decode("utf-8", errors="replace") if ret.stdout else ""
             raise RuntimeError(f"Compilation Failed! {command}\n{captured}\n{self.lib_code}")
 
-        if is_hip_target(target) and ret.stdout is not None:
+        if (is_hip_target(target) or is_hcu_target(target)) and ret.stdout is not None:
             captured = filter_and_record(ret.stdout.decode("utf-8", errors="replace"))
             if verbose and captured.strip():
                 print(captured)
