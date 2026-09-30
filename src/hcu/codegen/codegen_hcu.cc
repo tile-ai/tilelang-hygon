@@ -1321,6 +1321,15 @@ bool IsMlsLoadTileCallExtern(const CallNode *call) {
                          .find("tl::mls::mls_load_tile<") == 0;
 }
 
+bool IsMlsStoreTileCallExtern(const CallNode *call) {
+  if (!call->op.same_as(tirx::builtin::call_extern()) || call->args.empty()) {
+    return false;
+  }
+  const auto *name = call->args[0].as<StringImmNode>();
+  return name && static_cast<std::string>(name->value)
+                         .find("tl::mls::mls_store_tile<") == 0;
+}
+
 std::vector<std::string> SplitTopLevelTemplateArgs(const std::string &text) {
   std::vector<std::string> args;
   int depth = 0;
@@ -1629,6 +1638,12 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
            << refresh_k << ", " << refresh_mn << ">(" << dst_ptr << ", "
            << k_base << ", " << mn_base << ");\n";
     return;
+  }
+  if (call && IsMlsStoreTileCallExtern(call)) {
+    ICHECK_EQ(call->args.size(), 9U)
+        << "mls_store_tile extern expects symbol, src_fragment, dst, stride, "
+           "mn_len, k_len, mn_base, k_base, warp_id_offset";
+    enable_gemm_mls_ = true;
   }
 
   CodeGenC::VisitStmt_(op);
@@ -3166,7 +3181,13 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
 
     std::string lit = "";
     if (prefix.find("_lit") != std::string::npos) {
-      lit = ", 1";
+      bool use_lit = true;
+      auto lit_hint = op->annotations.find("tl.hcu_use_lit");
+      if (lit_hint != op->annotations.end()) {
+        const auto *imm = (*lit_hint).second.as<IntImmNode>();
+        use_lit = imm && imm->value != 0;
+      }
+      lit = use_lit ? ", 1" : ", 0";
     }
     std::string clamp = "";
     if (prefix.find("_clamp") != std::string::npos) {

@@ -809,6 +809,28 @@ private:
     return false;
   }
 
+  int GetDsReadAlt(const Buffer &input) const {
+    int alt = 1;
+    bool found = false;
+    for (const ProducerRecord &record : collector_->GetProducerRecords(input)) {
+      if (record.call == nullptr) {
+        continue;
+      }
+      Optional<TileOperator> producer =
+          ParseOperator(ffi::GetRef<Call>(record.call));
+      const auto *ds_read = producer.as<DsReadFormatNode>();
+      if (ds_read == nullptr) {
+        continue;
+      }
+      ICHECK(!found || alt == ds_read->alt_)
+          << "GEMM B fragment has ds_read_format producers with conflicting "
+             "Alt values";
+      alt = ds_read->alt_;
+      found = true;
+    }
+    return alt;
+  }
+
   bool LookupSharedMlsTrans(const Buffer &dst, bool *out_trans) {
     auto it = shared_mls_trans_.find(dst);
     if (it != shared_mls_trans_.end()) {
@@ -1103,6 +1125,11 @@ private:
       auto gemm = Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
       auto annotations =
           AnnotateGemmHcuMlsFlags(call->annotations, gemm.get(), collector_);
+      const int b_ds_read_alt = GetDsReadAlt(gemm->b_);
+      if (b_ds_read_alt != 1) {
+        annotations.Set(attr::kHcuBDsReadAlt,
+                        IntImm(DataType::Int(32), b_ds_read_alt));
+      }
       if (copy_ds_read_outputs_.count(gemm->a_)) {
         annotations.Set(attr::kHcuAFromMls, IntImm(DataType::Int(32), 1));
       }
