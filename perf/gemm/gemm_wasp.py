@@ -36,6 +36,10 @@ WASP_PASS_CONFIGS = {
     # tl.PassConfigKey.TL_ENABLE_DUMP_IR: True,
     # tl.PassConfigKey.TL_DUMP_IR_DIR: "./dump_ir_gemm_wasp",
     tl.PassConfigKey.TL_ENABLE_HCU_WDRA: True,
+    # PMD does not implement the WDRA trap handler used by hardware.
+    tl.PassConfigKey.TL_DEVICE_COMPILE_FLAGS: [
+        "-mllvm=-turn-off-wdra-trap-handler=true",
+    ],
 }
 
 
