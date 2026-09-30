@@ -111,6 +111,25 @@ Stmt MakeSyncWarpStmt() {
   return Evaluate(Call(DataType::Void(), sync_warp(), {}));
 }
 
+Stmt MakeExternStmt(const char *name) {
+  return Evaluate(
+      Call(DataType::Void(), builtin::call_extern(), {StringImm(name)}));
+}
+
+// One statement of an async producer group: the global->LDS copy itself, or the
+// commit_group that closes it.
+bool IsAsyncProducerStmt(const Stmt &stmt) {
+  const auto *eval = stmt.as<EvaluateNode>();
+  if (eval == nullptr) {
+    return false;
+  }
+  const auto *call = eval->value.as<CallNode>();
+  if (call == nullptr) {
+    return false;
+  }
+  return IsAsyncCopyCall(call) || call->op.same_as(builtin::ptx_commit_group());
+}
+
 PrimExpr MakeWarpIndexExpr() {
   return Call(DataType::Int(32), get_warp_idx(), {});
 }
@@ -136,6 +155,32 @@ Stmt RebuildFlattened(const Array<Stmt> &stmts) {
     return stmts[0];
   }
   return SeqStmt::Flatten(stmts);
+}
+
+// Bracket every async producer group with a wave-priority boost, so the warp
+// issuing G2S loads wins arbitration for them. This mirrors what the hand-written
+// perf/gemm/async_copy_gemm.py does with tl::promote_prio/restore_prio; on gfx936
+// at 10240^3 / 256x256x16 it is worth ~5% (380.5 -> 403.6 TFLOPS), while removing
+// it from the hand-written kernel drops that to 381.8. Instruction stream is
+// unchanged apart from the added s_setprio, so this is a pure arbitration hint.
+Stmt WrapProducerPrio(const Stmt &body) {
+  Array<Stmt> stmts = FlattenStmts(body);
+  Array<Stmt> out;
+  size_t i = 0;
+  while (i < stmts.size()) {
+    if (!IsAsyncProducerStmt(stmts[i])) {
+      out.push_back(stmts[i]);
+      ++i;
+      continue;
+    }
+    out.push_back(MakeExternStmt("tl::promote_prio"));
+    while (i < stmts.size() && IsAsyncProducerStmt(stmts[i])) {
+      out.push_back(stmts[i]);
+      ++i;
+    }
+    out.push_back(MakeExternStmt("tl::restore_prio"));
+  }
+  return RebuildFlattened(out);
 }
 
 Array<Stmt> RewriteAltLoopBody(const Array<Stmt> &stmts) {
@@ -206,10 +251,11 @@ public:
 private:
   Stmt VisitStmt_(const ForNode *op) override {
     if (IsGemmKLoop(op) && LoopEnabled(op)) {
-      For then_loop(op->loop_var, op->min, op->extent, op->kind, op->body,
+      Stmt then_body = WrapProducerPrio(op->body);
+      Stmt else_body = WrapProducerPrio(
+          RebuildFlattened(RewriteAltLoopBody(FlattenStmts(op->body))));
+      For then_loop(op->loop_var, op->min, op->extent, op->kind, then_body,
                     op->thread_binding, op->annotations, op->step, op->span);
-      Stmt else_body =
-          RebuildFlattened(RewriteAltLoopBody(FlattenStmts(op->body)));
       For else_loop(op->loop_var, op->min, op->extent, op->kind, else_body,
                     op->thread_binding, op->annotations, op->step, op->span);
       PrimExpr cond =

@@ -167,10 +167,14 @@ TL_DEVICE int get_warp_idx(int warp_size = detail::default_warp_size()) {
 
 TL_DEVICE void sync_warp(unsigned long long mask = ~0ull) {
   (void)mask;
-  // Same instruction as tl::wave_barrier: workgroup s_barrier. Do not hide it
-  // behind __HIP_DEVICE_COMPILE__; host-path empty body would drop the sync
-  // when this header is parsed without that macro.
-  asm volatile("s_barrier" : : : "memory");
+  // Emit the workgroup s_barrier through the AMDGPU builtin rather than
+  // `asm volatile("s_barrier")`. Both encode to the same instruction, but the
+  // opaque asm form is a scheduling barrier the AMDGPU machine scheduler cannot
+  // see through, which blocks software pipelining of the LDS DMA at every call
+  // site inside the K loop. Measured on gfx936 (example_gemm 10240^3, aicc 09):
+  // 310.8 -> 380.8 TFLOPS. TL_DEVICE already keeps this body out of the host
+  // pass, so no __HIP_DEVICE_COMPILE__ guard is needed.
+  __builtin_amdgcn_s_barrier();
 }
 
 TL_DEVICE unsigned long long activemask() {
