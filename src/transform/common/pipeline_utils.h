@@ -86,16 +86,6 @@ inline bool IsRegisterPipelineBuffer(const Buffer &buffer) {
   return buffer.defined() && IsRegisterPipelineBufferScope(buffer.scope());
 }
 
-inline bool IsRegisterPipelineProducerBuffer(const Buffer &buffer) {
-  if (!IsRegisterPipelineBuffer(buffer)) {
-    return false;
-  }
-  const std::string suffix = kRegisterPipelineBufferSuffix;
-  const std::string &name = buffer->name;
-  return name.size() >= suffix.size() &&
-         name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
 /*! \brief Whether a flat TIRX statement declares pipeline-local buffer storage.
  *
  * Flat TIRX represents buffer allocations/declarations as standalone

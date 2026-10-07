@@ -30,13 +30,6 @@ bool LoopEnabled(const ForNode *loop) {
   return LoopHasRegisterPipeline(loop) && LoopHasWarpDivergence(loop);
 }
 
-std::optional<int64_t> GetConstIntValue(const PrimExpr &expr) {
-  if (const auto *imm = expr.as<IntImmNode>()) {
-    return imm->value;
-  }
-  return std::nullopt;
-}
-
 bool IsThreadIdxXAttr(const AttrStmtNode *op) {
   if (op->attr_key != tirx::attr::thread_extent) {
     return false;
@@ -61,50 +54,6 @@ bool IsSyncWarpStmt(const Stmt &stmt) {
     }
   }
   return false;
-}
-
-bool IsSchedBarrierStmt(const Stmt &stmt) {
-  const auto *eval = stmt.as<EvaluateNode>();
-  if (eval == nullptr) {
-    return false;
-  }
-  const auto *call = eval->value.as<CallNode>();
-  if (call == nullptr || !call->op.same_as(builtin::call_extern()) ||
-      call->args.empty()) {
-    return false;
-  }
-  if (const auto *s = call->args[0].as<StringImmNode>()) {
-    return s->value == "__builtin_amdgcn_sched_barrier";
-  }
-  return false;
-}
-
-bool StmtContainsAsyncCopy(const Stmt &stmt) {
-  struct Checker : public StmtExprVisitor {
-    bool found{false};
-    void VisitExpr_(const CallNode *op) override {
-      if (IsAsyncCopyCall(op)) {
-        found = true;
-        return;
-      }
-      ExprVisitor::VisitExpr_(op);
-    }
-  };
-  Checker checker;
-  checker(stmt);
-  return checker.found;
-}
-
-bool IsMmaCluster(const Stmt &stmt) {
-  if (!StmtContainsMma(stmt)) {
-    return false;
-  }
-  if (const auto *for_op = stmt.as<ForNode>()) {
-    if (IsGemmKLoop(for_op)) {
-      return false;
-    }
-  }
-  return !StmtContainsAsyncCopy(stmt);
 }
 
 Stmt MakeSyncWarpStmt() {
@@ -157,12 +106,10 @@ Stmt RebuildFlattened(const Array<Stmt> &stmts) {
   return SeqStmt::Flatten(stmts);
 }
 
-// Bracket every async producer group with a wave-priority boost, so the warp
-// issuing G2S loads wins arbitration for them. This mirrors what the hand-written
-// perf/gemm/async_copy_gemm.py does with tl::promote_prio/restore_prio; on gfx936
-// at 10240^3 / 256x256x16 it is worth ~5% (380.5 -> 403.6 TFLOPS), while removing
-// it from the hand-written kernel drops that to 381.8. Instruction stream is
-// unchanged apart from the added s_setprio, so this is a pure arbitration hint.
+// Bracket every async producer group with a wave-priority boost so that the
+// warp issuing G2S loads wins arbitration for them. s_setprio only changes the
+// arbitration priority between waves; it does not reorder or add memory
+// operations, so this is a pure scheduling hint.
 Stmt WrapProducerPrio(const Stmt &body) {
   Array<Stmt> stmts = FlattenStmts(body);
   Array<Stmt> out;

@@ -553,13 +553,11 @@ public:
 };
 
 /*
- * mls_load_tile: one-shot MLS load for block K loop.
- * Flow: construct(k_length_raw) -> set_window_origin(block_mn_base, 0) ->
- * move_base_to(block_k_base)
- *       -> async_mls_load_asm(smem, block_k_base).
- * check_last_load=true (default, K analyze): compute last_load at runtime.
- * check_last_load=false: use last_load template param (K skip / refresh).
- * TIR boundary=(mn, k) is encoded as int8 modes after DstBits on mls_load_tile.
+ * mls_load_tile: one-shot MLS load (no hoist).
+ * Flow: construct -> set_window_origin(mn, k) -> async_mls_load_asm.
+ * KBoundary / MNBoundary: -1 analyze, 0 skip, 1 refresh; a one-shot load
+ * refreshes unless the axis is skip. TIR boundary=(mn, k) is encoded as int8
+ * modes after DstBits on mls_load_tile.
  */
 template <typename BlockSize, typename MlsTileSize, ::tl::index_t WarpMN,
           ::tl::index_t WarpK, typename DataType, ::tl::index_t Alt, bool Trans,

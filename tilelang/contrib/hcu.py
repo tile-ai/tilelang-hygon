@@ -237,20 +237,18 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
             "-mllvm=-disable-machine-sink=True",
             "-mllvm=-check-valu-data-forward-hazards=0",
             "-mllvm=-disable-cluster-lds-memops=true",
-            # "-mllvm=-amdgpu-disable-backoff-barrier=false",
         ]
         if _pass_config_truthy(pass_configs, PassConfigKey.TL_ENABLE_FAST_MATH):
             flags.append("-mllvm=-enable-hcu-approx-func-fp-math=true")
         if _pass_config_truthy(pass_configs, PassConfigKey.TL_ENABLE_HCU_WDRA):
             flags.append("-mllvm=-vgpr-greedy-alloc-mode=local-wave")
-            # flags.append("-mllvm=-turn-off-wdra-trap-handler=true")  # just for cmodel testing
         if arch in ["gfx938", "gfx92a", "gfx946"]:
             flags.append("-mllvm=-hcu-update-wait-by-reverse-search=true")
             flags.append("-mllvm=-hcu-pre-emit-load-store-opt=false")
-            # flags.append("-mllvm=-hcu-trust-special-waitcnt-for-lds-dma=true")
-        # New aicc (clang 22) defaults to code-object ABI 6. DTK bitcode on this
-        # machine still only ships oclc_abi_version_{400,500}.bc, so pin COV 5
-        # and point at /opt/dtk/amdgcn/bitcode.
+        # New aicc (clang 22) defaults to code-object ABI 6, while some DTK
+        # versions only ship oclc_abi_version_{400,500}.bc: point the device
+        # library path at the DTK bitcode dir and pin COV 5 when it has no
+        # ABI-6 device lib.
         bitcode_dir = _hcu_amdgcn_bitcode_dir()
         if bitcode_dir:
             flags.append(f"--rocm-device-lib-path={bitcode_dir}")

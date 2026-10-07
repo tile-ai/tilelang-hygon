@@ -111,13 +111,6 @@ private:
         HandleTileOp(tile_op);
       }
     }
-    if (const auto *op_node = op->op.as<OpNode>()) {
-      std::string name = op_node->name;
-      if (name.find("mmac") != std::string::npos ||
-          name.find("mma") != std::string::npos) {
-        has_mma_compute_ = true;
-      }
-    }
     StmtExprVisitor::VisitExpr_(op);
   }
 

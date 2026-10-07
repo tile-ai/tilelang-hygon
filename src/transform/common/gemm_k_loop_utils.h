@@ -2,6 +2,9 @@
 #define TVM_TL_TRANSFORM_COMMON_GEMM_K_LOOP_UTILS_H_
 
 #include <tvm/tirx/stmt.h>
+
+#include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace tvm {
@@ -10,6 +13,11 @@ namespace tl {
 bool IsAsyncCopyCall(const tirx::CallNode *call);
 bool IsMmaCall(const tirx::CallNode *call);
 bool StmtContainsMma(const tirx::Stmt &stmt);
+bool StmtContainsAsyncCopy(const tirx::Stmt &stmt);
+bool IsMmaCluster(const tirx::Stmt &stmt);
+bool IsSchedBarrierStmt(const tirx::Stmt &stmt);
+
+std::optional<int64_t> GetConstIntValue(const PrimExpr &expr);
 
 struct GemmKLoopFeatures {
   bool has_mma{false};

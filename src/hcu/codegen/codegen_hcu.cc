@@ -1394,8 +1394,6 @@ std::string MlsDataTypeFromLoadTile(const std::string &sym) {
   auto args = SplitTopLevelTemplateArgs(
       sym.substr(prefix.size(), sym.size() - prefix.size() - 1));
   return ::tvm::tl::MlsParseBoundaryArgs(args);
-  // auto lit = ::tvm::tl::MlsKModeToLastLoadLiterals(modes.k);
-  // return {lit.first, lit.second};
 }
 
 std::string MlsAsyncLoadTemplateArgs(const std::string &template_args) {

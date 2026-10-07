@@ -30,14 +30,11 @@ using ffi::GetRef;
 
 bool IsWaitAttr(const AttrStmtNode *op) {
   return op->attr_key == s_tir::attr::async_wait_queue_scope ||
-         op->attr_key == "async_wait_queue_scope" ||
-         op->attr_key == s_tir::attr::async_wait_inflight_count ||
-         op->attr_key == "async_wait_inflight_count";
+         op->attr_key == s_tir::attr::async_wait_inflight_count;
 }
 
 bool IsCommitAttr(const AttrStmtNode *op) {
-  return op->attr_key == s_tir::attr::async_commit_queue_scope ||
-         op->attr_key == "async_commit_queue_scope";
+  return op->attr_key == s_tir::attr::async_commit_queue_scope;
 }
 
 bool IsPtxCommitStmt(const Stmt &stmt) {
@@ -295,19 +292,17 @@ std::vector<int> CollectEpilogueWaitCounts(const Stmt &root) {
 
     void VisitStmt_(const AttrStmtNode *op) override {
       if (past_main_loop) {
-        if (op->attr_key == s_tir::attr::async_wait_queue_scope ||
-            op->attr_key == "async_wait_queue_scope") {
+        if (op->attr_key == s_tir::attr::async_wait_queue_scope) {
           const auto *inner = op->body.as<AttrStmtNode>();
-          if (inner && (inner->attr_key == s_tir::attr::async_wait_inflight_count ||
-                        inner->attr_key == "async_wait_inflight_count")) {
+          if (inner &&
+              inner->attr_key == s_tir::attr::async_wait_inflight_count) {
             if (const auto *imm = inner->value.as<IntImmNode>()) {
               counts.push_back(static_cast<int>(imm->value));
             }
             VisitStmt(inner->body);
             return;
           }
-        } else if (op->attr_key == s_tir::attr::async_wait_inflight_count ||
-                   op->attr_key == "async_wait_inflight_count") {
+        } else if (op->attr_key == s_tir::attr::async_wait_inflight_count) {
           if (const auto *imm = op->value.as<IntImmNode>()) {
             counts.push_back(static_cast<int>(imm->value));
           }

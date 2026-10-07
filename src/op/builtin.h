@@ -87,7 +87,6 @@ static constexpr const char *kMlsActualSizeBytesMap =
 // it without depending on the backend-specific source of the override.
 static constexpr const char *kSharedMemoryAllocationSizeBytesMap =
     "tl.shared_memory_allocation_size_bytes_map";
-static constexpr const char *kUseWarpDivergence = "tl.use_warp_divergence";
 } // namespace attr
 
 inline ffi::Optional<PrimExpr> GetAnnotatedMbarPhaseExpr(
@@ -134,7 +133,6 @@ static constexpr const char *kPtxasRegisterUsageLevel =
     "tl.ptxas_register_usage_level";
 static constexpr const char *kDisableVectorize256 = "tl.disable_vectorize_256";
 static constexpr const char *kEnableAsyncCopy = "tl.enable_async_copy";
-static constexpr const char *kUseWarpDivergence = "tl.use_warp_divergence";
 static constexpr const char *kPipelinedKUnrollFactor =
     "tl.pipelined_k_unroll_factor";
 static constexpr const char *kEnableVectorizePlannerVerbose =

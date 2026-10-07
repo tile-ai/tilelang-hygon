@@ -10,7 +10,6 @@ from tvm.tirx import FloatImm, IntImm, tvm_tuple
 
 __all__ = [
     "use_swizzle",
-    "use_warp_divergence",
     "annotate_layout",
     "annotate_safe_value",
     "annotate_l2_hit_ratio",
@@ -27,12 +26,6 @@ def use_swizzle(panel_size: int, order: str = "row", enable: bool = True):
     if not enable:
         return None
     return attr(None, "threadblock_swizzle_pattern", tvm_tuple(device_func, panel_size))
-
-
-def use_warp_divergence(enable: bool = True):
-    if not enable:
-        return None
-    return attr(None, "tl.use_warp_divergence", True)
 
 
 def annotate_layout(layout_map: dict):

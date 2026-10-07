@@ -50,7 +50,7 @@ def _fragment_pipeline_ptr_base(buffer_region, elems_per_version):
         return 0
     if _is_pipeline_version_region(buffer_region):
         return buffer_region.region[0].min * elems_per_version
-    raise AssertionError("Fragment operand must be a full region or a single pipeline version")
+    raise ValueError("Fragment operand must be a full region or a single pipeline version")
 
 
 def _int_annotation(annotations, key: str, default: int = 0) -> int:

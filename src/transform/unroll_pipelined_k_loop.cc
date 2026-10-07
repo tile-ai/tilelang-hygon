@@ -26,13 +26,6 @@ using ffi::GetRef;
 
 namespace {
 
-std::optional<int64_t> GetConstIntValue(const PrimExpr &expr) {
-  if (const auto *imm = expr.as<IntImmNode>()) {
-    return imm->value;
-  }
-  return std::nullopt;
-}
-
 class PipelineIndexFolder : public StmtExprMutator {
 public:
   explicit PipelineIndexFolder(const Var &loop_var) : loop_var_(loop_var) {}
@@ -117,11 +110,7 @@ private:
     if (op->op.same_as(builtin::bitwise_and()) && op->args.size() == 2) {
       PrimExpr lhs = VisitExpr(op->args[0]);
       PrimExpr rhs = VisitExpr(op->args[1]);
-      std::optional<int64_t> divisor = MatchAndMaskDivisor(rhs);
-      if (!divisor) {
-        divisor = MatchDivisor(rhs);
-      }
-      if (divisor) {
+      if (auto divisor = MatchAndMaskDivisor(rhs)) {
         if (auto folded = TryFoldMod(lhs, *divisor)) {
           return *folded;
         }
@@ -136,7 +125,7 @@ private:
   Var loop_var_;
 };
 
-Stmt FoldPipelineIndices(const Stmt &stmt, const Var &loop_var, int /*factor*/) {
+Stmt FoldPipelineIndices(const Stmt &stmt, const Var &loop_var) {
   return PipelineIndexFolder(loop_var)(stmt);
 }
 
@@ -149,7 +138,7 @@ Stmt BuildUnrolledBody(const Stmt &body, const Var &loop_var, int factor) {
   for (int i = 0; i < factor; ++i) {
     PrimExpr replaced = loop_var * factor + make_const(loop_var.dtype(), i);
     Stmt substituted = Substitute(body, {{loop_var, replaced}});
-    parts.push_back(FoldPipelineIndices(substituted, loop_var, factor));
+    parts.push_back(FoldPipelineIndices(substituted, loop_var));
   }
   return SeqStmt::Flatten(parts);
 }
@@ -188,7 +177,7 @@ private:
       if (remainder == 1) {
         epilogue_body = Substitute(epilogue_body, {{k_epi, make_zero(k_epi.dtype())}});
       }
-      epilogue_body = FoldPipelineIndices(epilogue_body, k_epi, factor_);
+      epilogue_body = FoldPipelineIndices(epilogue_body, k_epi);
       result.push_back(For(k_epi, op->min,
                            make_const(op->extent.dtype(), remainder), op->kind,
                            std::move(epilogue_body), std::nullopt, {},

@@ -2,10 +2,11 @@
  * \file inject_async_mma_fence.cc
  * \brief Insert LDS waits before MMA.
  *
- * If the user already issued an lgkmcnt wait after shared loads, do not insert
- * another wave_barrier in front of MMA. T.Pipelined kernels (better.log) go
- * waitcnt → MMA directly; the extra s_barrier is redundant and, inside
- * warp-divergent `if (warp_idx < 4)`, races G2S/LDS.
+ * A wait on lgkmcnt already issued after the shared-memory loads is enough to
+ * order them against the following MMA, so no extra wave barrier is emitted in
+ * front of the MMA in that case: it would be redundant, and inside a
+ * warp-divergent region it would also serialize the G2S and LDS traffic of the
+ * participating waves.
  */
 
 #include "common/gemm_k_loop_utils.h"
@@ -108,9 +109,7 @@ bool IsAsyncWaitScopeStmt(const Stmt &stmt) {
     return false;
   }
   return op->attr_key == s_tir::attr::async_wait_queue_scope ||
-         op->attr_key == "async_wait_queue_scope" ||
-         op->attr_key == s_tir::attr::async_wait_inflight_count ||
-         op->attr_key == "async_wait_inflight_count";
+         op->attr_key == s_tir::attr::async_wait_inflight_count;
 }
 
 bool CallProvidesLgkmcntWait(const CallNode *call, int *lgkmcnt) {
@@ -164,31 +163,6 @@ bool StmtProvidesLgkmcntWait(const Stmt &stmt) {
     }
   });
   return found;
-}
-
-bool StmtContainsAsyncCopy(const Stmt &stmt) {
-  bool found = false;
-  PostOrderVisit(stmt, [&found](const ObjectRef &node) {
-    if (const auto *call = node.as<CallNode>()) {
-      if (IsAsyncCopyCall(call)) {
-        found = true;
-      }
-    }
-  });
-  return found;
-}
-
-// MMA cluster: compute only, excluding the surrounding K loop.
-bool IsMmaCluster(const Stmt &stmt) {
-  if (!StmtContainsMma(stmt)) {
-    return false;
-  }
-  if (const auto *for_op = stmt.as<ForNode>()) {
-    if (IsGemmKLoop(for_op)) {
-      return false;
-    }
-  }
-  return !StmtContainsAsyncCopy(stmt);
 }
 
 struct EpilogueMmaCounts {

@@ -40,6 +40,55 @@ bool StmtContainsMma(const Stmt &stmt) {
   return found;
 }
 
+bool StmtContainsAsyncCopy(const Stmt &stmt) {
+  bool found = false;
+  PostOrderVisit(stmt, [&found](const ObjectRef &node) {
+    if (const auto *call = node.as<CallNode>()) {
+      if (IsAsyncCopyCall(call)) {
+        found = true;
+      }
+    }
+  });
+  return found;
+}
+
+// Compute-only statement: the surrounding K loop and anything that issues an
+// async copy belong to the producer side and are not an MMA cluster.
+bool IsMmaCluster(const Stmt &stmt) {
+  if (!StmtContainsMma(stmt)) {
+    return false;
+  }
+  if (const auto *loop = stmt.as<ForNode>()) {
+    if (IsGemmKLoop(loop)) {
+      return false;
+    }
+  }
+  return !StmtContainsAsyncCopy(stmt);
+}
+
+bool IsSchedBarrierStmt(const Stmt &stmt) {
+  const auto *eval = stmt.as<EvaluateNode>();
+  if (eval == nullptr) {
+    return false;
+  }
+  const auto *call = eval->value.as<CallNode>();
+  if (call == nullptr || !call->op.same_as(builtin::call_extern()) ||
+      call->args.empty()) {
+    return false;
+  }
+  if (const auto *s = call->args[0].as<StringImmNode>()) {
+    return s->value == "__builtin_amdgcn_sched_barrier";
+  }
+  return false;
+}
+
+std::optional<int64_t> GetConstIntValue(const PrimExpr &expr) {
+  if (const auto *imm = expr.as<IntImmNode>()) {
+    return imm->value;
+  }
+  return std::nullopt;
+}
+
 namespace {
 
 const BufferLoadNode *PeelBufferLoad(const PrimExpr &value) {

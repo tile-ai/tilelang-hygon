@@ -187,11 +187,6 @@ inline bool HasExplicitAsyncCopySemantics(const CopyNode &op) {
   return HasExplicitAsyncCopySemantics(op.annotations);
 }
 
-inline bool IsCopyLikeOp(const Op &op) {
-  static const Op &async_copy = Op::Get("tl.tileop.async_copy");
-  return op.same_as(Copy::Get()) || op.same_as(async_copy);
-}
-
 inline bool HasExplicitAsyncCopySemantics(const Call &call) {
   if (!call->op.as<OpNode>()) {
     return false;
