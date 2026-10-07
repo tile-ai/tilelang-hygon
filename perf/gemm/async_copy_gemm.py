@@ -302,9 +302,8 @@ def gemm_async_copy_n_major(
     )
 
 
-def main():
+def main(M=10240, N=10240, K=10240):
     """Correctness check and latency benchmark for ``gemm_async_copy_n_major``."""
-    M, N, K = 10240, 10240, 10240
     block_M, block_N, block_K = 256, 256, 16
 
     kernel = gemm_async_copy_n_major(
@@ -368,4 +367,11 @@ def run_regression_perf():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Hand-pipelined async-copy GEMM")
+    parser.add_argument("--m", type=int, default=10240, help="M (default: 10240)")
+    parser.add_argument("--n", type=int, default=10240, help="N (default: 10240)")
+    parser.add_argument("--k", type=int, default=10240, help="K (default: 10240)")
+    args = parser.parse_args()
+    main(args.m, args.n, args.k)
