@@ -190,7 +190,13 @@ std::optional<int64_t> TryEvalConstInt(const PrimExpr &expr) {
     auto a = TryEvalConstInt(div->a);
     auto b = TryEvalConstInt(div->b);
     if (a && b && *b != 0) {
-      return *a / *b;
+      // TIR floordiv rounds toward negative infinity, C++ `/` truncates
+      // toward zero; correct the quotient when the operands have mixed signs.
+      int64_t q = *a / *b;
+      if (*a % *b != 0 && ((*a < 0) != (*b < 0))) {
+        --q;
+      }
+      return q;
     }
   } else if (const auto *call = expr.as<CallNode>()) {
     if (call->args.size() == 2 && call->op.same_as(builtin::bitwise_and())) {

@@ -52,6 +52,18 @@ inline MlsBoundaryMode MlsParseModeToken(const std::string &s) {
   return MlsBoundaryMode::kAnalyze;
 }
 
+inline const char *MlsModeLiteral(MlsBoundaryMode m) {
+  switch (m) {
+  case MlsBoundaryMode::kAnalyze:
+    return "-1";
+  case MlsBoundaryMode::kSkip:
+    return "0";
+  case MlsBoundaryMode::kRefresh:
+    return "1";
+  }
+  return "-1";
+}
+
 inline bool MlsOneShotRefresh(MlsBoundaryMode m) {
   return m != MlsBoundaryMode::kSkip;
 }
@@ -81,26 +93,6 @@ MlsParseBoundaryArgs(const std::vector<std::string> &args) {
   if (args.size() > idx + 1)
     out.mn = MlsParseModeToken(args[idx + 1]);
   return out;
-}
-
-// Map K policy onto tilelang_mls_base::async_mls_load_asm<check, last>.
-inline std::pair<const char *, const char *>
-MlsKModeToLastLoadLiterals(MlsBoundaryMode k) {
-  switch (k) {
-  case MlsBoundaryMode::kAnalyze:
-    return {"true", "false"};
-  case MlsBoundaryMode::kSkip:
-    return {"false", "false"};
-  case MlsBoundaryMode::kRefresh:
-    return {"false", "true"};
-  }
-  return {"true", "false"};
-}
-
-inline bool MlsShouldFilter(MlsBoundaryMode m, bool proved_in_range) {
-  if (m != MlsBoundaryMode::kAnalyze)
-    return m == MlsBoundaryMode::kRefresh;
-  return !proved_in_range;
 }
 
 } // namespace tl

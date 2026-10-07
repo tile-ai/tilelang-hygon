@@ -210,7 +210,7 @@ tirx::transform::Pass UnrollPipelinedKLoop() {
   using namespace tirx::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &, const PassContext &ctx) {
     Target target = f->GetAttr<Target>(tvm::attr::kTarget).value_or(Target());
-    if (target.defined() && !TargetIsHCU(target)) {
+    if (!target.defined() || !TargetIsHCU(target)) {
       return f;
     }
     auto loops = CollectGemmKLoops(f->body);

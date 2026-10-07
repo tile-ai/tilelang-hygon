@@ -599,7 +599,12 @@ def ebarrier_arrive(ebar_id: int | Var, wave_count: int | Var = 1):
 
 
 def _pack_s_waitcnt_imm(cnt: int, flag: str) -> int:
-    """Pack a named wait counter into the HCU s_waitcnt immediate encoding."""
+    """Pack a named wait counter into the HCU s_waitcnt immediate encoding.
+
+    All three branches set bit 7, the HCU hybrid-wait bit: the C++ packers in
+    this tree (insert_mls_waitcnt.cc PackVmcntImm, inject_async_mma_fence.cc
+    PackLgkmcntImm) set it as well, so keep the three in sync.
+    """
     if not isinstance(cnt, int):
         raise TypeError(f"Expect cnt to be int, but got {type(cnt)}.")
 
@@ -620,6 +625,7 @@ def _pack_s_waitcnt_imm(cnt: int, flag: str) -> int:
     if flag == "expcnt":
         if not 0 <= cnt <= 7:
             raise ValueError(f"expcnt must be in [0, 7], but got {cnt}.")
+        # Bit 7 set as in the other two branches.
         return 0xF | (cnt << 4) | (1 << 7) | (15 << 8) | (3 << 12) | (3 << 14)
 
     raise ValueError(f"Unsupported s_waitcnt flag: {flag}. Expected one of vmcnt, lgkmcnt, expcnt.")

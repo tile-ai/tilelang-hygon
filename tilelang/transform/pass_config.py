@@ -128,8 +128,8 @@ class PassConfigKey(str, Enum):
     """
 
     TL_PIPELINED_K_UNROLL_FACTOR = "tl.pipelined_k_unroll_factor"
-    """Unroll factor for the GEMM K loop after software pipelining. Default: 4.
-    Set to 1 to disable.
+    """Unroll factor for the GEMM K loop after software pipelining (HCU only;
+    consumed by UnrollPipelinedKLoop). Default: 4. Set to 1 to disable.
     """
 
     TL_ENABLE_HCU_WDRA = "tl.enable_hcu_wdra"

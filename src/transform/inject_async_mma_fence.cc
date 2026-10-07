@@ -11,6 +11,7 @@
 
 #include "common/gemm_k_loop_utils.h"
 #include "common/pipeline_utils.h"
+#include "hcu/target_utils.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 
@@ -350,6 +351,10 @@ namespace transform {
 tirx::transform::Pass InjectAsyncMmaFence() {
   using namespace tirx::transform;
   auto pass_func = [=](PrimFunc f, IRModule, PassContext) {
+    Target target = f->GetAttr<Target>(tvm::attr::kTarget).value_or(Target());
+    if (!target.defined() || !TargetIsHCU(target)) {
+      return f;
+    }
     auto *n = f.CopyOnWrite();
     MMABarrierMutator mutator(n->body);
     n->body = mutator(std::move(n->body));

@@ -9,6 +9,7 @@
 
 #include "common/gemm_k_loop_utils.h"
 #include "common/pipeline_utils.h"
+#include "hcu/target_utils.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 
@@ -334,6 +335,12 @@ std::vector<int> ScaleWaitCountsToCommitUnits(const std::vector<int> &counts,
   return scaled;
 }
 
+// Synthesize the epilogue wait counts from the main-loop plan, used when the
+// epilogue carries no explicit wait counts: start at `main_wait` outstanding
+// commits and drop by `commits_per_tile` per iteration until none are left.
+// Precondition: the epilogue runs the same K-loop body with a shorter trip
+// count, so its outstanding-commit window shrinks by one tile per iteration.
+// This is a schedule derived from the plan, not an analysis of the epilogue IR.
 std::vector<int> SynthesizeEpilogueWaitCounts(int main_wait, int commits_per_tile) {
   std::vector<int> counts;
   if (commits_per_tile <= 0) {
@@ -421,6 +428,10 @@ SharedPipelineWaitPlan MakeWaitPlan(const Stmt &root) {
     return plan;
   }
   const ForNode *k_loop = loops.front();
+  // NOTE: the plan is derived from the first GEMM K loop and applies to the
+  // whole function. The pipelined kernels this pass serves have a single GEMM
+  // K loop (unroll_pipelined_k_loop.cc guards with the same loops.size() != 1
+  // assumption); a second K loop would share the first loop's plan.
   plan.register_pipeline = LoopHasRegisterPipeline(k_loop);
   int cpt = CountOutermostCommitsBeforeLds(k_loop->body, /*stop_at_lds=*/true);
   plan.commits_per_tile = cpt;
@@ -601,6 +612,10 @@ private:
     } else if (plan_.register_pipeline) {
       if (epilogue_gld_insert_idx_ >=
           static_cast<int>(plan_.epilogue_gld_fence_values.size())) {
+        // Plan exhausted: epilogue_gld_fence_values holds one wait count per
+        // planned fence and is consumed in order. Any further insert point is
+        // beyond the planned fence count and is left without a synthesized
+        // fence (no diagnostic is emitted).
         return -1;
       }
       wait_count = plan_.epilogue_gld_fence_values[epilogue_gld_insert_idx_++];
@@ -626,6 +641,7 @@ private:
     }
     const int wait_count = NextWaitCount();
     if (wait_count < 0) {
+      // No planned wait count left for this cluster (see NextWaitCount).
       return;
     }
     if (plan_.register_pipeline) {
@@ -651,6 +667,10 @@ using namespace tirx::transform;
 
 Pass InjectAsyncGlobalLoadFence() {
   auto pass_func = [](PrimFunc f, IRModule, PassContext) {
+    Target target = f->GetAttr<Target>(tvm::attr::kTarget).value_or(Target());
+    if (!target.defined() || !TargetIsHCU(target)) {
+      return f;
+    }
     auto *n = f.CopyOnWrite();
     InjectAsyncGlobalLoadFenceMutator mutator(n->body);
     n->body = mutator(std::move(n->body));

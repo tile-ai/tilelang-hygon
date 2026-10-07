@@ -82,39 +82,6 @@ def PrepareMlsSharedMemoryAllocation():
     return _ffi_api.PrepareMlsSharedMemoryAllocation()  # type: ignore
 
 
-def LayoutInference():
-    """LayoutInference
-
-    Returns
-    -------
-    fpass : tvm.transform.Pass
-        The result pass
-    """
-    return _ffi_api.LayoutInference()  # type: ignore
-
-
-def LowerTileOp():
-    """LowerTileOp
-
-    Returns
-    -------
-    fpass : tvm.transform.Pass
-        The result pass
-    """
-    return _ffi_api.LowerTileOp()  # type: ignore
-
-
-def InjectSoftwarePipeline():
-    """InjectSoftwarePipeline
-
-    Returns
-    -------
-    fpass : tvm.transform.Pass
-        The result pass
-    """
-    return _ffi_api.InjectSoftwarePipeline()  # type: ignore
-
-
 def RegisterPipelinePlanning():
     """Plan register-resident fragments and rewrite GEMMs for the register pipeline."""
     return _ffi_api.RegisterPipelinePlanning()  # type: ignore
@@ -163,6 +130,39 @@ def InsertMlsWaitcnt():
 def HoistMlsResource():
     """Hoist HCU MLS resource setup before codegen."""
     return _ffi_api.HoistMlsResource()  # type: ignore
+
+
+def LayoutInference():
+    """LayoutInference
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LayoutInference()  # type: ignore
+
+
+def LowerTileOp():
+    """LowerTileOp
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LowerTileOp()  # type: ignore
+
+
+def InjectSoftwarePipeline():
+    """InjectSoftwarePipeline
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.InjectSoftwarePipeline()  # type: ignore
 
 
 def LegalizeNegativeIndex():

@@ -5,6 +5,7 @@
 
 #include "common/gemm_k_loop_utils.h"
 #include "common/pipeline_utils.h"
+#include "hcu/target_utils.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 
@@ -22,7 +23,10 @@ using ffi::GetRef;
 
 namespace {
 
-constexpr int kAmdgcnSchedBarrierNoRestriction = 0;
+// llvm.amdgcn.sched.barrier mask: 0 leaves no instruction type allowed to be
+// reordered across the barrier, i.e. the strongest barrier (the templates in
+// tl_templates/hcu call sched_barrier(0) around s_barrier the same way).
+constexpr int kAmdgcnSchedBarrierFull = 0;
 
 bool FuncHasRegisterPipeline(const Stmt &root) {
   for (const ForNode *loop : CollectGemmKLoops(root)) {
@@ -37,7 +41,7 @@ Stmt MakeSchedBarrierStmt() {
   return Evaluate(Call(DataType::Void(), builtin::call_extern(),
                        {StringImm("__builtin_amdgcn_sched_barrier"),
                         IntImm(DataType::Int(32),
-                               kAmdgcnSchedBarrierNoRestriction)}));
+                               kAmdgcnSchedBarrierFull)}));
 }
 
 class SchedBarrierMutator : public StmtExprMutator {
@@ -84,6 +88,10 @@ namespace transform {
 tirx::transform::Pass InjectRegisterPipelineSchedBarrier() {
   using namespace tirx::transform;
   auto pass_func = [=](PrimFunc f, IRModule, PassContext) {
+    Target target = f->GetAttr<Target>(tvm::attr::kTarget).value_or(Target());
+    if (!target.defined() || !TargetIsHCU(target)) {
+      return f;
+    }
     auto *n = f.CopyOnWrite();
     if (!FuncHasRegisterPipeline(n->body)) {
       return f;

@@ -1,3 +1,9 @@
+/*!
+ * \file register_pipeline_planning.cc
+ * \brief Plan register-resident fragments and rewrite GEMMs for the register
+ * pipeline.
+ */
+
 #include "support/check.h"
 #include <algorithm>
 #include <string>
@@ -11,6 +17,7 @@
 #include <tvm/tirx/transform.h>
 
 #include "common/pipeline_utils.h"
+#include "hcu/target_utils.h"
 #include "op/copy.h"
 #include "op/gemm.h"
 #include "op/operator.h"
@@ -625,6 +632,10 @@ private:
 tirx::transform::Pass RegisterPipelinePlanning() {
   using namespace tirx::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &, const PassContext &) {
+    Target target = f->GetAttr<Target>(tvm::attr::kTarget).value_or(Target());
+    if (!target.defined() || !TargetIsHCU(target)) {
+      return f;
+    }
     auto *fptr = f.CopyOnWrite();
     fptr->body = RegisterPipelinePlanner()(fptr->body);
     return f;

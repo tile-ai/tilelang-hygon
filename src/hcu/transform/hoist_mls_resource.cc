@@ -170,10 +170,10 @@ std::string EncodeEstablishedMlsLoadTile(const std::string &sym,
     args.emplace_back("-1");
   args.resize(idx + 2);
   // Settled 0/1 so one-shot and a later SpecializeAxisFilter do not re-analyze.
-  args[idx] = MlsRefreshLiteral(refresh_k == "true" ? MlsBoundaryMode::kRefresh
+  args[idx] = MlsModeLiteral(refresh_k == "true" ? MlsBoundaryMode::kRefresh
                                                  : MlsBoundaryMode::kSkip);
   args[idx + 1] =
-      MlsRefreshLiteral(refresh_mn == "true" ? MlsBoundaryMode::kRefresh
+      MlsModeLiteral(refresh_mn == "true" ? MlsBoundaryMode::kRefresh
                                           : MlsBoundaryMode::kSkip);
   std::ostringstream os;
   os << kMlsLoadTilePrefix;

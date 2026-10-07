@@ -53,6 +53,20 @@ def _fragment_pipeline_ptr_base(buffer_region, elems_per_version):
     raise ValueError("Fragment operand must be a full region or a single pipeline version")
 
 
+def _check_scale_fp4_fragment_region(buffer_region, name: str) -> None:
+    """Validate a fragment operand of mmac_scale_fp4 (FP4 blocked-scaled).
+
+    Unlike ``mmac``, ``mmac_scale_fp4`` has no ``a_ptr_base``/``b_ptr_base``
+    parameter, so a register-pipeline version slice cannot be addressed here:
+    reject it instead of silently reading version 0.
+    """
+    if _is_pipeline_version_region(buffer_region):
+        raise NotImplementedError(
+            f"Register-pipeline version slice is not supported for hcu.mmac_scale_fp4 operand {name}"
+        )
+    assert is_full_region(buffer_region), f"Fragment input {name} must be a full region"
+
+
 def _int_annotation(annotations, key: str, default: int = 0) -> int:
     if not annotations:
         return default
@@ -534,7 +548,7 @@ class GemmHCUMMAC(GemmBase):
             return _Simplify(_gemm_bs_mls_mls, inline_let=True)
 
         if use_gemm_mls and b_from_mls and is_fragment(self.A) and _is_shared_like(self.B):
-            assert _is_full_fragment_region(A_region), "Fragment input A must be a full region"
+            _check_scale_fp4_fragment_region(A_region, "A")
 
             @T.prim_func
             def _gemm_bs_r_mls() -> None:
@@ -563,7 +577,7 @@ class GemmHCUMMAC(GemmBase):
             return _Simplify(_gemm_bs_r_mls, inline_let=True)
 
         if use_gemm_mls and a_from_mls and _is_shared_like(self.A) and is_fragment(self.B):
-            assert _is_full_fragment_region(B_region), "Fragment input B must be a full region"
+            _check_scale_fp4_fragment_region(B_region, "B")
 
             @T.prim_func
             def _gemm_bs_mls_r() -> None:
@@ -656,7 +670,7 @@ class GemmHCUMMAC(GemmBase):
             return _Simplify(_gemm_bs_ss, inline_let=True)
 
         if _is_shared_like(self.A) and is_fragment(self.B):
-            assert _is_full_fragment_region(B_region), "Fragment input B must be a full region"
+            _check_scale_fp4_fragment_region(B_region, "B")
             inner_k = emitter.inner_k_per_warp()
 
             @T.prim_func
@@ -687,7 +701,7 @@ class GemmHCUMMAC(GemmBase):
             return _Simplify(_gemm_bs_sr, inline_let=True)
 
         if is_fragment(self.A) and _is_shared_like(self.B):
-            assert _is_full_fragment_region(A_region), "Fragment input A must be a full region"
+            _check_scale_fp4_fragment_region(A_region, "A")
             inner_k = emitter.inner_k_per_warp()
 
             @T.prim_func
@@ -718,8 +732,8 @@ class GemmHCUMMAC(GemmBase):
             return _Simplify(_gemm_bs_rs, inline_let=True)
 
         if is_fragment(self.A) and is_fragment(self.B):
-            assert _is_full_fragment_region(A_region), "Fragment input A must be a full region"
-            assert _is_full_fragment_region(B_region), "Fragment input B must be a full region"
+            _check_scale_fp4_fragment_region(A_region, "A")
+            _check_scale_fp4_fragment_region(B_region, "B")
 
             @T.prim_func
             def _gemm_bs_rr() -> None:
