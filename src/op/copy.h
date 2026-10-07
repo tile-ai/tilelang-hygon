@@ -175,8 +175,8 @@ inline bool GetCopyBoolAnnotation(const Map<String, ObjectRef> &annotations,
   return false;
 }
 
-inline bool HasExplicitAsyncCopySemantics(
-    const Map<String, ObjectRef> &annotations) {
+inline bool
+HasExplicitAsyncCopySemantics(const Map<String, ObjectRef> &annotations) {
   if (GetCopyBoolAnnotation(annotations, attr::kIsAsyncCopy)) {
     return true;
   }

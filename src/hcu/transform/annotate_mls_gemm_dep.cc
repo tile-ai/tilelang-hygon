@@ -1079,9 +1079,9 @@ private:
       }
       if (IsMatrixLoadPreferredCopy(*copy.get())) {
         ICHECK(HasOnlyGemmReadersAfterCall(copy->dst, call))
-        << "Explicit prefer_instruction=\"matrix_load\" requires every "
-            "downstream reader of buffer "
-        << copy->dst->name << " after this copy to be tl.tileop.gemm.";
+            << "Explicit prefer_instruction=\"matrix_load\" requires every "
+               "downstream reader of buffer "
+            << copy->dst->name << " after this copy to be tl.tileop.gemm.";
         bool trans = true;
         LookupSharedMlsTrans(copy->dst, &trans);
         auto annotations = call->annotations;

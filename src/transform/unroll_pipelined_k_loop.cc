@@ -60,7 +60,8 @@ private:
     return std::nullopt;
   }
 
-  std::optional<PrimExpr> TryFoldMod(const PrimExpr &lhs, int64_t divisor) const {
+  std::optional<PrimExpr> TryFoldMod(const PrimExpr &lhs,
+                                     int64_t divisor) const {
     if (divisor <= 0) {
       return std::nullopt;
     }
@@ -173,15 +174,16 @@ private:
       Var k_epi = op->loop_var.copy_with_suffix("_epi");
       PrimExpr epilogue_base =
           make_const(op->loop_var.dtype(), main_extent * factor_);
-      Stmt epilogue_body = Substitute(body, {{op->loop_var, epilogue_base + k_epi}});
+      Stmt epilogue_body =
+          Substitute(body, {{op->loop_var, epilogue_base + k_epi}});
       if (remainder == 1) {
-        epilogue_body = Substitute(epilogue_body, {{k_epi, make_zero(k_epi.dtype())}});
+        epilogue_body =
+            Substitute(epilogue_body, {{k_epi, make_zero(k_epi.dtype())}});
       }
       epilogue_body = FoldPipelineIndices(epilogue_body, k_epi);
-      result.push_back(For(k_epi, op->min,
-                           make_const(op->extent.dtype(), remainder), op->kind,
-                           std::move(epilogue_body), std::nullopt, {},
-                           op->step, op->span));
+      result.push_back(For(
+          k_epi, op->min, make_const(op->extent.dtype(), remainder), op->kind,
+          std::move(epilogue_body), std::nullopt, {}, op->step, op->span));
     }
     *transformed_ = true;
     if (result.size() == 1) {
@@ -223,7 +225,8 @@ tirx::transform::Pass UnrollPipelinedKLoop() {
     }
     bool transformed = false;
     auto *n = f.CopyOnWrite();
-    n->body = PipelinedKLoopUnrollMutator(factor, &transformed)(std::move(n->body));
+    n->body =
+        PipelinedKLoopUnrollMutator(factor, &transformed)(std::move(n->body));
     if (transformed) {
       n->body = ConvertSSA(std::move(n->body));
     }

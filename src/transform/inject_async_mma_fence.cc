@@ -282,10 +282,9 @@ public:
         }
         if (pending_load_count > 0) {
           if (register_pipeline_) {
-            const int wait_n =
-                last_epilogue_mma
-                    ? 0
-                    : ResolveRegisterLgkmcnt(pending_load_count);
+            const int wait_n = last_epilogue_mma
+                                   ? 0
+                                   : ResolveRegisterLgkmcnt(pending_load_count);
             AppendRegisterPipelineLdsWait(new_seq, wait_n);
             last_sld_fence_val_ = wait_n;
           } else {
@@ -365,7 +364,8 @@ tirx::transform::Pass InjectAsyncMmaFence() {
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.InjectAsyncMmaFence", InjectAsyncMmaFence);
+  refl::GlobalDef().def("tl.transform.InjectAsyncMmaFence",
+                        InjectAsyncMmaFence);
 }
 
 } // namespace transform

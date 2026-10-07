@@ -508,9 +508,8 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
           logical_idx.push_back(logical_k);
           logical_idx.push_back(logical_n);
           Array<PrimExpr> logical_idx_last = logical_idx;
-          logical_idx_last.Set(
-              logical_idx_last.size() - 1,
-              logical_n + make_const(logical_n.dtype(), 7));
+          logical_idx_last.Set(logical_idx_last.size() - 1,
+                               logical_n + make_const(logical_n.dtype(), 7));
           auto forward_load = [&](const Array<PrimExpr> &logical) {
             if (layout->InputDim() == sr) {
               return layout->Forward(logical);

@@ -100,8 +100,8 @@ Stmt MakePtxWaitGroupStmt(int wait_count) {
   if (wait_count < 0) {
     wait_count = 0;
   }
-  return Evaluate(
-      Call(DataType::Handle(), builtin::ptx_wait_group(), {Integer(wait_count)}));
+  return Evaluate(Call(DataType::Handle(), builtin::ptx_wait_group(),
+                       {Integer(wait_count)}));
 }
 
 Stmt MakeWaveBarrierStmt() {
@@ -341,7 +341,8 @@ std::vector<int> ScaleWaitCountsToCommitUnits(const std::vector<int> &counts,
 // Precondition: the epilogue runs the same K-loop body with a shorter trip
 // count, so its outstanding-commit window shrinks by one tile per iteration.
 // This is a schedule derived from the plan, not an analysis of the epilogue IR.
-std::vector<int> SynthesizeEpilogueWaitCounts(int main_wait, int commits_per_tile) {
+std::vector<int> SynthesizeEpilogueWaitCounts(int main_wait,
+                                              int commits_per_tile) {
   std::vector<int> counts;
   if (commits_per_tile <= 0) {
     return counts;
@@ -360,7 +361,8 @@ std::vector<int> SynthesizeEpilogueWaitCounts(int main_wait, int commits_per_til
   return counts;
 }
 
-std::vector<int> BuildEpilogueGldFenceValues(const std::vector<int> &wait_counts) {
+std::vector<int>
+BuildEpilogueGldFenceValues(const std::vector<int> &wait_counts) {
   std::vector<int> shifted;
   if (wait_counts.size() <= 1) {
     return shifted;
@@ -439,8 +441,7 @@ SharedPipelineWaitPlan MakeWaitPlan(const Stmt &root) {
   if (auto ns = GetExplicitPipelinedNumStages(k_loop)) {
     plan.num_stages = static_cast<int>(ns.value().IntValue());
   }
-  plan.compiler_pipeline =
-      plan.register_pipeline || plan.num_stages >= 2;
+  plan.compiler_pipeline = plan.register_pipeline || plan.num_stages >= 2;
   if (plan.num_stages >= 2 && cpt > 0) {
     if (plan.register_pipeline) {
       plan.main_wait = (plan.num_stages - 2) * cpt;
@@ -488,8 +489,7 @@ public:
 
   Stmt VisitStmt_(const ForNode *op) override {
     const bool is_k = IsGemmKLoop(op);
-    const bool lds_for =
-        !is_k && IsSharedToLocalCopy(GetRef<For>(op));
+    const bool lds_for = !is_k && IsSharedToLocalCopy(GetRef<For>(op));
     if (is_k) {
       phase_ = PipelinePhase::kMainLoop;
       outstanding_ = plan_.main_wait;

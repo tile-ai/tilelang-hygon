@@ -78,8 +78,7 @@ inline bool LoopHasWarpDivergence(const ForNode *loop) {
 
 inline bool IsRegisterPipelineBufferScope(const ffi::String &scope) {
   std::string s = scope;
-  return s == "local" ||
-         (s.size() > 6 && s.compare(0, 6, "local.") == 0);
+  return s == "local" || (s.size() > 6 && s.compare(0, 6, "local.") == 0);
 }
 
 inline bool IsRegisterPipelineBuffer(const Buffer &buffer) {

@@ -233,8 +233,8 @@ BufferRegion MakeFragmentRegion(const Buffer &buffer,
   Array<Range> ranges;
   ranges.reserve(src_region->region.size());
   for (const Range &range : src_region->region) {
-    ranges.push_back(Range::FromMinExtent(
-        make_const(range->extent.dtype(), 0), range->extent));
+    ranges.push_back(Range::FromMinExtent(make_const(range->extent.dtype(), 0),
+                                          range->extent));
   }
   return BufferRegion(buffer, ranges);
 }
@@ -262,8 +262,7 @@ int ResolveNumRegisterStages(const ForNode *op) {
     if (const auto *imm = num_reg_stages_anno.value().as<IntImmNode>()) {
       num_register_stages = static_cast<int>(imm->value);
     }
-  } else if (auto enable_anno =
-                 op->annotations.Get(kEnableRegisterPipeline)) {
+  } else if (auto enable_anno = op->annotations.Get(kEnableRegisterPipeline)) {
     if (const auto *imm = enable_anno.value().as<IntImmNode>()) {
       if (imm->value != 0) {
         num_register_stages = kDefaultNumRegisterStages;
@@ -509,8 +508,8 @@ private:
     for (const Range &range : src_region->region) {
       shape.push_back(range->extent);
     }
-    Buffer frag = decl_buffer(shape, src->dtype, src->name + suffix,
-                              "local.fragment");
+    Buffer frag =
+        decl_buffer(shape, src->dtype, src->name + suffix, "local.fragment");
     shared_to_fragment_.Set(src, frag);
     pending_fragment_allocs_.push_back(frag);
     return frag;
@@ -546,8 +545,8 @@ private:
           copies.push_back(MakeCopyEvaluate(b_region, frag_region));
           b_region = frag_region;
         }
-        copies.push_back(Evaluate(RewriteGemmSharedOperands(
-            GetRef<Call>(call), a_region, b_region)));
+        copies.push_back(Evaluate(
+            RewriteGemmSharedOperands(GetRef<Call>(call), a_region, b_region)));
         return MakePipelineBody(copies);
       }
       return stmt;
@@ -578,9 +577,8 @@ private:
         return stmt;
       }
       return IfThenElse(ite->condition, then_case,
-                        ite->else_case.defined()
-                            ? Optional<Stmt>(else_case)
-                            : Optional<Stmt>(),
+                        ite->else_case.defined() ? Optional<Stmt>(else_case)
+                                                 : Optional<Stmt>(),
                         ite->span);
     }
     if (const auto *br = stmt.as<SBlockRealizeNode>()) {

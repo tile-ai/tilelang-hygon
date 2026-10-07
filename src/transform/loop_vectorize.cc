@@ -736,8 +736,7 @@ private:
         ICHECK_GE(transformed_indices.size(), output_shape.size())
             << "Forward indices size " << transformed_indices.size()
             << " < OutputShape size " << output_shape.size();
-        const size_t n_extra =
-            transformed_indices.size() - output_shape.size();
+        const size_t n_extra = transformed_indices.size() - output_shape.size();
         ICHECK_GE(buffer->shape.size(), n_extra)
             << "Buffer rank " << buffer->shape.size()
             << " is smaller than extra leading coords " << n_extra;
@@ -750,13 +749,11 @@ private:
           stride = stride * output_shape[i];
         }
         Array<PrimExpr> trailing_indices;
-        const int trailing =
-            static_cast<int>(buffer->shape.size() - n_extra);
+        const int trailing = static_cast<int>(buffer->shape.size() - n_extra);
         for (int i = trailing - 1; i >= 0; --i) {
           trailing_indices.push_back(
               FloorMod(linear_offset, buffer->shape[n_extra + i]));
-          linear_offset =
-              FloorDiv(linear_offset, buffer->shape[n_extra + i]);
+          linear_offset = FloorDiv(linear_offset, buffer->shape[n_extra + i]);
         }
         Array<PrimExpr> new_indices;
         new_indices.reserve(buffer->shape.size());

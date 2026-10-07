@@ -40,8 +40,7 @@ bool FuncHasRegisterPipeline(const Stmt &root) {
 Stmt MakeSchedBarrierStmt() {
   return Evaluate(Call(DataType::Void(), builtin::call_extern(),
                        {StringImm("__builtin_amdgcn_sched_barrier"),
-                        IntImm(DataType::Int(32),
-                               kAmdgcnSchedBarrierFull)}));
+                        IntImm(DataType::Int(32), kAmdgcnSchedBarrierFull)}));
 }
 
 class SchedBarrierMutator : public StmtExprMutator {
@@ -100,8 +99,8 @@ tirx::transform::Pass InjectRegisterPipelineSchedBarrier() {
     n->body = mutator(std::move(n->body));
     return f;
   };
-  return CreatePrimFuncPass(pass_func, 0, "tl.InjectRegisterPipelineSchedBarrier",
-                            {});
+  return CreatePrimFuncPass(pass_func, 0,
+                            "tl.InjectRegisterPipelineSchedBarrier", {});
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

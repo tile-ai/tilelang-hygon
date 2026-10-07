@@ -694,11 +694,10 @@ private:
         /*rw_mask=*/2);
   }
 
-  static Array<PrimExpr> PrependLeadingIndices(const Array<PrimExpr> &src_indices,
-                                               const Array<PrimExpr> &tile_indices,
-                                               size_t dst_ndim,
-                                               const String &buffer_name,
-                                               const char *operand) {
+  static Array<PrimExpr>
+  PrependLeadingIndices(const Array<PrimExpr> &src_indices,
+                        const Array<PrimExpr> &tile_indices, size_t dst_ndim,
+                        const String &buffer_name, const char *operand) {
     ICHECK_GE(dst_ndim, tile_indices.size())
         << "HCU GEMM " << operand << " physical buffer " << buffer_name
         << " has rank " << dst_ndim << ", expected at least "
@@ -706,7 +705,8 @@ private:
     const size_t extra = dst_ndim - tile_indices.size();
     ICHECK_GE(src_indices.size(), extra)
         << "HCU GEMM " << operand << " async-copy to " << buffer_name
-        << " needs " << extra << " leading index(es) for the pipelined "
+        << " needs " << extra
+        << " leading index(es) for the pipelined "
            "buffer, but the store only has "
         << src_indices.size();
     if (extra == 0) {

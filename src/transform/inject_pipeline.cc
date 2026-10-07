@@ -1545,16 +1545,14 @@ private:
           }
         }
       }
-      if (!need_multi_version &&
-          !(kind_ == PipelineKind::kRegister &&
-            IsRegisterPipelineBuffer(buffer) &&
-            buffer_info.use > buffer_info.def)) {
+      if (!need_multi_version && !(kind_ == PipelineKind::kRegister &&
+                                   IsRegisterPipelineBuffer(buffer) &&
+                                   buffer_info.use > buffer_info.def)) {
         num_versions--;
       }
     }
-    if (kind_ == PipelineKind::kRegister &&
-        IsRegisterPipelineBuffer(buffer) && buffer_info.use > buffer_info.def &&
-        buffer_info.def >= 0) {
+    if (kind_ == PipelineKind::kRegister && IsRegisterPipelineBuffer(buffer) &&
+        buffer_info.use > buffer_info.def && buffer_info.def >= 0) {
       num_versions = std::max(num_versions, register_min_versions_);
     }
     return num_versions;
@@ -3773,10 +3771,10 @@ private:
                         schedule.nested_local_allocs.begin(),
                         schedule.nested_local_allocs.end());
 
-    PipelineRewriteResult rewrite_result = RewritePipeline(
-        buffer_data_to_buffer_, pipeline_allocs, local_allocs, for_node,
-        pipeline_info, scalar_binding_blocks, target_, kind_,
-        register_min_versions_);
+    PipelineRewriteResult rewrite_result =
+        RewritePipeline(buffer_data_to_buffer_, pipeline_allocs, local_allocs,
+                        for_node, pipeline_info, scalar_binding_blocks, target_,
+                        kind_, register_min_versions_);
     Stmt pipeline = rewrite_result.pipeline;
     subtree_modified_ = true;
 
@@ -3870,9 +3868,9 @@ private:
     for (const auto &kv : rewrite_result.buffer_remap) {
       pending_buffer_remap_.Set(kv.first, kv.second);
     }
-    const bool delay_wait_attr_lower =
-        kind_ == PipelineKind::kShared && target_.defined() &&
-        TargetIsHCU(target_.value());
+    const bool delay_wait_attr_lower = kind_ == PipelineKind::kShared &&
+                                       target_.defined() &&
+                                       TargetIsHCU(target_.value());
     if (!delay_wait_attr_lower) {
       pipeline = LowerAsyncCommitWaitAttrs(pipeline);
     }

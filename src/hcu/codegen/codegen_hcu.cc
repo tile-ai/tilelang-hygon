@@ -215,8 +215,7 @@ std::optional<int64_t> TryEvalConstInt(const PrimExpr &expr) {
 std::optional<int64_t>
 ConstElementResidual(arith::Analyzer *analyzer, const PrimExpr &element_offset,
                      const PrimExpr &thread_linear_offset) {
-  PrimExpr residual =
-      analyzer->Simplify(element_offset - thread_linear_offset);
+  PrimExpr residual = analyzer->Simplify(element_offset - thread_linear_offset);
   if (auto value = TryEvalConstInt(residual)) {
     return value;
   }
@@ -1002,15 +1001,14 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
       }
       Call call_ref = GetRef<Call>(call);
       if (!group) {
-        lds_groups.push_back(
-            LdsBaseGroup{alias->second.root,
-                         transaction_bytes,
-                         wrap_offset,
-                         wrap_idx_mask,
-                         dest_alias_offset,
-                         destination->buffer_var,
-                         call_ref,
-                         {{call_ref, dest_alias_offset}}});
+        lds_groups.push_back(LdsBaseGroup{alias->second.root,
+                                          transaction_bytes,
+                                          wrap_offset,
+                                          wrap_idx_mask,
+                                          dest_alias_offset,
+                                          destination->buffer_var,
+                                          call_ref,
+                                          {{call_ref, dest_alias_offset}}});
         return;
       }
       group->calls.emplace_back(call_ref, dest_alias_offset);

@@ -1743,10 +1743,9 @@ private:
         curr.is_async_copy) {
       return false;
     }
-    if (is_hcu_ && ((prev.is_async_copy && prev.type == kWrite &&
-                     curr.type == kRead) ||
-                    (curr.is_async_copy && curr.type == kWrite &&
-                     prev.type == kRead))) {
+    if (is_hcu_ &&
+        ((prev.is_async_copy && prev.type == kWrite && curr.type == kRead) ||
+         (curr.is_async_copy && curr.type == kWrite && prev.type == kRead))) {
       return false;
     }
     // Access to different buffers does not conflict.
