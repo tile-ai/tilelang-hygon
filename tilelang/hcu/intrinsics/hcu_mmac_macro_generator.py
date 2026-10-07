@@ -123,6 +123,7 @@ class HCUMatrixCoreIntrinEmitter:
         scale_format_b: int | None = None,
         use_tf32: bool = False,
         fp4_mmac_mode: str = "native",
+        use_lit: bool | None = None,
         use_lts: bool = False,
     ):
         self.a_dtype = _normalize_dtype_str(a_dtype)
@@ -147,6 +148,10 @@ class HCUMatrixCoreIntrinEmitter:
         if target is None:
             target = Target(determine_target("auto", return_object=True))
         self.target = target
+        self.has_lit_lts = target_has_mmac_lit_lts(target)
+        self.use_lit = self.has_lit_lts if use_lit is None else bool(use_lit)
+        if (self.use_lit or self.use_lts) and not self.has_lit_lts:
+            raise ValueError("MMAC LIT requested on a target without LIT/LTS support")
         self._initialize_k_dim(a_dtype)
         self._initialize_abbrev(self.a_dtype, self.b_dtype, self.accum_dtype)
         self._initialize_local_size(self.M_DIM, self.N_DIM, self.k_dim, self.WARP_SIZE)
@@ -225,12 +230,11 @@ class HCUMatrixCoreIntrinEmitter:
         in_dtype, out_dtype = self.a_dtype, self.accum_dtype
         M_DIM, N_DIM = self.M_DIM, self.N_DIM
         use_tf32 = self.use_tf32
-        target = self.target
-        has_lit = target is not None and target_has_mmac_lit_lts(target)
+        has_lit_lts = self.has_lit_lts
 
         if in_dtype == "float32" and not use_tf32:
             suffix = f"16x16x{self.k_dim}_f32"
-            if has_lit:
+            if has_lit_lts:
                 suffix += "_lit_lts"
             self.mmac_suffix = suffix
             return
@@ -243,7 +247,7 @@ class HCUMatrixCoreIntrinEmitter:
             if not (_is_f8f6f4_operand_dtype(self.a_dtype) and _is_f8f6f4_operand_dtype(self.b_dtype)):
                 raise AssertionError("HCU f8f6f4 MMAC requires f8/f6/f4 operands")
             suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_f8f6f4"
-            if has_lit:
+            if has_lit_lts:
                 suffix += "_lit_lts"
             self.mmac_suffix = suffix
             return
@@ -262,13 +266,12 @@ class HCUMatrixCoreIntrinEmitter:
             "custom[float4_e2m1_unpacked]8": "fp4",
         }[in_dtype]
 
-        target = self.target
         if use_tf32:
             in_abbr = "tf32"
         else:
             in_abbr = in_dtype_abbrv
 
-        if target is not None and target_has_mmac_lit_lts(target):
+        if self.has_lit_lts:
             if in_abbr == "fp8":
                 self.mmac_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_fp8_fp8_lit_lts"
             elif in_abbr == "bf8":
@@ -509,9 +512,7 @@ class HCUMatrixCoreIntrinEmitter:
         )
 
         # use target on current device
-        target = self.target
-        # check if target has mmac lit lts
-        if target is not None and target_has_mmac_lit_lts(target):
+        if self.use_lit:
             return (
                 thread_id_shared_access_64x4_to_16x16_layout_C_lit_lts
                 if trans_c
@@ -930,8 +931,9 @@ class HCUMatrixCoreIntrinEmitter:
         mmac_annotations = {}
         if self.use_tf32:
             mmac_annotations["tl.hcu_tf32_ab"] = 1
-        if self.use_lts:
-            mmac_annotations["tl.hcu_use_lts"] = 1
+        if self.has_lit_lts:
+            mmac_annotations["tl.hcu_use_lit"] = int(self.use_lit)
+            mmac_annotations["tl.hcu_use_lts"] = int(self.use_lts)
         if "f8f6f4" in mmac_suffix:
             mmac_annotations["tl.hcu_mmac_a_dtype"] = tirx.StringImm(str(self.a_dtype))
             mmac_annotations["tl.hcu_mmac_b_dtype"] = tirx.StringImm(str(self.b_dtype))

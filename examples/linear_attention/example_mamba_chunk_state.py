@@ -128,29 +128,10 @@ def chunk_state_fwd(B, x, dt, dA_cumsum, block_M=64, block_N=64, block_K=64, num
     return Output
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch", type=int, default=8, help="batch size")
-    parser.add_argument("--heads", type=int, default=80, help="heads")
-    parser.add_argument("--groups", type=int, default=1, help="groups")
-    parser.add_argument("--seq_len", type=int, default=4096, help="sequence length")
-    parser.add_argument("--chunk_size", type=int, default=256, help="chunk size")
-    parser.add_argument("--dim", type=int, default=64, help="dim")
-    parser.add_argument("--dstate", type=int, default=128, help="dstate")
-    parser.add_argument("--tune", action="store_true", help="tune configs")
-    args = parser.parse_args()
-    batch, heads, groups, seq_len, chunk_size, dim, dstate = (
-        args.batch,
-        args.heads,
-        args.groups,
-        args.seq_len,
-        args.chunk_size,
-        args.dim,
-        args.dstate,
-    )
+def main(batch=8, heads=80, groups=1, seq_len=4096, chunk_size=256, dim=64, dstate=128, tune=False, do_bench=False):
     total_flops = 2 * batch * seq_len * heads * dim * dstate
 
-    if not args.tune:
+    if not tune:
         kernel = chunk_state_fwd.compile(
             batch=batch,
             seqlen=seq_len,
@@ -162,7 +143,7 @@ if __name__ == "__main__":
             block_M=64,
             block_N=128,
             block_K=64,
-            num_stages=4,
+            num_stages=0,
             threads=128,
         )
         profiler = kernel.get_profiler(tilelang.TensorSupplyType.Normal)
@@ -180,7 +161,21 @@ if __name__ == "__main__":
         )
         best_latency = best_result.latency
         best_config = best_result.config
-        ref_latency = best_result.ref_latency
+        # ref_latency = best_result.ref_latency
         print(f"Best latency: {best_latency}")
         print(f"Best TFlops: {total_flops / best_latency * 1e-9}")
         print(f"Best config: {best_config}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch", type=int, default=8, help="batch size")
+    parser.add_argument("--heads", type=int, default=80, help="heads")
+    parser.add_argument("--groups", type=int, default=1, help="groups")
+    parser.add_argument("--seq_len", type=int, default=4096, help="sequence length")
+    parser.add_argument("--chunk_size", type=int, default=256, help="chunk size")
+    parser.add_argument("--dim", type=int, default=64, help="dim")
+    parser.add_argument("--dstate", type=int, default=128, help="dstate")
+    parser.add_argument("--tune", action="store_true", help="tune configs")
+    args = parser.parse_args()
+    main(args.batch, args.heads, args.groups, args.seq_len, args.chunk_size, args.dim, args.dstate, args.tune)

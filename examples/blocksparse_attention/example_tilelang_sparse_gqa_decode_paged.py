@@ -56,6 +56,7 @@ def flashattn(batch, heads, heads_kv, dim, dim_v, block_N, block_H, page_block_s
             Q_shared = T.alloc_shared([block_H, dim], dtype)
             K_shared = T.alloc_shared([block_N, dim], dtype)
             V_shared = T.alloc_shared([block_N, dim_v], dtype)
+            P_shared = T.alloc_shared([block_H, block_N], dtype)
             acc_s = T.alloc_fragment([block_H, block_N], accum_dtype)
             acc_s_cast = T.alloc_fragment([block_H, block_N], dtype)
             acc_o = T.alloc_fragment([block_H, dim_v], accum_dtype)
@@ -109,7 +110,9 @@ def flashattn(batch, heads, heads_kv, dim, dim_v, block_N, block_H, page_block_s
                     T.reduce_sum(acc_s, scores_sum, dim=1)
                     for i in T.Parallel(block_H):
                         logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                    T.copy(acc_s, acc_s_cast)
+                    for i, j in T.Parallel(block_H, block_N):
+                        P_shared[i, j] = T.cast(acc_s[i, j], dtype)
+                    T.copy(P_shared, acc_s_cast)
                     for i, j in T.Parallel(block_H, dim_v):
                         acc_o[i, j] *= scores_scale[i]
                     T.copy(V[physical_block_idx, block_tile_idx * block_N : (block_tile_idx + 1) * block_N, cur_kv_head, :], V_shared)
@@ -215,7 +218,7 @@ class SparseFlashAttn(torch.nn.Module):
             block_N=block_size,
             block_H=self.block_H,
             page_block_size=self.page_block_size,
-            num_stages=2,
+            num_stages=0,
             threads=128,
             num_pages=self.num_pages,
         )(query, key, value, block_indices, cache_seqlens, block_table, glse, output_partial)

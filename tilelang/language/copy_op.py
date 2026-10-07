@@ -7,6 +7,8 @@ from tilelang._typing import BufferLikeType
 from tilelang.utils.language import (
     to_buffer_region,
     legalize_pairwise_extents,
+    is_fragment,
+    is_global,
     is_shared,
 )
 from tilelang.utils.deprecated import deprecated
@@ -133,11 +135,108 @@ def matrix_load(
     )
 
 
+def matrix_store(
+    src: tirx.Buffer | tirx.BufferLoad | tirx.BufferRegion,
+    dst: tirx.Buffer | tirx.BufferLoad | tirx.BufferRegion,
+    boundary: tuple[bool | None, bool | None] | None = None,
+):
+    """MLS store from local MMAC fragment to global.
+
+    On gfx946, a float16 source with a uint32 destination selects packed-B32
+    store: each adjacent pair along the innermost source dimension forms one
+    uint32 destination element.
+
+    ``boundary`` is ``(mn, k)`` over the last two logical tile axes.
+    Each entry is None (analyze), False (in-range), or True (partial).
+    """
+    if boundary is None:
+        mn_hint, k_hint = None, None
+    else:
+        if len(boundary) != 2:
+            raise ValueError("matrix_store boundary must be (mn, k) over the last two tile axes")
+        mn_hint, k_hint = boundary
+    mn_mode = _encode_mls_boundary_dim(mn_hint)
+    k_mode = _encode_mls_boundary_dim(k_hint)
+
+    def _get_extent(data):
+        if isinstance(data, tirx.Var) and T.has_let_value(data):
+            data = T.get_let_value(data)
+        if isinstance(data, tirx.Buffer):
+            return list(data.shape)
+        if isinstance(data, tirx.BufferRegion):
+            return [x.extent for x in data.region]
+        if isinstance(data, tirx.BufferLoad):
+            region = get_buffer_region_from_load(data)
+            if region is None:
+                return None
+            return [x.extent for x in region.region]
+        return None
+
+    def _get_buffer(data):
+        if isinstance(data, tirx.Buffer):
+            return data
+        if isinstance(data, (tirx.BufferLoad, tirx.BufferRegion)):
+            return data.buffer
+        return None
+
+    src_buf = _get_buffer(src)
+    dst_buf = _get_buffer(dst)
+    assert src_buf is not None, "matrix_store src must be Buffer, BufferLoad or BufferRegion"
+    assert dst_buf is not None, "matrix_store dst must be Buffer, BufferLoad or BufferRegion"
+    assert is_fragment(src_buf), f"matrix_store src must be local.fragment, got scope={src_buf.scope()}"
+    assert is_global(dst_buf), f"matrix_store dst must be global memory, got scope={dst_buf.scope()}"
+
+    src_extent = _get_extent(src)
+    dst_extent = _get_extent(dst)
+    assert src_extent is not None, "matrix_store src must have extent (use Buffer or BufferRegion)"
+    src_extent = list(src_extent)
+    mls_tile_rank = 2
+    src_tile_extent = src_extent[-mls_tile_rank:]
+    if dst_extent is None:
+        dst_extent = list(src_tile_extent)
+    else:
+        dst_extent = list(dst_extent)
+    dst_tile_extent = dst_extent[-mls_tile_rank:]
+    src_tile_extent, dst_tile_extent = legalize_pairwise_extents(src_tile_extent, dst_tile_extent)
+
+    def _to_region(data, access_type, per_buffer_extents):
+        if isinstance(data, tirx.Var) and T.has_let_value(data):
+            data = T.get_let_value(data)
+        if isinstance(data, tirx.Buffer):
+            return to_buffer_region(data, access_type=access_type, extents=per_buffer_extents)
+        if isinstance(data, tirx.BufferRegion):
+            return buffer_region_to_tile_region(data, access_type, per_buffer_extents)
+        if isinstance(data, tirx.BufferLoad):
+            region = get_buffer_region_from_load(data)
+            if region is None:
+                return buffer_load_to_tile_region(data, access_type, per_buffer_extents)
+            return buffer_region_to_tile_region(region, access_type, per_buffer_extents)
+        return buffer_load_to_tile_region(data, access_type, per_buffer_extents)
+
+    src_region = _to_region(src, "r", src_extent)
+    dst_region = _to_region(dst, "w", dst_extent)
+
+    return tirx.call_intrin(
+        "handle",
+        tirx.op.Op.get("tl.tileop.matrix_store"),
+        src_region,
+        dst_region,
+        tirx.IntImm("int32", mn_mode),
+        tirx.IntImm("int32", k_mode),
+    )
+
+
 def ds_read_format(
     src: tirx.Buffer | tirx.BufferLoad | tirx.BufferRegion,
     dst: tirx.Buffer | tirx.BufferLoad,
+    alt: Literal[1, 2, 4] = 1,
 ):
-    """Read MLS-formatted shared memory into register with ds_read_format layout."""
+    """Read MLS-formatted shared memory into registers.
+
+    ``alt`` selects the hardware interleave mode.
+    """
+    if alt not in (1, 2, 4):
+        raise ValueError(f"ds_read_format alt must be 1, 2, or 4, got {alt}")
 
     def _get_extent(data):
         if isinstance(data, tirx.Var) and T.has_let_value(data):
@@ -192,7 +291,13 @@ def ds_read_format(
     src_region = _to_region(src, "r", src_extent)
     dst_region = _to_region(dst, "w", dst_extent)
 
-    return tirx.call_intrin("handle", tirx.op.Op.get("tl.tileop.ds_read_format"), src_region, dst_region)
+    return tirx.call_intrin(
+        "handle",
+        tirx.op.Op.get("tl.tileop.ds_read_format"),
+        src_region,
+        dst_region,
+        tirx.IntImm("int32", alt),
+    )
 
 
 def copy_scale(

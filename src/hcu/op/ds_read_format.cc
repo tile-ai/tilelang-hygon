@@ -214,15 +214,24 @@ LayoutMap InferLayoutWithGemmDep(const DsReadFormatNode *self,
   int warp_m = policy->m_warp;
   int warp_n = policy->n_warp;
   int warp_k = policy->k_warp;
-  Fragment fragment =
-      meta->feeds_slot == 0
-          ? makeGemmFragmentAHCU(meta->gemm_m, meta->gemm_n, meta->gemm_k,
-                                 warp_m, warp_n, warp_k, element_bits,
-                                 meta->gemm_k_pack, meta->gemm_trans_a)
-          : makeGemmFragmentBHCU(meta->gemm_m, meta->gemm_n, meta->gemm_k,
-                                 warp_m, warp_n, warp_k, element_bits,
-                                 meta->gemm_k_pack, meta->gemm_trans_b,
-                                 floors.n_per_warp);
+  Fragment fragment;
+  if (meta->feeds_slot == 0) {
+    ICHECK_EQ(self->alt_, 1)
+        << "ds_read_format Alt2 is currently supported only for GEMM B";
+    fragment = makeGemmFragmentAHCU(meta->gemm_m, meta->gemm_n, meta->gemm_k,
+                                    warp_m, warp_n, warp_k, element_bits,
+                                    meta->gemm_k_pack, meta->gemm_trans_a);
+  } else if (self->alt_ == 2) {
+    fragment = makeGemmFragmentBHCUInterleave2(
+        meta->gemm_m, meta->gemm_n, meta->gemm_k, warp_m, warp_n, warp_k,
+        element_bits, meta->gemm_k_pack, meta->gemm_trans_b, floors.n_per_warp);
+  } else {
+    ICHECK_EQ(self->alt_, 1)
+        << "unsupported GEMM B ds_read_format Alt=" << self->alt_;
+    fragment = makeGemmFragmentBHCU(
+        meta->gemm_m, meta->gemm_n, meta->gemm_k, warp_m, warp_n, warp_k,
+        element_bits, meta->gemm_k_pack, meta->gemm_trans_b, floors.n_per_warp);
+  }
   auto layout = fragment->BindThreadRange(T.thread_bounds);
   if (T.layout_map.count(self->dst)) {
     if (!StructuralEqual()(layout, T.layout_map[self->dst])) {
@@ -275,6 +284,13 @@ DsReadFormat::DsReadFormat(Array<PrimExpr> args,
   AccessRegion dst_access{BufferRegion(node->dst, node->dst_ranges),
                           kAccessWrite};
   node->SetAccessRegions({src_access, dst_access});
+  if (args.size() >= 3) {
+    const auto *alt = args[2].as<IntImmNode>();
+    ICHECK(alt) << "ds_read_format alt must be IntImm";
+    node->alt_ = static_cast<int>(alt->value);
+  }
+  ICHECK(node->alt_ == 1 || node->alt_ == 2 || node->alt_ == 4)
+      << "ds_read_format alt must be 1, 2, or 4, got " << node->alt_;
   node->gemm_dep_ = GetMlsGemmDepFromAnnotations(annotations);
   if (auto value = annotations.Get(attr::kHcuLinearDsRead)) {
     const auto *imm = value.value().as<IntImmNode>();
@@ -308,7 +324,7 @@ LayoutMap DsReadFormatNode::InferLayout(const LayoutInferArgs &T,
     int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
     DsReadMlsPhysicalInfo info =
         InferDsReadMlsPhysicalInfo(src, trans, block_size, T.target);
-    const int alt = 1;
+    const int alt = alt_;
     int read_tile_mn, read_tile_k;
     GetReadTileFromMlsTile(trans, info.tile_mn, info.tile_k, alt,
                            info.element_bits, read_tile_mn, read_tile_k);
@@ -611,7 +627,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     w_mn = meta->feeds_slot == 0 ? warp_m : warp_n;
     w_k = warp_k_part;
   } else {
-    const int alt = 1;
+    const int alt = alt_;
     const int element_bits = lds_physical_bits;
     int read_tile_mn, read_tile_k;
     GetReadTileFromMlsTile(ds_trans, tile_mn, tile_k, alt, element_bits,
@@ -633,7 +649,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
       ss << "tl::mls::ds_read_format_tensor_a<tl::sequence<" << lds_mn << ", "
          << lds_k << ">, tl::sequence<" << read_mn << ", " << read_k
          << ">, tl::sequence<" << tile_mn << ", " << tile_k << ">, " << w_mn
-         << ", " << w_k << ", " << dtype_str << ", 1, "
+         << ", " << w_k << ", " << dtype_str << ", " << alt_ << ", "
          << (ds_trans ? "true" : "false")
          << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
          << target_dtype_str << ", " << lds_physical_bits << ", " << reg_bits
@@ -644,7 +660,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
          << lds_k << ">, tl::sequence<" << read_mn << ", " << read_k
          << ">, tl::sequence<" << tile_mn << ", " << tile_k << ">, "
          << total_warp << ", " << w_mn << ", " << w_k << ", " << dtype_str
-         << ", 1, " << (ds_trans ? "true" : "false")
+         << ", " << alt_ << ", " << (ds_trans ? "true" : "false")
          << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
          << target_dtype_str << ", " << lds_physical_bits << ", " << reg_bits
          << ">";
@@ -653,7 +669,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     ss << "tl::mls::ds_read_format_tensor_common<tl::sequence<" << lds_mn
        << ", " << lds_k << ">, tl::sequence<" << read_mn << ", " << read_k
        << ">, tl::sequence<" << tile_mn << ", " << tile_k << ">, " << w_mn
-       << ", " << w_k << ", " << dtype_str << ", 1, "
+       << ", " << w_k << ", " << dtype_str << ", " << alt_ << ", "
        << (ds_trans ? "true" : "false")
        << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
        << target_dtype_str << ", " << lds_physical_bits << ", " << reg_bits

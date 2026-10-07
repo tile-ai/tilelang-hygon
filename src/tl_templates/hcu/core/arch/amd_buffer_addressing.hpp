@@ -80,6 +80,26 @@ TL_DEVICE int32x4_t make_wave_buffer_resource(const void* ptr,
     return r;
 }
 
+// Enable cache swizzle without changing the ordinary byte-addressed resource
+// range. Unlike the structured-buffer overload above, const_stride affects
+// only the cache-swizzle fields in the descriptor.
+TL_DEVICE int32x4_t
+make_wave_buffer_resource_cache_swizzle(const void *ptr,
+                                        uint32_t size, // in bytes
+                                        uint32_t const_stride) {
+  buffer_resource res{ptr, size, TL_BUFFER_RESOURCE_3RD_DWORD};
+
+  res.const_stride |= uint64_t(const_stride) << 48;
+  res.const_stride |= uint64_t(1) << 62;
+
+  int32x4_t r = __builtin_bit_cast(int32x4_t, res);
+  r.x = __builtin_amdgcn_readfirstlane(r.x);
+  r.y = __builtin_amdgcn_readfirstlane(r.y);
+  r.z = __builtin_amdgcn_readfirstlane(r.z);
+  r.w = __builtin_amdgcn_readfirstlane(r.w);
+  return r;
+}
+
 namespace impl {
 // below type indicate the data type used for buffer load inline asm
 // clang-format off

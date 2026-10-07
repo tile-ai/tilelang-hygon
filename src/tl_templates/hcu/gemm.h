@@ -1,24 +1,10 @@
 #pragma once
 
 #include <tl_templates/hcu/common.h>
+#include <tl_templates/hcu/mmac_micro_k.hpp>
 #include <type_traits>
 
 namespace tl {
-
-// Per-arch per-dtype K extent for one MMAC along reduction axis.
-template <typename T> struct MmacMicroKDim {
-  static constexpr int value = 32 / sizeof(T);
-};
-
-template <> struct MmacMicroKDim<float> {
-#if defined(__gfx92a__) || defined(__gfx946__)
-  static constexpr int value = 4;
-#elif defined(__gfx938__)
-  static constexpr int value = 8;
-#else
-  static constexpr int value = 8;
-#endif
-};
 
 // Trait to determine the MMAC instruction to use based on data type
 template <typename T> struct MmacTraits;

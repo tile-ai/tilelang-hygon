@@ -77,6 +77,11 @@ static constexpr const char *kLexicalAllocScope = "lexical_alloc_scope";
 static constexpr const char *kHcuWdra = "tl.hcu_wdra";
 static constexpr const char *kHcuWdraWavesPerTg = "tl.hcu_wdra_waves_per_tg";
 static constexpr const char *kHcuScaleBufferSize = "tl.hcu_scale_buffer_size";
+// AttrStmt/call annotation value is the cache-swizzle stride in bytes. HCU
+// codegen uses it for enclosed VMEM copies; address and resource range stay
+// unchanged.
+static constexpr const char *kHcuBufferCacheSwizzleStride =
+    "tl.hcu_buffer_cache_swizzle_stride";
 // AttrStmt key carrying Map<String, PrimExpr> from MLS destination buffer data
 // Var name to the byte size required by the backend LDS layout.
 static constexpr const char *kMlsActualSizeBytesMap =
@@ -131,6 +136,7 @@ static constexpr const char *kDisableFastMath = "tl.disable_fast_math";
 static constexpr const char *kEnableFastMath = "tl.enable_fast_math";
 static constexpr const char *kPtxasRegisterUsageLevel =
     "tl.ptxas_register_usage_level";
+static constexpr const char *kZ3RLimit = "tl.z3_rlimit";
 static constexpr const char *kDisableVectorize256 = "tl.disable_vectorize_256";
 static constexpr const char *kEnableAsyncCopy = "tl.enable_async_copy";
 static constexpr const char *kPipelinedKUnrollFactor =

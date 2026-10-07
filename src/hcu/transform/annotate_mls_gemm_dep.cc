@@ -250,15 +250,15 @@ private:
   IterVar thread_x_var_;
 };
 
-bool HaveSameAtBnStrategyParameters(const HcuGemmAtBnLdsStrategy &lhs,
-                                    const HcuGemmAtBnLdsStrategy &rhs) {
+bool HaveCompatibleAtBnStrategyParameters(const HcuGemmAtBnLdsStrategy &lhs,
+                                          const HcuGemmAtBnLdsStrategy &rhs) {
+  // warp_mn_count is consumer-local partition metadata. It validates strategy
+  // derivation but does not affect the physical LDS or copy-loop layouts.
   return lhs->strategy_version == rhs->strategy_version &&
          lhs->block_mn == rhs->block_mn && lhs->block_k == rhs->block_k &&
          lhs->block_threads == rhs->block_threads &&
          lhs->thread_offset == rhs->thread_offset &&
-         lhs->warp_size == rhs->warp_size &&
-         lhs->warp_mn_count == rhs->warp_mn_count &&
-         lhs->bank_num == rhs->bank_num &&
+         lhs->warp_size == rhs->warp_size && lhs->bank_num == rhs->bank_num &&
          lhs->bank_width_bytes == rhs->bank_width_bytes &&
          lhs->element_bytes == rhs->element_bytes &&
          lhs->copy_bytes_per_lane == rhs->copy_bytes_per_lane &&
@@ -272,8 +272,8 @@ bool HaveSameAtBnStrategyParameters(const HcuGemmAtBnLdsStrategy &lhs,
          lhs->wrap_idx_mask == rhs->wrap_idx_mask;
 }
 
-bool HaveSameAnBtStrategyParameters(const HcuGemmAnBtLdsStrategy &lhs,
-                                    const HcuGemmAnBtLdsStrategy &rhs) {
+bool HaveCompatibleAnBtStrategyParameters(const HcuGemmAnBtLdsStrategy &lhs,
+                                          const HcuGemmAnBtLdsStrategy &rhs) {
   return lhs->strategy_version == rhs->strategy_version &&
          lhs->block_k == rhs->block_k && lhs->block_mn == rhs->block_mn &&
          lhs->block_threads == rhs->block_threads &&
@@ -708,18 +708,18 @@ private:
       }
       if (current_at_bn.defined()) {
         if (at_bn_strategy.defined()) {
-          ICHECK(HaveSameAtBnStrategyParameters(at_bn_strategy.value(),
-                                                current_at_bn.value()))
-              << "Conflicting AT/BN LDS strategies for shared buffer `"
-              << copy.dst->name << "` across GEMM consumers";
+          if (!HaveCompatibleAtBnStrategyParameters(at_bn_strategy.value(),
+                                                    current_at_bn.value())) {
+            return {std::nullopt, std::nullopt};
+          }
         } else {
           at_bn_strategy = current_at_bn;
         }
       } else if (an_bt_strategy.defined()) {
-        ICHECK(HaveSameAnBtStrategyParameters(an_bt_strategy.value(),
-                                              current_an_bt.value()))
-            << "Conflicting AN/BT LDS strategies for shared buffer `"
-            << copy.dst->name << "` across GEMM consumers";
+        if (!HaveCompatibleAnBtStrategyParameters(an_bt_strategy.value(),
+                                                  current_an_bt.value())) {
+          return {std::nullopt, std::nullopt};
+        }
       } else {
         an_bt_strategy = current_an_bt;
         an_bt_consumer = consumer;
@@ -740,21 +740,23 @@ private:
       constexpr int kCommonWrapCount = 2;
       const int common_wrap_count_limit =
           bank_ring_bytes / (2 * kCommonWrapStepBytes);
-      if (common_wrap_count_limit >= kCommonWrapCount &&
-          at_bn_required_wrap_count <= kCommonWrapCount &&
-          an_bt_consumer.has_value()) {
-        Optional<HcuGemmAnBtLdsStrategy> common_strategy =
-            TryDeriveAnBtCommonWrapStrategy(copy, *an_bt_consumer,
-                                            kCommonWrapCount);
-        if (common_strategy.defined()) {
-          an_bt_strategy = common_strategy;
-        }
+      if (common_wrap_count_limit < kCommonWrapCount ||
+          at_bn_required_wrap_count > kCommonWrapCount ||
+          !an_bt_consumer.has_value()) {
+        return {std::nullopt, std::nullopt};
       }
+      Optional<HcuGemmAnBtLdsStrategy> common_strategy =
+          TryDeriveAnBtCommonWrapStrategy(copy, *an_bt_consumer,
+                                          kCommonWrapCount);
+      if (!common_strategy.defined()) {
+        return {std::nullopt, std::nullopt};
+      }
+      an_bt_strategy = common_strategy;
     }
     return {at_bn_strategy, an_bt_strategy};
   }
 
-  HcuGemmLdsCopyStrategy SelectCopyStrategy(
+  Optional<HcuGemmLdsCopyStrategy> TrySelectCopyStrategy(
       const CopyNode &copy,
       const Optional<HcuGemmAtBnLdsStrategy> &at_bn_strategy,
       const Optional<HcuGemmAnBtLdsStrategy> &an_bt_strategy) const {
@@ -763,14 +765,14 @@ private:
       const HcuGemmAnBtLdsStrategy &an_bt = an_bt_strategy.value();
       if (at_bn_strategy.defined()) {
         const HcuGemmAtBnLdsStrategy &at_bn = at_bn_strategy.value();
-        ICHECK_EQ(at_bn->block_mn, an_bt->block_k);
-        ICHECK_EQ(at_bn->block_k, an_bt->block_mn);
-        ICHECK_EQ(at_bn->block_threads, an_bt->block_threads);
-        ICHECK_EQ(at_bn->thread_offset, an_bt->thread_offset);
-        ICHECK_EQ(at_bn->copy_bytes_per_lane, an_bt->copy_bytes_per_lane);
-        ICHECK_EQ(at_bn->copy_transaction_bytes, an_bt->copy_transaction_bytes)
-            << "Mixed HCU GEMM consumers of shared buffer `" << copy.dst->name
-            << "` require incompatible async-copy transactions";
+        if (at_bn->block_mn != an_bt->block_k ||
+            at_bn->block_k != an_bt->block_mn ||
+            at_bn->block_threads != an_bt->block_threads ||
+            at_bn->thread_offset != an_bt->thread_offset ||
+            at_bn->copy_bytes_per_lane != an_bt->copy_bytes_per_lane ||
+            at_bn->copy_transaction_bytes != an_bt->copy_transaction_bytes) {
+          return std::nullopt;
+        }
         DLOG(WARNING)
             << "Shared buffer `" << copy.dst->name
             << "` has both AT/BN and AN/BT GEMM consumers; selecting the "
@@ -815,6 +817,28 @@ private:
       }
     }
     return false;
+  }
+
+  int GetDsReadAlt(const Buffer &input) const {
+    int alt = 1;
+    bool found = false;
+    for (const ProducerRecord &record : collector_->GetProducerRecords(input)) {
+      if (record.call == nullptr) {
+        continue;
+      }
+      Optional<TileOperator> producer =
+          ParseOperator(ffi::GetRef<Call>(record.call));
+      const auto *ds_read = producer.as<DsReadFormatNode>();
+      if (ds_read == nullptr) {
+        continue;
+      }
+      ICHECK(!found || alt == ds_read->alt_)
+          << "GEMM B fragment has ds_read_format producers with conflicting "
+             "Alt values";
+      alt = ds_read->alt_;
+      found = true;
+    }
+    return alt;
   }
 
   bool LookupSharedMlsTrans(const Buffer &dst, bool *out_trans) {
@@ -915,15 +939,18 @@ private:
       return std::nullopt;
     }
     auto annotations = base_annotations;
-    HcuGemmLdsCopyStrategy copy_strategy =
-        SelectCopyStrategy(copy, at_bn_strategy, an_bt_strategy);
+    Optional<HcuGemmLdsCopyStrategy> copy_strategy =
+        TrySelectCopyStrategy(copy, at_bn_strategy, an_bt_strategy);
+    if (!copy_strategy.defined()) {
+      return std::nullopt;
+    }
     if (at_bn_strategy.defined()) {
       annotations.Set(kPendingGemmAtBnLdsStrategy, at_bn_strategy.value());
     }
     if (an_bt_strategy.defined()) {
       annotations.Set(kPendingGemmAnBtLdsStrategy, an_bt_strategy.value());
     }
-    annotations.Set(kPendingGemmLdsCopyStrategy, copy_strategy);
+    annotations.Set(kPendingGemmLdsCopyStrategy, copy_strategy.value());
     return annotations;
   }
 
@@ -962,8 +989,8 @@ private:
       auto [it, inserted] = auto_at_bn_strategies_.emplace(
           copy.dst->data, at_bn_strategy.value());
       if (!inserted) {
-        ICHECK(
-            HaveSameAtBnStrategyParameters(it->second, at_bn_strategy.value()))
+        ICHECK(HaveCompatibleAtBnStrategyParameters(it->second,
+                                                    at_bn_strategy.value()))
             << "Conflicting HCU GEMM AT/BN strategies for shared buffer "
             << copy.dst->name;
       }
@@ -973,8 +1000,8 @@ private:
       auto [it, inserted] = auto_an_bt_strategies_.emplace(
           copy.dst->data, an_bt_strategy.value());
       if (!inserted) {
-        ICHECK(
-            HaveSameAnBtStrategyParameters(it->second, an_bt_strategy.value()))
+        ICHECK(HaveCompatibleAnBtStrategyParameters(it->second,
+                                                    an_bt_strategy.value()))
             << "Conflicting HCU GEMM AN/BT strategies for shared buffer "
             << copy.dst->name;
       }
@@ -1136,6 +1163,11 @@ private:
       auto gemm = Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
       auto annotations =
           AnnotateGemmHcuMlsFlags(call->annotations, gemm.get(), collector_);
+      const int b_ds_read_alt = GetDsReadAlt(gemm->b_);
+      if (b_ds_read_alt != 1) {
+        annotations.Set(attr::kHcuBDsReadAlt,
+                        IntImm(DataType::Int(32), b_ds_read_alt));
+      }
       if (copy_ds_read_outputs_.count(gemm->a_)) {
         annotations.Set(attr::kHcuAFromMls, IntImm(DataType::Int(32), 1));
       }

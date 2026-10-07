@@ -1,7 +1,8 @@
 """
 HCU gfx946 WASP GEMM POC: warp-specialized producer/consumer handoff via ABarrier.
 
-Kernels (gfx946 + WDRA only): MLS 4p4c4c one-shot and persistent variants.
+Kernels (gfx946 + WDRA only): MLS 4p4c4c one-shot and persistent variants,
+with an optional packed-F16 MatrixStore output path.
 """
 
 import argparse
@@ -35,6 +36,10 @@ WASP_PASS_CONFIGS = {
     # tl.PassConfigKey.TL_ENABLE_DUMP_IR: True,
     # tl.PassConfigKey.TL_DUMP_IR_DIR: "./dump_ir_gemm_wasp",
     tl.PassConfigKey.TL_ENABLE_HCU_WDRA: True,
+    # PMD does not implement the WDRA trap handler used by hardware.
+    tl.PassConfigKey.TL_DEVICE_COMPILE_FLAGS: [
+        "-mllvm=-turn-off-wdra-trap-handler=true",
+    ],
 }
 
 
@@ -289,8 +294,14 @@ def gemm_wasp_mls_4p4c4c_persistent(
     num_persistent_blocks: int = 48,
     dtype: str = "float16",
     accum_dtype: str = "float",
+    use_matrix_store: bool = False,
 ):
     """Persistent 4p4c4c MLS kernel with role-local output-block loops."""
+    if use_matrix_store and dtype != "float16":
+        raise ValueError("packed MatrixStore output currently requires dtype=float16")
+    if use_matrix_store and (M % block_M != 0 or N % block_N != 0 or K % block_K != 0):
+        raise ValueError("packed MatrixStore output currently requires full M/N/K tiles")
+
     k_pair_boundary = (None, False)
     num_producer_waves = 4
     num_consumer_waves_per_group = 4
@@ -310,6 +321,8 @@ def gemm_wasp_mls_4p4c4c_persistent(
     pong_uses_per_block = full_k_pairs
     half_N = block_N // 2
     mls_annotations = {"no_implicit_async_commit_wait": T.int32(1)}
+    b_ds_read_alt = 2 if use_matrix_store else 1
+    mmac_annotations = {"tl.hcu_mmac_lit": 0, "trans_c": 1} if use_matrix_store else {"trans_c": True}
 
     @T.prim_func
     def _gemm_wasp_mls_4p4c4c_persistent(
@@ -319,6 +332,9 @@ def gemm_wasp_mls_4p4c4c_persistent(
     ):
         with T.Kernel(grid_size, threads=threads) as block_id:
             tx = T.get_thread_binding()
+
+            if use_matrix_store:
+                C_packed = T.view(C, (M, N // 2), dtype="uint32")
 
             A_shared_ping = T.alloc_shared((block_M, block_K), dtype)
             A_shared_pong = T.alloc_shared((block_M, block_K), dtype)
@@ -330,11 +346,13 @@ def gemm_wasp_mls_4p4c4c_persistent(
             B_local_ping = T.alloc_fragment((half_N, block_K), dtype)
             B_local_pong = T.alloc_fragment((half_N, block_K), dtype)
             C_local = T.alloc_fragment((block_M, half_N), accum_dtype)
+            C_store_local = T.alloc_fragment((block_M, half_N), dtype)
             A_local1_ping = T.alloc_fragment((block_M, block_K), dtype)
             A_local1_pong = T.alloc_fragment((block_M, block_K), dtype)
             B_local1_ping = T.alloc_fragment((half_N, block_K), dtype)
             B_local1_pong = T.alloc_fragment((half_N, block_K), dtype)
             C_local1 = T.alloc_fragment((block_M, half_N), accum_dtype)
+            C_store_local1 = T.alloc_fragment((block_M, half_N), dtype)
 
             T.abarrier_init(FREE_PING, num_consumer_waves)
             T.abarrier_init(READY_PING, num_producer_waves)
@@ -425,7 +443,7 @@ def gemm_wasp_mls_4p4c4c_persistent(
                         pong_phase = (block_iter * pong_uses_per_block + k_pair) & 1
                         T.abarrier_try_wait(READY_PING, ping_phase)
                         T.ds_read_format(A_shared_ping, A_local_ping)
-                        T.ds_read_format(B_shared_ping[0:half_N, :], B_local_ping)
+                        T.ds_read_format(B_shared_ping[0:half_N, :], B_local_ping, alt=b_ds_read_alt)
                         T.abarrier_arrive(FREE_PING)
                         T.ebarrier_arrive(CONSUMER_PING_EBAR_ID, num_consumer_waves)
                         T.call_extern("tl::set_prio<1>", dtype="void")
@@ -435,12 +453,12 @@ def gemm_wasp_mls_4p4c4c_persistent(
                             C_local,
                             transpose_B=True,
                             k_pack=1,
-                            annotations={"trans_c": True},
+                            annotations=mmac_annotations,
                         )
                         T.call_extern("tl::set_prio<0>", dtype="void")
                         T.abarrier_try_wait(READY_PONG, pong_phase)
                         T.ds_read_format(A_shared_pong, A_local_pong)
-                        T.ds_read_format(B_shared_pong[0:half_N, :], B_local_pong)
+                        T.ds_read_format(B_shared_pong[0:half_N, :], B_local_pong, alt=b_ds_read_alt)
                         T.abarrier_arrive(FREE_PONG)
                         T.ebarrier_sync_cnt(CONSUMER_PONG_EBAR_ID, num_consumer_waves)
                         T.call_extern("tl::set_prio<3>", dtype="void")
@@ -450,7 +468,7 @@ def gemm_wasp_mls_4p4c4c_persistent(
                             C_local,
                             transpose_B=True,
                             k_pack=1,
-                            annotations={"trans_c": True},
+                            annotations=mmac_annotations,
                         )
                         T.call_extern("tl::set_prio<0>", dtype="void")
 
@@ -458,7 +476,7 @@ def gemm_wasp_mls_4p4c4c_persistent(
                         tail_ping_phase = (block_iter * ping_uses_per_block + full_k_pairs) & 1
                         T.abarrier_try_wait(READY_PING, tail_ping_phase)
                         T.ds_read_format(A_shared_ping, A_local_ping)
-                        T.ds_read_format(B_shared_ping[0:half_N, :], B_local_ping)
+                        T.ds_read_format(B_shared_ping[0:half_N, :], B_local_ping, alt=b_ds_read_alt)
                         T.abarrier_arrive(FREE_PING)
                         T.ebarrier_arrive(CONSUMER_PING_EBAR_ID, num_consumer_waves)
                         T.call_extern("tl::set_prio<1>", dtype="void")
@@ -468,10 +486,17 @@ def gemm_wasp_mls_4p4c4c_persistent(
                             C_local,
                             transpose_B=True,
                             k_pack=1,
-                            annotations={"trans_c": True},
+                            annotations=mmac_annotations,
                         )
                         T.call_extern("tl::set_prio<0>", dtype="void")
-                    T.copy(C_local, C[by * block_M, bx * block_N])
+                    if use_matrix_store:
+                        T.copy(C_local, C_store_local)
+                        T.matrix_store(
+                            C_store_local,
+                            C_packed[by * block_M, bx * (block_N // 2)],
+                        )
+                    else:
+                        T.copy(C_local, C[by * block_M, bx * block_N])
             else:
                 T.set_max_nreg(MLS_CONSUMER_MAX_NREG_3BR, 0)
                 T.abarrier_arrive(FREE_PING)
@@ -488,7 +513,7 @@ def gemm_wasp_mls_4p4c4c_persistent(
                         T.ebarrier_sync_cnt(CONSUMER_PING_EBAR_ID, num_consumer_waves)
                         T.abarrier_try_wait(READY_PING, ping_phase)
                         T.ds_read_format(A_shared_ping, A_local1_ping)
-                        T.ds_read_format(B_shared_ping[half_N:block_N, :], B_local1_ping)
+                        T.ds_read_format(B_shared_ping[half_N:block_N, :], B_local1_ping, alt=b_ds_read_alt)
                         T.abarrier_arrive(FREE_PING)
                         T.sched_barrier(0)
                         T.gemm(
@@ -497,13 +522,13 @@ def gemm_wasp_mls_4p4c4c_persistent(
                             C_local1,
                             transpose_B=True,
                             k_pack=1,
-                            annotations={"trans_c": True},
+                            annotations=mmac_annotations,
                         )
                         T.sched_barrier(0)
                         T.ebarrier_arrive(CONSUMER_PONG_EBAR_ID, num_consumer_waves)
                         T.abarrier_try_wait(READY_PONG, pong_phase)
                         T.ds_read_format(A_shared_pong, A_local1_pong)
-                        T.ds_read_format(B_shared_pong[half_N:block_N, :], B_local1_pong)
+                        T.ds_read_format(B_shared_pong[half_N:block_N, :], B_local1_pong, alt=b_ds_read_alt)
                         T.abarrier_arrive(FREE_PONG)
                         T.call_extern("tl::set_prio<2>", dtype="void")
                         T.gemm(
@@ -512,7 +537,7 @@ def gemm_wasp_mls_4p4c4c_persistent(
                             C_local1,
                             transpose_B=True,
                             k_pack=1,
-                            annotations={"trans_c": True},
+                            annotations=mmac_annotations,
                         )
                         T.call_extern("tl::set_prio<0>", dtype="void")
 
@@ -521,7 +546,7 @@ def gemm_wasp_mls_4p4c4c_persistent(
                         T.ebarrier_sync_cnt(CONSUMER_PING_EBAR_ID, num_consumer_waves)
                         T.abarrier_try_wait(READY_PING, tail_ping_phase)
                         T.ds_read_format(A_shared_ping, A_local1_ping)
-                        T.ds_read_format(B_shared_ping[half_N:block_N, :], B_local1_ping)
+                        T.ds_read_format(B_shared_ping[half_N:block_N, :], B_local1_ping, alt=b_ds_read_alt)
                         T.abarrier_arrive(FREE_PING)
                         T.sched_barrier(0)
                         T.gemm(
@@ -530,10 +555,17 @@ def gemm_wasp_mls_4p4c4c_persistent(
                             C_local1,
                             transpose_B=True,
                             k_pack=1,
-                            annotations={"trans_c": True},
+                            annotations=mmac_annotations,
                         )
                         T.sched_barrier(0)
-                    T.copy(C_local1, C[by * block_M, bx * block_N + half_N])
+                    if use_matrix_store:
+                        T.copy(C_local1, C_store_local1)
+                        T.matrix_store(
+                            C_store_local1,
+                            C_packed[by * block_M, bx * (block_N // 2) + half_N // 2],
+                        )
+                    else:
+                        T.copy(C_local1, C[by * block_M, bx * block_N + half_N])
 
     return _gemm_wasp_mls_4p4c4c_persistent
 
@@ -563,8 +595,7 @@ def run_check(
     a = torch.randn(m, k, device=f"cuda:{device}", dtype=getattr(torch, dtype))
     b = torch.randn(n, k, device=f"cuda:{device}", dtype=getattr(torch, dtype))
     c = kernel(a, b)
-    ref = cpu_ref_program(a, b)
-    torch.testing.assert_close(c.cpu(), ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(c.cpu(), cpu_ref_program(a, b), rtol=1e-2, atol=1e-2)
     print(f"OK: gemm_wasp_{variant} M={m} N={n} K={k} on device {device}")
 
 

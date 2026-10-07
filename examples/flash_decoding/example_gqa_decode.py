@@ -36,7 +36,7 @@ def get_heuristic_config() -> Tuple[Dict, int]:
     if sm_version == 89:
         cfg = dict(block_N=128, block_H=64, num_split=1, num_stages=0, threads=128)
     else:
-        cfg = dict(block_N=128, block_H=64, num_split=8, num_stages=2, threads=128)
+        cfg = dict(block_N=64, block_H=64, num_split=8, num_stages=0, threads=128)
     return cfg, sm_version
 
 
@@ -77,6 +77,7 @@ def flashattn(batch, heads, groups, seqlen_kv, dim, block_N, block_H, num_split,
             K_shared = T.alloc_shared([block_N, dim], dtype)
             V_shared = T.alloc_shared([block_N, dim], dtype)
             O_shared = T.alloc_shared([valid_block_H, dim], dtype)
+            P_shared = T.alloc_shared([block_H, block_N], dtype)
             acc_s = T.alloc_fragment([block_H, block_N], accum_dtype)
             acc_s_cast = T.alloc_fragment([block_H, block_N], dtype)
             mask_local = T.alloc_fragment([block_N], "uint8")
@@ -133,7 +134,9 @@ def flashattn(batch, heads, groups, seqlen_kv, dim, block_N, block_H, num_split,
                 T.reduce_sum(acc_s, scores_sum, dim=1)
                 for i in T.Parallel(block_H):
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                T.copy(acc_s, acc_s_cast)
+                for i, j in T.Parallel(block_H, block_N):
+                    P_shared[i, j] = T.cast(acc_s[i, j], dtype)
+                T.copy(P_shared, acc_s_cast)
                 for i, j in T.Parallel(block_H, dim):
                     acc_o[i, j] *= scores_scale[i]
                 T.copy(
@@ -200,6 +203,7 @@ def flashattn(batch, heads, groups, seqlen_kv, dim, block_N, block_H, num_split,
             K_shared = T.alloc_shared([block_N, dim], dtype)
             V_shared = T.alloc_shared([block_N, dim], dtype)
             O_shared = T.alloc_shared([valid_block_H, dim], dtype)
+            P_shared = T.alloc_shared([block_H, block_N], dtype)
             acc_s = T.alloc_fragment([block_H, block_N], accum_dtype)
             acc_s_cast = T.alloc_fragment([block_H, block_N], dtype)
             mask_local = T.alloc_fragment([block_N], "uint8")
@@ -239,7 +243,9 @@ def flashattn(batch, heads, groups, seqlen_kv, dim, block_N, block_H, num_split,
                 T.reduce_sum(acc_s, scores_sum, dim=1)
                 for i in T.Parallel(block_H):
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                T.copy(acc_s, acc_s_cast)
+                for i, j in T.Parallel(block_H, block_N):
+                    P_shared[i, j] = T.cast(acc_s[i, j], dtype)
+                T.copy(P_shared, acc_s_cast)
                 for i, j in T.Parallel(block_H, dim):
                     acc_o[i, j] *= scores_scale[i]
                 T.copy(V[bid, k * block_N : (k + 1) * block_N, cur_kv_head, :], V_shared)

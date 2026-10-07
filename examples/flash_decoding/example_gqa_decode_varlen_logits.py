@@ -5,6 +5,11 @@ import tilelang
 import tilelang.language as T
 from tilelang.profiler import do_bench
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from hcu_example_utils import gqa_decode_kernel_config, jit_pass_configs, shared_swizzle_layout
 
 torch.manual_seed(0)
@@ -69,6 +74,7 @@ def flashattn(
             K_shared = T.alloc_shared([block_N, dim], dtype)
             V_shared = T.alloc_shared([block_N, dim], dtype)
             O_shared = T.alloc_shared([valid_block_H, dim], dtype)
+            P_shared = T.alloc_shared([block_H, block_N], dtype)
             acc_s = T.alloc_fragment([block_H, block_N], accum_dtype)
             acc_s_cast = T.alloc_fragment([block_H, block_N], dtype)
             acc_o = T.alloc_fragment([block_H, dim], accum_dtype)
@@ -77,7 +83,7 @@ def flashattn(
             scores_scale = T.alloc_fragment([block_H], accum_dtype)
             scores_sum = T.alloc_fragment([block_H], accum_dtype)
             logsum = T.alloc_fragment([block_H], accum_dtype)
-            S_shared = T.alloc_shared([block_H, math.ceil(max_seqlen_kv / block_N)], accum_dtype)
+            S_shared = T.alloc_shared([block_H, math.ceil(max_seqlen_kv / block_N)], accum_dtype, scope="shared")
             s_aux_shared = T.alloc_shared([block_H], T.float32)
 
             cur_kv_head = hid // (kv_group_num // valid_block_H)
@@ -111,7 +117,9 @@ def flashattn(
                 T.reduce_sum(acc_s, scores_sum, dim=1)
                 for i in T.Parallel(block_H):
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                T.copy(acc_s, acc_s_cast)
+                for i, j in T.Parallel(block_H, block_N):
+                    P_shared[i, j] = T.cast(acc_s[i, j], dtype)
+                T.copy(P_shared, acc_s_cast)
                 for i, j in T.Parallel(block_H, dim):
                     acc_o[i, j] *= scores_scale[i]
                 T.copy(V[cur_start_k + k * block_N : cur_start_k + (k + 1) * block_N, cur_kv_head, :], V_shared)

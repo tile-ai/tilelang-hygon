@@ -42,6 +42,7 @@ def flashattn(batch, heads, seq_q, seq_kv, dim, is_causal, block_M=64, block_N=6
             K_shared = T.alloc_shared([block_N, dim], dtype)
             V_shared = T.alloc_shared([block_N, dim], dtype)
             O_shared = T.alloc_shared([block_M, dim], dtype)
+            P_shared = T.alloc_shared([block_M, block_N], dtype)
             acc_s = T.alloc_fragment([block_M, block_N], accum_dtype)
             acc_s_cast = T.alloc_fragment([block_M, block_N], dtype)
             acc_o = T.alloc_fragment([block_M, dim], accum_dtype)
@@ -86,7 +87,9 @@ def flashattn(batch, heads, seq_q, seq_kv, dim, is_causal, block_M=64, block_N=6
                 T.reduce_sum(acc_s, scores_sum, dim=1)
                 for i in T.Parallel(block_M):
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                T.copy(acc_s, acc_s_cast)
+                for i, j in T.Parallel(block_M, block_N):
+                    P_shared[i, j] = T.cast(acc_s[i, j], dtype)
+                T.copy(P_shared, acc_s_cast)
 
                 for i, j in T.Parallel(block_M, dim):
                     acc_o[i, j] *= scores_scale[i]

@@ -17,7 +17,7 @@ def get_bwd_configs():
     if sm_version == 80:
         return 64, 32, 1, 128
     else:
-        return 128, 32, 2, 256
+        return 64, 32, 0, 256
 
 
 @tilelang.jit(
@@ -72,6 +72,7 @@ def flashattn_fwd(
             Q_shared = T.alloc_shared([block_M, dim], dtype)
             K_shared = T.alloc_shared([block_N, dim], dtype)
             V_shared = T.alloc_shared([block_N, dim], dtype)
+            P_shared = T.alloc_shared([block_M, block_N], dtype)
             acc_s = T.alloc_fragment([block_M, block_N], accum_dtype)
             acc_s_cast = T.alloc_fragment([block_M, block_N], dtype)
             acc_o = T.alloc_fragment([block_M, dim], accum_dtype)
@@ -187,7 +188,9 @@ def flashattn_fwd(
                 for i, j in T.Parallel(block_M, block_N):
                     acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
 
-                T.copy(acc_s, acc_s_cast)
+                for i, j in T.Parallel(block_M, block_N):
+                    P_shared[i, j] = T.cast(acc_s[i, j], dtype)
+                T.copy(P_shared, acc_s_cast)
                 T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
                 T.reduce_sum(acc_s, scores_sum, dim=1)
@@ -438,16 +441,20 @@ def flashattn_bwd(
                 T.copy(dO[q_start_idx + k * block_N : q_start_idx + (k + 1) * block_N, bx, :], dst=do)
                 T.clear(dsT)
                 T.gemm(V_shared, do, dsT, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-                T.copy(qkT, qkT_cast)
+                for i, j in T.Parallel(block_M, block_N):
+                    dsT_shared[i, j] = T.cast(qkT[i, j], dtype)
+                T.copy(dsT_shared, qkT_cast)
                 T.gemm(qkT_cast, do, dv, policy=T.GemmWarpPolicy.FullRow)
 
                 T.copy(Delta[bz, bx, k * block_N : (k + 1) * block_N], delta)
 
                 for i, j in T.Parallel(block_M, block_N):
-                    dsT_cast[i, j] = qkT[i, j] * (dsT[i, j] - delta[j]) * sm_scale
+                    dsT[i, j] = qkT[i, j] * (dsT[i, j] - delta[j]) * sm_scale
+                for i, j in T.Parallel(block_M, block_N):
+                    dsT_shared[i, j] = T.cast(dsT[i, j], dtype)
+                T.copy(dsT_shared, dsT_cast)
                 T.gemm(dsT_cast, q, dk, policy=T.GemmWarpPolicy.FullRow)
 
-                T.copy(dsT_cast, dsT_shared)
                 T.clear(dq)
                 T.gemm(dsT_shared, K_shared, dq, transpose_A=True)
                 T.atomic_add(dQ[q_start_idx + k * block_N : q_start_idx + (k + 1) * block_N, bx, :], dq)

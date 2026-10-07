@@ -267,8 +267,8 @@ def get_thread_template_configs():
 def get_autotuned_kernel(
     A,
     B,
-    BLOCK_N=None,
-    reduce_threads=None,
+    BLOCK_N=2,
+    reduce_threads=4,
 ):
     N, K = T.const("N, K")
     dtype = T.float16

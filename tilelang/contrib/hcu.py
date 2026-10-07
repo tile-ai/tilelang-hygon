@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import warnings
 
 import tvm_ffi
@@ -41,6 +43,45 @@ def find_hcu_path() -> str:
     if compiler_exe:
         return os.path.realpath(os.path.join(compiler_exe, "../.."))
     raise RuntimeError("Cannot find HCU toolchain path")
+
+
+@functools.cache
+def _hcu_multidie_api_available(hcu_path: str) -> bool:
+    """Probe whether the active HCU compiler can link a MultiDie launch call."""
+    source = """
+#include <hip/hip_runtime.h>
+int main() {
+    hipLaunchMultiDieConfig config{};
+    auto launch = &hipLaunchKernelMultiDie;
+    (void)config;
+    return launch == nullptr;
+}
+"""
+    try:
+        with tempfile.TemporaryDirectory(prefix="tilelang_hcu_multidie_") as directory:
+            source_path = os.path.join(directory, "probe.cpp")
+            output_path = os.path.join(directory, "probe")
+            with open(source_path, "w", encoding="utf-8") as file:
+                file.write(source)
+            result = subprocess.run(
+                [get_hcu_compiler(), source_path, "-o", output_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+            )
+            return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def hcu_multidie_api_available() -> bool:
+    """Return cached MultiDie launch availability for the active HCU toolchain."""
+    try:
+        hcu_path = os.path.realpath(find_hcu_path())
+    except RuntimeError:
+        return False
+    return _hcu_multidie_api_available(hcu_path)
 
 
 def get_hcu_arch(hcu_path: str | None = None) -> str:
