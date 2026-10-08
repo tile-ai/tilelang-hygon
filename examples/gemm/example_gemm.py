@@ -14,13 +14,22 @@ def matmul(A, B, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float
     with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
         A_shared = T.alloc_shared((block_M, block_K), dtype)
         B_shared = T.alloc_shared((block_K, block_N), dtype)
+        A_local = T.alloc_fragment((block_M, block_K), dtype)
+        B_local = T.alloc_fragment((block_K, block_N), dtype)
         C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
 
         T.clear(C_local)
-        for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=4):
-            T.copy(A[by * block_M, k * block_K], A_shared)
-            T.copy(B[k * block_K, bx * block_N], B_shared)
-            T.gemm(A_shared, B_shared, C_local)
+        for k in T.Pipelined(
+            T.ceildiv(K, block_K),
+            num_stages=4,
+            enable_register_pipeline=True,
+            enable_warp_divergence=True,
+        ):
+            T.copy(A[by * block_M, k * block_K], A_shared, enable_async=True)
+            T.copy(B[k * block_K, bx * block_N], B_shared, enable_async=True)
+            T.copy(A_shared, A_local)
+            T.copy(B_shared, B_local)
+            T.gemm(A_local, B_local, C_local, transpose_B=False, annotations={"trans_c": True})
 
         T.copy(C_local, C[by * block_M, bx * block_N])
 
@@ -28,12 +37,11 @@ def matmul(A, B, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float
 
 
 def main():
-    kernel = matmul.compile(M=8192, N=8192, K=8192, block_M=256, block_N=256, block_K=16)
-
+    kernel = matmul.compile(M=10240, N=10240, K=10240, block_M=256, block_N=256, block_K=16)
     import torch
 
-    a = torch.randn(8192, 8192).cuda().half()
-    b = torch.randn(8192, 8192).cuda().half()
+    a = torch.randn(10240, 10240).cuda().half()
+    b = torch.randn(10240, 10240).cuda().half()
 
     c = kernel(a, b)
 
@@ -43,13 +51,13 @@ def main():
     print(c)
     print("ref_c:")
     print(ref_c)
-
-    torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
-    print("All check passed.")
-
     # Get CUDA Source
     print("CUDA Source:")
     print(kernel.get_kernel_source())
+    torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+    print("All check passed.")
+
+
 
     # benchmark
     profiler = kernel.get_profiler()
