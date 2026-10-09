@@ -669,10 +669,20 @@ private:
         floordiv(local_element, Integer(transaction_elements));
     PrimExpr intra_transaction =
         floormod(local_element, Integer(transaction_elements));
+    PrimExpr local_thread = thread_var_ - Integer(thread_offset);
+    ICHECK_GT(warp_size, 0);
+    ICHECK_EQ(block_threads % warp_size, 0);
+    if (wrap_index != nullptr) {
+      PrimExpr phase = floordiv(local_thread, Integer(warp_size));
+      if (wrap_uses_copy_transaction) {
+        phase += transaction * (block_threads / warp_size);
+      }
+      *wrap_index = analyzer_.Simplify(phase);
+    }
     // Each issued transaction is contiguous across lanes. Multiple
     // transactions owned by one thread are placed transaction-major.
     PrimExpr physical_offset = analyzer_.Simplify(
-        (transaction * block_threads + thread_var_) * transaction_elements +
+        (transaction * block_threads + local_thread) * transaction_elements +
         intra_transaction);
     Array<PrimExpr> tile_indices = {
         floordiv(physical_offset, Integer(inner_extent)),
