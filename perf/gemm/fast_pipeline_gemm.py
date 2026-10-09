@@ -3,6 +3,7 @@ import tilelang.language as T
 
 tilelang.disable_cache()
 
+
 @tilelang.jit
 def matmul(A, B, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
     M, N, K = T.const("M, N, K")
@@ -56,8 +57,6 @@ def main():
     print(kernel.get_kernel_source())
     torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
     print("All check passed.")
-
-
 
     # benchmark
     profiler = kernel.get_profiler()

@@ -612,9 +612,7 @@ def _pack_s_waitcnt_imm(cnt: int, flag: str) -> int:
         if not 0 <= cnt <= 63:
             raise ValueError(f"vmcnt must be in [0, 63], but got {cnt}.")
         # Bit 7 must be 1 on HCU (same as insert_mls_waitcnt PackVmcntImm).
-        return (cnt & 0xF) | (7 << 4) | (1 << 7) | (15 << 8) | (3 << 12) | (
-            (cnt & 0x30) << 10
-        )
+        return (cnt & 0xF) | (7 << 4) | (1 << 7) | (15 << 8) | (3 << 12) | ((cnt & 0x30) << 10)
 
     if flag == "lgkmcnt":
         if not 0 <= cnt <= 15:
