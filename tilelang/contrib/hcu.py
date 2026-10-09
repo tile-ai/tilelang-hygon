@@ -255,7 +255,6 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
         return []
     if arch in ["gfx928", "gfx936", "gfx938", "gfx92a", "gfx946"]:
         flags = [
-            "-mllvm=-support-768-vgprs=true",
             "-mllvm=-enable-latency-hack=true",
             "-mllvm=-mmac-latency=5",
             "-mllvm=-ds-load-store-latency=6",
@@ -264,6 +263,10 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
             "-mllvm=-disable-cluster-lds-memops=true",
             "-mllvm=-amdgpu-disable-backoff-barrier=false",
         ]
+        if arch in ["gfx92a", "gfx946"]:
+            flags.append("-mllvm=-support-512-vgprs=true")
+        else:
+            flags.append("-mllvm=-support-768-vgprs=true")
         if _pass_config_truthy(pass_configs, PassConfigKey.TL_ENABLE_FAST_MATH):
             flags.append("-mllvm=-enable-hcu-approx-func-fp-math=true")
         if _pass_config_truthy(pass_configs, PassConfigKey.TL_ENABLE_HCU_WDRA):
