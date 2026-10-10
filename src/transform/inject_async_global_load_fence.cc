@@ -504,6 +504,7 @@ public:
     if (is_k) {
       phase_ = PipelinePhase::kEpilogue;
       outstanding_ = plan_.main_wait;
+      body = InsertLoopEntryReleaseBarrier(body);
     }
     return For(op->loop_var, op->min, op->extent, op->kind, body,
                op->thread_binding, op->annotations, op->step, op->span);
@@ -604,6 +605,37 @@ public:
   }
 
 private:
+  // Every iteration issues the async copies for tile k+1 into the buffer slot
+  // the previous iteration read from, so the loop needs a release barrier at
+  // its entry: without it a wave can issue its DMA while a peer wave is still
+  // reading that slot (write-after-read). The prologue gets the same barrier
+  // after its last commit (the commit-stage handling in VisitStmt_(SeqStmt));
+  // the fence+barrier pairs before the LDS read clusters only order the
+  // producer->consumer direction and do not cover this one. sync_warp lowers
+  // to the same s_barrier as wave_barrier but is visible to the AMDGPU machine
+  // scheduler, which matters for a call site inside the K loop.
+  Stmt InsertLoopEntryReleaseBarrier(const Stmt &body) {
+    if (!plan_.compiler_pipeline || plan_.register_pipeline ||
+        plan_.num_stages < 2 || plan_.commits_per_tile <= 0) {
+      return body;
+    }
+    Stmt flattened = SeqStmt::Flatten(body);
+    const auto *seq = flattened.as<SeqStmtNode>();
+    if (seq == nullptr) {
+      return SeqStmt::Flatten(Array<Stmt>{MakeSyncWarpStmt(), flattened});
+    }
+    if (!seq->seq.empty() && IsSBarrierStmt(UnwrapWaitAttrs(seq->seq[0]))) {
+      return body;
+    }
+    Array<Stmt> stmts;
+    stmts.reserve(seq->seq.size() + 1);
+    stmts.push_back(MakeSyncWarpStmt());
+    for (const Stmt &s : seq->seq) {
+      stmts.push_back(s);
+    }
+    return SeqStmt(stmts);
+  }
+
   int NextWaitCount() {
     int wait_count = 0;
     if (phase_ == PipelinePhase::kMainLoop ||
