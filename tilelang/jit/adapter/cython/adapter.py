@@ -16,7 +16,7 @@ from tvm.relax import TensorType
 from tilelang.jit.adapter.base import BaseKernelAdapter, CachedTextSource
 from tilelang.jit.adapter.wrapper import TLWrapper
 from tilelang.jit.adapter.libgen import LibraryGenerator
-from tilelang.jit.adapter.utils import is_cuda_target, is_hip_target, is_cpu_target, is_metal_target
+from tilelang.jit.adapter.utils import is_cuda_target, is_hip_target, is_hcu_target, is_cpu_target, is_metal_target
 from tilelang.backend.target import determine_target
 from tilelang.utils.language import retrieve_func_from_module
 
@@ -319,7 +319,7 @@ class CythonKernelAdapter(BaseKernelAdapter):
         buffer_map = func.buffer_map
         buffer_device_map = {}
         device = None
-        if is_cuda_target(self.target) or is_hip_target(self.target):
+        if is_cuda_target(self.target) or is_hip_target(self.target) or is_hcu_target(self.target):
             device = torch.device("cuda")
         elif is_cpu_target(self.target):
             device = torch.device("cpu")
@@ -347,15 +347,23 @@ class CythonKernelAdapter(BaseKernelAdapter):
     def _convert_torch_func(self) -> Callable:
         """Returns a PyTorch-compatible function wrapper for the kernel."""
 
-        def lambda_forward(*args, stream: int = -1, skip_tensor_validation: bool = False):
+        def lambda_forward(*args, stream: int = -1, skip_tensor_validation: bool = False, xcd_config=None):
             """
             Args:
                 args: List of input tensors
                 stream: CUDA stream ID, default to -1, will use the current stream if not specified
                 skip_tensor_validation: Whether to skip tensor attributes validation which
                 includes shape, dtype, device, etc.
+                xcd_config: Optional per-call HCU physical XCD dispatch configuration.
             """
-            return self.cython_wrapper.forward([*args], stream=stream, skip_tensor_validation=skip_tensor_validation)
+            if xcd_config is not None:
+                if not is_hcu_target(self.target):
+                    raise ValueError("xcd_config is only supported for the HCU Cython backend")
+                from tilelang.hcu.runtime import XCDLaunchConfig
+
+                if not isinstance(xcd_config, XCDLaunchConfig):
+                    raise TypeError(f"xcd_config must be XCDLaunchConfig or None, got {type(xcd_config).__name__}")
+            return self.cython_wrapper.forward([*args], stream=stream, skip_tensor_validation=skip_tensor_validation, xcd_config=xcd_config)
 
         return lambda_forward
 

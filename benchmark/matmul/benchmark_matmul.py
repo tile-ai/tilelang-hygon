@@ -135,13 +135,13 @@ def matmul(
     N,
     K,
     with_roller,
-    block_M=None,
-    block_N=None,
-    block_K=None,
-    num_stages=None,
-    thread_num=None,
-    policy=None,
-    enable_rasteration=None,
+    block_M=64,
+    block_N=64,
+    block_K=32,
+    num_stages=0,
+    thread_num=128,
+    policy=T.GemmWarpPolicy.Square,
+    enable_rasteration=True,
 ):
     """
     Create an autotuned matrix multiplication kernel for matrices of shape:

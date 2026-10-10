@@ -22,8 +22,8 @@ def test_example_grouped_gemm_fwd_small():
     )
 
 
-@tilelang.testing.requires_cuda
-@tilelang.testing.requires_cuda_compute_version(9, 0)
+# @tilelang.testing.requires_cuda
+# @tilelang.testing.requires_cuda_compute_version(9, 0)
 def test_example_grouped_gemm_fwd_ptr_small():
     example_grouped_gemm_fwd_ptr.run_tilelang_grouped_gemm_ptr(
         [5, 9, 13],

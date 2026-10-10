@@ -622,10 +622,12 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_16x64_trans_b16, Alt,
   }
 };
 
-template <::tl::index_t BlockSizeMN, ::tl::index_t BlockSizeK>
-struct make_lds_desc_generic<tl::mls::gfx946_mls_32x32_trans_b16, 1,
+template <::tl::index_t Alt, ::tl::index_t BlockSizeMN,
+          ::tl::index_t BlockSizeK>
+struct make_lds_desc_generic<tl::mls::gfx946_mls_32x32_trans_b16, Alt,
                              BlockSizeMN, BlockSizeK, true> {
-  using MlsTraits = mls_traits<tl::mls::gfx946_mls_32x32_trans_b16, 1>;
+  static_assert(Alt == 1 || Alt == 2, "Unsupported interleave config");
+  using MlsTraits = mls_traits<tl::mls::gfx946_mls_32x32_trans_b16, Alt>;
   static constexpr ::tl::index_t MlsTileMN = 32;
   static constexpr ::tl::index_t MlsTileK = 32;
 
@@ -662,10 +664,12 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_32x32_trans_b16, 1,
   }
 };
 
-template <::tl::index_t BlockSizeMN, ::tl::index_t BlockSizeK>
-struct make_lds_desc_generic<tl::mls::gfx946_mls_16x32_trans_b16, 1,
+template <::tl::index_t Alt, ::tl::index_t BlockSizeMN,
+          ::tl::index_t BlockSizeK>
+struct make_lds_desc_generic<tl::mls::gfx946_mls_16x32_trans_b16, Alt,
                              BlockSizeMN, BlockSizeK, true> {
-  using MlsTraits = mls_traits<tl::mls::gfx946_mls_16x32_trans_b16, 1>;
+  static_assert(Alt == 1 || Alt == 2, "Unsupported interleave config");
+  using MlsTraits = mls_traits<tl::mls::gfx946_mls_16x32_trans_b16, Alt>;
   static constexpr ::tl::index_t MlsTileMN = 16;
   static constexpr ::tl::index_t MlsTileK = 32;
 
@@ -702,10 +706,11 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_16x32_trans_b16, 1,
   }
 };
 
-template <::tl::index_t BlockSizeMN, ::tl::index_t BlockSizeK>
-struct make_lds_desc_generic<tl::mls::gfx946_mls_32x32_b16, 1, BlockSizeMN,
+template <::tl::index_t Alt, ::tl::index_t BlockSizeMN,
+          ::tl::index_t BlockSizeK>
+struct make_lds_desc_generic<tl::mls::gfx946_mls_32x32_b16, Alt, BlockSizeMN,
                              BlockSizeK, false> {
-  using MlsTraits = mls_traits<tl::mls::gfx946_mls_32x32_b16, 1>;
+  using MlsTraits = mls_traits<tl::mls::gfx946_mls_32x32_b16, Alt>;
   static constexpr ::tl::index_t MlsTileMN = 32;
   static constexpr ::tl::index_t MlsTileK = 32;
 
@@ -728,10 +733,11 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_32x32_b16, 1, BlockSizeMN,
   }
 };
 
-template <::tl::index_t BlockSizeMN, ::tl::index_t BlockSizeK>
-struct make_lds_desc_generic<tl::mls::gfx946_mls_32x16_b16, 1, BlockSizeMN,
+template <::tl::index_t Alt, ::tl::index_t BlockSizeMN,
+          ::tl::index_t BlockSizeK>
+struct make_lds_desc_generic<tl::mls::gfx946_mls_32x16_b16, Alt, BlockSizeMN,
                              BlockSizeK, false> {
-  using MlsTraits = mls_traits<tl::mls::gfx946_mls_32x16_b16, 1>;
+  using MlsTraits = mls_traits<tl::mls::gfx946_mls_32x16_b16, Alt>;
   static constexpr ::tl::index_t MlsTileMN = 32;
   static constexpr ::tl::index_t MlsTileK = 16;
 
@@ -832,10 +838,31 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_64x16_b16, Alt, BlockSizeMN,
   static constexpr auto apply() {
     constexpr auto tile_issue_mn = ::tl::number<BlockSizeMN / MlsTileMN>{};
     constexpr auto tile_issue_k = ::tl::number<BlockSizeK / MlsTileK>{};
-    constexpr auto tile_issue_mn_outer =
-        ::tl::integer_divide_ceil(tile_issue_mn, MlsTraits::kSlots);
-
-    if constexpr (tile_issue_k < MlsTraits::kSlots && tile_issue_mn > 1) {
+    if constexpr (tile_issue_mn == 1) {
+      constexpr auto kSlot = ::tl::number<(tile_issue_k < MlsTraits::kSlots
+                                               ? tile_issue_k
+                                               : MlsTraits::kSlots)>{};
+      constexpr auto mSlot = ::tl::number<(
+          tile_issue_k > MlsTraits::kSlots ? 1 : MlsTraits::kSlots / kSlot)>{};
+      constexpr auto kIssue = ::tl::number<(
+          tile_issue_k > MlsTraits::kSlots
+              ? ::tl::integer_divide_ceil(tile_issue_k, MlsTraits::kSlots)
+              : 1)>{};
+      constexpr auto PackedShape =
+          ::tl::make_tuple(kIssue, ::tl::number<1>{}, MlsTraits::kMN0, mSlot,
+                           kSlot, MlsTraits::kK, MlsTraits::kMN1);
+      constexpr auto lds_desc_raw =
+          ::tl::make_naive_tensor_descriptor_packed(PackedShape);
+      return ::tl::transform_tensor_descriptor(
+          lds_desc_raw,
+          ::tl::make_tuple(::tl::make_merge_transform(::tl::make_tuple(
+                               1, mSlot, MlsTraits::kMN0, MlsTraits::kMN1)),
+                           ::tl::make_merge_transform(
+                               ::tl::make_tuple(kIssue, kSlot, MlsTraits::kK))),
+          ::tl::make_tuple(::tl::sequence<1, 3, 2, 6>{},
+                           ::tl::sequence<0, 4, 5>{}),
+          ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
+    } else if constexpr (tile_issue_k <= MlsTraits::kSlots) {
       //    0         1        2      3        4        5               6      7
       // (m_issue, k_issue=1, mMN0=2, mSlot, kSlot, tile_issue_k=1/2, kK=16,
       // mMN1=32) number of tile_issue_k that can be stored in the Slots
@@ -871,18 +898,22 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_64x16_b16, Alt, BlockSizeMN,
                            ::tl::sequence<1, 4, 5, 6>{}),
           ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
     } else {
-      // (tile_issue_mn_outer, tile_issue_k, kMN0, kSlots, kK, kMN1)
+      constexpr auto kIssue =
+          ::tl::integer_divide_ceil(tile_issue_k, MlsTraits::kSlots);
+      // Keep the K issues in a complete slot group, matching the k<=kSlots
+      // branch, and advance MN/K groups outside the four hardware slots.
+      constexpr auto PackedShape =
+          ::tl::make_tuple(tile_issue_mn, kIssue, MlsTraits::kMN0,
+                           MlsTraits::kSlots, MlsTraits::kK, MlsTraits::kMN1);
       constexpr auto lds_desc_raw =
-          ::tl::make_naive_tensor_descriptor_packed(::tl::concat_tuple(
-              ::tl::make_tuple(tile_issue_mn_outer, tile_issue_k),
-              MlsTraits::PackedShape));
+          ::tl::make_naive_tensor_descriptor_packed(PackedShape);
       return ::tl::transform_tensor_descriptor(
           lds_desc_raw,
           ::tl::make_tuple(
               ::tl::make_merge_transform(::tl::make_tuple(
-                  tile_issue_mn_outer, MlsTraits::kMN0, MlsTraits::kMN1)),
-              ::tl::make_merge_transform(::tl::make_tuple(
-                  tile_issue_k, MlsTraits::kSlots, MlsTraits::kK))),
+                  tile_issue_mn, MlsTraits::kMN0, MlsTraits::kMN1)),
+              ::tl::make_merge_transform(
+                  ::tl::make_tuple(kIssue, MlsTraits::kSlots, MlsTraits::kK))),
           ::tl::make_tuple(::tl::sequence<0, 2, 5>{},
                            ::tl::sequence<1, 3, 4>{}),
           ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
@@ -1053,18 +1084,16 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_128x16_b8, Alt, BlockSizeMN,
   static constexpr auto apply() {
     constexpr auto tile_issue_mn = ::tl::number<BlockSizeMN / MlsTileMN>{};
     constexpr auto tile_issue_k = ::tl::number<BlockSizeK / MlsTileK>{};
-    constexpr auto tile_issue_mn_outer =
-        ::tl::integer_divide_ceil(tile_issue_mn, MlsTraits::kSlots);
-
-    if constexpr (tile_issue_mn == 1 && tile_issue_k > 1) {
+    if constexpr (tile_issue_mn == 1) {
       constexpr auto kSlot = ::tl::number<(tile_issue_k < MlsTraits::kSlots
                                                ? tile_issue_k
                                                : MlsTraits::kSlots)>{};
       constexpr auto mSlot = ::tl::number<(
           tile_issue_k > MlsTraits::kSlots ? 1 : MlsTraits::kSlots / kSlot)>{};
       constexpr auto kIssue = ::tl::number<(
-          tile_issue_k > MlsTraits::kSlots ? tile_issue_k / MlsTraits::kSlots
-                                           : 1)>{};
+          tile_issue_k > MlsTraits::kSlots
+              ? ::tl::integer_divide_ceil(tile_issue_k, MlsTraits::kSlots)
+              : 1)>{};
       constexpr auto PackedShape =
           ::tl::make_tuple(kIssue, ::tl::number<1>{}, MlsTraits::kMN0, mSlot,
                            kSlot, MlsTraits::kK, MlsTraits::kMN1);
@@ -1079,8 +1108,7 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_128x16_b8, Alt, BlockSizeMN,
           ::tl::make_tuple(::tl::sequence<1, 3, 2, 6>{},
                            ::tl::sequence<0, 4, 5>{}),
           ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
-    } else if constexpr (tile_issue_k < MlsTraits::kSlots &&
-                         tile_issue_mn > 1) {
+    } else if constexpr (tile_issue_k <= MlsTraits::kSlots) {
       constexpr auto kKSlots = ::tl::number<MlsTraits::kSlots / tile_issue_k>{};
       constexpr auto mSlot =
           ::tl::number<(tile_issue_mn < kKSlots ? tile_issue_mn : kKSlots)>{};
@@ -1106,20 +1134,24 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_128x16_b8, Alt, BlockSizeMN,
                            ::tl::sequence<1, 4, 5, 6>{}),
           ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
     } else {
-      // (tile_issue_mn_outer, tile_issue_k, kMN0, kSlots, kK, kMN1)
+      constexpr auto kIssue =
+          ::tl::integer_divide_ceil(tile_issue_k, MlsTraits::kSlots);
+      // Keep the K issues in a complete slot group, matching the k<=kSlots
+      // branch, and advance MN/K groups outside the four hardware slots.
+      constexpr auto PackedShape =
+          ::tl::make_tuple(tile_issue_mn, kIssue, MlsTraits::kMN0,
+                           MlsTraits::kSlots, MlsTraits::kK, MlsTraits::kMN1);
       constexpr auto lds_desc_raw =
-          ::tl::make_naive_tensor_descriptor_packed(::tl::concat_tuple(
-              ::tl::make_tuple(tile_issue_mn_outer, tile_issue_k),
-              MlsTraits::PackedShape));
+          ::tl::make_naive_tensor_descriptor_packed(PackedShape);
       return ::tl::transform_tensor_descriptor(
           lds_desc_raw,
-          ::tl::make_tuple(::tl::make_merge_transform(::tl::make_tuple(
-                               tile_issue_mn_outer, MlsTraits::kSlots,
-                               MlsTraits::kMN0, MlsTraits::kMN1)),
-                           ::tl::make_merge_transform(
-                               ::tl::make_tuple(tile_issue_k, MlsTraits::kK))),
-          ::tl::make_tuple(::tl::sequence<0, 2, 3, 5>{},
-                           ::tl::sequence<1, 4>{}),
+          ::tl::make_tuple(
+              ::tl::make_merge_transform(::tl::make_tuple(
+                  tile_issue_mn, MlsTraits::kMN0, MlsTraits::kMN1)),
+              ::tl::make_merge_transform(
+                  ::tl::make_tuple(kIssue, MlsTraits::kSlots, MlsTraits::kK))),
+          ::tl::make_tuple(::tl::sequence<0, 2, 5>{},
+                           ::tl::sequence<1, 3, 4>{}),
           ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
     }
   }
@@ -1136,8 +1168,8 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_16x128_trans_b8, Alt,
   static constexpr auto apply() {
     constexpr auto tile_issue_mn = ::tl::number<BlockSizeMN / MlsTileMN>{};
     constexpr auto tile_issue_k = ::tl::number<BlockSizeK / MlsTileK>{};
-    constexpr auto tile_issue_k_outer =
-        ::tl::integer_divide_ceil(tile_issue_k, MlsTraits::kSlots);
+    constexpr auto tile_issue_mn_outer =
+        ::tl::integer_divide_ceil(tile_issue_mn, MlsTraits::kSlots);
 
     if constexpr (tile_issue_mn < MlsTraits::kSlots &&
                   tile_issue_k < MlsTraits::kSlots) {
@@ -1165,35 +1197,35 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_16x128_trans_b8, Alt,
           ::tl::make_tuple(::tl::sequence<1, 3, 5, 6>{},
                            ::tl::sequence<0, 4, 2, 7>{}),
           ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
-    } else if constexpr (tile_issue_k_outer == 1) {
-      // (tile_issue_mn, kK0, kSlots, kMN, kK1)
+    } else if constexpr (tile_issue_k == 1) {
+      // (tile_issue_mn_outer, kK0, kSlots, kMN, kK1)
       constexpr auto lds_desc_raw =
           ::tl::make_naive_tensor_descriptor_packed(::tl::concat_tuple(
-              ::tl::make_tuple(tile_issue_mn), MlsTraits::PackedShape));
+              ::tl::make_tuple(tile_issue_mn_outer), MlsTraits::PackedShape));
       return ::tl::transform_tensor_descriptor(
           lds_desc_raw,
           ::tl::make_tuple(
-              ::tl::make_merge_transform(
-                  ::tl::make_tuple(tile_issue_mn, MlsTraits::kMN)),
               ::tl::make_merge_transform(::tl::make_tuple(
-                  MlsTraits::kK0, MlsTraits::kSlots, MlsTraits::kK1))),
-          ::tl::make_tuple(::tl::sequence<0, 3>{}, ::tl::sequence<1, 2, 4>{}),
+                  tile_issue_mn_outer, MlsTraits::kSlots, MlsTraits::kMN)),
+              ::tl::make_merge_transform(
+                  ::tl::make_tuple(MlsTraits::kK0, MlsTraits::kK1))),
+          ::tl::make_tuple(::tl::sequence<0, 2, 3>{}, ::tl::sequence<1, 4>{}),
           ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
     } else {
-      // (tile_issue_k_outer, tile_issue_mn, kK0, kSlots, kMN, kK1)
+      // (tile_issue_k, tile_issue_mn_outer, kK0, kSlots, kMN, kK1)
       constexpr auto lds_desc_raw =
           ::tl::make_naive_tensor_descriptor_packed(::tl::concat_tuple(
-              ::tl::make_tuple(tile_issue_k_outer, tile_issue_mn),
+              ::tl::make_tuple(tile_issue_k, tile_issue_mn_outer),
               MlsTraits::PackedShape));
       return ::tl::transform_tensor_descriptor(
           lds_desc_raw,
-          ::tl::make_tuple(::tl::make_merge_transform(
-                               ::tl::make_tuple(tile_issue_mn, MlsTraits::kMN)),
-                           ::tl::make_merge_transform(::tl::make_tuple(
-                               tile_issue_k_outer, MlsTraits::kK0,
-                               MlsTraits::kSlots, MlsTraits::kK1))),
-          ::tl::make_tuple(::tl::sequence<1, 3>{},
-                           ::tl::sequence<0, 2, 4, 5>{}),
+          ::tl::make_tuple(
+              ::tl::make_merge_transform(::tl::make_tuple(
+                  tile_issue_mn_outer, MlsTraits::kSlots, MlsTraits::kMN)),
+              ::tl::make_merge_transform(::tl::make_tuple(
+                  tile_issue_k, MlsTraits::kK0, MlsTraits::kK1))),
+          ::tl::make_tuple(::tl::sequence<1, 3, 4>{},
+                           ::tl::sequence<0, 2, 5>{}),
           ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
     }
   }
@@ -1287,10 +1319,7 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_256x16_b4, Alt, BlockSizeMN,
   static constexpr auto apply() {
     constexpr auto tile_issue_mn = ::tl::number<BlockSizeMN / MlsTileMN>{};
     constexpr auto tile_issue_k = ::tl::number<BlockSizeK / MlsTileK>{};
-    constexpr auto tile_issue_mn_outer =
-        ::tl::integer_divide_ceil(tile_issue_mn, MlsTraits::kSlots);
-
-    if constexpr (tile_issue_mn == 1 && tile_issue_k > 1) {
+    if constexpr (tile_issue_mn == 1) {
       // Compact the single MN issue across K slots before falling back to the
       // regular slotted 256x16_b4 layout.
       constexpr auto kSlot = ::tl::number<(tile_issue_k < MlsTraits::kSlots
@@ -1299,8 +1328,9 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_256x16_b4, Alt, BlockSizeMN,
       constexpr auto mSlot = ::tl::number<(
           tile_issue_k > MlsTraits::kSlots ? 1 : MlsTraits::kSlots / kSlot)>{};
       constexpr auto kIssue = ::tl::number<(
-          tile_issue_k > MlsTraits::kSlots ? tile_issue_k / MlsTraits::kSlots
-                                           : 1)>{};
+          tile_issue_k > MlsTraits::kSlots
+              ? ::tl::integer_divide_ceil(tile_issue_k, MlsTraits::kSlots)
+              : 1)>{};
       constexpr auto PackedShape =
           ::tl::make_tuple(kIssue, ::tl::number<1>{}, MlsTraits::kMN0, mSlot,
                            kSlot, MlsTraits::kK, MlsTraits::kMN1);
@@ -1315,8 +1345,7 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_256x16_b4, Alt, BlockSizeMN,
           ::tl::make_tuple(::tl::sequence<1, 3, 2, 6>{},
                            ::tl::sequence<0, 4, 5>{}),
           ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
-    } else if constexpr (tile_issue_k < MlsTraits::kSlots &&
-                         tile_issue_mn > 1) {
+    } else if constexpr (tile_issue_k <= MlsTraits::kSlots) {
       constexpr auto kKSlots = ::tl::number<MlsTraits::kSlots / tile_issue_k>{};
       constexpr auto mSlot =
           ::tl::number<(tile_issue_mn < kKSlots ? tile_issue_mn : kKSlots)>{};
@@ -1343,20 +1372,24 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_256x16_b4, Alt, BlockSizeMN,
                            ::tl::sequence<1, 4, 5, 6>{}),
           ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
     } else {
-      // (tile_issue_mn_outer, tile_issue_k, kMN0, kSlots, kK, kMN1)
+      constexpr auto kIssue =
+          ::tl::integer_divide_ceil(tile_issue_k, MlsTraits::kSlots);
+      // Keep the K issues in a complete slot group, matching the k<=kSlots
+      // branch, and advance MN/K groups outside the four hardware slots.
+      constexpr auto PackedShape =
+          ::tl::make_tuple(tile_issue_mn, kIssue, MlsTraits::kMN0,
+                           MlsTraits::kSlots, MlsTraits::kK, MlsTraits::kMN1);
       constexpr auto lds_desc_raw =
-          ::tl::make_naive_tensor_descriptor_packed(::tl::concat_tuple(
-              ::tl::make_tuple(tile_issue_mn_outer, tile_issue_k),
-              MlsTraits::PackedShape));
+          ::tl::make_naive_tensor_descriptor_packed(PackedShape);
       return ::tl::transform_tensor_descriptor(
           lds_desc_raw,
-          ::tl::make_tuple(::tl::make_merge_transform(::tl::make_tuple(
-                               tile_issue_mn_outer, MlsTraits::kSlots,
-                               MlsTraits::kMN0, MlsTraits::kMN1)),
-                           ::tl::make_merge_transform(
-                               ::tl::make_tuple(tile_issue_k, MlsTraits::kK))),
-          ::tl::make_tuple(::tl::sequence<0, 2, 3, 5>{},
-                           ::tl::sequence<1, 4>{}),
+          ::tl::make_tuple(
+              ::tl::make_merge_transform(::tl::make_tuple(
+                  tile_issue_mn, MlsTraits::kMN0, MlsTraits::kMN1)),
+              ::tl::make_merge_transform(
+                  ::tl::make_tuple(kIssue, MlsTraits::kSlots, MlsTraits::kK))),
+          ::tl::make_tuple(::tl::sequence<0, 2, 5>{},
+                           ::tl::sequence<1, 3, 4>{}),
           ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
     }
   }
@@ -1373,75 +1406,63 @@ struct make_lds_desc_generic<tl::mls::gfx946_mls_16x256_trans_b4, Alt,
   static constexpr auto apply() {
     constexpr auto tile_issue_mn = ::tl::number<BlockSizeMN / MlsTileMN>{};
     constexpr auto tile_issue_k = ::tl::number<BlockSizeK / MlsTileK>{};
-    constexpr auto tile_issue_k_outer =
-        ::tl::integer_divide_ceil(tile_issue_k, MlsTraits::kSlots);
+    constexpr auto tile_issue_mn_outer =
+        ::tl::integer_divide_ceil(tile_issue_mn, MlsTraits::kSlots);
 
     if constexpr (tile_issue_mn < MlsTraits::kSlots &&
-                  (tile_issue_k > 1 || tile_issue_mn > 1)) {
-      //    0        1       2              3      4      5       6
-      // (k_issue, kK0=4, tile_issue_mn, mSlot, kSlot, kMN=16, kK1=64)
-      // number of tile_issue_k that can be stored in the Slots
+                  tile_issue_k < MlsTraits::kSlots) {
       constexpr auto kMNSlots =
           ::tl::number<MlsTraits::kSlots / tile_issue_mn>{};
-      // number of tile_issue_k stored in the current slot group
       constexpr auto kSlot =
           ::tl::number<(tile_issue_k < kMNSlots ? tile_issue_k : kMNSlots)>{};
-      // mSlot: if > 1, means kSlots still has empty slots in MN direction
       constexpr auto mSlot =
           ::tl::number<(tile_issue_k > kMNSlots
                             ? 1
                             : MlsTraits::kSlots / (tile_issue_mn * kSlot))>{};
-      // kIssue
       constexpr auto kIssue = ::tl::number<(
           tile_issue_k > kMNSlots ? tile_issue_k / kMNSlots : 1)>{};
-      // create physical layout. Keep kK0 before the contiguous MN slot order
-      // used by matrix_load_256x16_b4 trans, while still splitting kSlots into
-      // mSlot/kSlot.
-      constexpr auto PackedShape =
-          ::tl::make_tuple(kIssue, MlsTraits::kK0, tile_issue_mn, mSlot, kSlot,
-                           MlsTraits::kMN, MlsTraits::kK1);
+      constexpr auto PackedShape = ::tl::make_tuple(
+          kIssue, ::tl::number<1>{}, MlsTraits::kK0, mSlot, kSlot,
+          tile_issue_mn, MlsTraits::kMN, MlsTraits::kK1);
       constexpr auto lds_desc_raw =
           ::tl::make_naive_tensor_descriptor_packed(PackedShape);
       return ::tl::transform_tensor_descriptor(
           lds_desc_raw,
-          ::tl::make_tuple(
-              // logical MN layout
-              ::tl::make_merge_transform(
-                  ::tl::make_tuple(mSlot, tile_issue_mn, MlsTraits::kMN)),
-              // logical K layout
-              ::tl::make_merge_transform(::tl::make_tuple(
-                  kIssue, kSlot, MlsTraits::kK0, MlsTraits::kK1))),
-          ::tl::make_tuple(::tl::sequence<3, 2, 5>{},
-                           ::tl::sequence<0, 4, 1, 6>{}),
+          ::tl::make_tuple(::tl::make_merge_transform(::tl::make_tuple(
+                               1, mSlot, tile_issue_mn, MlsTraits::kMN)),
+                           ::tl::make_merge_transform(::tl::make_tuple(
+                               kIssue, kSlot, MlsTraits::kK0, MlsTraits::kK1))),
+          ::tl::make_tuple(::tl::sequence<1, 3, 5, 6>{},
+                           ::tl::sequence<0, 4, 2, 7>{}),
           ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
-    } else if constexpr (tile_issue_k_outer == 1) {
-      // (tile_issue_mn, kK0, kSlots, kMN, kK1)
+    } else if constexpr (tile_issue_k == 1) {
+      // (tile_issue_mn_outer, kK0, kSlots, kMN, kK1)
       constexpr auto lds_desc_raw =
           ::tl::make_naive_tensor_descriptor_packed(::tl::concat_tuple(
-              ::tl::make_tuple(tile_issue_mn), MlsTraits::PackedShape));
+              ::tl::make_tuple(tile_issue_mn_outer), MlsTraits::PackedShape));
       return ::tl::transform_tensor_descriptor(
           lds_desc_raw,
           ::tl::make_tuple(
               ::tl::make_merge_transform(::tl::make_tuple(
-                  tile_issue_mn, MlsTraits::kSlots, MlsTraits::kMN)),
+                  tile_issue_mn_outer, MlsTraits::kSlots, MlsTraits::kMN)),
               ::tl::make_merge_transform(
                   ::tl::make_tuple(MlsTraits::kK0, MlsTraits::kK1))),
           ::tl::make_tuple(::tl::sequence<0, 2, 3>{}, ::tl::sequence<1, 4>{}),
           ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
     } else {
-      // (tile_issue_k_outer, tile_issue_mn, kK0, kSlots, kMN, kK1)
+      // (tile_issue_k, tile_issue_mn_outer, kK0, kSlots, kMN, kK1)
       constexpr auto lds_desc_raw =
           ::tl::make_naive_tensor_descriptor_packed(::tl::concat_tuple(
-              ::tl::make_tuple(tile_issue_k_outer, tile_issue_mn),
+              ::tl::make_tuple(tile_issue_k, tile_issue_mn_outer),
               MlsTraits::PackedShape));
       return ::tl::transform_tensor_descriptor(
           lds_desc_raw,
           ::tl::make_tuple(
               ::tl::make_merge_transform(::tl::make_tuple(
-                  MlsTraits::kSlots, tile_issue_mn, MlsTraits::kMN)),
+                  tile_issue_mn_outer, MlsTraits::kSlots, MlsTraits::kMN)),
               ::tl::make_merge_transform(::tl::make_tuple(
-                  tile_issue_k_outer, MlsTraits::kK0, MlsTraits::kK1))),
-          ::tl::make_tuple(::tl::sequence<3, 1, 4>{},
+                  tile_issue_k, MlsTraits::kK0, MlsTraits::kK1))),
+          ::tl::make_tuple(::tl::sequence<1, 3, 4>{},
                            ::tl::sequence<0, 2, 5>{}),
           ::tl::make_tuple(::tl::sequence<0>{}, ::tl::sequence<1>{}));
     }

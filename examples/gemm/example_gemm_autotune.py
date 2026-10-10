@@ -9,6 +9,11 @@ from tilelang.carver.arch import CDNA
 from tilelang.carver.roller.rasterization import NoRasterization
 import torch
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from hcu_example_utils import gemm_autotune_seed_config, warp_size
 
 

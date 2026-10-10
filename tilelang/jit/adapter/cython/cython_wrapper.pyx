@@ -161,7 +161,7 @@ cdef class CythonKernelWrapper:
                 return tensor.device
         return torch.cuda.current_device()
 
-    cpdef forward(self, list inputs, int64_t stream = -1, bint skip_tensor_validation = False):
+    cpdef forward(self, list inputs, int64_t stream = -1, bint skip_tensor_validation = False, object xcd_config = None):
         # Validate input dimensions and prepare for kernel execution
         cdef int total_params = len(self.params)
         cdef int total_inputs = len(inputs)
@@ -274,8 +274,13 @@ cdef class CythonKernelWrapper:
         # Add CUDA stream to kernel arguments
         call_args.append(ctypes.c_void_p(stream))
 
-        # Execute the kernel
-        result = self.lib.call(*call_args)
+        # Execute the ordinary or per-call HCU MultiDie entry point.
+        if xcd_config is None:
+            result = self.lib.call(*call_args)
+        else:
+            c_xcd_config = xcd_config._as_ctypes()
+            call_args.append(ctypes.byref(c_xcd_config))
+            result = self.lib.call_multidie(*call_args)
         if result != 0:
             error_msg = self.lib.get_last_error().decode('utf-8')
             raise RuntimeError(f"Kernel call failed: {error_msg}")

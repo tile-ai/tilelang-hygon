@@ -226,6 +226,14 @@ class LowerTileOpPass : arith::IRMutatorWithAnalyzer {
 public:
   static PrimFunc Substitute(PrimFunc f) {
     arith::Analyzer analyzer;
+    // LowerParallelLoop clones this analyzer, then VectorizeLoop re-plans the
+    // post-partition loop because vectorize_hint is unset. The default rlimit
+    // (10000) sometimes fails to prove a width that layout inference already
+    // chose. Kernels that need a higher cap set tl.z3_rlimit.
+    auto pass_ctx = tvm::transform::PassContext::Current();
+    if (auto cfg = pass_ctx->GetConfig(kZ3RLimit, ffi::Optional<Integer>())) {
+      analyzer.z3_prover.SetRLimit(static_cast<unsigned>(cfg.value()->value));
+    }
     LowerTileOpPass substituter(&analyzer);
     // Trace the buffer map for tvm_access_ptr
     // Insert both handle var and data var as keys for lookup

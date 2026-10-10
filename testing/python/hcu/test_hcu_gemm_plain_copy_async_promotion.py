@@ -52,5 +52,46 @@ def test_hcu_gemm_plain_copy_async_promotion():
     kernel.get_profiler().assert_allclose(lambda a, b: a @ b, atol=1e-2, rtol=1e-2)
 
 
+def test_hcu_gemm_plain_copy_shared_at_bn_multiple_consumers():
+    @T.prim_func
+    def main(
+        V: T.Tensor((2, 64, 32), T.float16),
+        DO: T.Tensor((2, 64, 32), T.float16),
+        DH: T.Tensor((2, 32, 32), T.float16),
+        C_ds: T.Tensor((64, 64), T.float32),
+        C_dk: T.Tensor((64, 32), T.float32),
+    ):
+        with T.Kernel(1, threads=128):
+            V_shared = T.alloc_shared((64, 32), T.float16)
+            DO_shared = T.alloc_shared((64, 32), T.float16)
+            DH_shared = T.alloc_shared((32, 32), T.float16)
+            C_ds_local = T.alloc_fragment((64, 64), T.float32)
+            C_dk_local = T.alloc_fragment((64, 32), T.float32)
+            T.clear(C_ds_local)
+            T.clear(C_dk_local)
+
+            for i in T.Pipelined(2, num_stages=2):
+                T.copy(V[i, 0, 0], V_shared)
+                T.copy(DO[i, 0, 0], DO_shared)
+                T.copy(DH[i, 0, 0], DH_shared)
+                # V_shared is an AT/BN B operand with n_warp=1.
+                T.gemm(DO_shared, V_shared, C_ds_local, False, True)
+                # The same LDS tile is an AT/BN A operand with m_warp=2.
+                T.gemm(V_shared, DH_shared, C_dk_local, False, True)
+
+            T.copy(C_ds_local, C_ds)
+            T.copy(C_dk_local, C_dk)
+
+    kernel = tl.compile(main, out_idx=[3, 4])
+    kernel.get_profiler().assert_allclose(
+        lambda v, do, dh: (
+            sum(do[i].float() @ v[i].float().T for i in range(2)),
+            sum(v[i].float() @ dh[i].float().T for i in range(2)),
+        ),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

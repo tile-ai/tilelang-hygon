@@ -127,8 +127,8 @@ TILELANG_EXAMPLES_NODEIDS=(
   # Example coverage from the tilelang repository itself. Keep these relative
   # to REPO_DIR for stable pytest progress output after cd.
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/analyze/test_example_analyze.py")"
-  # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/attention_sink/test_example_attention_sink.py")"
-  # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/blocksparse_attention/test_example_blocksparse_attention.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/attention_sink/test_example_attention_sink.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/blocksparse_attention/test_example_blocksparse_attention.py")"
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/blocksparse_gemm/test_example_blocksparse_gemm.py")"
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/cast/test_example_cast.py")"
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/convolution/test_example_convolution.py")"
@@ -139,8 +139,8 @@ TILELANG_EXAMPLES_NODEIDS=(
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/deepseek_v32/test_tilelang_example_deepseek_v32.py")"
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/dequantize_gemm/test_example_dequantize_gemm.py")"
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/elementwise/test_example_elementwise.py")"
-  # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/flash_attention/test_example_flash_attention.py")"
-  # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/flash_decoding/test_example_flash_decoding.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/flash_attention/test_example_flash_attention.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/flash_decoding/test_example_flash_decoding.py")"
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/fusedmoe/test_example_fusedmoe.py")"
   # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/gdn/test_example_gdn_compilation.py")"
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/gdn/test_utils.py")"
@@ -158,6 +158,7 @@ TILELANG_EXAMPLES_NODEIDS=(
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/seer_attention/test_block_sparse_attn_tilelang.py")"
   "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/topk/test_topk_tilelang.py")"
   # "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/warp_specialize/test_example_warp_specialize.py")"
+  "$(realpath --relative-to="${REPO_DIR}" "${TILELANG_REPO_DIR}/examples/linear_attention/test_mamba_chunk_state.py")"
 )
 
 ALL_NODEIDS=("${TILE_KERNEL_NODEIDS[@]}" "${TILELANG_NODEIDS[@]}" "${TILELANG_EXAMPLES_NODEIDS[@]}")

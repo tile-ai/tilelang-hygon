@@ -66,6 +66,7 @@ def flashattn_sink(
             K_shared = T.alloc_shared([block_N, dim], dtype)
             V_shared = T.alloc_shared([block_N, dim], dtype)
             O_shared = T.alloc_shared([block_M, dim], dtype)
+            P_shared = T.alloc_shared([block_M, block_N], dtype)
             acc_s = T.alloc_fragment([block_M, block_N], accum_dtype)
             acc_s_cast = T.alloc_fragment([block_M, block_N], dtype)
             acc_o = T.alloc_fragment([block_M, dim], accum_dtype)
@@ -184,7 +185,9 @@ def flashattn_sink(
                 T.reduce_sum(acc_s, scores_sum, dim=1)
                 for i in T.Parallel(block_M):
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                T.copy(acc_s, acc_s_cast)
+                for i, j in T.Parallel(block_M, block_N):
+                    P_shared[i, j] = T.cast(acc_s[i, j], dtype)
+                T.copy(P_shared, acc_s_cast)
 
                 for i, j in T.Parallel(block_M, dim):
                     acc_o[i, j] *= scores_scale[i]
@@ -353,7 +356,7 @@ def main(
     UKV = k_unpad.shape[0]
 
     kernel = flashattn_sink(
-        batch, groups, UQ, UKV, heads, dim, is_causal, window_size=window_size, block_M=128, block_N=128, num_stages=2, threads=256
+        batch, groups, UQ, UKV, heads, dim, is_causal, window_size=window_size, block_M=64, block_N=64, num_stages=0, threads=256
     )
 
     out_unpad = kernel(q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sinks)

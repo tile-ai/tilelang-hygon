@@ -93,6 +93,45 @@ public:
   static const Op &Get();
 };
 
+class MatrixStoreNode : public TileOperatorNode {
+public:
+  Buffer src, dst;
+  Array<Range> src_ranges;
+  Array<Range> dst_ranges;
+  /// Per-axis policy: -1 analyze, 0 skip, 1 refresh (see MlsBoundaryMode).
+  int mn_boundary;
+  int k_boundary;
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.MatrixStore", MatrixStoreNode,
+                                    TileOperatorNode);
+
+  static void RegisterReflection() {
+    namespace refl = reflection;
+    refl::ObjectDef<MatrixStoreNode>()
+        .def_ro("src", &MatrixStoreNode::src)
+        .def_ro("dst", &MatrixStoreNode::dst)
+        .def_ro("src_ranges", &MatrixStoreNode::src_ranges)
+        .def_ro("dst_ranges", &MatrixStoreNode::dst_ranges)
+        .def_ro("mn_boundary", &MatrixStoreNode::mn_boundary)
+        .def_ro("k_boundary", &MatrixStoreNode::k_boundary);
+  }
+
+  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
+  LayoutMap InferLayout(const LayoutInferArgs &T,
+                        InferLevel level) const override;
+  TileOperator Clone() const override;
+};
+
+class MatrixStore : public TileOperator {
+public:
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(MatrixStore, TileOperator,
+                                             MatrixStoreNode);
+  TVM_DLL
+  MatrixStore(Array<PrimExpr> args,
+              Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+  static const Op &Get();
+};
+
 } // namespace tl
 } // namespace tvm
 

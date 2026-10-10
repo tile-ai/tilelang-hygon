@@ -22,6 +22,7 @@ public:
   Array<Range> dst_ranges;
   /// Consumer GEMM facts from AnnotateMlsGemmDep (optional).
   Optional<MlsGemmDepMeta> gemm_dep_;
+  int alt_{1};
   bool hcu_linear_ds_read_{false};
   bool hcu_layout_ds_read_{false};
   mutable bool completed_ = false;
@@ -36,6 +37,7 @@ public:
         .def_ro("dst", &DsReadFormatNode::dst)
         .def_ro("src_ranges", &DsReadFormatNode::src_ranges)
         .def_ro("dst_ranges", &DsReadFormatNode::dst_ranges)
+        .def_ro("alt_", &DsReadFormatNode::alt_)
         .def_ro("gemm_dep_", &DsReadFormatNode::gemm_dep_);
   }
 

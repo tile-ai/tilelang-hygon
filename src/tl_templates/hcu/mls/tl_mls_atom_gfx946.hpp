@@ -27,6 +27,15 @@ struct gfx946_mls_32x16_b16 {
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, false, r, false, false, bps);
   }
+
+  template <::tl::index_t moffset, bool r, bool glc = false, bool slc = false>
+  TL_DEVICE static void
+  store(const ::tl::int32x4_t &vdata, const ::tl::int32x4_t &rsrc,
+        ::tl::number<moffset>, ::tl::bool_constant<r>,
+        ::tl::bool_constant<glc> = {}, ::tl::bool_constant<slc> = {}) {
+    __builtin_hcu_matrix_store_32x16_b16(vdata, rsrc, moffset, false, r, glc,
+                                         slc);
+  }
 };
 
 struct gfx946_mls_16x32_trans_b16 {
@@ -40,6 +49,15 @@ struct gfx946_mls_16x32_trans_b16 {
     __builtin_hcu_matrix_load_32x16_b16(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, true, r, false, false, bps);
+  }
+
+  template <::tl::index_t moffset, bool r, bool glc = false, bool slc = false>
+  TL_DEVICE static void
+  store(const ::tl::int32x4_t &vdata, const ::tl::int32x4_t &rsrc,
+        ::tl::number<moffset>, ::tl::bool_constant<r>,
+        ::tl::bool_constant<glc> = {}, ::tl::bool_constant<slc> = {}) {
+    __builtin_hcu_matrix_store_32x16_b16(vdata, rsrc, moffset, true, r, glc,
+                                         slc);
   }
 };
 
@@ -55,6 +73,15 @@ struct gfx946_mls_32x32_b16 {
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, false, r, false, false, bps);
   }
+
+  template <::tl::index_t moffset, bool r, bool glc = false, bool slc = false>
+  TL_DEVICE static void
+  store(const ::tl::int32x8_t &vdata, const ::tl::int32x4_t &rsrc,
+        ::tl::number<moffset>, ::tl::bool_constant<r>,
+        ::tl::bool_constant<glc> = {}, ::tl::bool_constant<slc> = {}) {
+    __builtin_hcu_matrix_store_32x32_b16(vdata, rsrc, moffset, false, r, glc,
+                                         slc);
+  }
 };
 
 struct gfx946_mls_32x32_trans_b16 {
@@ -68,6 +95,15 @@ struct gfx946_mls_32x32_trans_b16 {
     __builtin_hcu_matrix_load_32x32_b16(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, true, r, false, false, bps);
+  }
+
+  template <::tl::index_t moffset, bool r, bool glc = false, bool slc = false>
+  TL_DEVICE static void
+  store(const ::tl::int32x8_t &vdata, const ::tl::int32x4_t &rsrc,
+        ::tl::number<moffset>, ::tl::bool_constant<r>,
+        ::tl::bool_constant<glc> = {}, ::tl::bool_constant<slc> = {}) {
+    __builtin_hcu_matrix_store_32x32_b16(vdata, rsrc, moffset, true, r, glc,
+                                         slc);
   }
 };
 
@@ -111,6 +147,15 @@ struct gfx946_mls_16x16_b32 {
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, false, r, false, false, bps);
   }
+
+  template <::tl::index_t moffset, bool r, bool glc = false, bool slc = false>
+  TL_DEVICE static void
+  store(const ::tl::int32x4_t &vdata, const ::tl::int32x4_t &rsrc,
+        ::tl::number<moffset>, ::tl::bool_constant<r>,
+        ::tl::bool_constant<glc> = {}, ::tl::bool_constant<slc> = {}) {
+    __builtin_hcu_matrix_store_16x16_b32(vdata, rsrc, moffset, false, r, glc,
+                                         slc);
+  }
 };
 
 struct gfx946_mls_16x16_trans_b32 {
@@ -124,6 +169,15 @@ struct gfx946_mls_16x16_trans_b32 {
     __builtin_hcu_matrix_load_16x16_b32(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, true, r, false, false, bps);
+  }
+
+  template <::tl::index_t moffset, bool r, bool glc = false, bool slc = false>
+  TL_DEVICE static void
+  store(const ::tl::int32x4_t &vdata, const ::tl::int32x4_t &rsrc,
+        ::tl::number<moffset>, ::tl::bool_constant<r>,
+        ::tl::bool_constant<glc> = {}, ::tl::bool_constant<slc> = {}) {
+    __builtin_hcu_matrix_store_16x16_b32(vdata, rsrc, moffset, true, r, glc,
+                                         slc);
   }
 };
 

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import warnings
 
 import tvm_ffi
@@ -41,6 +43,45 @@ def find_hcu_path() -> str:
     if compiler_exe:
         return os.path.realpath(os.path.join(compiler_exe, "../.."))
     raise RuntimeError("Cannot find HCU toolchain path")
+
+
+@functools.cache
+def _hcu_multidie_api_available(hcu_path: str) -> bool:
+    """Probe whether the active HCU compiler can link a MultiDie launch call."""
+    source = """
+#include <hip/hip_runtime.h>
+int main() {
+    hipLaunchMultiDieConfig config{};
+    auto launch = &hipLaunchKernelMultiDie;
+    (void)config;
+    return launch == nullptr;
+}
+"""
+    try:
+        with tempfile.TemporaryDirectory(prefix="tilelang_hcu_multidie_") as directory:
+            source_path = os.path.join(directory, "probe.cpp")
+            output_path = os.path.join(directory, "probe")
+            with open(source_path, "w", encoding="utf-8") as file:
+                file.write(source)
+            result = subprocess.run(
+                [get_hcu_compiler(), source_path, "-o", output_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+            )
+            return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def hcu_multidie_api_available() -> bool:
+    """Return cached MultiDie launch availability for the active HCU toolchain."""
+    try:
+        hcu_path = os.path.realpath(find_hcu_path())
+    except RuntimeError:
+        return False
+    return _hcu_multidie_api_available(hcu_path)
 
 
 def get_hcu_arch(hcu_path: str | None = None) -> str:
@@ -214,7 +255,6 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
         return []
     if arch in ["gfx928", "gfx936", "gfx938", "gfx92a", "gfx946"]:
         flags = [
-            "-mllvm=-support-768-vgprs=true",
             "-mllvm=-enable-latency-hack=true",
             "-mllvm=-mmac-latency=5",
             "-mllvm=-ds-load-store-latency=6",
@@ -223,6 +263,10 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
             "-mllvm=-disable-cluster-lds-memops=true",
             "-mllvm=-amdgpu-disable-backoff-barrier=false",
         ]
+        if arch in ["gfx92a", "gfx946"]:
+            flags.append("-mllvm=-support-512-vgprs=true")
+        else:
+            flags.append("-mllvm=-support-768-vgprs=true")
         if _pass_config_truthy(pass_configs, PassConfigKey.TL_ENABLE_FAST_MATH):
             flags.append("-mllvm=-enable-hcu-approx-func-fp-math=true")
         if _pass_config_truthy(pass_configs, PassConfigKey.TL_ENABLE_HCU_WDRA):

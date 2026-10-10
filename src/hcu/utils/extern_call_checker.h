@@ -28,6 +28,10 @@ inline bool IsMlsLoadTileExternCall(const tirx::CallNode *call) {
   return IsCallExternWithPrefix(call, "tl::mls::mls_load_tile");
 }
 
+inline bool IsMlsStoreTileExternCall(const tirx::CallNode *call) {
+  return IsCallExternWithPrefix(call, "tl::mls::mls_store_tile");
+}
+
 inline bool IsMlsAsyncLoadExternCall(const tirx::CallNode *call) {
   return IsCallExternWithPrefix(call, "tl::mls::async_load");
 }

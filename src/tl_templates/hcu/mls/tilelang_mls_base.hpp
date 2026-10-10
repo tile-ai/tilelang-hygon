@@ -575,5 +575,128 @@ mls_load_tile(DataType *p_data, ::tl::index_t mls_stride,
       typed_smem, block_k_base, block_mn_base);
 }
 
+/*
+ * mls_store_tile: tiled VGPR MLS store (no hoist).
+ *
+ * Each warp emits one or more store atoms. The source pointer is the lowered
+ * per-thread local fragment storage for the current hardware thread; atom
+ * order follows the MMAC C-fragment non-thread repeat order.
+ */
+template <typename BlockSize, typename MlsTileSize, ::tl::index_t WarpMN,
+          ::tl::index_t WarpK, typename DataType, ::tl::index_t Alt, bool Trans,
+          ::tl::hcu_target_enum HcuArch, int k_boundary = -1,
+          int mn_boundary = -1>
+TL_DEVICE void
+mls_store_tile(void *local_src_storage, DataType *p_data,
+               ::tl::index_t mls_stride, ::tl::index_t mn_length_raw,
+               ::tl::index_t k_length_raw, ::tl::index_t block_mn_base,
+               ::tl::index_t block_k_base, ::tl::index_t warp_id_offset = 0) {
+  static_assert(HcuArch == ::tl::hcu_target_enum::gfx946,
+                "VGPR MLS store is only supported on gfx946");
+  static_assert(mls_elem_bits_v<DataType> == 16 ||
+                    mls_elem_bits_v<DataType> == 32,
+                "VGPR MLS store supports only b16 or b32 data");
+  static_assert((mls_elem_bits_v<DataType> == 16 && Alt == 4) ||
+                    (mls_elem_bits_v<DataType> == 32 && Alt == 1 && Trans),
+                "gfx946 matrix_store requires b16 Alt=4, or b32 Alt=1 with "
+                "Trans=true");
+
+  constexpr auto BlockSizeMN = BlockSize::at(::tl::number<0>{});
+  constexpr auto BlockSizeK = BlockSize::at(::tl::number<1>{});
+  constexpr auto TileMN = MlsTileSize::at(::tl::number<0>{});
+  constexpr auto TileK = MlsTileSize::at(::tl::number<1>{});
+  static_assert(BlockSizeMN % (WarpMN * TileMN) == 0 &&
+                    BlockSizeK % (WarpK * TileK) == 0,
+                "VGPR MLS store requires a uniform integral number of atoms "
+                "per warp");
+  static_assert(
+      (mls_elem_bits_v<DataType> == 16 &&
+       ((TileMN == 16 && TileK == 32 && Trans) ||
+        (TileMN == 32 && TileK == 16 && !Trans) ||
+        (TileMN == 32 && TileK == 32))) ||
+          (mls_elem_bits_v<DataType> == 32 && TileMN == 16 && TileK == 16),
+      "Unsupported VGPR MLS store atom");
+
+  static constexpr bool AtomTrans = Trans;
+  using MlsAtom =
+      typename mls_atom_for_tile<TileMN, TileK, AtomTrans,
+                                 mls_elem_bits_v<DataType>,
+                                 mls_elem_bits_v<DataType>, HcuArch>::Type;
+  constexpr auto ElementsPerThread = TileMN * TileK / 64;
+  constexpr auto AtomsPerWarpMN = BlockSizeMN / (WarpMN * TileMN);
+  constexpr auto AtomsPerWarpK = BlockSizeK / (WarpK * TileK);
+  constexpr auto WarpTileMN = AtomsPerWarpMN * TileMN;
+  constexpr auto WarpTileK = AtomsPerWarpK * TileK;
+  constexpr auto MOffsetValue = 0;
+  constexpr auto MOffset = ::tl::number<MOffsetValue>{};
+  constexpr bool ResourceAlongMN = true;
+  static_assert(MOffsetValue >= -512 && MOffsetValue <= 511,
+                "MLS moffset exceeds its signed 10-bit element range");
+
+  const auto *local_src = reinterpret_cast<const DataType *>(local_src_storage);
+
+  const auto scoped_warp_id =
+      __builtin_amdgcn_readfirstlane(::tl::get_warp_id() - warp_id_offset);
+  const auto warp_mn = scoped_warp_id % WarpMN;
+  const auto warp_k = scoped_warp_id / WarpMN;
+
+  auto clamp_filter_uniform = [](::tl::index_t coord, ::tl::index_t tile,
+                                 ::tl::index_t length) {
+    ::tl::index_t value = coord + tile - length;
+    value = value < 0 ? 0 : value;
+    value = value > tile ? tile : value;
+    return value;
+  };
+  constexpr auto mfmt = ::tl::mls::detail::mfmt_traits<Alt>::value;
+#pragma unroll
+  for (::tl::index_t atom_mn = 0; atom_mn < AtomsPerWarpMN; ++atom_mn) {
+#pragma unroll
+    for (::tl::index_t atom_k = 0; atom_k < AtomsPerWarpK; ++atom_k) {
+      const auto coord_mn =
+          block_mn_base + warp_mn * WarpTileMN + atom_mn * TileMN;
+      const auto coord_k = block_k_base + warp_k * WarpTileK + atom_k * TileK;
+      ::tl::index_t mn_filter =
+          (mn_boundary != 0)
+              ? clamp_filter_uniform(coord_mn, TileMN, mn_length_raw)
+              : 0;
+      ::tl::index_t k_filter =
+          (k_boundary != 0) ? clamp_filter_uniform(coord_k, TileK, k_length_raw)
+                            : 0;
+
+      uint8_t *ptr_offset = reinterpret_cast<uint8_t *>(p_data);
+      if constexpr (Trans) {
+        const ::tl::long_index_t offset_elems =
+            static_cast<::tl::long_index_t>(coord_mn) * mls_stride + coord_k;
+        ptr_offset += ::tl::mls::mls_storage_traits<
+            DataType>::logical_offset_to_byte_offset(offset_elems);
+      } else {
+        const ::tl::long_index_t offset_elems =
+            static_cast<::tl::long_index_t>(coord_k) * mls_stride + coord_mn;
+        ptr_offset += ::tl::mls::mls_storage_traits<
+            DataType>::logical_offset_to_byte_offset(offset_elems);
+      }
+
+      const ::tl::int32x4_t rsrc =
+          Trans ? ::tl::mls::make_mls_resource(
+                      static_cast<const void *>(ptr_offset), mls_stride,
+                      k_filter, mn_filter, mfmt)
+                : ::tl::mls::make_mls_resource(
+                      static_cast<const void *>(ptr_offset), mls_stride,
+                      mn_filter, k_filter, mfmt);
+      const auto atom_index = atom_mn * AtomsPerWarpK + atom_k;
+      const auto *atom_src = local_src + atom_index * ElementsPerThread;
+      if constexpr (ElementsPerThread == 4 || ElementsPerThread == 8) {
+        const auto vdata = *reinterpret_cast<const ::tl::int32x4_t *>(atom_src);
+        MlsAtom::template store<MOffsetValue, ResourceAlongMN>(
+            vdata, rsrc, MOffset, ::tl::bool_constant<ResourceAlongMN>{});
+      } else if constexpr (ElementsPerThread == 16) {
+        const auto vdata = *reinterpret_cast<const ::tl::int32x8_t *>(atom_src);
+        MlsAtom::template store<MOffsetValue, ResourceAlongMN>(
+            vdata, rsrc, MOffset, ::tl::bool_constant<ResourceAlongMN>{});
+      }
+    }
+  }
+}
+
 } // namespace mls
 } // namespace tl

@@ -125,8 +125,8 @@ jobs:
             echo "AICC install done: $(basename "${run_file}")"
           }
 
-          aicc_base="${PKG_BASE_URL}/ai_cc/nightly"
-          latest_run=$(curl -fsSL "${aicc_base}/" | grep -oE 'dtk_llvm_[^"]+\.run' | sort -u | sort -t '_' -k4 -nr | head -n1)
+          aicc_base="${PKG_BASE_URL}/ai_cc/Nightly"
+          latest_run=$(curl -fsSL "${aicc_base}/" | grep -oE 'dtk_llvm-1\.0\.0%2B[^"]+\.run' | sort -u | sort -t '.' -k4,4nr | head -n1)
           if [[ -z "${latest_run}" ]]; then
             echo "Skip AICC install (no dtk_llvm_*.run on ${aicc_base})"
             exit 0
@@ -180,9 +180,13 @@ jobs:
             pip3 install dist/*.whl
           fi
           # GitLab test job: regression deps (not full requirements-test.txt)
-          pip3 install "numpy>=1.26,<2" allure-pytest pytest-xdist \
+          pip3 install "numpy>=1.26,<2" allure-pytest pytest-xdist einops \
             --index-url https://mirrors.aliyun.com/pypi/simple/ \
             --trusted-host mirrors.aliyun.com
+          pip3 install "flash-attn==2.8.3+dtk2604.torch2100.2609071852.g4bb8ca" \
+            --index-url https://pypi.sourcefind.cn/nightly/dtk2604/ \
+            --trusted-host pypi.sourcefind.cn \
+            --no-deps
           python3 -c "import torch; print('torch:', torch.__version__)"
           python3 -m torch.utils.collect_env || true
 

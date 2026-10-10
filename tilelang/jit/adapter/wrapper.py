@@ -12,6 +12,7 @@ from .utils import (
     match_declare_kernel_cpu,
     is_cuda_target,
     is_hip_target,
+    is_hcu_target,
     is_cpu_target,
     get_annotated_mod,
     pythonic_expr,
@@ -83,6 +84,33 @@ extern "C" TL_EXPORT int call({}) {{
 {}
 \treturn 0;
 }}
+"""
+
+HCU_XCD_LAUNCH_CONFIG_ABI = r"""
+enum TLXCDDispatchMode : uint32_t {
+    TL_XCD_DISPATCH_BLOCK = 0,
+    TL_XCD_DISPATCH_LINEAR = 1,
+    TL_XCD_DISPATCH_FIXED = 2,
+};
+
+struct TLXCDLinearConfig { uint32_t chunk_size; uint32_t reserved; };
+struct TLXCDBlockConfig { uint32_t block_x; uint32_t block_y; };
+struct TLXCDFixedConfig { uint32_t reserved0; uint32_t reserved1; };
+union TLXCDDispatchConfig {
+    TLXCDLinearConfig linear;
+    TLXCDBlockConfig block;
+    TLXCDFixedConfig fixed;
+};
+struct TLXCDLaunchConfig {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint32_t mode;
+    uint32_t flags;
+    uint32_t die_mask;
+    uint32_t reserved0;
+    TLXCDDispatchConfig dispatch;
+    uint64_t reserved[4];
+};
 """
 
 L2_PERSISTENT_MAP_CREATE_HANDLE = """
@@ -730,6 +758,142 @@ class TLHIPSourceWrapper(TLCUDASourceWrapper):
         return {"name": "stream=hipStreamDefault", "type": "hipStream_t"}
 
 
+class TLHCUSourceWrapper(TLHIPSourceWrapper):
+    """HIP-compatible HCU wrapper with an optional per-call MultiDie entry point."""
+
+    def create_multidie_dispatch_func(self, code, function_informations):
+        dynamic_symbolic_set = self.get_dynamic_symbolic_set(self.prim_func)
+        function_args = []
+        for param in self.prim_func.params:
+            if param in self.prim_func.buffer_map:
+                buffer = self.prim_func.buffer_map[param]
+                function_args.append(
+                    {
+                        "name": buffer.data.name,
+                        "type": self._lookup_type(buffer.dtype) + "* __restrict__",
+                    }
+                )
+            elif isinstance(param, tvm.tirx.Var):
+                function_args.append({"name": param.name, "type": self._lookup_type(param.dtype)})
+            else:
+                raise ValueError(f"Parameter {param} is not in the buffer map of the primary function.")
+        for dyn_sym, dyn_sym_dtype in dynamic_symbolic_set:
+            if dyn_sym not in [arg["name"] for arg in function_args]:
+                function_args.append({"name": dyn_sym, "type": self._lookup_type(dyn_sym_dtype)})
+        function_args.append(self.get_stream_type())
+
+        def_args = ", ".join([f"{arg['type']} {arg['name'].split('=', maxsplit=1)[0]}" for arg in function_args])
+        def_args += ", const TLXCDLaunchConfig* xcd_config"
+        from tilelang.contrib.hcu import hcu_multidie_api_available
+
+        if not hcu_multidie_api_available():
+            return (
+                HCU_XCD_LAUNCH_CONFIG_ABI
+                + f'\nextern "C" TL_EXPORT int call_multidie({def_args}) {{\n'
+                + '    snprintf(error_buf, ERROR_BUF_SIZE, "MultiDie launch is unavailable in the current HCU headers or runtime");\n'
+                + "    return -1;\n}\n"
+            )
+        launch_code = r"""
+    if (xcd_config == nullptr) {
+        snprintf(error_buf, ERROR_BUF_SIZE, "xcd_config must not be null");
+        return -1;
+    }
+    if (xcd_config->abi_version != 1 || xcd_config->struct_size < sizeof(TLXCDLaunchConfig)) {
+        snprintf(error_buf, ERROR_BUF_SIZE, "unsupported XCD launch config ABI: version=%u size=%u",
+                 xcd_config->abi_version, xcd_config->struct_size);
+        return -1;
+    }
+    if (xcd_config->flags != 0 || xcd_config->reserved0 != 0) {
+        snprintf(error_buf, ERROR_BUF_SIZE, "unsupported non-zero XCD config flags or reserved fields");
+        return -1;
+    }
+    hipLaunchMultiDieConfig die_config{};
+    switch (xcd_config->mode) {
+    case TL_XCD_DISPATCH_LINEAR:
+        die_config.linearMode.mode = hipDispatchLinearMode;
+        die_config.linearMode.dieMask = static_cast<hipDieExecMask>(xcd_config->die_mask);
+        die_config.linearMode.chunkSize = xcd_config->dispatch.linear.chunk_size;
+        break;
+    case TL_XCD_DISPATCH_BLOCK:
+        die_config.blockMode.mode = hipDispatchBlockMode;
+        die_config.blockMode.dieMask = static_cast<hipDieExecMask>(xcd_config->die_mask);
+        die_config.blockMode.numMcmBlockX = xcd_config->dispatch.block.block_x;
+        die_config.blockMode.numMcmBlockY = xcd_config->dispatch.block.block_y;
+        break;
+    case TL_XCD_DISPATCH_FIXED:
+        die_config.fixedMode.mode = hipDispatchFixedMode;
+        break;
+    default:
+        snprintf(error_buf, ERROR_BUF_SIZE, "unsupported XCD dispatch mode: %u", xcd_config->mode);
+        return -1;
+    }
+"""
+        desc_name_map: dict[str, str] = {}
+        desc_name_var_map: dict[str, tvm.tirx.Var] = {}
+        for function_name, function_info in function_informations.items():
+            if self.use_cooperative_groups[function_name]:
+                raise ValueError("MultiDie launch does not support cooperative groups")
+            if self.cluster_dims[function_name] is not None:
+                raise ValueError("MultiDie launch does not support cluster dimensions")
+
+            block_info = function_info["block_info"]
+            grid_info = function_info["grid_info"]
+            dynamic_smem_buf = function_info["dynamic_smem_buf"]
+            function_params = function_info["function_params"]
+            index = match_declare_kernel(code, function_name + "(")
+            declaration = self.get_declaration(code[index:])
+            args_list = parse_function_call_args(declaration, function_args, function_params, desc_name_map, desc_name_var_map)
+            assert len(function_params) == len(args_list), (
+                f"Function {function_name} has {len(function_params)} parameters, but {len(args_list)} arguments"
+            )
+            grid_str = (
+                f"dim3({self._pythonic_expr(grid_info[0])}, {self._pythonic_expr(grid_info[1])}, {self._pythonic_expr(grid_info[2])})"
+            )
+            block_str = (
+                f"dim3({self._pythonic_expr(block_info[0])}, {self._pythonic_expr(block_info[1])}, {self._pythonic_expr(block_info[2])})"
+            )
+            smem_str = 0 if dynamic_smem_buf is None else dynamic_smem_buf
+            arg_locals = []
+            arg_addresses = []
+            for arg_index, arg in enumerate(args_list):
+                local_name = f"{function_name}_xcd_arg_{arg_index}"
+                arg_locals.append(f"    auto {local_name} = {arg};\n")
+                arg_addresses.append(f"reinterpret_cast<void*>(&{local_name})")
+            launch_code += "".join(arg_locals)
+            args_array = ", ".join(arg_addresses)
+            grid_var = f"{function_name}_xcd_grid"
+            launch_code += (
+                f"\n    dim3 {grid_var} = {grid_str};\n"
+                f"    if (xcd_config->mode == TL_XCD_DISPATCH_FIXED && "
+                f"({grid_var}.x < 2 || {grid_var}.y < 2)) {{\n"
+                f'        snprintf(error_buf, ERROR_BUF_SIZE, "Fixed XCD dispatch requires grid_x >= 2 '
+                f'and grid_y >= 2 for {function_name}, but got grid=(%u, %u, %u)", '
+                f"{grid_var}.x, {grid_var}.y, {grid_var}.z);\n"
+                f"        return -1;\n"
+                f"    }}\n"
+                f"    void* {function_name}_xcd_args[] = {{{args_array}}};\n"
+            )
+            launch_code += (
+                f"    hipError_t {function_name}_xcd_result = hipLaunchKernelMultiDie(\n"
+                f"        reinterpret_cast<const void*>({function_name}), {grid_var}, {block_str},\n"
+                f"        {function_name}_xcd_args, {smem_str}, stream, &die_config);\n"
+                f"    if ({function_name}_xcd_result != hipSuccess) {{\n"
+                f'        snprintf(error_buf, ERROR_BUF_SIZE, "MultiDie launch failed for {function_name}: %s", '
+                f"hipGetErrorString({function_name}_xcd_result));\n"
+                f"        return -1;\n"
+                f"    }}\n"
+            )
+
+        launch_code = self.generate_tma_descriptor_args(desc_name_map, desc_name_var_map) + launch_code
+        return (
+            HCU_XCD_LAUNCH_CONFIG_ABI + f'\nextern "C" TL_EXPORT int call_multidie({def_args}) {{\n' + launch_code + "\n    return 0;\n}\n"
+        )
+
+    def create_dispatch_func(self, code, function_informations):
+        ordinary_dispatch = super().create_dispatch_func(code, function_informations)
+        return ordinary_dispatch + self.create_multidie_dispatch_func(code, function_informations)
+
+
 class TLCPUSourceWrapper:
     _TYPE_MAP = {
         "float32": "float",
@@ -972,6 +1136,8 @@ class TLWrapper(BaseWrapper):
         assert self.scheduled_ir_module is not None, "Please assign optimized module first."
         if is_cuda_target(self.target):
             wrapper_class = TLCUDASourceWrapper
+        elif is_hcu_target(self.target):
+            wrapper_class = TLHCUSourceWrapper
         elif is_hip_target(self.target):
             wrapper_class = TLHIPSourceWrapper
         elif is_cpu_target(self.target):

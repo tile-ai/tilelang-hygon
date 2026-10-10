@@ -150,6 +150,25 @@ HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
   HcuMnPerWarp floors = ResolveHcuMnPerWarp(
       element_bits, A_from_mls, B_from_mls, A_mls_trans, B_mls_trans,
       extra_min_m_per_warp, extra_min_n_per_warp);
+  int a_nontrans_4k_atom_mn = 0;
+  int b_nontrans_4k_atom_mn = 0;
+  if (GetHcuArchString(target) == "gfx938" && element_bits == 8) {
+    auto resolve_b8_nontrans_4k_atom = [&](bool from_mls, bool mls_trans,
+                                           int block_mn) {
+      if (!from_mls || mls_trans) {
+        return 0;
+      }
+      int producer_warp_mn, producer_warp_k, tile_mn, tile_k;
+      ComputeMlsWarpPartition(false, block_mn, K, block_size, target,
+                              element_bits, producer_warp_mn, producer_warp_k,
+                              tile_mn, tile_k, element_bits);
+      return tile_mn == 128 && tile_k == 16 ? tile_mn : 0;
+    };
+    a_nontrans_4k_atom_mn =
+        resolve_b8_nontrans_4k_atom(A_from_mls, A_mls_trans, M);
+    b_nontrans_4k_atom_mn =
+        resolve_b8_nontrans_4k_atom(B_from_mls, B_mls_trans, N);
+  }
   const int kMPerWarp = floors.m_per_warp;
   const int kNPerWarp = floors.n_per_warp;
   ICHECK(element_bits == 4 || element_bits == 8 || element_bits == 16 ||
@@ -190,13 +209,24 @@ HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
     }
   } else if (policy.IsSquare()) {
     int max_m_warps = M / kMPerWarp;
-    float ideal_ratio = N > 0 ? static_cast<float>(M) / N : 1.0f;
+    // Compare per-wave work in units of the legal MLS atoms.  Using the raw
+    // M/N ratio here biases the partition when the M/N atom floors differ
+    // (for example 16x32 for an N-major B operand).
+    float ideal_ratio =
+        N > 0 ? static_cast<float>(M / kMPerWarp) / (N / kNPerWarp) : 1.0f;
 
     int best_m = 1;
     int best_n = 1;
     float best_balance = std::numeric_limits<float>::max();
     int max_no_recompute_warps = (M / kMPerWarp) * (N / kNPerWarp);
     max_no_recompute_warps = std::min(max_no_recompute_warps, num_warps);
+    auto tiles_4k_atom = [](int block_mn, int warp_mn, int atom_mn) {
+      if (atom_mn == 0) {
+        return true;
+      }
+      int per_warp_mn = block_mn / warp_mn;
+      return per_warp_mn % atom_mn == 0 || atom_mn % per_warp_mn == 0;
+    };
     for (int m = 1; m <= max_m_warps && m <= max_no_recompute_warps; m++) {
       int n = max_no_recompute_warps / m;
 
@@ -208,7 +238,17 @@ HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
       if (m * n != max_no_recompute_warps) {
         continue;
       }
-
+      // Each warp must own an integral number of the resolved MLS/MMAC MN
+      // atoms.  A fractional atom can pass the minimum-size checks above but
+      // cannot be consumed by ds_read_format (for example, 96 / 2 = 48 rows
+      // with a 32-row read atom).
+      if (M % (m * kMPerWarp) != 0 || N % (n * kNPerWarp) != 0) {
+        continue;
+      }
+      if (!tiles_4k_atom(M, m, a_nontrans_4k_atom_mn) ||
+          !tiles_4k_atom(N, n, b_nontrans_4k_atom_mn)) {
+        continue;
+      }
       float balance = std::abs(m_per_warp / n_per_warp - ideal_ratio);
       if (balance < best_balance) {
         best_balance = balance;

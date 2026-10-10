@@ -93,6 +93,8 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
     a_at_bn_auto_lds_strategy = _has_annotation(annotations, "tl.hcu_gemm_at_bn_lds_strategy")
     b_from_async_copy_linear = _int_annotation(annotations, "tl.hcu_b_from_async_copy_linear")
     trans_c = _int_annotation(annotations, "trans_c")
+    mmac_lit = _int_annotation(annotations, "tl.hcu_mmac_lit", int(target_has_mmac_lit_lts(target)))
+    b_ds_read_alt = _int_annotation(annotations, "tl.hcu_b_ds_read_alt", 1)
     trans_a = bool(gemm_node.transA)
     trans_b = bool(gemm_node.transB)
     a_mls_trans = not trans_a
@@ -120,6 +122,8 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
         a_at_bn_auto_lds_strategy=a_at_bn_auto_lds_strategy,
         b_from_async_copy_linear=b_from_async_copy_linear,
         trans_c=trans_c,
+        mmac_lit=mmac_lit,
+        b_ds_read_alt=b_ds_read_alt,
         a_mls_trans=int(a_mls_trans),
         b_mls_trans=int(b_mls_trans),
         mmac_mode=mmac_mode,
@@ -204,6 +208,13 @@ def _make_hcu_emitter(
         min_n_per_warp=min_n_per_warp,
         use_tf32=gemm.use_tf32,
         fp4_mmac_mode=fp4_mmac_mode,
+        use_lit=bool(
+            _int_annotation(
+                getattr(gemm.gemm_node, "annotations", None),
+                "tl.hcu_mmac_lit",
+                int(target_has_mmac_lit_lts(target)),
+            )
+        ),
         use_lts=bool(_int_annotation(getattr(gemm.gemm_node, "annotations", None), "trans_c")) and target_has_mmac_lit_lts(target),
     )
 
@@ -301,8 +312,9 @@ class GemmHCUMMAC(GemmBase):
             warp_k,
             elem_bits_c,
             min_n_per_warp,
-            lit=target_has_mmac_lit_lts(target),
+            lit=bool(meta.mmac_lit),
             lts=bool(meta.trans_c),
+            b_interleave=int(meta.b_ds_read_alt),
         )
         out = {self.C: frag_c}
         if _is_shared_like(self.A):
@@ -355,6 +367,7 @@ class GemmHCUMMAC(GemmBase):
                 bool(self.trans_B),
                 min_n_per_warp,
                 mmac_k_dim=mmac_k_b,
+                interleave=int(meta.b_ds_read_alt),
             )
         else:
             raise ValueError(f"Unsupported B scope for HCU gemm: {self.B.scope()}")

@@ -1871,6 +1871,11 @@ private:
       ConstrSet curr_cset{curr.cset};
       arith::Analyzer analyzer;
 
+      auto pass_ctx = tvm::transform::PassContext::Current();
+      if (auto cfg = pass_ctx->GetConfig(kZ3RLimit, ffi::Optional<Integer>())) {
+        analyzer.z3_prover.SetRLimit(static_cast<unsigned>(cfg.value()->value));
+      }
+
       // Add loop variable constraint for loop-carry analysis
       if (loop != nullptr) {
         // For loop-carry analysis, we compare iteration i with iteration i+1.

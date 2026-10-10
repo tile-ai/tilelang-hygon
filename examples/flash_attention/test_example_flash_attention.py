@@ -22,7 +22,7 @@ def test_example_gqa_bwd():
     example_gqa_bwd.main()
 
 
-@tilelang.testing.requires_cuda
+# @tilelang.testing.requires_cuda
 def test_example_mha_bwd():
     example_mha_bwd_bshd.main(
         BATCH=1,
@@ -33,7 +33,7 @@ def test_example_mha_bwd():
     )
 
 
-@tilelang.testing.requires_cuda
+# @tilelang.testing.requires_cuda
 def test_example_mha_bwd_bhsd():
     example_mha_bwd_bhsd.main(
         BATCH=1,
@@ -49,12 +49,12 @@ def test_example_gqa_fwd_bshd():
     example_gqa_fwd_bshd.main(batch=1, heads=16, seq_len=1024, dim=128, is_causal=False, groups=16, tune=False)
 
 
-@tilelang.testing.requires_cuda
+# @tilelang.testing.requires_cuda
 def test_example_mha_fwd_bhsd():
     example_mha_fwd_bhsd.main()
 
 
-@tilelang.testing.requires_cuda
+# @tilelang.testing.requires_cuda
 def test_example_mha_fwd_bshd():
     example_mha_fwd_bshd.main(batch=1, seq_len=256)
 
