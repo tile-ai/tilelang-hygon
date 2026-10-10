@@ -9,11 +9,11 @@
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/stmt_functor.h>
 
+#include "hcu/op/builtin.h"
 #include "hcu/op/mls.h"
 #include "hcu/target_utils.h"
 #include "hcu/transform/async_copy_injector.h"
 #include "hcu/utils/gemm_lds_strategy_utils.h"
-#include "op/builtin.h"
 #include "op/utils.h"
 #include "transform/common/loop_fusion_utils.h"
 #include "transform/loop_partition.h"
@@ -39,6 +39,12 @@ constexpr int64_t kWaveSize = 64;
 constexpr int64_t kNaturallyDistributedBytes = 256;
 constexpr int64_t kMinCacheSwizzleStrideBytes = 64;
 constexpr int64_t kMaxCacheSwizzleStrideBytes = 8192;
+
+Var RequireHcuThreadVar(const LowerArgs &args) {
+  const auto *var = args.thread_index.as<VarNode>();
+  ICHECK(var) << "HCU copy lowering requires a bound threadIdx.x variable";
+  return GetRef<Var>(var);
+}
 
 PrimExpr LinearizeAccess(const Buffer &buffer, Array<PrimExpr> indices) {
   ICHECK_EQ(indices.size(), buffer->shape.size());
@@ -207,7 +213,7 @@ private:
 
 bool NeedsCacheSwizzle(const Stmt &stmt, const LowerArgs &lower_args,
                        arith::Analyzer *analyzer) {
-  return GlobalCopyAccessAnalyzer(lower_args.thread_var,
+  return GlobalCopyAccessAnalyzer(RequireHcuThreadVar(lower_args),
                                   lower_args.thread_bounds, analyzer)
       .NeedsCacheSwizzle(stmt);
 }
@@ -281,8 +287,9 @@ Stmt AnnotateCacheSwizzle(const CopyNode &op, Stmt stmt,
   auto stride = GetCacheSwizzleStrideBytes(op, stmt, lower_args, analyzer);
   if (!stride.has_value())
     return stmt;
-  return AttrStmt(lower_args.thread_var, attr::kHcuBufferCacheSwizzleStride,
-                  Integer(stride.value()), std::move(stmt));
+  return AttrStmt(RequireHcuThreadVar(lower_args),
+                  attr::kHcuBufferCacheSwizzleStride, Integer(stride.value()),
+                  std::move(stmt));
 }
 
 bool GetBoolAnnotation(const CopyNode &op, const char *key) {
@@ -397,27 +404,29 @@ private:
                            lower_args.thread_bounds,
                            lower_args.layout_map,
                            analyzer,
-                           false,
                            lower_args.buffer_remap,
-                           {}},
+                           {},
+                           false,
+                           {},
+                           0},
                           level);
     }
     auto loop_layout = par_op->GetLoopLayout();
+    Var thread_var = RequireHcuThreadVar(lower_args);
     Stmt lowered_loop = LowerParallelLoop(
-        par_op->GetRoot(), loop_layout, lower_args.thread_var, analyzer,
-        lower_args.layout_map, par_op->GetPredicate(lower_args.thread_var),
-        /*parallel_loop=*/true,
-        /*should_vectorize=*/true, par_op->LoopLayoutRequiresPaddingGuard());
+        par_op->GetRoot(), loop_layout, thread_var, analyzer,
+        lower_args.layout_map, par_op->GetPredicate(thread_var),
+        /*parallel_loop=*/true, par_op->LoopLayoutRequiresPaddingGuard());
     auto annotations = GetHCUAsyncCopyAnnotations(op);
     if (auto stride = GetCacheSwizzleStrideBytes(op, lowered_loop, lower_args,
                                                  analyzer)) {
       annotations.Set(attr::kHcuBufferCacheSwizzleStride,
                       Integer(stride.value()));
     }
-    auto inject_result = InjectHCUAsyncCopy(
-        lowered_loop, /*async_without_async_commit_wait=*/
-        no_implicit_commit_wait || GetIsAsyncCopy(op), annotations,
-        lower_args.thread_var, lower_args.buffer_remap);
+    auto inject_result =
+        InjectHCUAsyncCopy(lowered_loop, /*async_without_async_commit_wait=*/
+                           no_implicit_commit_wait || GetIsAsyncCopy(op),
+                           annotations, thread_var, lower_args.buffer_remap);
     Stmt async_copy_loop = inject_result.stmt;
     if (!inject_result.injected_hcu_async_copy) {
       DLOG(WARNING) << "HCU async-copy rewrite miss for copy src="

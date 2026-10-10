@@ -5,10 +5,9 @@ from __future__ import annotations
 import tvm.tirx.script.parser as T
 from tilelang._typing import BufferLikeType, BufferLikeTypeTuple, BarrierType, DType
 from tilelang import tvm as tvm
-from tilelang.language import ptx_arrive_barrier, evaluate
+from tilelang.language.common import ptx_arrive_barrier, evaluate
 from tilelang.language.eager.builder import macro
-from tilelang.language.kernel import get_thread_bindings, get_block_extents
-from tvm import DataType, tirx
+from tvm import DataType, DataTypeCode, tirx
 from tvm.runtime import convert
 from tvm.tirx import PrimExpr, Var, Call, BufferLoad, BufferRegion
 from tilelang.utils.language import retrieve_ptr, get_buffer_region_from_load, retrieve_buffer_and_offset
@@ -538,100 +537,6 @@ def mbarrier_arrive_expect_tx(mbarrier: BarrierType, tx: int):
     return ptx_arrive_barrier_expect_tx(mbarrier, tx)
 
 
-def abarrier_init(abar_id: int | Var, arrive_waves: int | Var):
-    """Initialize a Hygon gfx946 ABarrier hardware slot."""
-    return tirx.call_intrin("handle", tirx.op.Op.get("tl.abarrier_init"), abar_id, arrive_waves)
-
-
-def abarrier_inv(abar_id: int | Var):
-    """Invalidate a Hygon gfx946 ABarrier hardware slot."""
-    return tirx.call_intrin("handle", tirx.op.Op.get("tl.abarrier_inv"), abar_id)
-
-
-def abarrier_arrive(abar_id: int | Var, wave_count: int | Var = 1):
-    """Arrive at a Hygon gfx946 ABarrier."""
-    return tirx.call_intrin("int32", tirx.op.Op.get("tl.abarrier_arrive"), abar_id, wave_count)
-
-
-def abarrier_try_wait(abar_id: int | Var, phase: int | Var):
-    """Single-shot ABarrier try_wait."""
-    return tirx.call_intrin("int32", tirx.op.Op.get("tl.abarrier_try_wait"), abar_id, phase)
-
-
-def abarrier_wait(abar_id: int | Var, phase: int | Var):
-    """Wait until ABarrier phase completes."""
-    return tirx.call_intrin("handle", tirx.op.Op.get("tl.abarrier_wait"), abar_id, phase)
-
-
-def abarrier_test_wait(abar_id: int | Var, phase: int | Var):
-    """Non-blocking ABarrier poll."""
-    return tirx.call_intrin("int32", tirx.op.Op.get("tl.abarrier_test_wait"), abar_id, phase)
-
-
-def abarrier_seq(abar_id: int | Var):
-    """Bind the next memory access to this ABarrier slot."""
-    return tirx.call_intrin("handle", tirx.op.Op.get("tl.abarrier_seq"), abar_id)
-
-
-def abarrier_expect_tx(abar_id: int | Var, num_bytes: int | Var):
-    """Declare expected transaction byte count on an ABarrier slot."""
-    return tirx.call_intrin("handle", tirx.op.Op.get("tl.abarrier_expect_tx"), abar_id, num_bytes)
-
-
-def abarrier_complete_tx(abar_id: int | Var, num_bytes: int | Var):
-    """Complete expected transaction byte count on an ABarrier slot."""
-    return tirx.call_intrin("handle", tirx.op.Op.get("tl.abarrier_complete_tx"), abar_id, num_bytes)
-
-
-def ebarrier_sync(ebar_id: int | Var):
-    """Synchronize all waves in the workgroup on an EBarrier slot."""
-    return tirx.call_intrin("handle", tirx.op.Op.get("tl.ebarrier_sync"), ebar_id)
-
-
-def ebarrier_sync_cnt(ebar_id: int | Var, wave_count: int | Var):
-    """Synchronize wave_count waves on an EBarrier slot."""
-    return tirx.call_intrin("handle", tirx.op.Op.get("tl.ebarrier_sync_cnt"), ebar_id, wave_count)
-
-
-def ebarrier_arrive(ebar_id: int | Var, wave_count: int | Var = 1):
-    """Arrive at an EBarrier slot with wave_count waves."""
-    return tirx.call_intrin("handle", tirx.op.Op.get("tl.ebarrier_arrive"), ebar_id, wave_count)
-
-
-def _pack_s_waitcnt_imm(cnt: int, flag: str) -> int:
-    """Pack a named wait counter into the HCU s_waitcnt immediate encoding."""
-    if not isinstance(cnt, int):
-        raise TypeError(f"Expect cnt to be int, but got {type(cnt)}.")
-
-    if flag == "vmcnt":
-        if not 0 <= cnt <= 63:
-            raise ValueError(f"vmcnt must be in [0, 63], but got {cnt}.")
-        return (cnt & 0xF) | (7 << 4) | (15 << 8) | (3 << 12) | ((cnt & 0x30) << 10)
-
-    if flag == "lgkmcnt":
-        if not 0 <= cnt <= 15:
-            raise ValueError(f"lgkmcnt must be in [0, 15], but got {cnt}.")
-        return 0xF | (7 << 4) | (cnt << 8) | (3 << 12) | (3 << 14)
-
-    if flag == "expcnt":
-        if not 0 <= cnt <= 7:
-            raise ValueError(f"expcnt must be in [0, 7], but got {cnt}.")
-        return 0xF | (cnt << 4) | (15 << 8) | (3 << 12) | (3 << 14)
-
-    raise ValueError(f"Unsupported s_waitcnt flag: {flag}. Expected one of vmcnt, lgkmcnt, expcnt.")
-
-
-def s_waitcnt(cnt: int = 0, flag: str = "vmcnt"):
-    """Wait for HCU ops tracked by vmcnt/lgkmcnt/expcnt (``__builtin_amdgcn_s_waitcnt``)."""
-    imm = _pack_s_waitcnt_imm(cnt, flag)
-    return tirx.call_extern("int32", "__builtin_amdgcn_s_waitcnt", tirx.IntImm("int32", imm))
-
-
-def sched_barrier(mask: int = 0):
-    """Insert an HCU scheduler barrier (``__builtin_amdgcn_sched_barrier``). HIP/HCU only."""
-    return tirx.call_extern("void", "__builtin_amdgcn_sched_barrier", tirx.IntImm("int32", mask))
-
-
 def warpgroup_arrive():
     """Signal warpgroup readiness for subsequent WGMMA operations.
 
@@ -1139,6 +1044,18 @@ def shfl_sync(
 # ---------------------------------------------------------------------------
 
 
+def _validate_predicate(predicate: int | PrimExpr, intrinsic: str) -> PrimExpr:
+    """Normalize an intrinsic predicate and reject lossy float-to-int coercion."""
+    predicate = tirx.convert(predicate)
+    if DataType(predicate.dtype).type_code not in (
+        DataTypeCode.INT,
+        DataTypeCode.UINT,
+        DataTypeCode.BOOL,
+    ):
+        raise TypeError(f"T.{intrinsic} requires an integer or boolean predicate, but got {predicate.dtype}.")
+    return predicate
+
+
 def any_sync(
     predicate: int | PrimExpr,
     mask: int | PrimExpr = _FULL_WARP_MASK,
@@ -1156,6 +1073,7 @@ def any_sync(
     Returns:
         int32: Non-zero if any thread in the mask has a non-zero predicate.
     """
+    predicate = _validate_predicate(predicate, "any_sync")
     return tirx.call_intrin("int32", tirx.op.Op.get("tl.any_sync"), _as_uint32_mask(mask), predicate)
 
 
@@ -1175,6 +1093,7 @@ def all_sync(
     Returns:
         int32: Non-zero if all threads in the mask have a non-zero predicate.
     """
+    predicate = _validate_predicate(predicate, "all_sync")
     return tirx.call_intrin("int32", tirx.op.Op.get("tl.all_sync"), _as_uint32_mask(mask), predicate)
 
 
@@ -1192,6 +1111,7 @@ def ballot_sync(
     Returns:
         uint64: Bitmask with bit N set if lane N's predicate is non-zero.
     """
+    predicate = _validate_predicate(predicate, "ballot_sync")
     return tirx.call_intrin("uint64", tirx.op.Op.get("tl.ballot_sync"), _as_uint32_mask(mask), predicate)
 
 
@@ -1202,6 +1122,7 @@ def ballot(predicate: int | PrimExpr) -> PrimExpr:
     Returns:
         uint64: Bitmask with bit N set if lane N's predicate is non-zero.
     """
+    predicate = _validate_predicate(predicate, "ballot")
     return tirx.call_intrin("uint64", tirx.op.Op.get("tl.ballot"), predicate)
 
 
@@ -1223,6 +1144,7 @@ def syncthreads_count(predicate: int | PrimExpr) -> PrimExpr:
     """Block barrier that returns the number of threads whose ``predicate``
     evaluates to non-zero (``__syncthreads_count`` on CUDA and HIP).
     """
+    predicate = _validate_predicate(predicate, "syncthreads_count")
     return tirx.call_intrin("int32", tirx.op.Op.get("tl.syncthreads_count"), predicate)
 
 
@@ -1230,6 +1152,7 @@ def syncthreads_and(predicate: int | PrimExpr) -> PrimExpr:
     """Block barrier that returns non-zero only if ALL threads have a non-zero
     ``predicate`` (``__syncthreads_and`` on CUDA and HIP).
     """
+    predicate = _validate_predicate(predicate, "syncthreads_and")
     return tirx.call_intrin("int32", tirx.op.Op.get("tl.syncthreads_and"), predicate)
 
 
@@ -1237,6 +1160,7 @@ def syncthreads_or(predicate: int | PrimExpr) -> PrimExpr:
     """Block barrier that returns non-zero if ANY thread has a non-zero
     ``predicate`` (``__syncthreads_or`` on CUDA and HIP).
     """
+    predicate = _validate_predicate(predicate, "syncthreads_or")
     return tirx.call_intrin("int32", tirx.op.Op.get("tl.syncthreads_or"), predicate)
 
 
@@ -1268,15 +1192,6 @@ def match_all_sync(
     on HIP.
     """
     return tirx.call_intrin("uint32", tirx.op.Op.get("tl.match_all_sync"), _as_uint32_mask(mask), value)
-
-
-def sync_global():
-    """Synchronize all threads in the entire grid."""
-    tx, ty, tz = get_thread_bindings()
-    ex, ey, ez = get_block_extents()
-    print(tx, ty, tz, ex, ey, ez)
-    args = ["global", tx == 0 and ty == 0 and tz == 0, ex * ey * ez]
-    return evaluate(tirx.Call("handle", "tirx.tvm_storage_sync", args))
 
 
 def sync_grid():
@@ -1362,7 +1277,7 @@ def increase_descriptor_offset(descriptor: PrimExpr, offset: PrimExpr) -> PrimEx
     if not isinstance(descriptor, (BufferLoad, tirx.Buffer)):
         raise TypeError("Descriptor must be a tvm.tirx.Buffer or tvm.tirx.BufferLoad.")
 
-    if isinstance(descriptor, tirx.Buffer) and len(descriptor.shape) != 1 or descriptor.shape[0] != 1:
+    if isinstance(descriptor, tirx.Buffer) and (len(descriptor.shape) != 1 or descriptor.shape[0] != 1):
         raise ValueError("Descriptor must be a 1D buffer of size 1.")
 
     descriptor = descriptor if isinstance(descriptor, BufferLoad) else tirx.BufferLoad(descriptor, [0])
@@ -1370,9 +1285,118 @@ def increase_descriptor_offset(descriptor: PrimExpr, offset: PrimExpr) -> PrimEx
     return evaluate(tirx.call_intrin("handle", tirx.op.Op.get("tl.increase_descriptor_offset"), descriptor, offset))
 
 
-def loop_break():
-    """Break out of the innermost loop."""
-    return tirx.call_intrin("handle", tirx.op.Op.get("tl.loop_break"))
+def cooperative_tensor_fill(data, idx, value, rows: int, cols: int):
+    return evaluate(
+        tirx.call_intrin(
+            "handle",
+            tirx.op.Op.get("tl.cooperative_tensor_fill"),
+            data,
+            idx,
+            value,
+            rows,
+            cols,
+        )
+    )
+
+
+def cooperative_tensor_load(
+    data,
+    idx,
+    ptr,
+    stride,
+    rows: int,
+    cols: int,
+    transposed,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    operand_role: int,
+):
+    return evaluate(
+        tirx.call_intrin(
+            "handle",
+            tirx.op.Op.get("tl.cooperative_tensor_load"),
+            data,
+            idx,
+            ptr,
+            stride,
+            rows,
+            cols,
+            transposed,
+            tile_m,
+            tile_n,
+            tile_k,
+            operand_role,
+        )
+    )
+
+
+def cooperative_tensor_store(
+    data,
+    idx,
+    ptr,
+    stride,
+    rows: int,
+    cols: int,
+    transposed,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    operand_role: int,
+):
+    return evaluate(
+        tirx.call_intrin(
+            "handle",
+            tirx.op.Op.get("tl.cooperative_tensor_store"),
+            data,
+            idx,
+            ptr,
+            stride,
+            rows,
+            cols,
+            transposed,
+            tile_m,
+            tile_n,
+            tile_k,
+            operand_role,
+        )
+    )
+
+
+def cooperative_tensor_multiply_accumulate(
+    c_data,
+    c_idx,
+    a_data,
+    a_idx,
+    b_data,
+    b_idx,
+    d_data,
+    d_idx,
+    m: int,
+    n: int,
+    k: int,
+    trans_a,
+    trans_b,
+):
+    return evaluate(
+        tirx.call_intrin(
+            "handle",
+            tirx.op.Op.get("tl.cooperative_tensor_multiply_accumulate"),
+            c_data,
+            c_idx,
+            a_data,
+            a_idx,
+            b_data,
+            b_idx,
+            d_data,
+            d_idx,
+            m,
+            n,
+            k,
+            trans_a,
+            trans_b,
+        )
+    )
 
 
 def cp_async_barrier_noinc(barrier: BarrierType):

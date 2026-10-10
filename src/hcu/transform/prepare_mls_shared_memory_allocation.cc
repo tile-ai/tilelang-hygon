@@ -13,9 +13,9 @@
 #include <string>
 #include <unordered_map>
 
+#include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/extern_call_checker.h"
-#include "op/builtin.h"
 
 namespace tvm {
 namespace tl {

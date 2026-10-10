@@ -57,9 +57,9 @@ def native_sparse_attention(Q, K, V, BlockIndices, dim, is_causal, scale=None, b
         K_shared = T.alloc_shared([BS, BK], dtype)
         V_shared = T.alloc_shared([BS, BV], dtype)
         O_shared = T.alloc_shared([G, BV], dtype)
+        S_shared = T.alloc_shared([G, BS], dtype)
 
         acc_s = T.alloc_fragment([G, BS], accum_dtype)
-        acc_s_cast = T.alloc_fragment([G, BS], dtype)
         acc_o = T.alloc_fragment([G, BV], accum_dtype)
         scores_max = T.alloc_fragment([G], accum_dtype)
         scores_max_prev = T.alloc_fragment([G], accum_dtype)
@@ -102,7 +102,7 @@ def native_sparse_attention(Q, K, V, BlockIndices, dim, is_causal, scale=None, b
                 T.reduce_sum(acc_s, scores_sum, dim=1)
                 for i in T.Parallel(G):
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                T.copy(acc_s, acc_s_cast)
+                T.copy(acc_s, S_shared)
 
                 # Rescale
                 for i, j in T.Parallel(G, BV):
@@ -110,7 +110,7 @@ def native_sparse_attention(Q, K, V, BlockIndices, dim, is_causal, scale=None, b
 
                 # V * softmax(Q * K)
                 T.copy(V[i_b, i_s : i_s + BS, i_h, i_v * BV : (i_v + 1) * BV], V_shared)
-                T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(S_shared, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
         for i, j in T.Parallel(G, BV):
             acc_o[i, j] /= logsum[i]

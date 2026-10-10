@@ -30,7 +30,7 @@ using namespace tirx;
 using namespace ffi;
 
 /*!
- * \brief True when `call` is high-level `T.gemm` (`tl.tileop.gemm`).
+ * \brief True when `call` is a dense or block-scaled high-level GEMM.
  *
  * Used by MLS propagation (`AnnotateMlsGemmDep`, `PropagateToFindGemm*`) on
  * pre-lower tile-op IR. Kernels that emit `tl.tvm_mfma` directly should set
@@ -41,7 +41,8 @@ inline bool IsGemmTileOpCall(const CallNode *call) {
   if (call == nullptr || !call->op.as<OpNode>()) {
     return false;
   }
-  return call->op.as<OpNode>()->name == "tl.tileop.gemm";
+  const ffi::String &name = call->op.as<OpNode>()->name;
+  return name == "tl.tileop.gemm" || name == "tl.tileop.gemm_blockscaled";
 }
 
 struct CallNodePtrHash {

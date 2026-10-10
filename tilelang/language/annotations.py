@@ -2,27 +2,41 @@
 
 from collections.abc import Callable
 
-from tilelang.layout import Fragment, Layout
-from tilelang.utils.language import is_fragment
+from tilelang.layout import Fragment, Layout, PartialFragment
+from tilelang.utils.language import is_fragment, is_reducer
+from tvm.tirx import FloatImm, IntImm, tvm_tuple
 from tvm.tirx.script.parser import attr
 from tvm.tirx.script.builder.ir import sblock_attr
-from tvm.tirx import FloatImm, IntImm, tvm_tuple
 
 __all__ = [
+    "WSID",
     "use_swizzle",
     "annotate_layout",
     "annotate_safe_value",
     "annotate_l2_hit_ratio",
-    "annotate_direct_to_lds",
-    "annotate_buffer_ops_rebase",
     "annotate_restrict_buffers",
     "annotate_min_blocks_per_sm",
+    "annotate_ws_pipeline_depth",
+    "annotate_ws_schedule",
+    "ws_op",
 ]
+
+# Annotation key carrying a statement's stable warp-specialization op id
+# (kWSOpIdKey in src/transform/common/warp_specialize.h). Shorthand so kernels
+# write ``annotations={T.WSID: "copy_A"}`` on tile ops and loops.
+WSID = "tl.ws_op_id"
 
 
 def use_swizzle(panel_size: int, order: str = "row", enable: bool = True):
     """Annotate a kernel to use a specific threadblock swizzle pattern."""
-    device_func = "rasterization2DRow" if order == "row" else "rasterization2DColumn"
+    if order == "row":
+        device_func = "rasterization2DRow"
+    elif order == "column":
+        device_func = "rasterization2DColumn"
+    elif order == "mlx":
+        device_func = "rasterization2DMLX"
+    else:
+        raise ValueError(f"Unsupported swizzle order: {order}")
     if not enable:
         return None
     return attr(None, "threadblock_swizzle_pattern", tvm_tuple(device_func, panel_size))
@@ -32,7 +46,15 @@ def annotate_layout(layout_map: dict):
     """Annotate the layout of the buffer."""
     _layout_map = {}
     for buffer, layout in layout_map.items():
-        if is_fragment(buffer):
+        if is_reducer(buffer):
+            # The reducer's replicas are addends awaiting the finalize
+            # collective, not equal copies: plain Fragment semantics would
+            # silently misdescribe them.
+            assert isinstance(layout, PartialFragment), (
+                f"for reducer {buffer} (T.alloc_reducer), the layout must be a "
+                f"PartialFragment describing the per-thread partials, but got {type(layout)}"
+            )
+        elif is_fragment(buffer):
             assert isinstance(layout, Fragment), f"for Fragment {buffer}, layout must be a Fragment, but got {type(layout)}"
         if isinstance(layout, Layout):
             _layout_map[buffer.data] = layout
@@ -59,37 +81,6 @@ def annotate_l2_hit_ratio(l2_hit_ratio_map: dict):
         assert buffer.scope() == "global", "persistent L2 can only be applied to global buffers"
         _l2_hit_ratio_map[buffer.data] = FloatImm("float32", float(hit_ratio))
     return sblock_attr({"l2_hit_ratio_map": _l2_hit_ratio_map})
-
-
-def annotate_direct_to_lds(buffers):
-    """Annotate buffers to use direct-to-LDS loading on HCU."""
-    _direct_to_lds_map = {}
-    if isinstance(buffers, dict):
-        for buffer, enabled in buffers.items():
-            _direct_to_lds_map[buffer.data] = IntImm("int32", 1 if enabled else 0)
-    elif isinstance(buffers, (list, tuple)):
-        for buffer in buffers:
-            _direct_to_lds_map[buffer.data] = IntImm("int32", 1)
-    else:
-        _direct_to_lds_map[buffers.data] = IntImm("int32", 1)
-    return sblock_attr({"direct_to_lds": _direct_to_lds_map})
-
-
-def annotate_buffer_ops_rebase(buffers):
-    """Authorize blockIdx-based rebasing of ordinary HCU VM buffer stores.
-
-    Codegen moves blockIdx-dependent, threadIdx-independent additive address
-    terms into the resource's 64-bit base pointer.  The caller guarantees that
-    the resulting per-thread offsets are valid.  Loads, async copies, and
-    direct-to-LDS operations are unaffected.
-    """
-    if isinstance(buffers, dict):
-        rebase_map = {buffer.data: IntImm("int32", 1 if enabled else 0) for buffer, enabled in buffers.items()}
-    elif isinstance(buffers, (list, tuple)):
-        rebase_map = {buffer.data: IntImm("int32", 1) for buffer in buffers}
-    else:
-        rebase_map = {buffers.data: IntImm("int32", 1)}
-    return sblock_attr({"buffer_ops_rebase_map": rebase_map})
 
 
 def annotate_min_blocks_per_sm(n: int):
@@ -140,3 +131,63 @@ def annotate_restrict_buffers(*buffers):
             raise TypeError(f"annotate_restrict_buffers expects Buffer arguments, got {type(buf)}") from e
     # Also return as block attribute (root block exists by default) for readability/tools.
     return sblock_attr({"tl.non_restrict_params": data_vars})
+
+
+def annotate_ws_pipeline_depth(depth_map: dict):
+    """Declare the depth of the pipelines the automatic scheduler hosts at
+    the ENCLOSING scope for the given buffers, asserting each recurrence
+    resets per version — otherwise the depth derives from the loop's
+    ``num_stages``, and accumulators pin single-buffered.
+
+    ``depth_map`` maps each buffer to its pipeline depth at this scope.
+    """
+    _map = {}
+    for buffer, depth in depth_map.items():
+        assert isinstance(depth, int) and depth >= 1, f"pipeline depth must be a positive int, got {depth!r}"
+        _map[buffer.data] = IntImm("int32", depth)
+    return attr(_map, "tl.ws_pipeline_depth", 0)
+
+
+def annotate_ws_schedule(schedule):
+    """Attach a warp-specialization schedule to the kernel.
+
+    ``schedule`` is a typed :class:`~tilelang.language.warp_specialize.WSSchedule`
+    object describing how to transform the straight-line kernel into a
+    warp-specialized one: warp roles, pipelines (full/empty barrier pairs
+    protecting multi-versioned buffers), and per-role instruction sequences
+    per loop scope. It is materialized by the ``MaterializeWSSchedule`` pass;
+    see ``examples/aws/gemm.py`` for a complete example.
+    """
+    from tilelang.language.warp_specialize import WSSchedule
+
+    assert isinstance(schedule, WSSchedule), f"annotate_ws_schedule expects a T.WSSchedule object, got {type(schedule)}"
+    return sblock_attr({"tl.ws_schedule": schedule})
+
+
+def ws_op(op_id: str):
+    """Manually annotate the enclosed statement(s) with a stable
+    warp-specialization op or scope id.
+
+    Wraps the body in an ``AttrStmt`` with key :data:`WSID`. This is the
+    annotation of last resort, for statement forms that cannot carry
+    ``annotations=`` themselves. The enclosed statements — a scalar Bind,
+    or several statements such as an inlined scheduler method — become
+    ONE opaque op:
+
+    >>> with T.ws_op("rescale_vote"):
+    ...     should_rescale = T.any_sync(scale_shared[tid] < 1.0)
+    >>> with T.ws_op("sched_next"):
+    ...     sched.next_tile()
+
+    With a scope id the wrapper encloses a ``while`` loop and opens that
+    scope (serial scope loops carry the id in their own annotations):
+
+    >>> with T.ws_op("loop_wave"):
+    ...     while sched.valid():
+    ...         ...
+
+    Tile ops and loops pass ``annotations={T.WSID: ...}`` directly
+    instead.
+    """
+    assert isinstance(op_id, str) and op_id, "ws_op id must be a non-empty string"
+    return attr(None, WSID, op_id)

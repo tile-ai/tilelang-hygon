@@ -102,6 +102,11 @@ public:
                              ///< (use __hmax_nan/__hmin_nan) instead of the
                              ///< default __hmax/__hmin which return the
                              ///< non-NaN operand.
+  Map<String, ObjectRef> annotations; ///< Backend-specific lowering controls.
+
+  /// Whether this buffer reduction preserves the logical fragment shape and
+  /// reduces values within each hardware warp/wave.
+  bool IsWarpReduce() const;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.ReduceOp", ReduceOpNode,
                                     TileOperatorNode);
@@ -117,7 +122,8 @@ public:
         .def_ro("type", &ReduceOpNode::type)
         .def_ro("clear", &ReduceOpNode::clear)
         .def_ro("batch", &ReduceOpNode::batch)
-        .def_ro("nan_propagate", &ReduceOpNode::nan_propagate);
+        .def_ro("nan_propagate", &ReduceOpNode::nan_propagate)
+        .def_ro("annotations", &ReduceOpNode::annotations);
   }
 
   /// Lower the operator to TIR statements
@@ -139,6 +145,7 @@ struct ReduceImpl {
 
   Stmt (*lower)(const ReduceOpNode &op, const LowerArgs &lower_args,
                 arith::Analyzer *analyzer);
+  bool supports_warp_reduce{false};
 };
 
 void RegisterReduceImpl(ReduceImpl impl);

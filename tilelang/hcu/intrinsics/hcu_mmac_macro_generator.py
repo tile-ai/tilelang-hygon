@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-import tilelang.language as T
+import tilelang.language.common as T
 from tilelang import tvm as tvm
 from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import (
     block_col_warps_no_recompute,
@@ -936,7 +936,7 @@ class HCUMatrixCoreIntrinEmitter:
             mmac_annotations["tl.hcu_mmac_a_dtype"] = tirx.StringImm(str(self.a_dtype))
             mmac_annotations["tl.hcu_mmac_b_dtype"] = tirx.StringImm(str(self.b_dtype))
         mmac_annotations = mmac_annotations or None
-        mmac_op = tirx.op.Op.get("tl.tvm_mfma")
+        mmac_op = tirx.op.Op.get("tl.hcu_mmac")
 
         a_is_fragment = is_fragment(A_local_buf)
         b_is_fragment = is_fragment(B_local_buf)

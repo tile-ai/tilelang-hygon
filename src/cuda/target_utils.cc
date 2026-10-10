@@ -121,6 +121,13 @@ bool TargetHasBulkCopy(Target target) {
   return arch >= 90;
 }
 
+bool TargetSupportsNamedBarrier(Target target) {
+  if (!TargetIsCuda(target))
+    return false;
+  int arch = GetCudaArchInt(target);
+  return arch >= 80;
+}
+
 bool TargetSupportVectorize256(Target target) {
   if (!TargetIsCuda(target))
     return false;
@@ -250,6 +257,11 @@ bool IsCudaVectorizableCast(DataType from_ty, DataType target_ty) {
 
   // bfloat16 -> float4_e2m1fn
   if (from_ty.is_bfloat16() && target_ty.is_float4_e2m1fn())
+    return true;
+
+  // float4_e2m1fn -> float8 (E4M3)
+  if (from_ty.is_float4_e2m1fn() &&
+      (target_ty.is_float8_e4m3() || target_ty.is_float8_e4m3fn()))
     return true;
 
   return false;

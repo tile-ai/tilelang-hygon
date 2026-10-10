@@ -8,7 +8,7 @@
  */
 
 #include "propagation_util.h"
-#include "op/builtin.h"
+#include "hcu/op/builtin.h"
 #include "op/gemm.h"
 #include "op/operator.h"
 #include "propagation_tir_collector.h"
@@ -22,7 +22,8 @@ namespace tl {
 using namespace tirx;
 
 static bool IsGemm(const TileOperator &op) {
-  return op->GetTypeKey() == std::string("tl.Gemm");
+  const std::string type_key = op->GetTypeKey();
+  return type_key == "tl.Gemm" || type_key == "tl.GemmBlockScaled";
 }
 
 static bool GemmUsesBuffer(const GemmNode *gemm, const Buffer &buffer) {

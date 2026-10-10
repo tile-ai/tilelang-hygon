@@ -32,6 +32,8 @@ public:
   Buffer src, dst;                   // Source and destination buffers
   Array<Range> src_range, dst_range; // Ranges for each dimension in src and dst
   Optional<PrimExpr> dst_block;      // Destination block index for cluster copy
+  // Annotated source OOB fallback value resolved from the enclosing block.
+  Optional<PrimExpr> src_oob_safe_value;
   Map<String, ObjectRef> annotations; // Backend/pass-specific annotations.
   // Common SIMT annotation keys:
   //   - "coalesced_width": IntImm, width for coalesced memory access.
@@ -42,7 +44,9 @@ public:
 
   mutable ParallelOp par_op_; // Optional associated parallelization operator
 
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Copy", CopyNode, TileOperatorNode);
+  // Non-final so dialects can extend the copy with typed backend state
+  // (e.g. AscendCopyNode in src/ascend/op/copy.h).
+  TVM_FFI_DECLARE_OBJECT_INFO("tl.Copy", CopyNode, TileOperatorNode);
 
   static void RegisterReflection() {
     namespace refl = reflection;
@@ -52,6 +56,7 @@ public:
         .def_ro("src_range", &CopyNode::src_range)
         .def_ro("dst_range", &CopyNode::dst_range)
         .def_ro("dst_block", &CopyNode::dst_block)
+        .def_ro("src_oob_safe_value", &CopyNode::src_oob_safe_value)
         .def_ro("annotations", &CopyNode::annotations);
   }
 
@@ -179,7 +184,7 @@ public:
   int padding_;  // Padding amount
   int dilation_; // Dilation factor
   int kernel_;   // Kernel size
-  int eviction_policy_;                // Cache eviction policy
+  int eviction_policy_ = 0;            // Cache eviction policy (annotation)
   PrimExpr nhw_step_;                  // Step size in NHW dimensions
   PrimExpr c_step_;                    // Step size in channel dimension
   Map<String, ObjectRef> annotations_; // Annotations from Call node
