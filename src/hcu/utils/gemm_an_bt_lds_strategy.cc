@@ -330,7 +330,8 @@ DeriveHcuGemmAnBtLdsStrategyImpl(const CopyNode &copy, const GemmNode &gemm,
   if (!TargetIsHCU(target) || !TargetHcuHasAsyncCopy(target) ||
       block_threads <= 0 || !IsGlobalBuffer(copy.src) ||
       !IsSharedBuffer(copy.dst) || copy.src->dtype != copy.dst->dtype ||
-      !(copy.dst->dtype.is_float16() || copy.dst->dtype.is_bfloat16()) ||
+      !(copy.dst->dtype.is_float16() || copy.dst->dtype.is_bfloat16() ||
+        copy.dst->dtype.is_float8()) ||
       !HasOnlyUnitLeadingExtents(copy.dst_range) || gemm.kPack_ != 1) {
     return std::nullopt;
   }
@@ -376,7 +377,7 @@ DeriveHcuGemmAnBtLdsStrategyImpl(const CopyNode &copy, const GemmNode &gemm,
   params.phase_bytes = kDsReadPhaseBytes;
   params.panel_mn = kDsReadPanelN;
   if (params.warp_size != 64 || params.block_threads % params.warp_size != 0 ||
-      copy.dst->dtype.bits() != 16 ||
+      (copy.dst->dtype.bits() != 16 && copy.dst->dtype.bits() != 8) ||
       params.phase_bytes % params.read_bytes_per_lane != 0 ||
       params.block_mn % params.panel_mn != 0) {
     return std::nullopt;
