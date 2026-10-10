@@ -94,6 +94,18 @@ bool IsGemmKLoop(const tirx::ForNode *loop);
  */
 std::vector<const tirx::ForNode *> CollectGemmKLoops(const tirx::Stmt &stmt);
 
+/*!
+ * \brief Check whether InjectAsyncGlobalLoadFence owns the wait plan of `stmt`.
+ *
+ * The fence planner replaces a pipeline's commit/wait pairs -- barriers
+ * included -- when the first GEMM K loop is a register pipeline or a compiler
+ * pipeline with at least two stages.
+ *
+ * \param stmt The statement to inspect.
+ * \return True if the fence planner owns the wait plan.
+ */
+bool FencePlannerOwnsWaitPlan(const tirx::Stmt &stmt);
+
 } // namespace tl
 } // namespace tvm
 

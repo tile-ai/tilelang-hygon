@@ -4,6 +4,7 @@
  */
 
 #include "common/gemm_k_loop_utils.h"
+#include "common/pipeline_utils.h"
 #include "hcu/target_utils.h"
 #include "op/builtin.h"
 #include "tir/transforms/ir_utils.h"
@@ -217,6 +218,9 @@ tirx::transform::Pass UnrollPipelinedKLoop() {
     }
     auto loops = CollectGemmKLoops(f->body);
     if (loops.size() != 1) {
+      return f;
+    }
+    if (!LoopHasRegisterPipeline(loops.front())) {
       return f;
     }
     int factor = GetUnrollFactor(ctx);

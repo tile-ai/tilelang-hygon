@@ -722,14 +722,14 @@ public:
         }
       }
     }
-
-    // Shared-memory software pipeline should only prefetch Global→Shared
-    // copies. Shared→register copies (and ds_read_format) are part of the
-    // compute stage; if they remain the G2S last-use, InjectSoftwarePipeline
-    // emits S2R / G2S / S2R / G2S / MMA instead of G2S then S2R+MMA.
-    ExtendCopyLastUseThroughRegisterLoads(pipeline_stage_infos);
   }
 
+  /*!
+   * \brief Whether a stage only loads shared memory into registers.
+   *
+   * Shared→Register copies (and ds_read_format) belong to the compute stage,
+   * not to the prefetch stage that a Global→Shared copy opens.
+   */
   static bool IsSharedToRegisterStage(const PipelineStageInfo &pinfo) {
     if (pinfo.IsCopyStage() || pinfo.writes.empty()) {
       return false;
@@ -752,6 +752,15 @@ public:
     return true;
   }
 
+  /*!
+   * \brief Move a Global→Shared copy's last use past the Shared→Register loads
+   * it feeds.
+   *
+   * Shared-memory software pipeline should only prefetch Global→Shared copies.
+   * Shared→register copies (and ds_read_format) are part of the compute stage;
+   * if they remain the G2S last-use, InjectSoftwarePipeline emits
+   * S2R / G2S / S2R / G2S / MMA instead of G2S then S2R+MMA.
+   */
   void ExtendCopyLastUseThroughRegisterLoads(
       std::vector<PipelineStageInfo> *pipeline_stage_infos) const {
     auto last_reader_index = [&](const PipelineStageInfo &producer) -> int {
@@ -1139,6 +1148,21 @@ private:
   PipelinePlanner() = default;
   PipelinePlanner(bool use_async_copy) : use_async_copy_(use_async_copy) {}
 
+  // Whether the loop runs a register pipeline.
+  static bool RegisterPipelineEnabled(const ForNode *loop) {
+    if (auto reg_anno = loop->annotations.Get(kNumRegisterStages)) {
+      if (const auto *imm = reg_anno.value().as<IntImmNode>()) {
+        return imm->value > 1;
+      }
+    }
+    if (auto en_anno = loop->annotations.Get(kEnableRegisterPipeline)) {
+      if (const auto *imm = en_anno.value().as<IntImmNode>()) {
+        return imm->value != 0;
+      }
+    }
+    return false;
+  }
+
   PipelineStageAnalyzer MakeStageAnalyzer() const {
     return PipelineStageAnalyzer(buffer_data_to_buffer_, target_,
                                  use_async_copy_);
@@ -1147,6 +1171,12 @@ private:
   void AnalyzeCopyLastUse(
       std::vector<PipelineStageInfo> *pipeline_stage_infos) const {
     MakeStageAnalyzer().AnalyzeCopyLastUse(pipeline_stage_infos);
+  }
+
+  void ExtendCopyLastUseThroughRegisterLoads(
+      std::vector<PipelineStageInfo> *pipeline_stage_infos) const {
+    MakeStageAnalyzer().ExtendCopyLastUseThroughRegisterLoads(
+        pipeline_stage_infos);
   }
 
   void PropagateBufferProducersForCopy(
@@ -1332,7 +1362,11 @@ private:
     // identifies the index of the last statement that consumes data produced by
     // copy stages, enabling optimal placement of copy operations in the
     // pipeline schedule.
+    const bool register_pipeline_enabled = RegisterPipelineEnabled(loop);
     AnalyzeCopyLastUse(&pipeline_stage_infos);
+    if (register_pipeline_enabled) {
+      ExtendCopyLastUseThroughRegisterLoads(&pipeline_stage_infos);
+    }
 
     PropagateScalarProducersForCopy(&pipeline_stage_infos);
 
@@ -1392,19 +1426,6 @@ private:
       return -1;
     }();
     if (copy_stage_at_end > 0 && num_stages >= 2) {
-      bool register_pipeline_enabled = false;
-      if (auto reg_anno = loop->annotations.Get(kNumRegisterStages)) {
-        if (const auto *imm = reg_anno.value().as<IntImmNode>()) {
-          register_pipeline_enabled = imm->value > 1;
-        }
-      }
-      if (!register_pipeline_enabled) {
-        if (auto en_anno = loop->annotations.Get(kEnableRegisterPipeline)) {
-          if (const auto *imm = en_anno.value().as<IntImmNode>()) {
-            register_pipeline_enabled = imm->value != 0;
-          }
-        }
-      }
       for (auto &pinfo : pipeline_stage_infos) { // move copy to the beginning
         pinfo.order =
             (pinfo.order + copy_stage_at_end) % pipeline_stage_infos.size();

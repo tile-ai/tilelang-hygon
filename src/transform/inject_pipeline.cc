@@ -1216,13 +1216,14 @@ public:
           it->second.def >= 0) {
         num_versions = std::max(num_versions, register_min_versions_);
       }
-      if (IsSharedBuffer(buffer)) {
+      // Shared buffers produced outside the pipeline (def == -1) keep a single
+      // version: their producers still refer to the unversioned alias buffer,
+      // which a versioned access cannot be propagated to. The remaining shared
+      // buffers never get more versions than there are stages.
+      if (IsSharedBuffer(buffer) && it->second.def >= 0) {
         if (auto ns = GetPipelineNumStages(pipeline_loop_.get())) {
           const int n = static_cast<int>(ns.value()->value);
-          if (n > 1) {
-            num_versions = std::max(num_versions, n);
-          }
-          if (n > 0) {
+          if (num_versions >= 2 && n > 0) {
             num_versions = std::min(num_versions, n);
           }
         }
@@ -3868,9 +3869,17 @@ private:
     for (const auto &kv : rewrite_result.buffer_remap) {
       pending_buffer_remap_.Set(kv.first, kv.second);
     }
-    const bool delay_wait_attr_lower = kind_ == PipelineKind::kShared &&
-                                       target_.defined() &&
-                                       TargetIsHCU(target_.value());
+    // HCU shared pipelines with at least two stages keep their commit/wait
+    // pairs in attribute form so that InjectAsyncGlobalLoadFence can replace
+    // them with a static wait plan; the other pipelines lower the attributes
+    // here, which ThreadSync relies on to place the barrier after a wait.
+    int explicit_num_stages = 0;
+    if (auto ns = GetExplicitPipelinedNumStages(op)) {
+      explicit_num_stages = static_cast<int>(ns.value()->value);
+    }
+    const bool delay_wait_attr_lower =
+        kind_ == PipelineKind::kShared && explicit_num_stages >= 2 &&
+        target_.defined() && TargetIsHCU(target_.value());
     if (!delay_wait_attr_lower) {
       pipeline = LowerAsyncCommitWaitAttrs(pipeline);
     }

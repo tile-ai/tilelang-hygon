@@ -2,6 +2,7 @@
 
 #include "op/builtin.h"
 #include "op/utils.h"
+#include "pipeline_utils.h"
 
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
@@ -175,6 +176,21 @@ std::vector<const ForNode *> CollectGemmKLoops(const Stmt &stmt) {
   LoopCollector collector;
   collector(stmt);
   return collector.loops;
+}
+
+bool FencePlannerOwnsWaitPlan(const Stmt &stmt) {
+  std::vector<const ForNode *> loops = CollectGemmKLoops(stmt);
+  if (loops.empty()) {
+    return false;
+  }
+  const ForNode *k_loop = loops.front();
+  if (LoopHasRegisterPipeline(k_loop)) {
+    return true;
+  }
+  if (auto ns = GetExplicitPipelinedNumStages(k_loop)) {
+    return static_cast<int>(ns.value()->value) >= 2;
+  }
+  return false;
 }
 
 } // namespace tl

@@ -441,7 +441,7 @@ SharedPipelineWaitPlan MakeWaitPlan(const Stmt &root) {
   if (auto ns = GetExplicitPipelinedNumStages(k_loop)) {
     plan.num_stages = static_cast<int>(ns.value().IntValue());
   }
-  plan.compiler_pipeline = plan.register_pipeline || plan.num_stages >= 2;
+  plan.compiler_pipeline = FencePlannerOwnsWaitPlan(root);
   if (plan.num_stages >= 2 && cpt > 0) {
     if (plan.register_pipeline) {
       plan.main_wait = (plan.num_stages - 2) * cpt;

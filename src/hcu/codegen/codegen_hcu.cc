@@ -2509,7 +2509,7 @@ void CodeGenTileLangHCU::PrintStorageSync(const CallNode *op) {
       this->stream << "tl::ebarrier_sync_cnt(" << barrier_id->value << ", "
                    << thread_count->value / warp_size << ");\n";
     } else {
-      this->stream << "tl::wave_barrier();\n";
+      this->stream << "__syncthreads();\n";
     }
   }
 }

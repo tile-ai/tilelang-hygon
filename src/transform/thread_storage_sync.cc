@@ -25,6 +25,7 @@
 #include "./common/thread_sync_types.h"
 #include "arith/ir_mutator_with_analyzer.h"
 #include "common/attr.h"
+#include "common/gemm_k_loop_utils.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/extern_call_checker.h"
 #include "runtime/thread_storage_scope.h"
@@ -567,9 +568,10 @@ private:
 
 struct TileLangThreadSyncPlanner : public ConstrVisitor {
   explicit TileLangThreadSyncPlanner(StorageScope sync_scope,
-                                     int warp_size = 32, bool is_hcu = false)
+                                     int warp_size = 32, bool is_hcu = false,
+                                     bool fence_planner_owns_waits = false)
       : sync_scope_(std::move(sync_scope)), warp_size_(warp_size),
-        is_hcu_(is_hcu) {
+        is_hcu_(is_hcu), fence_planner_owns_waits_(fence_planner_owns_waits) {
     scope_.push_back(std::vector<StmtEntry>());
   }
 
@@ -1014,12 +1016,15 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
     // Mark async cp.async load context so that tvm_access_ptr within the call
     // can be tagged accordingly. This allows the sync planner to avoid
     // inserting unnecessary barriers between back-to-back cp.async writes.
+    // The indexed copy is only async where InjectAsyncGlobalLoadFence pairs
+    // every wait with a block-wide barrier.
     auto is_cp_async = [&]() {
       if (auto opt = op->op.as<Op>()) {
         const Op &call_op = opt.value();
         return call_op.same_as(builtin::ptx_cp_async()) ||
                call_op.same_as(tl::ptx_cp_async()) ||
-               call_op.same_as(tl::hcu_cp_async_idxen());
+               (is_hcu_ && fence_planner_owns_waits_ &&
+                call_op.same_as(tl::hcu_cp_async_idxen()));
       }
       return false;
     }();
@@ -1447,6 +1452,8 @@ private:
   // warp size from target
   int warp_size_;
   bool is_hcu_{false};
+  // whether InjectAsyncGlobalLoadFence owns this function's wait plan
+  bool fence_planner_owns_waits_{false};
 
   void insert_syncs(const Object *obj) {
     if (syncs_inserted_.count(obj))
@@ -1743,7 +1750,10 @@ private:
         curr.is_async_copy) {
       return false;
     }
-    if (is_hcu_ &&
+    // Where the fence planner owns the waits, every wait already comes with a
+    // block-wide barrier, so the read/write conflicts around an async copy are
+    // covered there.
+    if (is_hcu_ && fence_planner_owns_waits_ &&
         ((prev.is_async_copy && prev.type == kWrite && curr.type == kRead) ||
          (curr.is_async_copy && curr.type == kWrite && prev.type == kRead))) {
       return false;
@@ -2043,11 +2053,18 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
                     .value()
                     .IntValue();
   }
+  // The wait plan InjectAsyncGlobalLoadFence installs already carries a barrier
+  // with every fence, so the pipelines it owns skip the generic barrier after a
+  // wait_group; the others still need it, as wait_asyncmark only orders the
+  // waiting wave's own copies while shared memory is consumed block-wide.
+  const bool fence_planner_owns_waits =
+      is_hcu && FencePlannerOwnsWaitPlan(stmt);
   if (sync_scope.rank == StorageRank::kShared && sync_scope.tag.empty() &&
-      !is_hcu) {
+      !fence_planner_owns_waits) {
     stmt = ThreadSyncAfterWaitGroupInserter(sync_scope)(stmt);
   }
-  TileLangThreadSyncPlanner planner(sync_scope, warp_size, is_hcu);
+  TileLangThreadSyncPlanner planner(sync_scope, warp_size, is_hcu,
+                                    fence_planner_owns_waits);
   for (const auto &[_, buffer] : func->buffer_map) {
     planner.SetBufferDataToBuffer(buffer->data, buffer);
   }
