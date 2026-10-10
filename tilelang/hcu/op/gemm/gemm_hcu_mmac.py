@@ -35,10 +35,7 @@ def _is_pipeline_version_region(buffer_region) -> bool:
     expr_equal = tirx.analysis.expr_deep_equal
     if not expr_equal(ranges[0].extent, 1):
         return False
-    for dim, r in zip(buf.shape[1:], ranges[1:]):
-        if not expr_equal(r.min, 0) or not expr_equal(r.extent, dim):
-            return False
-    return True
+    return all(expr_equal(r.min, 0) and expr_equal(r.extent, dim) for dim, r in zip(buf.shape[1:], ranges[1:]))
 
 
 def _is_full_fragment_region(buffer_region) -> bool:
@@ -61,9 +58,7 @@ def _check_scale_fp4_fragment_region(buffer_region, name: str) -> None:
     reject it instead of silently reading version 0.
     """
     if _is_pipeline_version_region(buffer_region):
-        raise NotImplementedError(
-            f"Register-pipeline version slice is not supported for hcu.mmac_scale_fp4 operand {name}"
-        )
+        raise NotImplementedError(f"Register-pipeline version slice is not supported for hcu.mmac_scale_fp4 operand {name}")
     assert is_full_region(buffer_region), f"Fragment input {name} must be a full region"
 
 
@@ -821,16 +816,8 @@ class GemmHCUMMAC(GemmBase):
             f"block_K ({block_K}) must be divisible by micro_size_k ({micro_size_k}) * k_pack ({k_pack})"
         )
         assert is_full_region(C_region), "Fragment output C must be a full region"
-        a_ptr_base = (
-            _fragment_pipeline_ptr_base(A_region, emitter.local_elems_a(full_k=True))
-            if is_fragment(self.A)
-            else 0
-        )
-        b_ptr_base = (
-            _fragment_pipeline_ptr_base(B_region, emitter.local_elems_b(full_k=True))
-            if is_fragment(self.B)
-            else 0
-        )
+        a_ptr_base = _fragment_pipeline_ptr_base(A_region, emitter.local_elems_a(full_k=True)) if is_fragment(self.A) else 0
+        b_ptr_base = _fragment_pipeline_ptr_base(B_region, emitter.local_elems_b(full_k=True)) if is_fragment(self.B) else 0
 
         use_gemm_mls = (a_from_mls and not is_fragment(self.A)) or (b_from_mls and not is_fragment(self.B))
         use_b_linear_ds_read = b_from_async_copy_linear and not is_fragment(self.B)
@@ -885,9 +872,7 @@ class GemmHCUMMAC(GemmBase):
                         T.clear(C_buf)
                     emitter.ldmatrix_mls_b(B_local, B_region)
                     for ki in T.serial(0, inner_k):
-                        emitter.mmac(
-                            A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, a_ptr_base=a_ptr_base
-                        )
+                        emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, a_ptr_base=a_ptr_base)
 
                 return _Simplify(_gemm_r_mls, inline_let=True)
 
@@ -919,9 +904,7 @@ class GemmHCUMMAC(GemmBase):
                         T.clear(C_buf)
                     emitter.ldmatrix_b_linear(B_local, B_region)
                     for ki in T.serial(0, inner_k):
-                        emitter.mmac(
-                            A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, a_ptr_base=a_ptr_base
-                        )
+                        emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, a_ptr_base=a_ptr_base)
 
                 return _Simplify(_gemm_r_b_linear, inline_let=True)
 
@@ -967,9 +950,7 @@ class GemmHCUMMAC(GemmBase):
                     T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_a(A_local, A_region, ki)
-                    emitter.mmac(
-                        A_local, B_buf, C_buf, ki, trans_c=mmac_trans_c, b_ptr_base=b_ptr_base
-                    )
+                    emitter.mmac(A_local, B_buf, C_buf, ki, trans_c=mmac_trans_c, b_ptr_base=b_ptr_base)
 
             return _Simplify(_gemm_sr, inline_let=True)
 
@@ -983,9 +964,7 @@ class GemmHCUMMAC(GemmBase):
                     T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_b(B_local, B_region, ki)
-                    emitter.mmac(
-                        A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, a_ptr_base=a_ptr_base
-                    )
+                    emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, a_ptr_base=a_ptr_base)
 
             return _Simplify(_gemm_rs, inline_let=True)
 
