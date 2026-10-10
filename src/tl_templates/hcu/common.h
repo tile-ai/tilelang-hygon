@@ -124,6 +124,44 @@ TL_DEVICE half_t __shfl(half_t var, int src_lane,
   return tmp.f;
 }
 
+// Shuffle FP8 as its raw byte.  HCU uses either wrapper structs or native
+// _BitInt(8) aliases depending on the target; bit_cast handles both without a
+// numeric FP8 -> float -> FP8 round trip.
+#define TL_DEFINE_HCU_FP8_SHFL_OVERLOADS(TYPE)                                 \
+  TL_DEVICE TYPE __shfl(TYPE value, int src_lane,                              \
+                        int width = __AMDGCN_WAVEFRONT_SIZE) {                 \
+    uint8_t raw = tl::bit_cast<uint8_t>(value);                                \
+    raw = static_cast<uint8_t>(                                                \
+        __shfl(static_cast<unsigned int>(raw), src_lane, width));              \
+    return tl::bit_cast<TYPE>(raw);                                            \
+  }                                                                            \
+  TL_DEVICE TYPE __shfl_xor(TYPE value, int lane_mask,                         \
+                            int width = __AMDGCN_WAVEFRONT_SIZE) {             \
+    uint8_t raw = tl::bit_cast<uint8_t>(value);                                \
+    raw = static_cast<uint8_t>(                                                \
+        __shfl_xor(static_cast<unsigned int>(raw), lane_mask, width));         \
+    return tl::bit_cast<TYPE>(raw);                                            \
+  }                                                                            \
+  TL_DEVICE TYPE __shfl_down(TYPE value, unsigned int delta,                   \
+                             int width = __AMDGCN_WAVEFRONT_SIZE) {            \
+    uint8_t raw = tl::bit_cast<uint8_t>(value);                                \
+    raw = static_cast<uint8_t>(                                                \
+        __shfl_down(static_cast<unsigned int>(raw), delta, width));            \
+    return tl::bit_cast<TYPE>(raw);                                            \
+  }                                                                            \
+  TL_DEVICE TYPE __shfl_up(TYPE value, unsigned int delta,                     \
+                           int width = __AMDGCN_WAVEFRONT_SIZE) {              \
+    uint8_t raw = tl::bit_cast<uint8_t>(value);                                \
+    raw = static_cast<uint8_t>(                                                \
+        __shfl_up(static_cast<unsigned int>(raw), delta, width));              \
+    return tl::bit_cast<TYPE>(raw);                                            \
+  }
+
+TL_DEFINE_HCU_FP8_SHFL_OVERLOADS(tl::fp8_t)
+TL_DEFINE_HCU_FP8_SHFL_OVERLOADS(tl::bf8_t)
+
+#undef TL_DEFINE_HCU_FP8_SHFL_OVERLOADS
+
 // Pack two half_t values.
 TL_DEVICE unsigned __pack_half2(const half_t x, const half_t y) {
   unsigned v0 = *((unsigned short *)&x);

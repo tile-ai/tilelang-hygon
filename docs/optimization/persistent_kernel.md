@@ -38,6 +38,7 @@ import tilelang as tl
 from tilelang import tvm as tvm
 from tilelang.language import T
 
+
 @tl.jit(out_idx=[-1])
 def matmul_persistent(M, N, K, block_M, block_N, block_K, dtype="float16"):
     # 1. Determine Grid Size (usually match #SMs)
@@ -52,14 +53,9 @@ def matmul_persistent(M, N, K, block_M, block_N, block_K, dtype="float16"):
     ):
         # 2. Launch fixed number of blocks (sm_num)
         with T.Kernel(sm_num, threads=128) as (block_id):
-
             # 3. Use T.Persistent to iterate over output tiles
             # Problem size is [M/block_M, N/block_N]
-            for bx, by in T.Persistent(
-                [T.ceildiv(M, block_M), T.ceildiv(N, block_N)],
-                sm_num,
-                block_id
-            ):
+            for bx, by in T.Persistent([T.ceildiv(M, block_M), T.ceildiv(N, block_N)], sm_num, block_id):
                 # ... Initialize shared memory & registers ...
                 # ... Compute GEMM for tile (bx, by) ...
                 pass

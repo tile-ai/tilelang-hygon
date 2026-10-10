@@ -4,9 +4,9 @@
  */
 
 #include "propagation_tir_collector.h"
+#include "hcu/op/builtin.h"
 #include "hcu/utils/extern_call_checker.h"
 #include "op/builtin.h"
-#include "op/region.h"
 
 #include <algorithm>
 
@@ -76,7 +76,7 @@ static Optional<BufferAndMask> GetBufferAndMaskFromExpr(const PrimExpr &expr,
           return r;
         }
       }
-    } else if (call->op.same_as(RegionOp::Get()) && call->args.size() >= 2) {
+    } else if (call->op.same_as(region()) && call->args.size() >= 2) {
       if (const auto *load = call->args[0].as<BufferLoadNode>()) {
         BufferAndMask r;
         r.buffer = load->buffer;

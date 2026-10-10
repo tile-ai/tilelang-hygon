@@ -23,10 +23,10 @@
 #include <utility>
 #include <vector>
 
+#include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "hcu/utils/mls_boundary.h"
-#include "op/builtin.h"
 
 namespace tvm {
 namespace codegen {
@@ -145,6 +145,159 @@ private:
     return Select(VisitExpr(op->args[0]), VisitExpr(op->args[1]),
                   VisitExpr(op->args[2]));
   }
+};
+
+// Convert an element-wise vector expression into one scalar lane while
+// preserving lazy Select branch evaluation.  Physical vector representation
+// remains owned by the HCU codegen.
+class VectorLaneScalarizer : public ExprMutator {
+public:
+  explicit VectorLaneScalarizer(int lane) : lane_(lane) {}
+
+private:
+  PrimExpr VisitExpr(const PrimExpr &expr) final {
+    PrimExpr result = ExprMutator::VisitExpr(expr);
+    if (result.dtype().is_fixed_length_vector())
+      return Shuffle::ExtractElement(expr, lane_);
+    return result;
+  }
+
+  PrimExpr VisitExpr_(const RampNode *op) final {
+    PrimExpr base = VisitExpr(op->base);
+    PrimExpr stride = VisitExpr(op->stride);
+    return base + stride * IntImm(stride.dtype(), lane_);
+  }
+
+  PrimExpr VisitExpr_(const BroadcastNode *op) final {
+    return VisitExpr(op->value);
+  }
+
+  PrimExpr VisitExpr_(const LetNode *op) final {
+    return VisitExpr(Substitute(op->body, {{op->var, op->value}}));
+  }
+
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    if (op->dtype.is_fixed_length_vector()) {
+      if (op->op.same_as(builtin::reinterpret())) {
+        ICHECK_EQ(op->args.size(), 1U);
+        DataType source_dtype = op->args[0].dtype();
+        if (source_dtype.lanes() == op->dtype.lanes() &&
+            source_dtype.bits() == op->dtype.bits()) {
+          return Call(op->dtype.element_of(), op->op, {VisitExpr(op->args[0])},
+                      op->annotations);
+        }
+        ICHECK_EQ(source_dtype.lanes() * source_dtype.bits(),
+                  op->dtype.lanes() * op->dtype.bits())
+            << "reinterpret expects source and target to have the same number "
+               "of bits";
+        DataType result_element_dtype = op->dtype.element_of();
+        DataType source_bits_dtype = DataType::UInt(source_dtype.bits());
+        DataType result_bits_dtype = DataType::UInt(op->dtype.bits());
+        auto as_unsigned_bits = [](PrimExpr value,
+                                   DataType unsigned_dtype) -> PrimExpr {
+          return value.dtype() == unsigned_dtype
+                     ? value
+                     : Call(unsigned_dtype, builtin::reinterpret(), {value});
+        };
+        auto from_unsigned_bits = [](PrimExpr value,
+                                     DataType result_dtype) -> PrimExpr {
+          return value.dtype() == result_dtype
+                     ? value
+                     : Call(result_dtype, builtin::reinterpret(), {value});
+        };
+
+        if (source_dtype.bits() < op->dtype.bits()) {
+          ICHECK_EQ(op->dtype.bits() % source_dtype.bits(), 0);
+          int source_lanes_per_result = op->dtype.bits() / source_dtype.bits();
+          PrimExpr packed = make_zero(result_bits_dtype);
+          for (int i = 0; i < source_lanes_per_result; ++i) {
+            int source_lane = lane_ * source_lanes_per_result + i;
+            PrimExpr source_value =
+                VectorLaneScalarizer(source_lane)(op->args[0]);
+            PrimExpr source_bits =
+                as_unsigned_bits(source_value, source_bits_dtype);
+            PrimExpr widened = Cast(result_bits_dtype, source_bits);
+            packed = packed | (widened << IntImm(result_bits_dtype,
+                                                 i * source_dtype.bits()));
+          }
+          return from_unsigned_bits(packed, result_element_dtype);
+        }
+
+        ICHECK_EQ(source_dtype.bits() % op->dtype.bits(), 0);
+        int result_lanes_per_source = source_dtype.bits() / op->dtype.bits();
+        int source_lane = lane_ / result_lanes_per_source;
+        int bit_offset =
+            (lane_ % result_lanes_per_source) * result_element_dtype.bits();
+        PrimExpr source_value = VectorLaneScalarizer(source_lane)(op->args[0]);
+        PrimExpr source_bits =
+            as_unsigned_bits(source_value, source_bits_dtype);
+        PrimExpr shifted = source_bits >> IntImm(source_bits_dtype, bit_offset);
+        PrimExpr narrowed = Cast(result_bits_dtype, shifted);
+        return from_unsigned_bits(narrowed, result_element_dtype);
+      }
+
+      Array<PrimExpr> args;
+      args.reserve(op->args.size());
+      for (const PrimExpr &arg : op->args)
+        args.push_back(VisitExpr(arg));
+      if (op->op.same_as(builtin::call_pure_extern()) ||
+          op->op.same_as(builtin::call_extern()))
+        return Call(op->dtype.element_of(), op->op, args, op->annotations);
+      if (op->op.same_as(tl::add2()))
+        return args[0] + args[1];
+      if (op->op.same_as(tl::sub2()))
+        return args[0] - args[1];
+      if (op->op.same_as(tl::mul2()))
+        return args[0] * args[1];
+      if (op->op.same_as(tl::fma2()))
+        return args[0] * args[1] + args[2];
+      if (op->op.same_as(tl::max2()))
+        return Select(args[0] > args[1], args[0], args[1]);
+      if (op->op.same_as(tl::min2()))
+        return Select(args[0] < args[1], args[0], args[1]);
+      if (op->op.same_as(tl::abs2())) {
+        if (args[0].dtype().is_bfloat16())
+          return Call(args[0].dtype(), builtin::call_pure_extern(),
+                      {StringImm("__habs"), args[0]});
+        PrimExpr zero = make_zero(args[0].dtype());
+        return Select(args[0] >= zero, args[0], -args[0]);
+      }
+    }
+    return ExprMutator::VisitExpr_(op);
+  }
+
+  PrimExpr VisitExpr_(const ShuffleNode *op) final {
+    int output_lane = op->dtype.is_scalar() ? 0 : lane_;
+    ICHECK_LT(output_lane, op->indices.size());
+    const int64_t *index = as_const_int(op->indices[output_lane]);
+    ICHECK(index) << "Vector select scalarization requires constant Shuffle "
+                     "indices: "
+                  << GetRef<Shuffle>(op);
+    int64_t source_lane = *index;
+    for (const PrimExpr &vector : op->vectors) {
+      ICHECK(!vector.dtype().is_scalable_vector());
+      int lanes = vector.dtype().lanes();
+      if (source_lane < lanes) {
+        if (vector.dtype().is_scalar()) {
+          ICHECK_EQ(source_lane, 0);
+          return VisitExpr(vector);
+        }
+        return VectorLaneScalarizer(static_cast<int>(source_lane))(vector);
+      }
+      source_lane -= lanes;
+    }
+    ICHECK(false) << "Shuffle index out of range: " << GetRef<Shuffle>(op);
+    return PrimExpr();
+  }
+
+  PrimExpr VisitExpr_(const CastNode *op) final {
+    PrimExpr value = VisitExpr(op->value);
+    DataType dtype =
+        op->dtype.is_fixed_length_vector() ? op->dtype.element_of() : op->dtype;
+    return value.dtype() == dtype ? value : Cast(dtype, value);
+  }
+
+  int lane_;
 };
 
 bool IsValidCPAsyncTransferBytes(int64_t bytes) {
@@ -1818,11 +1971,6 @@ void CodeGenTileLangHCU::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
     return;
   }
 
-  if (t == tl::CuTensorMapType()) {
-    os << "CUtensorMap";
-    return;
-  }
-
   bool fail = false;
   if (t.is_float()) {
     switch (t.bits()) {
@@ -2537,6 +2685,53 @@ void CodeGenTileLangHCU::VisitExpr_(const CastNode *op, std::ostream &os) {
   os << sret;
 }
 
+void CodeGenTileLangHCU::VisitExpr_(const SelectNode *op, std::ostream &os) {
+  if (!op->condition.dtype().is_fixed_length_vector()) {
+    CodeGenC::VisitExpr_(op, os);
+    return;
+  }
+
+  TVM_FFI_ICHECK(op->false_value->dtype == op->dtype &&
+                 op->true_value->dtype == op->dtype &&
+                 op->dtype.lanes() == op->condition.dtype().lanes());
+
+  std::string result = name_supply_->FreshName("_");
+  this->PrintIndent();
+  this->PrintType(op->dtype, stream);
+  stream << ' ' << result << "{};\n";
+  for (int lane = 0; lane < op->dtype.lanes(); ++lane) {
+    PrimExpr lane_select = VectorLaneScalarizer(lane)(GetRef<PrimExpr>(op));
+    ICHECK(lane_select.dtype().is_scalar());
+    PrintVecElemStore(result, op->dtype, lane, PrintExpr(lane_select));
+  }
+  os << result;
+}
+
+void CodeGenTileLangHCU::VisitExpr_(const NotNode *op, std::ostream &os) {
+  if (!op->dtype.is_fixed_length_vector()) {
+    CodeGenC::VisitExpr_(op, os);
+    return;
+  }
+
+  std::string result = name_supply_->FreshName("_");
+  this->PrintIndent();
+  this->PrintType(op->dtype, stream);
+  stream << ' ' << result << ";\n";
+  int ssa_scope = BeginScope();
+  {
+    std::string value = SSAGetID(PrintExpr(op->a), op->a.dtype());
+    for (int lane_index = 0; lane_index < op->dtype.lanes(); ++lane_index) {
+      std::ostringstream lane;
+      lane << "!bool(";
+      PrintVecElemLoad(value, op->a.dtype(), lane_index, lane);
+      lane << ')';
+      PrintVecElemStore(result, op->dtype, lane_index, lane.str());
+    }
+  }
+  EndScope(ssa_scope);
+  os << result;
+}
+
 void CodeGenTileLangHCU::VisitExpr_(const FloorDivNode *op,
                                     std::ostream &os) { // NOLINT(*)
   // Match CUDA codegen behavior: lower FloorDiv to plain Div before printing.
@@ -2702,6 +2897,20 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       predicate_stack_.pop_back();
       return;
     }
+  }
+
+  if (op->op.same_as(builtin::reinterpret()) && op->args.size() == 1U &&
+      !op->dtype.is_float4() && !op->args[0].dtype().is_float4()) {
+    ICHECK_EQ(op->dtype.lanes() * op->dtype.bits(),
+              op->args[0].dtype().lanes() * op->args[0].dtype().bits())
+        << "reinterpret expects source and target to have the same number of "
+           "bits";
+    os << "__builtin_bit_cast(";
+    this->PrintType(op->dtype, os);
+    os << ", ";
+    this->PrintExpr(op->args[0], os);
+    os << ")";
+    return;
   }
 
   auto print_extern_call_stmt = [&](std::string name, size_t offset = 0) {
@@ -2951,7 +3160,7 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
        << "), " << PrintExpr(op->args[1]) << ")";
   } else if (op->op.same_as(tl::match_all_sync())) {
     LOG(FATAL) << "tl.match_all_sync is not supported on HCU";
-  } else if (op->op.same_as(tl::get_lane_idx())) {
+  } else if (op->op.same_as(tl::hcu_get_lane_idx())) {
     ICHECK_LE(op->args.size(), 1)
         << "tl.get_lane_idx expects at most one argument <warp_size>.";
     os << "tl::get_lane_idx(";
@@ -2959,7 +3168,7 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       os << PrintExpr(op->args[0]);
     }
     os << ")";
-  } else if (op->op.same_as(tl::get_warp_idx())) {
+  } else if (op->op.same_as(tl::hcu_get_wave_idx())) {
     ICHECK_LE(op->args.size(), 1)
         << "tl.get_warp_idx expects at most one argument <warp_size>.";
     os << "tl::get_warp_idx(";
@@ -2967,9 +3176,27 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       os << PrintExpr(op->args[0]);
     }
     os << ")";
+  } else if (op->op.same_as(tl::hcu_get_wave_idx_sync())) {
+    ICHECK_LE(op->args.size(), 1)
+        << "tl.hcu_get_wave_idx_sync expects at most one wave size argument";
+    os << "tl::get_warp_idx_sync(";
+    if (!op->args.empty()) {
+      os << PrintExpr(op->args[0]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::hcu_get_wave_group_idx())) {
+    ICHECK_LE(op->args.size(), 2)
+        << "tl.hcu_get_wave_group_idx expects wave size and waves per group";
+    os << "tl::get_warp_group_idx(";
+    for (size_t i = 0; i < op->args.size(); ++i) {
+      if (i != 0)
+        os << ", ";
+      os << PrintExpr(op->args[i]);
+    }
+    os << ")";
   } else if (op->op.same_as(tl::get_wave_id())) {
     os << "__builtin_hcu_get_wave_id()";
-  } else if (op->op.same_as(tl::ieee_fmaf())) {
+  } else if (op->op.same_as(tl::hcu_ieee_fmaf())) {
     ICHECK_EQ(op->args.size(), 4U)
         << "tl.ieee_fmaf expects <x, y, z, rounding_mode>.";
     std::string rounding_mode = Downcast<StringImm>(op->args[3])->value;
@@ -3104,7 +3331,7 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->PrintExpr(op->args[i * 2 + 1], os);
       os << "]" << ((i < 3) ? ", " : ")");
     }
-  } else if (op->op.same_as(tl::tvm_mfma())) {
+  } else if (op->op.same_as(tl::hcu_mmac())) {
     // arg 0: prefix: {otype}_{intrM}x{intrN}x{intrK}_{itype}
     // arg 1: A layout: row/col
     // arg 2: B layout: row/col
@@ -3267,7 +3494,7 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("{clamp_suffix}", clamp);
     replacer.register_rule("{lts_suffix}", lts);
     os << replacer.rewrite(call_mfma_code);
-  } else if (op->op.same_as(tl::tvm_rdna_wmma())) {
+  } else if (op->op.same_as(tl::hcu_wmma())) {
     ICHECK(op->args.size() == 12U) << "tvm_rdna_wmma expects 12 arguments";
     std::string shape = Downcast<StringImm>(op->args[0])->value;
     std::string a_ref = this->PrintExpr(op->args[6]);
@@ -3336,6 +3563,13 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << ", " << PrintExpr(op->args[2]);
     }
     this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_addx2_ret_elem_op())) {
+    os << "AtomicAddx2Ret(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
   } else if (op->op.same_as(tl::atomic_addx4_elem_op())) {
     std::string dst_ptr = PrintExpr(op->args[0]);
     std::string src_ptr = PrintExpr(op->args[1]);
@@ -3345,6 +3579,13 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << ", " << PrintExpr(op->args[2]);
     }
     this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_addx4_ret_elem_op())) {
+    os << "AtomicAddx4Ret(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
   } else if (op->op.same_as(tl::atomic_load_elem_op())) {
     os << "AtomicLoad(" << PrintExpr(op->args[0]) << ", "
        << PrintExpr(op->args[1]) << ")";
@@ -3397,7 +3638,7 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     this->stream << ");\n";
     return;
-  } else if (op->op.same_as(tl::set_max_nreg())) {
+  } else if (op->op.same_as(tl::hcu_set_max_nreg())) {
     this->PrintIndent();
     int nreg = Downcast<IntImm>(op->args[0])->value;
     this->stream << "__builtin_hcu_s_set_vgpr_size(" << nreg << ");\n";
@@ -3485,11 +3726,15 @@ void CodeGenTileLangHCU::VisitStmt_(const AttrStmtNode *op) {
     ICHECK(!func_name.empty() && panel_size > 0)
         << "threadblock_swizzle_pattern: failed to extract func_name and "
            "panel_size";
+    ICHECK(func_name == "rasterization2DRow" ||
+           func_name == "rasterization2DColumn")
+        << "threadblock swizzle pattern `" << func_name
+        << "` is not supported by the HCU backend";
     this->stream << "const dim3 blockIdx = tl::" << func_name << "<"
                  << panel_size << ">();\n";
     this->VisitStmt(op->body);
     return;
-  } else if (op->attr_key == tl::attr::kDisableBufferOpsMap) {
+  } else if (op->attr_key == tl::attr::kHcuDirectToLds) {
     if (auto map = op->node.as<Map<String, PrimExpr>>()) {
       for (const auto &[var, enabled] : map.value()) {
         if (auto int_val = enabled.as<IntImmNode>()) {
@@ -3499,13 +3744,13 @@ void CodeGenTileLangHCU::VisitStmt_(const AttrStmtNode *op) {
         }
       }
     }
-  } else if (op->attr_key == tl::attr::kBufferOpsRebaseMap) {
+  } else if (op->attr_key == tl::attr::kHcuBufferOpsRebaseMap) {
     const auto *var = op->node.as<VarNode>();
-    ICHECK(var) << tl::attr::kBufferOpsRebaseMap
+    ICHECK(var) << tl::attr::kHcuBufferOpsRebaseMap
                 << " expects the buffer data Var in AttrStmt.node";
 
     const auto *enabled = op->value.as<IntImmNode>();
-    ICHECK(enabled) << tl::attr::kBufferOpsRebaseMap
+    ICHECK(enabled) << tl::attr::kHcuBufferOpsRebaseMap
                     << " expects a constant boolean value";
 
     const std::string name = var->name_hint;
@@ -3553,7 +3798,9 @@ void CodeGenTileLangHCU::VisitStmt_(const AllocBufferNode *op) {
          op->buffer->dtype == DataType::UInt(4) ||
          op->buffer->dtype == DataType::Int(1)) &&
         scope == "shared") {
-      constant_size = constant_size / (32 / op->buffer->dtype.bits());
+      const size_t elements_per_storage_word = 32 / op->buffer->dtype.bits();
+      constant_size = (constant_size + elements_per_storage_word - 1) /
+                      elements_per_storage_word;
     }
 
     if (scope == "local.var") {
@@ -3746,8 +3993,14 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
                        CodeGenTileLangHCU *p) { // NOLINT(*)
   // Type code is kBFloat
   if (op->dtype.is_bfloat16()) {
-    os << "bfloat16_t";
-    os << '(' << std::scientific << op->value << 'f' << ')';
+    os << "bfloat16_t(";
+    if (std::isinf(op->value) || std::isnan(op->value)) {
+      FloatImm const_f32 = FloatImm(DataType::Float(32), op->value);
+      PrintConst(const_f32.get(), os, p);
+    } else {
+      os << std::scientific << op->value << 'f';
+    }
+    os << ')';
     return;
   } else if (op->dtype.is_float8_e4m3fnuz() || op->dtype.is_float8_e4m3() ||
              op->dtype.is_float8_e4m3fn()) {

@@ -4,6 +4,7 @@
  * consumer GEMM facts collected via PropagationTirCollector.
  */
 
+#include "hcu/op/builtin.h"
 #include "hcu/op/ds_read_format.h"
 #include "hcu/op/mls.h"
 #include "hcu/target_utils.h"
@@ -15,9 +16,9 @@
 #include "hcu/utils/propagation_tir_collector.h"
 #include "hcu/utils/propagation_util.h"
 #include "layout/layout.h"
-#include "op/builtin.h"
 #include "op/copy.h"
 #include "op/gemm.h"
+#include "op/gemm_blockscaled.h"
 #include "op/operator.h"
 #include "op/utils.h"
 #include "transform/common/pipeline_utils.h"
@@ -77,7 +78,7 @@ private:
       if (call->op.as<OpNode>()) {
         Op tir_op = Downcast<Op>(call->op);
         if (tir_op == MatrixLoad::Get() || tir_op == DsReadFormat::Get() ||
-            tir_op == Gemm::Get()) {
+            tir_op == Gemm::Get() || tir_op == GemmBlockScaled::Get()) {
           found_ = true;
           return;
         }
@@ -1126,7 +1127,7 @@ private:
       return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
 
-    if (tir_op.same_as(Gemm::Get())) {
+    if (tir_op.same_as(Gemm::Get()) || tir_op.same_as(GemmBlockScaled::Get())) {
       auto gemm = Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
       auto annotations =
           AnnotateGemmHcuMlsFlags(call->annotations, gemm.get(), collector_);

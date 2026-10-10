@@ -1,22 +1,3 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
-
 /*!
  * \file merge_shared_memory_allocations.cc
  * \brief Each GPU kernel is allowed to have only one dynamic or static shared
@@ -43,7 +24,8 @@
 #include <unordered_set>
 #include <utility>
 
-#include "../op/builtin.h"
+#include "common/storage_size.h"
+#include "cuda/op/builtin.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
 #include <tvm/tirx/function.h>
@@ -70,6 +52,26 @@ static bool IsStaticSharedMemory(Var buffer_var) {
       runtime::StorageScope::Create(GetPtrStorageScope(std::move(buffer_var)));
   return storage_scope.rank == runtime::StorageRank::kShared &&
          storage_scope.tag.empty();
+}
+
+// Scalar packed NVFP4 stores two logical elements per byte, and its buffer
+// shapes are expressed in logical elements.  Storage sizing is handled by the
+// shared GetBufferStorageSizeBytes helper; the byte-offset -> logical-index
+// conversion below is the remaining NVFP4-specific piece of this pass.
+static bool IsPackedScalarFp4(DataType dtype) {
+  return dtype.is_float4_e2m1fn() && dtype.is_scalar();
+}
+
+static PrimExpr SharedByteOffsetToLogicalIndexOffset(PrimExpr byte_offset,
+                                                     DataType dtype) {
+  // buffer_byte_offsets_ stores byte offsets into the merged uint8 arena, but
+  // the non-alias rewrite still indexes the original typed buffer. Convert the
+  // byte offset back to that buffer's logical element index.  Packed scalar
+  // NVFP4 has two logical elements per byte.
+  if (IsPackedScalarFp4(dtype)) {
+    return byte_offset * make_const(byte_offset.dtype(), 2);
+  }
+  return indexdiv(byte_offset, dtype.bytes() * dtype.lanes());
 }
 
 /*!
@@ -516,6 +518,15 @@ private:
     }
   }
 
+  PrimExpr GetAllocationSizeBytes(const VarNode *var,
+                                  const AllocBufferNode *alloc) const {
+    auto it = special_size_bytes_.find(var);
+    if (it != special_size_bytes_.end()) {
+      return it->second;
+    }
+    return GetBufferStorageSizeBytes(alloc->buffer);
+  }
+
   std::vector<Stmt> MakeAliasBindings() const {
     struct AliasInfo {
       const VarNode *var{nullptr};
@@ -583,29 +594,7 @@ private:
 
     for (const VarNode *var : sorted_vars) {
       const AllocBufferNode *alloc = shmem_allocs_.at(var);
-      int64_t bytes_per_elem = static_cast<int64_t>(
-          alloc->buffer->dtype.bytes() * alloc->buffer->dtype.lanes());
-
-      DataType size_dtype = DataType::Int(32);
-      if (!alloc->buffer->shape.empty()) {
-        size_dtype = alloc->buffer->shape[0].dtype();
-      }
-      if (!size_dtype.is_int() && !size_dtype.is_uint()) {
-        size_dtype = DataType::Int(32);
-      }
-
-      PrimExpr size_expr = make_const(size_dtype, bytes_per_elem);
-      for (const PrimExpr &extent : alloc->buffer->shape) {
-        PrimExpr e = extent;
-        if (e.dtype() != size_dtype) {
-          e = cast(size_dtype, e);
-        }
-        size_expr = size_expr * e;
-      }
-      if (auto special_it = special_size_bytes_.find(var);
-          special_it != special_size_bytes_.end()) {
-        size_expr = special_it->second;
-      }
+      PrimExpr size_expr = GetAllocationSizeBytes(var, alloc);
 
       int alignment = align_bytes_;
       auto align_it = shmem_alignment_map_.find(var);
@@ -644,13 +633,8 @@ private:
           auto alloc_it = shmem_allocs_.find(buffer_var_node);
           if (alloc_it != shmem_allocs_.end()) {
             const AllocBufferNode *alloc = alloc_it->second;
-            PrimExpr buffer_size_bytes = alloc->buffer->shape[0] *
-                                         alloc->buffer->dtype.bytes() *
-                                         alloc->buffer->dtype.lanes();
-            if (auto special_it = special_size_bytes_.find(buffer_var_node);
-                special_it != special_size_bytes_.end()) {
-              buffer_size_bytes = special_it->second;
-            }
+            PrimExpr buffer_size_bytes =
+                GetAllocationSizeBytes(buffer_var_node, alloc);
             LOG(DEBUG) << "    Buffer: " << buffer_var_node->name_hint
                        << " (Type: " << alloc->buffer->dtype << ")"
                        << ", Start Offset: " << byte_offset
@@ -782,8 +766,9 @@ private:
                    op->args[4]});
     } else if (op->op.same_as(builtin::ptx_cp_async()) ||
                op->op.same_as(tl::ptx_cp_async())) {
-      ICHECK(op->args.size() >= 3U && op->args.size() <= 6U)
-          << "ptx_cp_async expects 3 to 6 arguments";
+      ICHECK(op->args.size() == 3U || op->args.size() == 4U)
+          << "ptx_cp_async expects 3 or 4 arguments (dst_access_ptr, "
+             "src_access_ptr, count[, predicate])";
 
       // Extract dst_access_ptr and check if it needs merging
       Call dst_access_ptr = Downcast<Call>(op->args[0]);
@@ -820,13 +805,10 @@ private:
 
       Array<PrimExpr> cp_async_args = {new_dst_access_ptr, op->args[1],
                                        op->args[2]};
-      if (op->args.size() >= 4U) {
+      if (op->args.size() == 4U) {
         cp_async_args.push_back(op->args[3]);
       }
-      for (size_t i = 4; i < op->args.size(); ++i) {
-        cp_async_args.push_back(op->args[i]);
-      }
-      return Call(dtype, op->op, cp_async_args, op->annotations, op->span);
+      return Call(dtype, op->op, cp_async_args);
     }
     return StmtExprMutator::VisitExpr_(op);
   }
@@ -835,7 +817,7 @@ private:
     auto it = buffer_byte_offsets_.find(buffer_var.get());
     ICHECK(it != buffer_byte_offsets_.end())
         << "buffer_var = " << buffer_var->name_hint << ", dtype = " << dtype;
-    return indexdiv(it->second * 8, dtype.bits() * dtype.lanes());
+    return SharedByteOffsetToLogicalIndexOffset(it->second, dtype);
   }
 
   bool HasBufferOffset(const Var &buffer_var) {
@@ -1429,30 +1411,8 @@ private:
       }
 
       const AllocBufferNode *alloc = shmem_allocs_.at(var);
-      int64_t bytes_per_elem = static_cast<int64_t>(
-          alloc->buffer->dtype.bytes() * alloc->buffer->dtype.lanes());
-      DataType size_dtype = DataType::Int(32);
-      if (!alloc->buffer->shape.empty()) {
-        size_dtype = alloc->buffer->shape[0].dtype();
-      }
-      if (!size_dtype.is_int() && !size_dtype.is_uint()) {
-        size_dtype = DataType::Int(32);
-      }
-
-      PrimExpr size_expr = make_const(size_dtype, bytes_per_elem);
-      for (const PrimExpr &extent : alloc->buffer->shape) {
-        PrimExpr e = extent;
-        if (e.dtype() != size_dtype) {
-          e = cast(size_dtype, e);
-        }
-        size_expr = size_expr * e;
-      }
-      if (auto special_it = special_size_bytes_.find(var);
-          special_it != special_size_bytes_.end()) {
-        size_expr = special_it->second;
-        size_dtype = size_expr.dtype();
-      }
-      info.size_dtype = size_dtype;
+      PrimExpr size_expr = GetAllocationSizeBytes(var, alloc);
+      info.size_dtype = size_expr.dtype();
       info.size_expr = size_expr;
 
       if (auto special_it = special_size_bytes_.find(var);
@@ -1463,7 +1423,8 @@ private:
       } else {
         auto const_size = GetRef<AllocBuffer>(alloc).ConstantAllocationSize();
         if (const_size.has_value()) {
-          info.const_size_bytes = const_size.value() * bytes_per_elem;
+          info.const_size_bytes = GetBufferStorageSizeBytes(
+              static_cast<int64_t>(const_size.value()), alloc->buffer->dtype);
         }
       }
 
@@ -1627,6 +1588,8 @@ private:
   // The mapping from the original buffer var to its offset in the merged buffer
   std::unordered_map<const VarNode *, PrimExpr> buffer_byte_offsets_;
   // Per-buffer allocation size overrides for special shared-memory layouts.
+  // The producer remains backend-specific; this common allocator only consumes
+  // the generic PrimFunc attribute.
   std::unordered_map<const VarNode *, PrimExpr> special_size_bytes_;
   std::unordered_map<std::string, PrimExpr> special_size_bytes_by_name_;
   // The mapping from the original buffer objects to their location in the
@@ -1682,16 +1645,9 @@ Stmt MergeSharedMemoryAllocations(
         }
         return false;
       };
-  if (collector.dyn_shmem_allocs_.size() > 1) {
-    SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_, true, verbose,
-                                  align_bytes, preserve_aliases,
-                                  special_size_bytes_by_name);
-    rewriter.PlanReuse(stmt, true,
-                       disable_reuse ? false : enable_aggressive_merge, false,
-                       disable_reuse, resolve(collector.dyn_shmem_allocs_));
-    stmt = rewriter(std::move(stmt));
-  } else if (collector.dyn_shmem_allocs_.size() == 1 &&
-             has_special_size(collector.dyn_shmem_allocs_)) {
+  if (collector.dyn_shmem_allocs_.size() > 1 ||
+      (collector.dyn_shmem_allocs_.size() == 1 &&
+       has_special_size(collector.dyn_shmem_allocs_))) {
     SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_, true, verbose,
                                   align_bytes, preserve_aliases,
                                   special_size_bytes_by_name);
@@ -1700,16 +1656,10 @@ Stmt MergeSharedMemoryAllocations(
                        disable_reuse, resolve(collector.dyn_shmem_allocs_));
     stmt = rewriter(std::move(stmt));
   }
-  if (merge_static_smem && collector.static_shmem_allocs_.size() > 1) {
-    SharedMemoryRewriter rewriter(collector.static_shmem_allocs_, false,
-                                  verbose, align_bytes, preserve_aliases,
-                                  special_size_bytes_by_name);
-    rewriter.PlanReuse(stmt, false,
-                       disable_reuse ? false : enable_aggressive_merge, false,
-                       disable_reuse, resolve(collector.static_shmem_allocs_));
-    stmt = rewriter(std::move(stmt));
-  } else if (merge_static_smem && collector.static_shmem_allocs_.size() == 1 &&
-             has_special_size(collector.static_shmem_allocs_)) {
+  if (merge_static_smem &&
+      (collector.static_shmem_allocs_.size() > 1 ||
+       (collector.static_shmem_allocs_.size() == 1 &&
+        has_special_size(collector.static_shmem_allocs_)))) {
     SharedMemoryRewriter rewriter(collector.static_shmem_allocs_, false,
                                   verbose, align_bytes, preserve_aliases,
                                   special_size_bytes_by_name);

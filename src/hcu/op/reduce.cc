@@ -5,11 +5,11 @@
 
 #include "backend/common/op/reduce.h"
 
+#include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/auto_ebarrier.h"
 #include "layout/layout.h"
 #include "layout/utils.h"
-#include "op/builtin.h"
 
 #include <sstream>
 
@@ -32,7 +32,7 @@ Stmt LowerWarpReduce(const ReduceOpNode &op, const LowerArgs &lower_args,
          op.dst.scope() == "local.fragment")
       << "Reduce for shared memory not implemented.";
   ICHECK(TargetIsHCU(lower_args.target))
-      << "Warp reduce (dim=-1) is only supported on HCU target.";
+      << "Warp buffer reduce is only supported on HCU target.";
 
   auto get_buffer = [&](const Buffer &buf) {
     if (lower_args.buffer_remap.count(buf)) {
@@ -205,9 +205,16 @@ Stmt LowerWarpReduce(const ReduceOpNode &op, const LowerArgs &lower_args,
 }
 
 struct HCUReduce : backend::ReduceLowerer<HCUReduce> {
+  static bool AllReduceNeedsWorkspace(int reducing_threads, int,
+                                      Target target) {
+    return reducing_threads > TargetHcuGetWarpSize(target);
+  }
+
   static bool SupportsFp16Bf16NanReduce(Target) { return false; }
 
-  static int GetPreferedVectorizedSize(DataType, Target) { return 1; }
+  static int GetPreferredVectorizedSize(const ReduceOpNode &, Target) {
+    return 1;
+  }
 
   static std::string MakeBatchAllReduce(std::string reducer,
                                         int reducing_threads, int scale,
@@ -245,7 +252,7 @@ struct HCUReduce : backend::ReduceLowerer<HCUReduce> {
 
 Stmt HcuReduceLower(const ReduceOpNode &op, const LowerArgs &lower_args,
                     arith::Analyzer *analyzer) {
-  if (op.dim == -1) {
+  if (op.IsWarpReduce()) {
     return LowerWarpReduce(op, lower_args, analyzer);
   }
   return HCUReduce::Lower(op, lower_args, analyzer);
@@ -262,6 +269,7 @@ bool RegisterHCUReduce() {
       "hcu.Reduce",
       MatchHCUReduceTarget,
       hcu::HcuReduceLower,
+      true,
   });
   return true;
 }

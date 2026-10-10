@@ -8,6 +8,7 @@
 #include <tvm/tirx/stmt.h>
 #include <tvm/tirx/stmt_functor.h>
 
+#include "hcu/op/builtin.h"
 #include "hcu/utils/extern_call_checker.h"
 #include "op/builtin.h"
 
@@ -22,7 +23,7 @@ bool IsHcuWdraVgprCall(const CallNode *call) {
   }
 
   // Uniform / WDRA control flow helpers.
-  if (call->op.same_as(get_wave_id()) || call->op.same_as(set_max_nreg()) ||
+  if (call->op.same_as(get_wave_id()) || call->op.same_as(hcu_set_max_nreg()) ||
       call->op.same_as(no_set_max_nreg()) ||
       call->op.same_as(hcu_wdra_init())) {
     return false;
@@ -52,29 +53,15 @@ bool IsHcuWdraVgprCall(const CallNode *call) {
     return false;
   }
 
-  if (call->op.same_as(tvm_mfma()) || call->op.same_as(tvm_rdna_wmma()) ||
-      call->op.same_as(tvm_rdna_wmma_store()) || call->op.same_as(tma_load()) ||
-      call->op.same_as(tma_load_im2col()) || call->op.same_as(tma_store()) ||
-      call->op.same_as(tma_store_arrive()) ||
-      call->op.same_as(tma_store_wait()) || call->op.same_as(ptx_wgmma_ss()) ||
-      call->op.same_as(ptx_wgmma_rs()) || call->op.same_as(wait_wgmma()) ||
-      call->op.same_as(warpgroup_arrive()) ||
-      call->op.same_as(warpgroup_commit_batch()) ||
-      call->op.same_as(warpgroup_wait()) ||
-      call->op.same_as(warpgroup_fence_operand()) ||
+  if (call->op.same_as(hcu_mmac()) || call->op.same_as(hcu_wmma()) ||
+      call->op.same_as(hcu_wmma_store()) || call->op.same_as(wait_wgmma()) ||
       call->op.same_as(ptx_cp_async()) ||
       call->op.same_as(async_gld_sld_fence()) ||
-      call->op.same_as(ptx_ldmatrix()) || call->op.same_as(ptx_stmatrix()) ||
-      call->op.same_as(ptx_mma_sm70()) ||
-      call->op.same_as(ptx_tcgen05_mma_ss()) ||
-      call->op.same_as(ptx_tcgen05_mma_ts()) ||
-      call->op.same_as(get_lane_idx()) || call->op.same_as(get_warp_idx()) ||
-      call->op.same_as(get_warp_idx_sync()) ||
-      call->op.same_as(get_warp_group_idx()) || call->op.same_as(ldg32()) ||
-      call->op.same_as(ldg64()) || call->op.same_as(ldg128()) ||
-      call->op.same_as(ldg256()) || call->op.same_as(stg32()) ||
-      call->op.same_as(stg64()) || call->op.same_as(stg128()) ||
-      call->op.same_as(stg256())) {
+      call->op.same_as(ptx_stmatrix()) ||
+      call->op.same_as(hcu_get_lane_idx()) ||
+      call->op.same_as(hcu_get_wave_idx()) ||
+      call->op.same_as(hcu_get_wave_idx_sync()) ||
+      call->op.same_as(hcu_get_wave_group_idx())) {
     return true;
   }
 

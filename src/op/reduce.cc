@@ -70,6 +70,7 @@ void RegisterReduceImpl(ReduceImpl impl) {
 
 ReduceOp::ReduceOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   ObjectPtr<ReduceOpNode> node = make_object<ReduceOpNode>();
+  node->annotations = annotations;
   // Accept BufferRegion/BufferLoad for src/dst
   auto src_access = NormalizeToAccessRegion(args[0], kAccessRead);
   auto dst_access = NormalizeToAccessRegion(args[1], kAccessReadWrite);
@@ -99,6 +100,16 @@ ReduceOp::ReduceOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
       node->nan_propagate = i.value()->value != 0;
     }
   }
+  const bool is_minmax =
+      node->type->IsMax() || node->type->IsMin() || node->type->IsAbsMax();
+
+  if (node->nan_propagate && is_minmax) {
+    CHECK(node->dst->dtype.is_float16() || node->dst->dtype.is_bfloat16(),
+          ValueError)
+        << "reduce_" << reduce_type
+        << " with nan_propagate=True requires float16 or bfloat16 output, got "
+        << node->dst->dtype;
+  }
   data_ = std::move(node);
 }
 
@@ -110,6 +121,21 @@ AccessRegions ReduceOpNode::GetAccessRegions() const {
   }
   result.writes.push_back(dstRegion_);
   return result;
+}
+
+bool ReduceOpNode::IsWarpReduce() const {
+  auto value = annotations.Get("tl.warp_reduce");
+  if (!value) {
+    return false;
+  }
+  if (auto enabled = value.value().as<Bool>()) {
+    return enabled.value();
+  }
+  if (auto enabled = value.value().as<IntImm>()) {
+    return enabled.value()->value != 0;
+  }
+  LOG(FATAL) << "ReduceOp annotation tl.warp_reduce must be a bool or integer";
+  return false;
 }
 
 TileOperator ReduceOpNode::Clone() const {
@@ -187,8 +213,11 @@ static Fragment ComputeReducerLayout(const Fragment &src_layout, int dim) {
  */
 Stmt ReduceOpNode::Lower(const LowerArgs &lower_args,
                          arith::Analyzer *analyzer) const {
-  return ResolveReduceImpl(lower_args.target)
-      .lower(*this, lower_args, analyzer);
+  const ReduceImpl &impl = ResolveReduceImpl(lower_args.target);
+  CHECK(!IsWarpReduce() || impl.supports_warp_reduce, ValueError)
+      << "tl.warp_reduce buffer reduction is not supported by target "
+      << lower_args.target->str();
+  return impl.lower(*this, lower_args, analyzer);
 }
 
 LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &layout_args,
@@ -200,8 +229,8 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &layout_args,
       layout_args.layout_map.count(src)) {
     auto src_layout = layout_args.layout_map[src].as<Fragment>().value();
 
-    // Warp-level reduce (dim == -1): src and dst share the same layout.
-    if (dim == -1) {
+    // Warp-level buffer reduce preserves the logical fragment shape.
+    if (IsWarpReduce()) {
       Fragment dst_layout = src_layout;
 
       if (!layout_args.layout_map.count(dst)) {

@@ -16,6 +16,7 @@ Options:
   -h, --help           Show this help
 
 Default: install requirements-dev.txt + requirements.txt, then editable install.
+On Linux this Hygon source tree builds HCU+ROCm by default and leaves CUDA off.
 EOF
 }
 

@@ -7,6 +7,7 @@
 #include "op/gemm.h"
 #include "hcu/op/gemm_partition.h"
 #include "hcu/op/mls.h"
+#include "op/gemm_blockscaled.h"
 #include "support/check.h"
 
 #include "hcu/target_utils.h"
@@ -29,6 +30,7 @@ using namespace ffi;
 namespace hcu {
 
 constexpr const char *kHCUMMAC = "hcu.mmac";
+constexpr const char *kHCUMMACBlockScaled = "hcu.mmac.blockscaled";
 
 HcuMmacModeInfo ResolveHcuMmacMode(DataType a_dtype, DataType b_dtype,
                                    bool a_is_fragment, bool b_is_fragment,
@@ -145,7 +147,13 @@ HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
     ICHECK(k_pack == 1) << "gemm_mls does not support kPack > 1";
   }
 
-  int num_warps = block_size / TargetHcuGetWarpSize(target);
+  const int warp_size = TargetHcuGetWarpSize(target);
+  ICHECK_GE(block_size, warp_size)
+      << "HCU T.gemm needs at least one full wave, but this block has only "
+      << block_size << " threads while the wave size for " << target->str()
+      << " is " << warp_size << ". Raise the kernel thread count to at least "
+      << warp_size << ".";
+  int num_warps = block_size / warp_size;
   int m_warp = 1, n_warp = 1, k_warp = 1;
   HcuMnPerWarp floors = ResolveHcuMnPerWarp(
       element_bits, A_from_mls, B_from_mls, A_mls_trans, B_mls_trans,
@@ -349,6 +357,19 @@ struct Gemm {
   }
 };
 
+String SelectBlockScaledInst(const GemmBlockScaled &op, int block_size,
+                             const Target &target) {
+  (void)block_size;
+  ICHECK(TargetIsHCU(target))
+      << "HCU block-scaled GEMM implementation requires target=hcu, got "
+      << target;
+  ICHECK(is_zero(op->sfKStart_))
+      << "HCU block-scaled GEMM currently requires k_start=0 because its "
+         "wave-local shared.scale allocation is coupled to the GEMM warp "
+         "partition";
+  return kHCUMMACBlockScaled;
+}
+
 } // namespace hcu
 
 namespace {
@@ -362,6 +383,11 @@ bool RegisterHCUGemm() {
       hcu::Gemm::SelectInst,
       hcu::Gemm::ComputeWarpPartition,
       hcu::Gemm::ReuseExistingSharedLayout,
+  });
+  RegisterGemmBlockScaledImpl(GemmBlockScaledImpl{
+      "hcu.GemmBlockScaled",
+      MatchHCUGemmTarget,
+      hcu::SelectBlockScaledInst,
   });
   return true;
 }

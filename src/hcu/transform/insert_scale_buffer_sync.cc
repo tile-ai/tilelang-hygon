@@ -7,9 +7,9 @@
  * it.
  */
 
+#include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
-#include "op/builtin.h"
-#include "op/gemm.h"
+#include "op/gemm_blockscaled.h"
 #include "op/operator.h"
 
 #include <tvm/ir/transform.h>
@@ -30,7 +30,10 @@ public:
 
 private:
   void VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == attr::kWarpSpecializationScope) {
+    // Warp specialization is currently a CUDA-owned transform, so HCU must
+    // not include the CUDA builtin header merely to recognize the stable IR
+    // marker if such a scope is present in imported IR.
+    if (op->attr_key == "kWarpSpecializationScope") {
       found_ = true;
       return;
     }
@@ -68,10 +71,11 @@ bool IsBlockscaledGemmEvaluate(const EvaluateNode *op) {
     return false;
   }
   Op tir_op = Downcast<Op>(call->op);
-  if (tir_op != Gemm::Get()) {
+  if (tir_op != GemmBlockScaled::Get()) {
     return false;
   }
-  auto gemm = Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
+  auto gemm =
+      Downcast<GemmBlockScaled>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
   return gemm->sfaRegion_.defined() && gemm->sfbRegion_.defined();
 }
 

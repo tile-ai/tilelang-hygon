@@ -2,9 +2,9 @@
  * \file lower_and_validate_hcu_wdra.cc
  * \brief Lower tx-based warp specialization to HCU WDRA form and validate.
  */
+#include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
 #include "hcu_wdra_op_classify.h"
-#include "op/builtin.h"
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/transform.h>
@@ -80,7 +80,7 @@ bool ContainsSetMaxNreg(const Stmt &stmt) {
 
     void VisitStmt_(const EvaluateNode *op) final {
       if (const auto *call = op->value.as<CallNode>()) {
-        if (call->op.same_as(set_max_nreg())) {
+        if (call->op.same_as(hcu_set_max_nreg())) {
           found = true;
           return;
         }
@@ -95,7 +95,7 @@ bool ContainsSetMaxNreg(const Stmt &stmt) {
 Optional<int> ExtractFirstSetMaxNreg(const Stmt &stmt) {
   if (const auto *eval = stmt.as<EvaluateNode>()) {
     if (const auto *call = eval->value.as<CallNode>()) {
-      if (call->op.same_as(set_max_nreg())) {
+      if (call->op.same_as(hcu_set_max_nreg())) {
         return call->args[0].as<IntImmNode>()->value;
       }
     }
@@ -274,7 +274,7 @@ Stmt PrependBranchSetup(Stmt body, Optional<Var> tx_var, const Var &thread_x) {
   auto parse_set_max = [](const Stmt &stmt) -> Optional<Evaluate> {
     if (const auto *eval = stmt.as<EvaluateNode>()) {
       if (const auto *call = eval->value.as<CallNode>()) {
-        if (call->op.same_as(set_max_nreg())) {
+        if (call->op.same_as(hcu_set_max_nreg())) {
           return ffi::GetRef<Evaluate>(eval);
         }
       }
@@ -616,7 +616,7 @@ private:
   void VisitStmt_(const EvaluateNode *op) final {
     if (in_branch_ && branch_depth_ == 1 && !branch_seen_set_max_nreg_) {
       if (const auto *call = op->value.as<CallNode>()) {
-        if (call->op.same_as(set_max_nreg())) {
+        if (call->op.same_as(hcu_set_max_nreg())) {
           int nreg = call->args[0].as<IntImmNode>()->value;
           ICHECK(nreg % kVgprGranularity == 0)
               << "HCU WDRA set_max_nreg must be multiple of "

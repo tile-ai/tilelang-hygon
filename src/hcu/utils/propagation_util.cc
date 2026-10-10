@@ -8,7 +8,7 @@
  */
 
 #include "propagation_util.h"
-#include "op/builtin.h"
+#include "hcu/op/builtin.h"
 #include "op/gemm.h"
 #include "op/operator.h"
 #include "propagation_tir_collector.h"

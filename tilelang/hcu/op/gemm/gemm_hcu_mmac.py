@@ -16,13 +16,15 @@ from tilelang.transform.simplify import _Simplify
 from tilelang.utils.language import is_fragment, is_full_region, is_shared, is_shared_dynamic
 from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import hcu_mmac_k_dim_for_operand
 from tilelang.hcu.target import target_has_mmac_lit_lts, target_is_hcu
-from tvm import DataType, tirx
+from tvm import DataType, arith, tirx
 from tvm.ir import Range
 from tvm.target import Target
 
 from tilelang.tileop.gemm.gemm_base import GemmBase
+from tilelang.tileop.gemm_blockscaled.gemm_blockscaled_base import GemmBlockScaledMixin
 
 GEMM_INST_HCU_MMAC = "hcu.mmac"
+GEMM_INST_HCU_MMAC_BLOCKSCALED = "hcu.mmac.blockscaled"
 logger = logging.getLogger(__name__)
 
 
@@ -107,8 +109,8 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
         bool(is_fragment(B)),
         bool(getattr(gemm_node, "sfaRegion", None) is not None and getattr(gemm_node, "sfbRegion", None) is not None),
         int(gemm_node.k),
-        _int_annotation(annotations, "tl.scale_a_format", 0),
-        _int_annotation(annotations, "tl.scale_b_format", 0),
+        _int_annotation(annotations, "tl.hcu.scale_a_format", 0),
+        _int_annotation(annotations, "tl.hcu.scale_b_format", 0),
         target,
     )
     mmac_mode = "f8f6f4" if int(mode[0]) == 1 else "native"
@@ -140,8 +142,8 @@ def _compute_hcu_warp_partition(gemm, thread_nums: int, target: Target, meta) ->
     """
     element_bits = int(meta.gemm_element_bits)
     annotations = getattr(gemm.gemm_node, "annotations", None) or {}
-    min_m = _int_annotation(annotations, "tl.scale_min_m_per_warp", 0)
-    min_n = _int_annotation(annotations, "tl.scale_min_n_per_warp", 0)
+    min_m = _int_annotation(annotations, "tl.hcu.scale_min_m_per_warp", 0)
+    min_n = _int_annotation(annotations, "tl.hcu.scale_min_n_per_warp", 0)
     if meta.b_from_async_copy_linear:
         min_n = max(min_n, 32)
     floors = _ffi_api.GemmWarpPolicyComputeWarpPartitionHCU(
@@ -289,6 +291,10 @@ class GemmHCUMMAC(GemmBase):
     """HCU matrix core GEMM: layout and lowering via Python ``HCUMatrixCoreIntrinEmitter``."""
 
     @property
+    def use_tf32(self) -> bool:
+        return bool(_int_annotation(getattr(self.gemm_node, "annotations", None), "tl.hcu.use_tf32", 0))
+
+    @property
     def allow_f8f6f4_mixed_dtypes(self) -> bool:
         return True
 
@@ -390,16 +396,16 @@ class GemmHCUMMAC(GemmBase):
         if not target_has_mmac_lit_lts(target):
             raise ValueError("HCU gemm_blockscaled requires lit/lts target support")
 
-        gran_m = _ann_int(annotations, "sf_a_granularity_m", 1)
+        gran_m = _ann_int(annotations, "tl.hcu.sf_a_granularity_m", 1)
         gran_ka = _ann_int(annotations, "sf_a_granularity_k")
-        gran_n = _ann_int(annotations, "sf_b_granularity_n", 1)
+        gran_n = _ann_int(annotations, "tl.hcu.sf_b_granularity_n", 1)
         gran_kb = _ann_int(annotations, "sf_b_granularity_k")
-        a_k_major = bool(_ann_int(annotations, "a_scale_k_major", 0))
-        b_k_major = bool(_ann_int(annotations, "b_scale_k_major", 0))
-        row_base_a = _ann_expr(annotations, "tl.scale_a_row_base")
-        row_base_b = _ann_expr(annotations, "tl.scale_b_row_base")
-        scale_format_a = _ann_int(annotations, "tl.scale_a_format")
-        scale_format_b = _ann_int(annotations, "tl.scale_b_format")
+        a_k_major = bool(_ann_int(annotations, "tl.hcu.a_scale_k_major", 0))
+        b_k_major = bool(_ann_int(annotations, "tl.hcu.b_scale_k_major", 0))
+        row_base_a = _ann_expr(annotations, "tl.hcu.scale_a_row_base")
+        row_base_b = _ann_expr(annotations, "tl.hcu.scale_b_row_base")
+        scale_format_a = _ann_int(annotations, "tl.hcu.scale_a_format")
+        scale_format_b = _ann_int(annotations, "tl.hcu.scale_b_format")
 
         thread_nums = int(thread_bounds.extent)
         meta = _resolve_hcu_mls_meta(self.gemm_node, self.A, self.B, thread_nums, target)
@@ -733,9 +739,6 @@ class GemmHCUMMAC(GemmBase):
         if not target_is_hcu(target):
             raise ValueError("GemmHCUMMAC lowering requires an HCU target")
 
-        if self.is_blockscaled:
-            return self._lower_blockscaled(layout_map, target, thread_bounds, thread_var)
-
         thread_nums = int(thread_bounds.extent)
         meta = _resolve_hcu_mls_meta(self.gemm_node, self.A, self.B, thread_nums, target)
         a_from_mls = int(meta.a_from_mls)
@@ -954,3 +957,22 @@ class GemmHCUMMAC(GemmBase):
 
     def is_gemm_rr(self) -> bool:
         return is_fragment(self.A) and is_fragment(self.B)
+
+
+class GemmHCUMMACBlockScaled(GemmBlockScaledMixin, GemmHCUMMAC):
+    """HCU lowering for the official ``GemmBlockScaledNode`` contract."""
+
+    def lower(
+        self,
+        layout_map: dict,
+        target: Target,
+        thread_bounds: Range,
+        thread_var: tirx.Var,
+        mbar_phase_expr: tirx.PrimExpr | None = None,
+    ):
+        _ = mbar_phase_expr
+        if not target_is_hcu(target):
+            raise ValueError("GemmHCUMMACBlockScaled lowering requires an HCU target")
+        if not arith.Analyzer().can_prove_equal(self.sf_k_start, 0):
+            raise ValueError("HCU gemm_blockscaled currently supports only k_start=0")
+        return self._lower_blockscaled(layout_map, target, thread_bounds, thread_var)

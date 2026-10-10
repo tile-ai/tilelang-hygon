@@ -4,7 +4,7 @@ from tvm import IRModule, s_tir, tirx
 from tvm.target import Target
 
 import tilelang
-from tilelang.backend.pass_pipeline import PassPipeline, register_pipeline
+from tilelang.backend.pass_pipeline import PassPipeline
 from tilelang.backend.pass_pipeline.pipeline_utils import (
     LayoutVisual,
     allow_vectorize,
@@ -17,7 +17,12 @@ from tilelang.backend.pass_pipeline.pipeline_utils import (
 
 def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tirx.transform.BindTarget(target)(mod)
-    mod = tilelang.transform.MaterializeKernelLaunch()(mod)
+    mod = tilelang.transform.MaterializeKernelLaunch(
+        lower_grid_binding=True,
+        lower_thread_binding=True,
+        default_threads=128,
+        unsupported_annotations=["cluster_dims"],
+    )(mod)
     pass_ctx = tilelang.transform.get_pass_context()
 
     if should_force_let_inline():
@@ -28,23 +33,27 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.VerifyParallelLoop()(mod)
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
-    mod = tilelang.transform.AnnotateMlsGemmDep()(mod)
-    mod = tilelang.transform.AnnotateScaleGemmDep()(mod)
-    mod = tilelang.transform.LayoutReducer()(mod)
+    mod = tilelang.transform.CanonicalizeLegacyReducer()(mod)
+    mod = tilelang.transform.VerifyReducerEpoch()(mod)
+    mod = tilelang.transform.VerifyBufferInit()(mod)
+    mod = tilelang.hcu.transform.AnnotateMlsGemmDep()(mod)
+    mod = tilelang.hcu.transform.AnnotateScaleGemmDep()(mod)
 
     mod = tilelang.transform.IfStmtBinding()(mod)
     mod = tilelang.transform.PipelinePlanning()(mod)
-    mod = tilelang.transform.MaterializeHcuGemmLdsStrategy()(mod)
+    mod = tilelang.hcu.transform.MaterializeHcuGemmLdsStrategy()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)
     mod = tilelang.transform.Simplify()(mod)
     # MatrixLoad producers use the pipeline async-group path. Keep the legacy
     # MLS waitcnt planner disabled while this path owns commit/wait placement.
-    mod = tilelang.transform.InsertScaleBufferSync()(mod)
+    mod = tilelang.hcu.transform.InsertScaleBufferSync()(mod)
 
     mod = tilelang.transform.LayoutInference()(mod)
+    mod = tilelang.transform.ReducerPlanAndMaterialize()(mod)
     LayoutVisual(mod)
-    mod = tilelang.transform.AllocateScaleBuffer()(mod)
+    mod = tilelang.hcu.transform.AllocateScaleBuffer()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
+    mod = tilelang.transform.VerifyReducerConsumed()(mod)
 
     mod = tilelang.transform.DecoupleTypeCast()(mod)
     mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
@@ -55,6 +64,7 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
     mod = tilelang.transform.HoistGlobalBufferAllocations()(mod)
+    mod = tilelang.hcu.transform.LowerHcuBlockAnnotations()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tirx.transform.NarrowDataType(32)(mod)
@@ -69,7 +79,7 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tirx.transform.Simplify()(mod)
     mod = tirx.transform.RemoveNoOp()(mod)
     mod = s_tir.transform.HoistIfThenElse()(mod)
-    mod = tilelang.transform.InjectHcuCopyIdxen()(mod)
+    mod = tilelang.hcu.transform.InjectHcuCopyIdxen()(mod)
 
     mod = tirx.transform.VerifyMemory()(mod)
     mod = tirx.transform.AnnotateEntryFunc()(mod)
@@ -78,25 +88,24 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.AnnotateDeviceRegions()(mod)
     mod = tilelang.transform.SplitHostDevice()(mod)
+    mod = tilelang.hcu.transform.MaterializeHcuDeviceAttrs()(mod)
     mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
-    mod = tilelang.transform.PrepareMlsSharedMemoryAllocation()(mod)
+    mod = tilelang.hcu.transform.PrepareMlsSharedMemoryAllocation()(mod)
 
     enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
     disable_reuse = should_disable_shared_memory_reuse(pass_ctx=pass_ctx)
     mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge, disable_reuse=disable_reuse)(mod)
 
-    mod = tilelang.transform.HoistMlsResource()(mod)
+    mod = tilelang.hcu.transform.HoistMlsResource()(mod)
     mod = tilelang.transform.ThreadSync("shared")(mod)
     mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
-    mod = tilelang.transform.ResolveHcuEBarrier()(mod)
+    mod = tilelang.hcu.transform.ResolveHcuEBarrier()(mod)
     mod = tilelang.transform.MergeIfStmt()(mod)
-    mod = tilelang.transform.LowerAndValidateHcuWdra()(mod)
+    mod = tilelang.hcu.transform.LowerAndValidateHcuWdra()(mod)
     mod = tilelang.transform.MakePackedAPI()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
     return mod
 
 
-hcu_pipeline = PassPipeline("hcu", HCUPassPipelineBody)
-
-register_pipeline(hcu_pipeline)
+HCU_PIPELINE = PassPipeline("hcu", HCUPassPipelineBody)

@@ -10,7 +10,7 @@ from perf.gemm.vanilla_gemm import get_best_vanilla_config
 from perf.gemm.persistent_gemm import get_best_persistent_config_v1
 from perf.utils.device import get_free_devices
 
-from tilelang.profiler import do_bench_cudagraph
+from tilelang.profiler import do_bench
 
 
 def normalize_dtype(dtype_str: str) -> str:
@@ -111,8 +111,8 @@ def main(
     # tilelang_latency = profiler.do_bench()
     # ref_latency = profiler.do_bench(ref_program)
 
-    tilelang_latency = do_bench_cudagraph(tilelang_run)
-    ref_latency = do_bench_cudagraph(ref_run)
+    tilelang_latency = do_bench(tilelang_run, backend="cudagraph")
+    ref_latency = do_bench(ref_run, backend="cudagraph")
 
     profiler.assert_allclose(layout_ref_program, atol=1e-2, rtol=1e-2)
     print("\n=== Benchmark Results ===")

@@ -13,12 +13,13 @@
  *   alignedRows = align8((shape[-2] * shape[-1] + 15) / 16)
  */
 
+#include "hcu/op/builtin.h"
 #include "hcu/op/copy_scale.h"
 #include "hcu/op/gemm_partition.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/scale_gemm_dep.h"
-#include "op/builtin.h"
 #include "op/gemm.h"
+#include "op/gemm_blockscaled.h"
 #include "op/operator.h"
 
 #include <tvm/ir/transform.h>
@@ -170,8 +171,8 @@ private:
     MergePlan(plan);
   }
 
-  void RecordFromGemm(const GemmNode *gemm, const Map<String, ObjectRef> &ann,
-                      bool is_a) {
+  void RecordFromGemm(const GemmBlockScaledNode *gemm,
+                      const Map<String, ObjectRef> &ann, bool is_a) {
     BufferRegion region = is_a ? gemm->sfaRegion_ : gemm->sfbRegion_;
     if (!region.defined()) {
       return;
@@ -179,13 +180,15 @@ private:
     ScaleBufferPlan plan;
     plan.buffer = region->buffer;
     if (is_a) {
-      plan.granularity_mn = GetIntAnn(ann, "sf_a_granularity_m").value_or(1);
+      plan.granularity_mn =
+          GetIntAnn(ann, "tl.hcu.sf_a_granularity_m").value_or(1);
       plan.granularity_k = GetIntAnn(ann, "sf_a_granularity_k").value_or(1);
-      plan.scale_k_major = GetIntAnn(ann, "a_scale_k_major").value_or(0);
+      plan.scale_k_major = GetIntAnn(ann, "tl.hcu.a_scale_k_major").value_or(0);
     } else {
-      plan.granularity_mn = GetIntAnn(ann, "sf_b_granularity_n").value_or(1);
+      plan.granularity_mn =
+          GetIntAnn(ann, "tl.hcu.sf_b_granularity_n").value_or(1);
       plan.granularity_k = GetIntAnn(ann, "sf_b_granularity_k").value_or(1);
-      plan.scale_k_major = GetIntAnn(ann, "b_scale_k_major").value_or(0);
+      plan.scale_k_major = GetIntAnn(ann, "tl.hcu.b_scale_k_major").value_or(0);
     }
     auto shape = ParseScaleShape(plan.buffer, plan.scale_k_major);
     plan.scale_shape_mn = shape.first;
@@ -240,9 +243,9 @@ private:
           auto cs =
               Downcast<CopyScale>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
           RecordFromCopyScale(cs.get(), call->annotations);
-        } else if (tir_op == Gemm::Get()) {
-          auto gemm =
-              Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
+        } else if (tir_op == GemmBlockScaled::Get()) {
+          auto gemm = Downcast<GemmBlockScaled>(
+              ParseOperator(tvm::ffi::GetRef<Call>(call)));
           RecordFromGemm(gemm.get(), gemm->annotations_, true);
           RecordFromGemm(gemm.get(), gemm->annotations_, false);
         }
@@ -293,9 +296,9 @@ private:
           auto cs =
               Downcast<CopyScale>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
           MaybeAdd(cs->dst);
-        } else if (tir_op == Gemm::Get()) {
-          auto gemm =
-              Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
+        } else if (tir_op == GemmBlockScaled::Get()) {
+          auto gemm = Downcast<GemmBlockScaled>(
+              ParseOperator(tvm::ffi::GetRef<Call>(call)));
           if (gemm->sfaRegion_.defined()) {
             MaybeAdd(gemm->sfaRegion_->buffer);
           }
@@ -356,9 +359,9 @@ private:
           ++stmt_index_;
           return;
         }
-        if (tir_op == Gemm::Get()) {
-          auto gemm =
-              Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
+        if (tir_op == GemmBlockScaled::Get()) {
+          auto gemm = Downcast<GemmBlockScaled>(
+              ParseOperator(tvm::ffi::GetRef<Call>(call)));
           if (gemm->sfaRegion_.defined() && gemm->sfbRegion_.defined()) {
             TouchRead(gemm->sfaRegion_->buffer);
             TouchRead(gemm->sfbRegion_->buffer);
@@ -618,8 +621,13 @@ public:
         << slots << " rows=" << max_end_row;
 
     AllocateScaleBufferMutator mutator(start_rows);
-    f.CopyOnWrite()->body = mutator(f->body);
-    return WithAttr(std::move(f), attr::kHcuScaleBufferSize, Integer(slots));
+    Stmt body = mutator(f->body);
+    // Carry the HCU-only value inside the device body. AnnotateDeviceRegions
+    // will enclose this marker, so the backend-neutral SplitHostDevice moves
+    // it with the device region without knowing its meaning.
+    f.CopyOnWrite()->body = AttrStmt(Integer(0), attr::kHcuScaleBufferSize,
+                                     Integer(slots), std::move(body));
+    return f;
   }
 
 private:
@@ -652,7 +660,7 @@ private:
     if (const auto *call = op->value.as<CallNode>()) {
       if (call->op.as<OpNode>()) {
         Op tir_op = Downcast<Op>(call->op);
-        if (tir_op == CopyScale::Get() || tir_op == Gemm::Get()) {
+        if (tir_op == CopyScale::Get() || tir_op == GemmBlockScaled::Get()) {
           auto annotations = call->annotations;
           bool changed = false;
           for (const auto &kv : call->annotations) {
@@ -671,8 +679,8 @@ private:
               changed = true;
             }
           } else {
-            auto gemm =
-                Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
+            auto gemm = Downcast<GemmBlockScaled>(
+                ParseOperator(tvm::ffi::GetRef<Call>(call)));
             if (gemm->sfaRegion_.defined()) {
               if (auto start = LookupStartRow(gemm->sfaRegion_->buffer)) {
                 annotations.Set(attr::kScaleARowBase, start.value());

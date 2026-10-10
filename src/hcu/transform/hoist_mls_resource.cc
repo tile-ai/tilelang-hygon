@@ -45,9 +45,9 @@
 #include <utility>
 #include <vector>
 
+#include "hcu/op/builtin.h"
 #include "hcu/utils/extern_call_checker.h"
 #include "hcu/utils/mls_boundary.h"
-#include "op/builtin.h"
 
 namespace tvm {
 namespace tl {
@@ -616,11 +616,11 @@ bool ExprUsesWarpRolePred(const PrimExpr &expr) {
     if (call == nullptr) {
       return;
     }
-    if (call->op.same_as(get_warp_idx()) ||
-        call->op.same_as(get_warp_idx_sync()) ||
+    if (call->op.same_as(hcu_get_wave_idx()) ||
+        call->op.same_as(hcu_get_wave_idx_sync()) ||
         call->op.same_as(get_wave_id()) ||
-        call->op.same_as(get_warp_group_idx()) ||
-        call->op.same_as(get_lane_idx())) {
+        call->op.same_as(hcu_get_wave_group_idx()) ||
+        call->op.same_as(hcu_get_lane_idx())) {
       found = true;
     }
   });
@@ -1019,7 +1019,8 @@ public:
       }
       Array<PrimExpr> args(call->args.begin(), call->args.end());
       args.Set(0, StringImm(specialized));
-      return Evaluate(Call(op->value.dtype(), call->op, args));
+      return Evaluate(Call(op->value.dtype(), call->op, args, call->annotations,
+                           call->span));
     }
 
     const std::string &obj_name = it->second;

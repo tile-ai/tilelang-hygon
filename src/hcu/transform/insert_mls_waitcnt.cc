@@ -37,11 +37,12 @@
 #include <utility>
 #include <vector>
 
+#include "hcu/op/builtin.h"
 #include "hcu/op/ds_read_format.h"
 #include "hcu/op/mls.h"
 #include "hcu/utils/mls_gemm_dep.h"
-#include "op/builtin.h"
 #include "op/gemm.h"
+#include "op/gemm_blockscaled.h"
 #include "op/operator.h"
 #include "op/utils.h"
 #include "transform/common/constr_visitor.h"
@@ -92,10 +93,11 @@ bool UsesThreadOrWavePartition(
       return;
     }
     if (const auto *call = node.as<CallNode>()) {
-      if (call->op.same_as(get_wave_id()) || call->op.same_as(get_warp_idx()) ||
-          call->op.same_as(get_warp_idx_sync()) ||
-          call->op.same_as(get_lane_idx()) ||
-          call->op.same_as(get_warp_group_idx())) {
+      if (call->op.same_as(get_wave_id()) ||
+          call->op.same_as(hcu_get_wave_idx()) ||
+          call->op.same_as(hcu_get_wave_idx_sync()) ||
+          call->op.same_as(hcu_get_lane_idx()) ||
+          call->op.same_as(hcu_get_wave_group_idx())) {
         found = true;
       }
     }
@@ -445,9 +447,7 @@ private:
   bool EventsCompatible(const TimelineEvent &lhs,
                         const TimelineEvent &rhs) const {
     arith::Analyzer analyzer;
-    ConstrSet combined;
-    combined.Extend(lhs.cset);
-    combined.Extend(rhs.cset);
+    ConstrSet combined = lhs.cset.Merge(rhs.cset);
     combined.Populate(analyzer);
     PrimExpr conj =
         tirx::And(lhs.cset.ToConjunction(), rhs.cset.ToConjunction());
@@ -705,7 +705,7 @@ private:
         auto ds =
             Downcast<DsReadFormat>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
         PushConsumer(op, {SharedRegion{ds->src, ds->src_ranges}});
-      } else if (tir_op == Gemm::Get()) {
+      } else if (tir_op == Gemm::Get() || tir_op == GemmBlockScaled::Get()) {
         auto gemm = Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
         const bool a_from_mls =
             AnnotationIsTrue(call->annotations, attr::kHcuAFromMls);

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-import tilelang.language as T
+import tilelang.language.common as T
 from tilelang.layout import Fragment
 from tvm import DataType
 from tvm.runtime import convert

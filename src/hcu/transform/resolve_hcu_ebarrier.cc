@@ -6,9 +6,9 @@
  * \brief Resolve deferred HCU AllReduce barrier policies.
  */
 #include "arith/ir_mutator_with_analyzer.h"
+#include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/auto_ebarrier.h"
-#include "op/builtin.h"
 #include "transform/common/thread_sync_types.h"
 
 #include <tvm/ffi/reflection/registry.h>

@@ -17,6 +17,7 @@
 """Utility for ROCm backend"""
 
 # ruff: noqa
+import logging
 import re
 import shutil
 import subprocess
@@ -30,7 +31,7 @@ import tvm.target
 
 from tvm.contrib import utils
 
-from tilelang.env import get_hip_compiler
+logger = logging.getLogger(__name__)
 
 
 def find_lld(required=True):
@@ -58,8 +59,7 @@ def find_lld(required=True):
         lld_list += [f"ld.lld-{major}.0"]
         lld_list += [f"ld.lld-{major}"]
     lld_list += ["ld.lld"]
-    _lld_basenames = list(lld_list)
-    lld_list += [os.path.join(get_rocm_llvm_bin_dir(), x) for x in _lld_basenames]
+    lld_list += [f"/opt/rocm/llvm/bin/{x}" for x in lld_list]
     valid_list = [utils.which(x) for x in lld_list]
     valid_list = [x for x in valid_list if x]
     if not valid_list and required:
@@ -246,12 +246,8 @@ def get_rocm_arch(rocm_path="/opt/rocm"):
         The AMD GPU architecture
     """
     gpu_arch = "gfx900"
-    # check if rocm is installed (path exists and rocminfo is present)
-    rocm_valid = os.path.exists(rocm_path) and os.path.exists(os.path.join(rocm_path, "bin", "rocminfo"))
-    if not rocm_valid and os.environ.get("ROCM_PATH"):
-        rocm_path = os.environ["ROCM_PATH"]
-        rocm_valid = os.path.exists(rocm_path) and os.path.exists(os.path.join(rocm_path, "bin", "rocminfo"))
-    if not rocm_valid:
+    # check if rocm is installed
+    if not os.path.exists(rocm_path):
         print("ROCm not detected, using default gfx900")
         return gpu_arch
     try:
@@ -272,6 +268,81 @@ def get_rocm_arch(rocm_path="/opt/rocm"):
         return gpu_arch
 
 
+# Well-known ROCm install prefix used as the last-resort hipcc candidate.
+# Module-level so tests can point it at a scratch toolchain.
+DEFAULT_ROCM_PATH = "/opt/rocm"
+
+
+def _hipcc_toolchain_prefix(hipcc_path):
+    """Return the toolchain prefix a hipcc binary belongs to ({prefix}/bin/hipcc)."""
+    return os.path.dirname(os.path.dirname(os.path.realpath(hipcc_path)))
+
+
+def _hip_headers_exist(prefix):
+    """Whether a toolchain prefix carries the public HIP headers."""
+    return exists(join(prefix, "include", "hip", "hip_runtime.h"))
+
+
+def _which_all(cmd):
+    """All resolutions of ``cmd`` across PATH entries, in PATH order."""
+    results = []
+    for path_dir in os.environ.get("PATH", "").split(os.pathsep):
+        if not path_dir:
+            continue
+        found = shutil.which(cmd, path=path_dir)
+        if found:
+            results.append(found)
+    return results
+
+
+_warned_incomplete_hipcc = set()
+
+
+def find_hipcc():
+    """Resolve the hipcc executable to invoke for JIT compilation.
+
+    Resolution order:
+        1. ``$ROCM_PATH/bin/hipcc`` -- an explicit ROCM_PATH is honored as-is.
+        2. every ``hipcc`` on PATH, in PATH order.
+        3. ``/opt/rocm/bin/hipcc``.
+
+    Candidates from 2 and 3 are only accepted when their toolchain prefix
+    carries the public HIP headers (``include/hip/hip_runtime.h``). Partial
+    toolchains without headers exist in the wild (e.g. the preview compiler
+    that some ROCm 7 installs prepend to PATH) and fail on any TileLang
+    kernel; skipping them lets a complete sibling install win. If no
+    candidate validates, the first existing one is returned so the compiler
+    can report its own error.
+
+    Returns
+    -------
+    path : str
+        Path to the hipcc executable.
+    """
+    rocm_path = os.environ.get("ROCM_PATH")
+    if rocm_path:
+        explicit = join(rocm_path, "bin", "hipcc")
+        if exists(explicit):
+            return explicit
+
+    candidates = _which_all("hipcc") + [join(DEFAULT_ROCM_PATH, "bin", "hipcc")]
+    candidates = [c for c in dict.fromkeys(candidates) if exists(c)]
+    for candidate in candidates:
+        prefix = _hipcc_toolchain_prefix(candidate)
+        if _hip_headers_exist(prefix):
+            return candidate
+        if candidate not in _warned_incomplete_hipcc:
+            _warned_incomplete_hipcc.add(candidate)
+            logger.warning(
+                "Skipping hipcc at %s: no HIP headers under %s (incomplete HIP toolchain); trying the next candidate. Set ROCM_PATH to override.",
+                candidate,
+                prefix,
+            )
+    if candidates:
+        return candidates[0]
+    raise RuntimeError("Cannot find hipcc. Install ROCm or set ROCM_PATH to a ROCm SDK containing bin/hipcc.")
+
+
 def find_rocm_path():
     """Utility function to find ROCm path
 
@@ -282,25 +353,12 @@ def find_rocm_path():
     """
     if "ROCM_PATH" in os.environ:
         return os.environ["ROCM_PATH"]
-    hip_exe = shutil.which(get_hip_compiler())
-    if hip_exe:
-        return os.path.realpath(os.path.join(hip_exe, "../.."))
-    rocm_path = "/opt/rocm"
-    if os.path.exists(os.path.join(rocm_path, "bin/hipcc")):
-        return rocm_path
+    try:
+        hipcc = find_hipcc()
+    except RuntimeError:
+        hipcc = None
+    if hipcc is not None:
+        return _hipcc_toolchain_prefix(hipcc)
+    if os.path.exists(os.path.join(DEFAULT_ROCM_PATH, "bin/hipcc")):
+        return DEFAULT_ROCM_PATH
     raise RuntimeError("Cannot find ROCm path")
-
-
-def get_rocm_llvm_bin_dir() -> str:
-    """Directory containing ``ld.lld`` under the ROCm root.
-
-    Respects ``ROCM_PATH`` / ``ROCM_HOME`` when set.
-    """
-    if "ROCM_PATH" in os.environ:
-        rocm = os.environ["ROCM_PATH"]
-    else:
-        try:
-            rocm = find_rocm_path()
-        except RuntimeError:
-            rocm = "/opt/rocm"
-    return os.path.join(rocm, "llvm", "bin")

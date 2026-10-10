@@ -16,13 +16,30 @@ logger = logging.getLogger(__name__)
 EnvVarDefault = str | None | Callable[[], str | None]
 TargetConfig = dict[str, object]
 
+
+def parse_pass_profile_threshold_ms(value: object, name: str = "pass profile threshold") -> float:
+    """Parse a finite, non-negative pass profile threshold in milliseconds."""
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite non-negative number") from exc
+    if not math.isfinite(threshold) or threshold < 0:
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return threshold
+
+
+def resolve_pass_profile_threshold_ms(pass_configs: Mapping[object, object], key: object, env_threshold_ms: Callable[[], float]) -> float:
+    """Resolve pass profile threshold with an explicit pass config taking precedence."""
+    if key in pass_configs:
+        return parse_pass_profile_threshold_ms(pass_configs[key], str(key))
+    return env_threshold_ms()
+
+
 # SETUP ENVIRONMENT VARIABLES
-CUTLASS_NOT_FOUND_MESSAGE = (
-    "CUTLASS is not installed or found in the expected path, which may lead to compilation bugs when utilize tilelang backend."
-)
-TL_TEMPLATE_NOT_FOUND_MESSAGE = (
-    "TileLang is not installed or found in the expected path, which may lead to compilation bugs when utilize tilelang backend."
-)
+CUTLASS_NOT_FOUND_MESSAGE = "CUTLASS is not installed or found in the expected path"
+", which may lead to compilation bugs when utilize tilelang backend."
+TL_TEMPLATE_NOT_FOUND_MESSAGE = "TileLang is not installed or found in the expected path"
+", which may lead to compilation bugs when utilize tilelang backend."
 TVM_LIBRARY_NOT_FOUND_MESSAGE = "TVM is not installed or found in the expected path"
 
 TL_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -130,16 +147,26 @@ def _find_cuda_home() -> str:
         # Guess #2
         nvcc_path = shutil.which("nvcc")
         if nvcc_path is not None:
-            # Standard CUDA pattern
-            if "cuda" in nvcc_path.lower():
-                cuda_home = os.path.dirname(os.path.dirname(nvcc_path))
-            # NVIDIA HPC SDK pattern
-            elif "hpc_sdk" in nvcc_path.lower():
-                # Navigate to the root directory of nvhpc
-                cuda_home = os.path.dirname(os.path.dirname(os.path.dirname(nvcc_path)))
-            # Generic fallback for non-standard or symlinked installs
+
+            def cuda_home_from_nvcc(path: str) -> str:
+                # NVIDIA HPC SDK keeps nvcc an extra level down (e.g.
+                # .../hpc_sdk/Linux_x86_64/25.7/compilers/bin/nvcc), so step up
+                # three levels to reach the SDK root. Its bundled toolkit
+                # (.../25.7/cuda/12.9/bin/nvcc) instead follows the standard
+                # <cuda_home>/bin/nvcc layout, hence the "cuda" exclusion.
+                if "hpc_sdk" in path.lower() and "cuda" not in path.lower():
+                    return os.path.dirname(os.path.dirname(os.path.dirname(path)))
+                return os.path.dirname(os.path.dirname(path))
+
+            visible_cuda_home = cuda_home_from_nvcc(nvcc_path)
+            # Keep a composed toolkit prefix when it supplies the headers and
+            # libraries around a compiler symlink. Pip CUDA shims instead
+            # resolve into the package root, because their visible prefix does
+            # not contain a usable toolkit.
+            if os.path.exists(os.path.join(visible_cuda_home, "include", "cuda_runtime.h")):
+                cuda_home = visible_cuda_home
             else:
-                cuda_home = os.path.dirname(os.path.dirname(nvcc_path))
+                cuda_home = cuda_home_from_nvcc(os.path.realpath(nvcc_path))
 
         elif _get_package_version("nvidia-cuda-nvcc") is not None:
             # Guess #3
@@ -171,24 +198,19 @@ def _find_cuda_home() -> str:
     return cuda_home if cuda_home is not None else ""
 
 
-def get_hip_compiler() -> str:
-    """Resolve the HIP compiler executable name for this process.
-
-    Prefer ``aicc`` when it is on PATH (hipcc-compatible toolchain, e.g. HCU);
-    otherwise use ``hipcc``. Call sites should use this instead of hardcoding
-    ``\"hipcc\"`` so ROCm/HCU builds stay consistent.
-    """
-    return "aicc" if shutil.which("aicc") else "hipcc"
-
-
 def _find_rocm_home() -> str:
     """Find the ROCM install path."""
     rocm_home = os.environ.get("ROCM_PATH") or os.environ.get("ROCM_HOME")
     if rocm_home is None:
-        rocmcc_path = shutil.which(get_hip_compiler())
+        rocmcc_path = shutil.which("hipcc")
         if rocmcc_path is not None:
-            rocm_home = os.path.dirname(os.path.dirname(rocmcc_path))
-        else:
+            candidate = os.path.dirname(os.path.dirname(os.path.realpath(rocmcc_path)))
+            # Only trust a PATH-derived prefix when it carries the public HIP
+            # headers; partial toolchains without them exist in the wild (e.g.
+            # the preview compiler some ROCm 7 installs prepend to PATH).
+            if os.path.exists(os.path.join(candidate, "include", "hip", "hip_runtime.h")):
+                rocm_home = candidate
+        if rocm_home is None:
             rocm_home = "/opt/rocm"
             if not os.path.exists(rocm_home):
                 rocm_home = None
@@ -354,10 +376,11 @@ class Environment:
     TILELANG_KERNEL_CACHE_USE_LIB_STAMP = EnvVar(
         "TILELANG_KERNEL_CACHE_USE_LIB_STAMP", "0"
     )  # include native TileLang library content hash in kernel cache keys
-    # Replace the emitted HCU device translation unit from disk before offload compilation.
+    # HCU source-replacement and dump controls used by the device compiler and
+    # disk-cache diagnostics.  Keep them centralized with the official env
+    # facade so cache operations do not depend on ad-hoc os.environ reads.
     TILELANG_OVERRIDE_DEVICE_SOURCE = EnvVar("TILELANG_OVERRIDE_DEVICE_SOURCE", None)
     TILELANG_OVERRIDE_DEVICE_SOURCE_DIR = EnvVar("TILELANG_OVERRIDE_DEVICE_SOURCE_DIR", None)
-    # When saving kernel disk cache (HCU/ROCm): run hip compiler (aicc if on PATH, else hipcc) for .asm / LLVM IR / TIR.
     TILELANG_KERNEL_DUMP = EnvVar("TILELANG_KERNEL_DUMP", "0")
     TILELANG_CLEANUP_TEMP_FILES = EnvVar(
         "TILELANG_CLEANUP_TEMP_FILES", "1"
@@ -370,6 +393,19 @@ class Environment:
     TILELANG_PASS_DIFF = EnvVar("TILELANG_PASS_DIFF", "0")  # "0"=off, "terminal", "html", "both"
     TILELANG_PASS_DIFF_OUTPUT = EnvVar("TILELANG_PASS_DIFF_OUTPUT", "tmp/pass_diff_output")  # output directory for HTML reports
 
+    # Lower trace debugging
+    TL_LOWER_TRACE = EnvVar("TL_LOWER_TRACE", "0")  # "0"=off, "1"/"on"->html, "terminal", "html", "both"
+    TL_LOWER_TRACE_DIR = EnvVar(
+        "TL_LOWER_TRACE_DIR", lambda: os.path.join(".", "tmp", "lower_trace_dir")
+    )  # base output dir for trace artifacts
+
+    # Pass timing / profiling
+    TILELANG_PASS_PROFILE = EnvVar("TILELANG_PASS_PROFILE", "0")  # "0"=off, "1"/"true"=on
+    TILELANG_PASS_PROFILE_THRESHOLD_MS = EnvVar("TILELANG_PASS_PROFILE_THRESHOLD_MS", "0")  # 0=show all
+
+    # Source span injection into tirx IR (error locations / LSP / visualization)
+    TILELANG_ENABLE_IR_SPAN = EnvVar("TILELANG_ENABLE_IR_SPAN", "1")  # "1"=on (default), "0"=off
+
     # Auto-tuning settings
     TILELANG_AUTO_TUNING_DISABLE_CACHE = EnvVar("TILELANG_AUTO_TUNING_DISABLE_CACHE", "0")
     TILELANG_AUTO_TUNING_CPU_UTILITIES = EnvVar("TILELANG_AUTO_TUNING_CPU_UTILITIES", "0.9")  # percent of CPUs used
@@ -381,6 +417,9 @@ class Environment:
     TILELANG_DEFAULT_TARGET = EnvVar("TILELANG_DEFAULT_TARGET", "auto")
     TILELANG_DEFAULT_EXECUTION_BACKEND = EnvVar("TILELANG_EXECUTION_BACKEND", "auto")
     TILELANG_DEFAULT_VERBOSE = EnvVar("TILELANG_VERBOSE", "0")
+    TILELANG_LAYOUT_COST_MODEL = EnvVar(
+        "TILELANG_LAYOUT_COST_MODEL", None
+    )  # default for the `tl.layout_cost_model` pass config; unset keeps the built-in default
 
     # TVM integration
     SKIP_LOADING_TILELANG_SO = EnvVar("SKIP_LOADING_TILELANG_SO", "0")
@@ -427,6 +466,15 @@ class Environment:
     def is_jit_diagnostics_enabled(self) -> bool:
         return str(self.TILELANG_JIT_DIAGNOSTICS).lower() in ("1", "true", "yes", "on")
 
+    def is_pass_profile_enabled(self) -> bool:
+        return str(self.TILELANG_PASS_PROFILE).strip().lower() in ("1", "true", "yes", "on")
+
+    def get_pass_profile_threshold_ms(self) -> float:
+        value = str(self.TILELANG_PASS_PROFILE_THRESHOLD_MS).strip()
+        if not value:
+            return 0.0
+        return parse_pass_profile_threshold_ms(value, "TILELANG_PASS_PROFILE_THRESHOLD_MS")
+
     def get_compile_timeout_seconds(self) -> float | None:
         value = str(self.TILELANG_COMPILE_TIMEOUT_SECONDS).strip()
         if not value:
@@ -450,6 +498,22 @@ class Environment:
             return value
         return "terminal"  # fallback for unrecognized truthy values
 
+    def get_lower_trace_mode(self) -> str | None:
+        """Return the lower trace mode: None (off), 'terminal', 'html', or 'both'."""
+        value = str(self.TL_LOWER_TRACE).lower().strip()
+        if value in ("0", "false", "no", "off", ""):
+            return None
+        if value in ("1", "true", "yes", "on", "html"):
+            return "html"
+        if value in ("terminal", "both"):
+            return value
+        return "html"  # fallback for unrecognized truthy values
+
+    def get_lower_trace_dir(self) -> str:
+        """Return the base output directory for lower trace artifacts."""
+        value = str(self.TL_LOWER_TRACE_DIR).strip()
+        return value or os.path.join(".", "tmp", "lower_trace_dir")
+
     def get_default_target(self) -> str | TargetConfig:
         """Get default compilation target from environment."""
         target = self.TILELANG_DEFAULT_TARGET
@@ -469,6 +533,16 @@ class Environment:
         """Get default verbose flag from environment."""
         return self.TILELANG_DEFAULT_VERBOSE.lower() in ("1", "true", "yes", "on")
 
+    def get_default_layout_cost_model(self) -> str | None:
+        """Default for the `tl.layout_cost_model` pass config, or None when
+        unset (the compiler then falls back to its built-in default). An
+        explicit `pass_configs` entry always takes precedence over this."""
+        value = self.TILELANG_LAYOUT_COST_MODEL
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
+
     def is_running_autodd(self) -> bool:
         """Return True if we are running under `python -m tilelang.autodd`."""
         # means we are running under `python -m tilelang.autodd`
@@ -479,6 +553,9 @@ class Environment:
         # means we are running under `python -m tilelang.autodd` or some
         # other scripts that only require the minimal environment variables.
         return self.is_running_autodd()
+
+    def is_span_enable(self) -> bool:
+        return self.TILELANG_ENABLE_IR_SPAN.lower() in ("1", "true", "yes", "on")
 
 
 # Instantiate as a global configuration object
@@ -515,14 +592,12 @@ def get_cuda_dll_search_dirs() -> list[str]:
     return [os.path.abspath(p) for p in cands if os.path.isdir(p)]
 
 
-def get_windows_runtime_dll_dirs() -> list[str]:
-    """Return Windows-only DLL directories shipped with sibling Python packages.
+def get_runtime_library_dirs() -> list[str]:
+    """Return library directories shipped with sibling Python packages.
 
-    Currently locates ``tvm_ffi`` and ``z3`` install dirs so their DLLs resolve
+    Currently locates ``tvm_ffi`` and ``z3`` install dirs so their libraries resolve
     when TileLang is imported. Each lookup is best-effort; failures are ignored.
     """
-    if not sys.platform.startswith("win32"):
-        return []
     dirs: list[str] = []
     try:
         from tvm_ffi import libinfo as tvm_ffi_libinfo

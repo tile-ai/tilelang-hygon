@@ -1,6 +1,6 @@
 # ruff: noqa
 import torch
-from tilelang.profiler import do_bench_cudagraph
+from tilelang.profiler import do_bench
 from perf.sparse_mla.sparse_mla_fwd import tilelang_sparse_fwd, ref_sparse_mla_fwd_interface
 
 
@@ -43,7 +43,7 @@ def test_sparse_mla_fwd(
     def fn():
         return tilelang_sparse_fwd(q, kv, indices, sm_scale, d_v=DV)
 
-    ms = do_bench_cudagraph(fn)
+    ms = do_bench(fn, backend="cudagraph")
     print(f"{B=} {S=} {SKV=} {H=} {HKV=} {q_start_s_index=} {topk=} {dtype=}")
     print(f"Average time: {ms:.3f} ms")
     print(f"fwd io bandwidth = {(B * S * DQK * topk * 2) / (ms * 1e-3) / 1e9} GB/s")
