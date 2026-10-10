@@ -724,6 +724,82 @@ public:
     }
   }
 
+  /*!
+   * \brief Whether a stage only loads shared memory into registers.
+   *
+   * Shared→Register copies (and ds_read_format) belong to the compute stage,
+   * not to the prefetch stage that a Global→Shared copy opens.
+   */
+  static bool IsSharedToRegisterStage(const PipelineStageInfo &pinfo) {
+    if (pinfo.IsCopyStage() || pinfo.writes.empty()) {
+      return false;
+    }
+    bool reads_shared = false;
+    for (const BufferRegion &read : pinfo.reads) {
+      if (IsSharedBuffer(read->buffer)) {
+        reads_shared = true;
+        break;
+      }
+    }
+    if (!reads_shared) {
+      return false;
+    }
+    for (const BufferRegion &write : pinfo.writes) {
+      if (!(IsFragmentBuffer(write->buffer) || IsLocalBuffer(write->buffer))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /*!
+   * \brief Move a Global→Shared copy's last use past the Shared→Register loads
+   * it feeds.
+   *
+   * Shared-memory software pipeline should only prefetch Global→Shared copies.
+   * Shared→register copies (and ds_read_format) are part of the compute stage;
+   * if they remain the G2S last-use, InjectSoftwarePipeline emits
+   * S2R / G2S / S2R / G2S / MMA instead of G2S then S2R+MMA.
+   */
+  void ExtendCopyLastUseThroughRegisterLoads(
+      std::vector<PipelineStageInfo> *pipeline_stage_infos) const {
+    auto last_reader_index = [&](const PipelineStageInfo &producer) -> int {
+      int last = -1;
+      for (int i = producer.original_stmt_index + 1;
+           i < static_cast<int>(pipeline_stage_infos->size()); ++i) {
+        for (const BufferRegion &read : (*pipeline_stage_infos)[i].reads) {
+          if (std::find_if(producer.writes.begin(), producer.writes.end(),
+                           [&](const BufferRegion &write) {
+                             return write->buffer == read->buffer &&
+                                    MayConflict(write->region, read->region);
+                           }) != producer.writes.end()) {
+            last = i;
+          }
+        }
+      }
+      return last;
+    };
+
+    for (auto &pinfo : *pipeline_stage_infos) {
+      if (!pinfo.IsCopyStage() || !pinfo.IsLastUseStmtIndexValid()) {
+        continue;
+      }
+      int consumer = pinfo.last_use_stmt_index;
+      std::unordered_set<int> seen;
+      while (consumer >= 0 &&
+             consumer < static_cast<int>(pipeline_stage_infos->size()) &&
+             seen.insert(consumer).second &&
+             IsSharedToRegisterStage((*pipeline_stage_infos)[consumer])) {
+        int next = last_reader_index((*pipeline_stage_infos)[consumer]);
+        if (next < 0) {
+          break;
+        }
+        consumer = next;
+      }
+      pinfo.last_use_stmt_index = consumer;
+    }
+  }
+
   void PropagateBufferProducersForCopy(
       std::vector<PipelineStageInfo> *pipeline_stage_infos) const {
     struct CopyStageDependencyReadsManager {
@@ -1072,6 +1148,21 @@ private:
   PipelinePlanner() = default;
   PipelinePlanner(bool use_async_copy) : use_async_copy_(use_async_copy) {}
 
+  // Whether the loop runs a register pipeline.
+  static bool RegisterPipelineEnabled(const ForNode *loop) {
+    if (auto reg_anno = loop->annotations.Get(kNumRegisterStages)) {
+      if (const auto *imm = reg_anno.value().as<IntImmNode>()) {
+        return imm->value > 1;
+      }
+    }
+    if (auto en_anno = loop->annotations.Get(kEnableRegisterPipeline)) {
+      if (const auto *imm = en_anno.value().as<IntImmNode>()) {
+        return imm->value != 0;
+      }
+    }
+    return false;
+  }
+
   PipelineStageAnalyzer MakeStageAnalyzer() const {
     return PipelineStageAnalyzer(buffer_data_to_buffer_, target_,
                                  use_async_copy_);
@@ -1080,6 +1171,12 @@ private:
   void AnalyzeCopyLastUse(
       std::vector<PipelineStageInfo> *pipeline_stage_infos) const {
     MakeStageAnalyzer().AnalyzeCopyLastUse(pipeline_stage_infos);
+  }
+
+  void ExtendCopyLastUseThroughRegisterLoads(
+      std::vector<PipelineStageInfo> *pipeline_stage_infos) const {
+    MakeStageAnalyzer().ExtendCopyLastUseThroughRegisterLoads(
+        pipeline_stage_infos);
   }
 
   void PropagateBufferProducersForCopy(
@@ -1265,7 +1362,11 @@ private:
     // identifies the index of the last statement that consumes data produced by
     // copy stages, enabling optimal placement of copy operations in the
     // pipeline schedule.
+    const bool register_pipeline_enabled = RegisterPipelineEnabled(loop);
     AnalyzeCopyLastUse(&pipeline_stage_infos);
+    if (register_pipeline_enabled) {
+      ExtendCopyLastUseThroughRegisterLoads(&pipeline_stage_infos);
+    }
 
     PropagateScalarProducersForCopy(&pipeline_stage_infos);
 
@@ -1328,7 +1429,11 @@ private:
       for (auto &pinfo : pipeline_stage_infos) { // move copy to the beginning
         pinfo.order =
             (pinfo.order + copy_stage_at_end) % pipeline_stage_infos.size();
-        if (!pinfo.IsCopyStage() && !pinfo.IsProducerForCopy())
+        // Register pipeline: shared consumer is S2R, not MMA. Keep compute at
+        // num_stages so prologue prefetches num_stages global→shared tiles
+        // (InjectRegisterSoftwarePipeline uses max_stage as prologue length).
+        if (!pinfo.IsCopyStage() && !pinfo.IsProducerForCopy() &&
+            !register_pipeline_enabled)
           pinfo.stage--;
       }
     }

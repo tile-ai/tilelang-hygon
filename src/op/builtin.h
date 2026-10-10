@@ -47,6 +47,9 @@ static constexpr const char *kParallelAsyncWithoutAsyncCommitWait =
 // Value should be IntImm/Bool-like truthy scalar.
 static constexpr const char *kAsyncCopyNoImplicitCommitWait =
     "no_implicit_async_commit_wait";
+// Copy-op annotation for explicit async global->shared copy semantics
+// (T.async_copy / T.copy(..., enable_async=True)). Value is a truthy IntImm.
+static constexpr const char *kIsAsyncCopy = "is_async_copy";
 // Tile-op annotation key carrying an explicit mbarrier parity expression.
 // Pipeline transforms set this on ops whose lowering would otherwise infer
 // parity from surrounding loop context.
@@ -136,6 +139,8 @@ static constexpr const char *kPtxasRegisterUsageLevel =
 static constexpr const char *kZ3RLimit = "tl.z3_rlimit";
 static constexpr const char *kDisableVectorize256 = "tl.disable_vectorize_256";
 static constexpr const char *kEnableAsyncCopy = "tl.enable_async_copy";
+static constexpr const char *kPipelinedKUnrollFactor =
+    "tl.pipelined_k_unroll_factor";
 static constexpr const char *kEnableVectorizePlannerVerbose =
     "tl.enable_vectorize_planner_verbose";
 static constexpr const char *kDisableWGMMA = "tl.disable_wgmma";
@@ -579,6 +584,10 @@ TVM_DLL const Op &ds_read_vector();
  *
  */
 TVM_DLL const Op &async_gld_sld_fence();
+
+TVM_DLL const Op &async_gld_fence();
+
+TVM_DLL const Op &wave_barrier();
 
 /*!
  * \brief TileLang intrinsic for zeroing shared memory with st.bulk.

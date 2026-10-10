@@ -26,6 +26,47 @@ using namespace ffi;
 
 namespace {
 
+// Pipeline versioning keeps logical regions as [stage, ...spatial], while
+// LowerTileOp remaps fragments onto layout OutputShape (often dropping the
+// spatial rank). Offset the remapped buffer with an index vector that matches
+// its rank: leading extras from the region, remaining axes zero.
+PrimExpr LeadingPipelineElemOffset(const Buffer &buf,
+                                   const Array<Range> &ranges) {
+  const size_t region_rank = ranges.size();
+  const size_t buf_rank = buf->shape.size();
+  ICHECK_GE(region_rank, 2U);
+  ICHECK_GE(buf_rank, 1U);
+  Array<PrimExpr> indices;
+  indices.reserve(buf_rank);
+  const DataType idx_dtype = buf->DefaultIndexType();
+  const size_t extra = region_rank - 2;
+  if (buf_rank == region_rank) {
+    for (size_t i = 0; i + 2 < region_rank; ++i) {
+      indices.push_back(ranges[i]->min);
+    }
+    indices.push_back(make_zero(idx_dtype));
+    indices.push_back(make_zero(idx_dtype));
+  } else if (buf_rank < region_rank) {
+    const size_t n_lead = extra < buf_rank ? extra : buf_rank;
+    for (size_t i = 0; i < n_lead; ++i) {
+      indices.push_back(ranges[i]->min);
+    }
+    while (indices.size() < buf_rank) {
+      indices.push_back(make_zero(idx_dtype));
+    }
+  } else {
+    for (size_t i = 0; i + 2 < region_rank; ++i) {
+      indices.push_back(ranges[i]->min);
+    }
+    while (indices.size() < buf_rank) {
+      indices.push_back(make_zero(idx_dtype));
+    }
+  }
+  Array<PrimExpr> offs = buf.OffsetOf(indices);
+  ICHECK_EQ(offs.size(), 1u);
+  return offs[0];
+}
+
 // mls_ds_traits: (mls_tile_mn, mls_tile_k, trans, alt) -> (read_tile_mn,
 // read_tile_k).
 using MlsReadKey = std::tuple<int, int, bool, int>;
@@ -279,8 +320,7 @@ LayoutMap DsReadFormatNode::InferLayout(const LayoutInferArgs &T,
     result = InferLayoutWithGemmDep(this, gemm_dep_.get(), T);
   } else {
     const bool trans = true;
-    int64_t block_mn = *as_const_int(dst->shape[0]);
-    int64_t block_k = *as_const_int(dst->shape[1]);
+    auto [block_mn, block_k] = MlsBlockDims(dst, trans);
     int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
     DsReadMlsPhysicalInfo info =
         InferDsReadMlsPhysicalInfo(src, trans, block_size, T.target);
@@ -356,11 +396,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   int64_t read_mn = *read_mn_c;
   int64_t read_k = *read_k_c;
 
-  // Fragment / gemm tile must match the read extent.
-  int64_t frag_mn =
-      ds_trans ? *as_const_int(dst->shape[0]) : *as_const_int(dst->shape[1]);
-  int64_t frag_k =
-      ds_trans ? *as_const_int(dst->shape[1]) : *as_const_int(dst->shape[0]);
+  auto [frag_mn, frag_k] = MlsBlockDims(dst, ds_trans);
   ICHECK_EQ(frag_mn, read_mn)
       << "ds_read_format dst fragment MN must match src read extent MN, got "
       << frag_mn << " vs " << read_mn;
@@ -402,30 +438,26 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     ICHECK_GE(dr, 2U);
     PrimExpr src_leading_offset = IntImm(DataType::Int(32), 0);
     if (sr > 2) {
-      Array<PrimExpr> indices;
-      for (size_t i = 0; i + 2 < sr; ++i)
-        indices.push_back(src_ranges[i]->min);
-      indices.push_back(make_zero(src_buf->DefaultIndexType()));
-      indices.push_back(make_zero(src_buf->DefaultIndexType()));
-      src_leading_offset = src_buf.OffsetOf(indices)[0];
+      src_leading_offset = LeadingPipelineElemOffset(src_buf, src_ranges);
     }
     PrimExpr dst_leading_offset = IntImm(DataType::Int(32), 0);
     if (dr > 2) {
-      Array<PrimExpr> indices;
-      for (size_t i = 0; i + 2 < dr; ++i)
-        indices.push_back(dst_ranges[i]->min);
-      indices.push_back(make_zero(dst_buf->DefaultIndexType()));
-      indices.push_back(make_zero(dst_buf->DefaultIndexType()));
-      dst_leading_offset = dst_buf.OffsetOf(indices)[0];
+      dst_leading_offset = LeadingPipelineElemOffset(dst_buf, dst_ranges);
     }
 
     if (hcu_layout_ds_read_) {
+      // Software pipeline Expand()s a rank-2 [K,MN] layout with a leading
+      // identity stage dim, so InputDim may be 2 (unexpanded) or src rank
+      // (expanded). Spatial mapping always lives in the last two dims.
       ICHECK(T.layout_map.count(src))
           << "layout-aware AN/BT ds_read requires annotate_layout";
       Layout layout = T.layout_map.at(src);
-      ICHECK_EQ(layout->InputDim(), sr)
-          << "layout-aware AN/BT ds_read layout rank must match input rank";
+      ICHECK_GE(layout->InputDim(), 2U);
       ICHECK_GE(layout->OutputDim(), 2U);
+      ICHECK(layout->InputDim() == 2U || layout->InputDim() == sr)
+          << "layout-aware AN/BT ds_read layout InputDim must be 2 ([K,MN]) "
+             "or match src rank (pipelined), got InputDim="
+          << layout->InputDim() << " src rank=" << sr;
 
       int warp_size = TargetHcuGetWarpSize(T.target);
       int total_warp = block_size / warp_size;
@@ -468,26 +500,43 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
               origin_dim1 + panel * make_const(panel.dtype(), 32) +
               FloorMod(lane, make_const(lane.dtype(), 4)) *
                   make_const(lane.dtype(), 8));
-          Array<PrimExpr> logical;
+          Array<PrimExpr> logical_idx;
+          logical_idx.reserve(sr);
           for (size_t i = 0; i + 2 < sr; ++i) {
-            logical.push_back(src_ranges[i]->min);
+            logical_idx.push_back(src_ranges[i]->min);
           }
-          logical.push_back(logical_k);
-          logical.push_back(logical_n);
-          Array<PrimExpr> logical_last = logical;
-          logical_last.Set(logical_last.size() - 1,
-                           logical_n + make_const(logical_n.dtype(), 7));
-          Array<PrimExpr> physical = layout->Forward(logical);
-          Array<PrimExpr> physical_last = layout->Forward(logical_last);
+          logical_idx.push_back(logical_k);
+          logical_idx.push_back(logical_n);
+          Array<PrimExpr> logical_idx_last = logical_idx;
+          logical_idx_last.Set(logical_idx_last.size() - 1,
+                               logical_n + make_const(logical_n.dtype(), 7));
+          auto forward_load = [&](const Array<PrimExpr> &logical) {
+            if (layout->InputDim() == sr) {
+              return layout->Forward(logical);
+            }
+            ICHECK_EQ(layout->InputDim(), 2U);
+            Array<PrimExpr> spatial = {logical[logical.size() - 2],
+                                       logical[logical.size() - 1]};
+            Array<PrimExpr> physical = layout->Forward(spatial);
+            Array<PrimExpr> full;
+            full.reserve(sr - 2 + physical.size());
+            for (size_t i = 0; i + 2 < sr; ++i) {
+              full.push_back(logical[i]);
+            }
+            for (const auto &p : physical) {
+              full.push_back(p);
+            }
+            return full;
+          };
+          Array<PrimExpr> physical = forward_load(logical_idx);
+          Array<PrimExpr> physical_last = forward_load(logical_idx_last);
           ICHECK_EQ(physical.size(), physical_last.size());
-          for (size_t i = 0; i + 1 < physical.size(); ++i) {
-            ICHECK(analyzer->CanProveEqual(physical[i], physical_last[i]))
-                << "each AN/BT ds_read 8-half segment must remain in one "
-                   "physical row";
-          }
-          ICHECK(analyzer->CanProveEqual(physical.back() + 7,
-                                         physical_last.back()))
-              << "each AN/BT ds_read 8-half segment must remain contiguous";
+          ICHECK_GE(physical.size(), 2U);
+          const size_t p0 = physical.size() - 2;
+          const size_t p1 = physical.size() - 1;
+          ICHECK(analyzer->CanProveEqual(physical[p0], physical_last[p0]) &&
+                 analyzer->CanProveEqual(physical[p1] + 7, physical_last[p1]))
+              << "each B ds_read 8-half segment must remain contiguous";
           PrimExpr local_offset = analyzer->Simplify(
               dst_leading_offset +
               make_const(dst_leading_offset.dtype(),
@@ -632,28 +681,13 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   // Leading dims only; last-2 are handled via logical origin and full LdsDesc.
   PrimExpr src_leading_elem_offset = IntImm(DataType::Int(32), 0);
   if (sr > 2) {
-    ICHECK_EQ(src_buf->shape.size(), sr)
-        << "ds_read_format src buffer rank must match src region rank, got "
-           "shape.size()="
-        << src_buf->shape.size() << " vs region rank=" << sr;
     if (auto packed_offset = TryGetMlsPackedLeadingElemOffset(
             src_buf, this->src_ranges, tile_mn, tile_k, ds_trans, T.target,
             lds_physical_bits)) {
       src_leading_elem_offset = packed_offset.value();
     } else {
-      Array<PrimExpr> src_idx_leading;
-      DataType idx_dtype = src_buf->DefaultIndexType();
-      for (size_t j = 0; j + 2 < sr; ++j) {
-        src_idx_leading.push_back(this->src_ranges[j]->min);
-      }
-      src_idx_leading.push_back(make_const(idx_dtype, 0));
-      src_idx_leading.push_back(make_const(idx_dtype, 0));
-      Array<PrimExpr> src_offs = src_buf.OffsetOf(src_idx_leading);
-      ICHECK_EQ(src_offs.size(), 1u)
-          << "ds_read_format src OffsetOf expects a single flat offset, got "
-             "size="
-          << src_offs.size();
-      src_leading_elem_offset = src_offs[0];
+      src_leading_elem_offset =
+          LeadingPipelineElemOffset(src_buf, this->src_ranges);
     }
   }
 
@@ -661,22 +695,8 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   ICHECK(dr >= 2) << "ds_read_format dst region must be at least 2D";
   PrimExpr dst_leading_elem_offset = IntImm(DataType::Int(32), 0);
   if (dr > 2) {
-    ICHECK_EQ(dst_buf->shape.size(), dr)
-        << "ds_read_format dst buffer rank must match dst region rank, got "
-           "shape.size()="
-        << dst_buf->shape.size() << " vs region rank=" << dr;
-    Array<PrimExpr> dst_idx_leading;
-    DataType dst_idx_dtype = dst_buf->DefaultIndexType();
-    for (size_t j = 0; j + 2 < dr; ++j) {
-      dst_idx_leading.push_back(this->dst_ranges[j]->min);
-    }
-    dst_idx_leading.push_back(make_const(dst_idx_dtype, 0));
-    dst_idx_leading.push_back(make_const(dst_idx_dtype, 0));
-    Array<PrimExpr> dst_offs = dst_buf.OffsetOf(dst_idx_leading);
-    ICHECK_EQ(dst_offs.size(), 1u)
-        << "ds_read_format dst OffsetOf expects a single flat offset, got size="
-        << dst_offs.size();
-    dst_leading_elem_offset = dst_offs[0];
+    dst_leading_elem_offset =
+        LeadingPipelineElemOffset(dst_buf, this->dst_ranges);
   }
 
   auto src_ptr =

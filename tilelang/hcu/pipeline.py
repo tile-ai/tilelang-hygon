@@ -34,11 +34,16 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.IfStmtBinding()(mod)
     mod = tilelang.transform.PipelinePlanning()(mod)
+    # Two-phase HCU GEMM LDS strategy: AnnotateMlsGemmDep only parks pending
+    # layouts on plain T.copy. This pass must run after PipelinePlanning so
+    # async-producer selection is known, then rewrite AN/BT S2R copies to
+    # ds_read_m32x16.
     mod = tilelang.transform.MaterializeHcuGemmLdsStrategy()(mod)
+    mod = tilelang.transform.RegisterPipelinePlanning()(mod)
+    mod = tilelang.transform.InjectRegisterSoftwarePipeline()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)
     mod = tilelang.transform.Simplify()(mod)
-    # MatrixLoad producers use the pipeline async-group path. Keep the legacy
-    # MLS waitcnt planner disabled while this path owns commit/wait placement.
+    # MatrixLoad uses the pipeline async-group path for commit/wait.
     mod = tilelang.transform.InsertScaleBufferSync()(mod)
 
     mod = tilelang.transform.LayoutInference()(mod)
@@ -94,6 +99,12 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.MakePackedAPI()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
+    mod = tilelang.transform.InjectAsyncGlobalLoadFence()(mod)
+    mod = tilelang.transform.LowerAsyncCommitWait()(mod)
+    mod = tilelang.transform.UnrollPipelinedKLoop()(mod)
+    mod = tilelang.transform.InjectAsyncMmaFence()(mod)
+    mod = tilelang.transform.InjectWarpDivergence()(mod)
+    mod = tilelang.transform.InjectRegisterPipelineSchedBarrier()(mod)
     return mod
 
 

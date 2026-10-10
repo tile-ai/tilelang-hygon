@@ -926,9 +926,14 @@ Array<PrimExpr> FragmentNode::GetForwardVars() const {
 PrimExpr FragmentNode::ForwardThread(const Array<PrimExpr> &vars,
                                      const Optional<PrimExpr> &rep_var) const {
   Map<Var, PrimExpr> vmap;
-  ICHECK_EQ(vars.size(), InputDim());
+  ICHECK_GE(vars.size(), InputDim())
+      << "ForwardThread access rank " << vars.size()
+      << " is smaller than layout input dim " << InputDim();
+  // Extra leading indices are pipeline version slots (same convention as
+  // Layout::Forward). Thread mapping only depends on the spatial tail.
+  const size_t offset = vars.size() - InputDim();
   for (size_t i = 0; i < InputDim(); i++) {
-    vmap.Set(InputPlaceholder(i), vars[i]);
+    vmap.Set(InputPlaceholder(i), vars[offset + i]);
   }
   if (rep_var.defined())
     vmap.Set(ReplicationPlaceholder(), rep_var.value());

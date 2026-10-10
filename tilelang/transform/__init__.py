@@ -82,6 +82,56 @@ def PrepareMlsSharedMemoryAllocation():
     return _ffi_api.PrepareMlsSharedMemoryAllocation()  # type: ignore
 
 
+def RegisterPipelinePlanning():
+    """Plan register-resident fragments and rewrite GEMMs for the register pipeline."""
+    return _ffi_api.RegisterPipelinePlanning()  # type: ignore
+
+
+def InjectRegisterSoftwarePipeline():
+    """Inject the software pipeline of the register-resident K loop."""
+    return _ffi_api.InjectRegisterSoftwarePipeline()  # type: ignore
+
+
+def InjectAsyncMmaFence():
+    """Insert LDS waits before MMA."""
+    return _ffi_api.InjectAsyncMmaFence()  # type: ignore
+
+
+def InjectRegisterPipelineSchedBarrier():
+    """Wrap MMA clusters with sched_barrier when the register pipeline is on."""
+    return _ffi_api.InjectRegisterPipelineSchedBarrier()  # type: ignore
+
+
+def InjectAsyncGlobalLoadFence():
+    """Lower async wait scopes and insert G2S barriers."""
+    return _ffi_api.InjectAsyncGlobalLoadFence()  # type: ignore
+
+
+def UnrollPipelinedKLoop():
+    """Unroll a pipelined GEMM K loop and fold stage indices."""
+    return _ffi_api.UnrollPipelinedKLoop()  # type: ignore
+
+
+def InjectWarpDivergence():
+    """Split a register-pipelined K loop across two warp groups."""
+    return _ffi_api.InjectWarpDivergence()  # type: ignore
+
+
+def LowerAsyncCommitWait():
+    """Lower async commit/wait attributes to concrete intrinsics."""
+    return _ffi_api.LowerAsyncCommitWait()  # type: ignore
+
+
+def InsertMlsWaitcnt():
+    """Insert conservative s_waitcnt before LDS consumers of MLS async loads."""
+    return _ffi_api.InsertMlsWaitcnt()  # type: ignore
+
+
+def HoistMlsResource():
+    """Hoist HCU MLS resource setup before codegen."""
+    return _ffi_api.HoistMlsResource()  # type: ignore
+
+
 def LayoutInference():
     """LayoutInference
 
@@ -113,16 +163,6 @@ def InjectSoftwarePipeline():
         The result pass
     """
     return _ffi_api.InjectSoftwarePipeline()  # type: ignore
-
-
-def InsertMlsWaitcnt():
-    """Insert conservative s_waitcnt before LDS consumers of MLS async loads."""
-    return _ffi_api.InsertMlsWaitcnt()  # type: ignore
-
-
-def HoistMlsResource():
-    """Hoist HCU MLS resource setup before codegen."""
-    return _ffi_api.HoistMlsResource()  # type: ignore
 
 
 def LegalizeNegativeIndex():

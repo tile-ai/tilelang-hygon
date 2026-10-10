@@ -583,8 +583,10 @@ TVM_REGISTER_OP("tl.tileop.async_copy")
                              [](Array<PrimExpr> args,
                                 Map<String, ObjectRef> annotations) {
                                Map<String, ObjectRef> ann = annotations;
-                               ann.Set("is_async_copy",
-                                       IntImm(DataType::Int(32), 1));
+                               if (!HasExplicitAsyncCopySemantics(ann)) {
+                                 ann.Set(attr::kIsAsyncCopy,
+                                         IntImm(DataType::Int(32), 1));
+                               }
                                return Copy(args, ann);
                              })
     .set_num_inputs(5)

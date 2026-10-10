@@ -91,8 +91,9 @@ struct CopyInstSelection {
   std::string reason;
 };
 
-// Final CUDA lowering decision. Explicit T.tma_copy/T.async_copy semantics are
-// enforced here and reported through CopyInstSelection::reason.
+// Final CUDA lowering decision. Explicit T.tma_copy / T.async_copy /
+// T.copy(..., enable_async=True) semantics are enforced here and reported
+// through CopyInstSelection::reason.
 CopyInstSelection SelectCopyInstForLowering(const CopyNode &op,
                                             const CopyAnalysisContext &ctx);
 

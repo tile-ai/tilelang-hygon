@@ -73,6 +73,8 @@ struct PipelineAnnotation {
 using PipelineInfo = std::unordered_map<SBlock, PipelineAnnotation,
                                         ObjectPtrHash, ObjectPtrEqual>;
 
+enum class PipelineKind { kShared, kRegister };
+
 struct BufferAccessInfo {
   int def = -1; // the defining stage of the buffer
   int use = -1; // the last using stage of the buffer
@@ -98,13 +100,6 @@ bool GetIsTmaCopy(const CopyNode &op) {
   return GetBoolAnnotation(op, "is_tma_copy");
 }
 
-bool GetIsAsyncCopy(const CopyNode &op) {
-  if (GetBoolAnnotation(op, "is_async_copy")) {
-    return true;
-  }
-  return GetBoolAnnotation(op, "force_cp_async");
-}
-
 bool CheckTargetIndependentAsyncCopyPreconditions(const CopyNode &op) {
   if (!IsGlobalBuffer(op.src) || !IsSharedBuffer(op.dst)) {
     return false;
@@ -117,8 +112,7 @@ bool CheckTargetIndependentAsyncCopyPreconditions(const CopyNode &op) {
 
 bool CheckPipelineManagedCPAsyncCopy(const CopyNode &op,
                                      Optional<Target> target) {
-  if (GetIsTmaCopy(op) || GetIsAsyncCopy(op) ||
-      !CheckTargetIndependentAsyncCopyPreconditions(op)) {
+  if (GetIsTmaCopy(op) || !CheckTargetIndependentAsyncCopyPreconditions(op)) {
     return false;
   }
   return !target.defined() || TargetHasAsyncCopy(target.value());
@@ -285,7 +279,14 @@ private:
 
   PrimExpr VisitExpr_(const CallNode *op) final {
     static const Op &copy_op = Op::Get("tl.tileop.copy");
+    static const Op &matrix_load_op = Op::Get("tl.tileop.matrix_load");
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    if (call->op.same_as(matrix_load_op)) {
+      auto annotations = call->annotations;
+      annotations.Set(attr::kAsyncCopyNoImplicitCommitWait,
+                      IntImm(DataType::Int(32), 1));
+      return Call(call->dtype, call->op, call->args, annotations, call->span);
+    }
     if (!call->op.same_as(copy_op) || !CanUsePipelineManagedCPAsyncCopy(call)) {
       return call;
     }
@@ -572,6 +573,9 @@ public:
     static const Op &deprecated_c2d_im2col_op = Op::Get("tl.tileop.c2d_im2col");
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
     if (call->op.same_as(copy_op)) {
+      if (HasExplicitAsyncCopySemantics(call)) {
+        return call;
+      }
       auto new_annotations = call->annotations;
       new_annotations.Set("barrier", MakeBarrierRef(barrier_buf_, barrier_id_));
       new_annotations.Set("is_tma_copy", IntImm(DataType::Int(32), 1));
@@ -1182,12 +1186,14 @@ public:
                    const Array<Buffer> &local_allocs, const For &pipeline_loop,
                    const PipelineInfo &pipeline_info,
                    const Array<SBlock> &scalar_binding_blocks,
-                   Optional<Target> target)
+                   Optional<Target> target, PipelineKind kind,
+                   int register_min_versions)
       : buffer_data_to_buffer_(std::move(buffer_data_to_buffer)),
         pipeline_allocs_(pipeline_allocs), local_allocs_(local_allocs),
         pipeline_loop_(pipeline_loop), pipeline_info_(pipeline_info),
         scalar_binding_blocks_(scalar_binding_blocks),
-        target_(std::move(target)) {}
+        target_(std::move(target)), kind_(kind),
+        register_min_versions_(register_min_versions) {}
 
   Stmt BuildPipeline() {
     // Step 1: Analyze accesses to the buffers in the pipeline and compute the
@@ -1200,7 +1206,28 @@ public:
         // Buffer is not accessed in the pipeline blocks, skip it
         continue;
       }
+      if (kind_ == PipelineKind::kRegister && !IsSharedBuffer(buffer) &&
+          !IsRegisterPipelineBuffer(buffer)) {
+        continue;
+      }
       int num_versions = ComputeBufferVersions(buffer, it->second);
+      if (kind_ == PipelineKind::kRegister &&
+          IsRegisterPipelineBuffer(buffer) && it->second.use > it->second.def &&
+          it->second.def >= 0) {
+        num_versions = std::max(num_versions, register_min_versions_);
+      }
+      // Shared buffers produced outside the pipeline (def == -1) keep a single
+      // version: their producers still refer to the unversioned alias buffer,
+      // which a versioned access cannot be propagated to. The remaining shared
+      // buffers never get more versions than there are stages.
+      if (IsSharedBuffer(buffer) && it->second.def >= 0) {
+        if (auto ns = GetPipelineNumStages(pipeline_loop_.get())) {
+          const int n = static_cast<int>(ns.value()->value);
+          if (num_versions >= 2 && n > 0) {
+            num_versions = std::min(num_versions, n);
+          }
+        }
+      }
       if (num_versions > 1) {
         buffer_remap_.Set(buffer, RewriteAllocBuffer(buffer, num_versions));
       }
@@ -1519,9 +1546,15 @@ private:
           }
         }
       }
-      if (!need_multi_version) {
+      if (!need_multi_version && !(kind_ == PipelineKind::kRegister &&
+                                   IsRegisterPipelineBuffer(buffer) &&
+                                   buffer_info.use > buffer_info.def)) {
         num_versions--;
       }
+    }
+    if (kind_ == PipelineKind::kRegister && IsRegisterPipelineBuffer(buffer) &&
+        buffer_info.use > buffer_info.def && buffer_info.def >= 0) {
+      num_versions = std::max(num_versions, register_min_versions_);
     }
     return num_versions;
   }
@@ -3031,6 +3064,18 @@ private:
         preserved_annotations.Set("tl_pipelined_num_stages",
                                   pipeline_num_stages.value());
       }
+      if (kind_ == PipelineKind::kRegister) {
+        auto keep_if_present = [&](const char *key) {
+          if (auto val = pipeline_loop_->annotations.Get(key)) {
+            preserved_annotations.Set(key, val.value());
+          }
+        };
+        keep_if_present("num_stages");
+        keep_if_present(kEnableRegisterPipeline);
+        keep_if_present(kNumRegisterStages);
+        keep_if_present(kEnableWarpDivergence);
+        preserved_annotations.Set(kRegisterPipelineApplied, Integer(1));
+      }
       new_loop = For(Downcast<Var>(new_loop_var), pipeline_loop_->min, extent,
                      unroll_loop ? ForKind::kUnrolled : pipeline_loop_->kind,
                      std::move(new_loop), std::nullopt, preserved_annotations);
@@ -3054,16 +3099,20 @@ private:
   std::vector<ScalarBinding> scalar_bindings_;
   ScalarBindingMap scalar_binding_map_;
   std::map<int, AsyncStateGlobal> async_states_;
+  PipelineKind kind_{PipelineKind::kShared};
+  int register_min_versions_{0};
 };
 
 PipelineRewriteResult RewritePipeline(
     Map<Var, Buffer> buffer_data_to_buffer,
     const Array<Buffer> &pipeline_allocs, const Array<Buffer> &local_allocs,
     const For &pipeline_loop, const PipelineInfo &pipeline_info,
-    const Array<SBlock> &scalar_binding_blocks, Optional<Target> target) {
+    const Array<SBlock> &scalar_binding_blocks, Optional<Target> target,
+    PipelineKind kind, int register_min_versions) {
   PipelineRewriter rewriter(std::move(buffer_data_to_buffer), pipeline_allocs,
                             local_allocs, pipeline_loop, pipeline_info,
-                            scalar_binding_blocks, std::move(target));
+                            scalar_binding_blocks, std::move(target), kind,
+                            register_min_versions);
   PipelineRewriteResult result;
   result.pipeline = rewriter.BuildPipeline();
   result.buffer_remap = rewriter.GetBufferRemap();
@@ -3072,10 +3121,10 @@ PipelineRewriteResult RewritePipeline(
 
 class PipelineInjector : private StmtExprMutator {
 public:
-  static Stmt Inject(const PrimFunc &func) {
+  static Stmt Inject(const PrimFunc &func, PipelineKind kind) {
     auto global_symbol = func->GetAttr<String>(tvm::attr::kGlobalSymbol);
     auto target = func->GetAttr<Target>(tvm::attr::kTarget);
-    PipelineInjector injector(global_symbol, target);
+    PipelineInjector injector(global_symbol, target, kind);
     for (const auto &kv : func->buffer_map) {
       const Buffer &buffer = kv.second;
       injector.buffer_data_to_buffer_.Set(buffer->data, buffer);
@@ -3085,8 +3134,9 @@ public:
 
 private:
   explicit PipelineInjector(Optional<String> global_symbol,
-                            Optional<Target> target)
-      : global_symbol_(std::move(global_symbol)), target_(std::move(target)) {}
+                            Optional<Target> target, PipelineKind kind)
+      : global_symbol_(std::move(global_symbol)), target_(std::move(target)),
+        kind_(kind) {}
 
   /*!
    * \brief Check the pipeline satisfies the following conditions:
@@ -3263,6 +3313,14 @@ private:
     Map<String, Any> preserved_annotations;
     for (const auto &kv : annotations) {
       const String &key = kv.first;
+      if (kind_ == PipelineKind::kRegister) {
+        if (key == kRegisterPipelineStage || key == kRegisterPipelineOrder ||
+            key == kRegisterPipelineAsyncStages) {
+          continue;
+        }
+        preserved_annotations.Set(key, kv.second);
+        continue;
+      }
       if (key != s_tir::attr::software_pipeline_stage &&
           key != s_tir::attr::software_pipeline_order &&
           key != s_tir::attr::software_pipeline_async_stages &&
@@ -3393,6 +3451,23 @@ private:
     pipeline_allocs =
         CollectUsedPipelineBuffers(MakePipelineBody(pipeline_body_stmts),
                                    buffer_data_to_buffer_, allocated_buffers_);
+    if (kind_ == PipelineKind::kRegister) {
+      Array<Buffer> filtered;
+      for (const Buffer &buffer : pipeline_allocs) {
+        if (IsSharedBuffer(buffer) || IsRegisterPipelineBuffer(buffer)) {
+          filtered.push_back(buffer);
+        }
+      }
+      pipeline_allocs = filtered;
+    } else if (op->annotations.count(kRegisterPipelineApplied)) {
+      Array<Buffer> filtered;
+      for (const Buffer &buffer : pipeline_allocs) {
+        if (!IsRegisterPipelineBuffer(buffer)) {
+          filtered.push_back(buffer);
+        }
+      }
+      pipeline_allocs = filtered;
+    }
 
     Optional<Array<Integer>> replayable_bind_mask;
     if (auto replayable_bind_anno =
@@ -3438,9 +3513,13 @@ private:
            "statements after removing replayable scalar Bind statements";
 
     auto pipeline_stages = Downcast<Array<Integer>>(
-        op->annotations.at(s_tir::attr::software_pipeline_stage));
+        op->annotations.at(kind_ == PipelineKind::kRegister
+                               ? kRegisterPipelineStage
+                               : s_tir::attr::software_pipeline_stage));
     auto pipeline_orders = Downcast<Array<Integer>>(
-        op->annotations.at(s_tir::attr::software_pipeline_order));
+        op->annotations.at(kind_ == PipelineKind::kRegister
+                               ? kRegisterPipelineOrder
+                               : s_tir::attr::software_pipeline_order));
     ICHECK_EQ(pipeline_stages.size(), pipeline_orders.size())
         << "PrimFunc " << global_symbol_
         << " has software_pipeline_stage annotation " << pipeline_stages
@@ -3488,8 +3567,10 @@ private:
                                         : scheduled_order.size();
 
     std::unordered_set<int> pipeline_async_stages;
-    if (auto async_annot =
-            op->annotations.Get(s_tir::attr::software_pipeline_async_stages)) {
+    if (auto async_annot = op->annotations.Get(
+            kind_ == PipelineKind::kRegister
+                ? kRegisterPipelineAsyncStages
+                : s_tir::attr::software_pipeline_async_stages)) {
       for (const Integer &stage :
            Downcast<Array<Integer>>(async_annot.value())) {
         pipeline_async_stages.insert(static_cast<int>(stage.IntValue()));
@@ -3589,6 +3670,13 @@ private:
     ValidateScheduledBindDependencies(pipeline_info, scheduled_order);
     ValidatePipelineBody(pipeline_info, scheduled_order);
 
+    register_min_versions_ = 2;
+    if (auto anno = op->annotations.Get("num_register_stages")) {
+      if (const auto *imm = anno.value().as<IntImmNode>()) {
+        register_min_versions_ = std::max(2, static_cast<int>(imm->value));
+      }
+    }
+
     if (!HasOverlappableStages(pipeline_info)) {
       for (const auto &buffer : flat_local_allocs) {
         buffer_data_to_buffer_.erase(buffer->data);
@@ -3607,7 +3695,7 @@ private:
     // Creates pipeline_mbar[pipeline_depth] at final size so LowerTileOp
     // uses the provided barrier instead of allocating separate per-copy ones.
     Buffer pipeline_barrier_buf;
-    {
+    if (kind_ == PipelineKind::kShared) {
       int max_stage = 0;
       for (const auto &pair : pipeline_info) {
         max_stage = std::max(max_stage, pair.second.stage);
@@ -3659,7 +3747,7 @@ private:
     // This handles both ISP-created pipeline_mbar AND user-written
     // T.alloc_barrier, so that no late standalone barrier-only fixup is needed.
     // Must run BEFORE local_allocs is copied from block_local_allocs.
-    {
+    if (kind_ == PipelineKind::kShared) {
       Optional<Integer> pipelined_ns = GetPipelineNumStages(op);
       int barrier_depth = 1;
       if (pipelined_ns.defined()) {
@@ -3684,9 +3772,10 @@ private:
                         schedule.nested_local_allocs.begin(),
                         schedule.nested_local_allocs.end());
 
-    PipelineRewriteResult rewrite_result = RewritePipeline(
-        buffer_data_to_buffer_, pipeline_allocs, local_allocs, for_node,
-        pipeline_info, scalar_binding_blocks, target_);
+    PipelineRewriteResult rewrite_result =
+        RewritePipeline(buffer_data_to_buffer_, pipeline_allocs, local_allocs,
+                        for_node, pipeline_info, scalar_binding_blocks, target_,
+                        kind_, register_min_versions_);
     Stmt pipeline = rewrite_result.pipeline;
     subtree_modified_ = true;
 
@@ -3780,7 +3869,20 @@ private:
     for (const auto &kv : rewrite_result.buffer_remap) {
       pending_buffer_remap_.Set(kv.first, kv.second);
     }
-    pipeline = LowerAsyncCommitWaitAttrs(pipeline);
+    // HCU shared pipelines with at least two stages keep their commit/wait
+    // pairs in attribute form so that InjectAsyncGlobalLoadFence can replace
+    // them with a static wait plan; the other pipelines lower the attributes
+    // here, which ThreadSync relies on to place the barrier after a wait.
+    int explicit_num_stages = 0;
+    if (auto ns = GetExplicitPipelinedNumStages(op)) {
+      explicit_num_stages = static_cast<int>(ns.value()->value);
+    }
+    const bool delay_wait_attr_lower =
+        kind_ == PipelineKind::kShared && explicit_num_stages >= 2 &&
+        target_.defined() && TargetIsHCU(target_.value());
+    if (!delay_wait_attr_lower) {
+      pipeline = LowerAsyncCommitWaitAttrs(pipeline);
+    }
 
     return pipeline;
   }
@@ -3977,12 +4079,25 @@ private:
   }
 
   bool HasPipelineAnnotation(const ForNode *op) const {
-    auto it1 = op->annotations.find(s_tir::attr::software_pipeline_stage);
-    auto it2 = op->annotations.find(s_tir::attr::software_pipeline_order);
+    if (kind_ == PipelineKind::kShared &&
+        op->annotations.count(kRegisterPipelineApplied)) {
+      return false;
+    }
+    const char *stage_key = kind_ == PipelineKind::kRegister
+                                ? kRegisterPipelineStage
+                                : s_tir::attr::software_pipeline_stage;
+    const char *order_key = kind_ == PipelineKind::kRegister
+                                ? kRegisterPipelineOrder
+                                : s_tir::attr::software_pipeline_order;
+    auto it1 = op->annotations.find(stage_key);
+    auto it2 = op->annotations.find(order_key);
     bool has_stage = it1 != op->annotations.end();
     bool has_order = it2 != op->annotations.end();
     if (has_stage && has_order) {
       return true;
+    }
+    if (kind_ == PipelineKind::kRegister) {
+      return false;
     }
     if (has_stage) {
       LOG(FATAL)
@@ -4001,37 +4116,62 @@ private:
   std::vector<std::pair<Buffer, Buffer>> pending_layout_remapped_allocs_;
   Optional<Target> target_;
   Optional<String> global_symbol_;
+  PipelineKind kind_{PipelineKind::kShared};
+  int register_min_versions_{2};
   // Track whether any pipeline was actually injected in the current
   // subtree.  Used to avoid unnecessary reads/writes recalculation
   // on blocks whose descendants were not modified.
   bool subtree_modified_ = false;
 };
 
-Stmt InjectPipeline(const PrimFunc &func) {
-  return PipelineInjector::Inject(func);
+Stmt InjectPipeline(const PrimFunc &func, PipelineKind kind) {
+  return PipelineInjector::Inject(func, kind);
 }
 
 } // namespace software_pipeline
 
-/*!
- * \brief Transform annotated loops into pipelined one that parallelize
- * producers and consumers. \return The IR transform pass.
- */
 tirx::transform::Pass InjectSoftwarePipeline() {
   using namespace tirx::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     auto *fptr = f.CopyOnWrite();
-    fptr->body = software_pipeline::InjectPipeline(f);
+    fptr->body = software_pipeline::InjectPipeline(
+        f, software_pipeline::PipelineKind::kShared);
     fptr->body = ConvertSSA(std::move(fptr->body));
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectSoftwarePipeline", {});
 }
 
+tirx::transform::Pass InjectRegisterSoftwarePipeline() {
+  using namespace tirx::transform;
+  auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
+    auto *fptr = f.CopyOnWrite();
+    fptr->body = software_pipeline::InjectPipeline(
+        f, software_pipeline::PipelineKind::kRegister);
+    fptr->body = ConvertSSA(std::move(fptr->body));
+    return f;
+  };
+  return CreatePrimFuncPass(pass_func, 0, "tl.InjectRegisterSoftwarePipeline",
+                            {});
+}
+
+tirx::transform::Pass LowerAsyncCommitWait() {
+  using namespace tirx::transform;
+  auto pass_func = [=](PrimFunc f, const IRModule &, const PassContext &) {
+    auto *fptr = f.CopyOnWrite();
+    fptr->body = software_pipeline::LowerAsyncCommitWaitAttrs(fptr->body);
+    return f;
+  };
+  return CreatePrimFuncPass(pass_func, 0, "tl.LowerAsyncCommitWait", {});
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = reflection;
-  refl::GlobalDef().def("tl.transform.InjectSoftwarePipeline",
-                        InjectSoftwarePipeline);
+  refl::GlobalDef()
+      .def("tl.transform.InjectSoftwarePipeline", InjectSoftwarePipeline)
+      .def("tl.transform.InjectRegisterSoftwarePipeline",
+           InjectRegisterSoftwarePipeline)
+      .def("tl.transform.LowerAsyncCommitWait", LowerAsyncCommitWait);
 }
 
 } // namespace tl

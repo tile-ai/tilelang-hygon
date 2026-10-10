@@ -12,6 +12,7 @@
 #define TVM_TL_TRANSFORM_COMMON_PIPELINE_UTILS_H_
 
 #include "support/check.h"
+#include <string>
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/cast.h>
 #include <tvm/s_tir/stmt.h>
@@ -38,6 +39,51 @@ static constexpr const char *kPipelineAsyncProducerGroups =
 /*! Per-original-statement replayable scalar Bind flag (1 = replayable). */
 static constexpr const char *kPipelineReplayableScalarBinds =
     "software_pipeline_replayable_scalar_binds";
+
+static constexpr const char *kRegisterPipelineStage =
+    "tl_register_pipeline_stage";
+static constexpr const char *kRegisterPipelineOrder =
+    "tl_register_pipeline_order";
+static constexpr const char *kRegisterPipelineAsyncStages =
+    "tl_register_pipeline_async_stages";
+static constexpr const char *kEnableRegisterPipeline =
+    "enable_register_pipeline";
+static constexpr const char *kNumRegisterStages = "num_register_stages";
+static constexpr const char *kEnableWarpDivergence = "enable_warp_divergence";
+static constexpr const char *kRegisterPipelineApplied =
+    "tl_register_pipeline_applied";
+static constexpr int kDefaultNumRegisterStages = 2;
+static constexpr const char *kRegisterPipelineBufferSuffix = "_reg_pipe";
+
+inline bool LoopAnnotationIsTruthy(const ForNode *loop, const char *key) {
+  if (loop == nullptr) {
+    return false;
+  }
+  if (auto val = loop->annotations.Get(key)) {
+    if (const auto *imm = val.value().as<IntImmNode>()) {
+      return imm->value != 0;
+    }
+  }
+  return false;
+}
+
+inline bool LoopHasRegisterPipeline(const ForNode *loop) {
+  return LoopAnnotationIsTruthy(loop, kRegisterPipelineApplied) ||
+         LoopAnnotationIsTruthy(loop, kEnableRegisterPipeline);
+}
+
+inline bool LoopHasWarpDivergence(const ForNode *loop) {
+  return LoopAnnotationIsTruthy(loop, kEnableWarpDivergence);
+}
+
+inline bool IsRegisterPipelineBufferScope(const ffi::String &scope) {
+  std::string s = scope;
+  return s == "local" || (s.size() > 6 && s.compare(0, 6, "local.") == 0);
+}
+
+inline bool IsRegisterPipelineBuffer(const Buffer &buffer) {
+  return buffer.defined() && IsRegisterPipelineBufferScope(buffer.scope());
+}
 
 /*! \brief Whether a flat TIRX statement declares pipeline-local buffer storage.
  *
@@ -104,6 +150,27 @@ inline ffi::Optional<Integer> GetPipelineNumStages(const ForNode *loop) {
     }
     if (max_stage >= 0) {
       return Integer(max_stage + 1);
+    }
+  }
+  return ffi::Optional<Integer>();
+}
+
+/*!
+ * \brief Stage count from T.Pipelined / InjectSoftwarePipeline only.
+ *
+ * Ignores software_pipeline_stage so handwritten K loops that happen to
+ * carry that annotation are not treated as compiler-managed pipelines.
+ */
+inline ffi::Optional<Integer>
+GetExplicitPipelinedNumStages(const ForNode *loop) {
+  if (auto num_stages = loop->annotations.Get("num_stages")) {
+    if (const auto *imm = num_stages->as<IntImmNode>()) {
+      return Integer(static_cast<int>(imm->value));
+    }
+  }
+  if (auto num_stages = loop->annotations.Get("tl_pipelined_num_stages")) {
+    if (const auto *imm = num_stages->as<IntImmNode>()) {
+      return Integer(static_cast<int>(imm->value));
     }
   }
   return ffi::Optional<Integer>();

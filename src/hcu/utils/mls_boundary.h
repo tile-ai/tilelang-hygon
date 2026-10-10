@@ -2,7 +2,7 @@
  * \file hcu/utils/mls_boundary.h
  * \brief Per-axis MLS boundary policy packed as int8 in TIR / template args.
  *
- * -1 = analyze (compiler may prove in-range, else refresh)
+ * -1 = analyze (compiler may prove in-range, else runtime last-tile check)
  *  0 = skip filter (caller contract)
  *  1 = always refresh (caller contract)
  *
@@ -15,6 +15,7 @@
 #include "support/check.h"
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tvm {
@@ -71,6 +72,12 @@ inline const char *MlsRefreshLiteral(MlsBoundaryMode m) {
   return MlsOneShotRefresh(m) ? "true" : "false";
 }
 
+inline MlsBoundaryMode MlsModeFromInt(int64_t value) {
+  ICHECK(value == -1 || value == 0 || value == 1)
+      << "MLS boundary mode must be -1, 0, or 1, got " << value;
+  return static_cast<MlsBoundaryMode>(static_cast<int>(value));
+}
+
 struct MlsBoundaryModes {
   MlsBoundaryMode k{MlsBoundaryMode::kAnalyze};
   MlsBoundaryMode mn{MlsBoundaryMode::kAnalyze};
@@ -86,12 +93,6 @@ MlsParseBoundaryArgs(const std::vector<std::string> &args) {
   if (args.size() > idx + 1)
     out.mn = MlsParseModeToken(args[idx + 1]);
   return out;
-}
-
-inline MlsBoundaryMode MlsModeFromInt(int64_t value) {
-  ICHECK(value == -1 || value == 0 || value == 1)
-      << "MLS boundary mode must be -1, 0, or 1, got " << value;
-  return static_cast<MlsBoundaryMode>(static_cast<int>(value));
 }
 
 } // namespace tl

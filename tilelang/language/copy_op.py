@@ -24,9 +24,9 @@ from tvm import ir, tirx
 
 
 def _encode_mls_boundary_dim(value: bool | None) -> int:
-    """Map one (MN or K) hint to a TIR int8 policy.
+    """Map one (MN or K) hint to a TIR int32 policy.
 
-    None  -> -1, compiler may prove in-range or refresh at runtime.
+    None  -> -1, compiler may prove in-range or check at runtime.
     False ->  0, caller contract: in-range, skip filter.
     True  ->  1, caller contract: always apply filter.
     """
@@ -40,19 +40,24 @@ def matrix_load(
     dst: tirx.Buffer | tirx.BufferLoad | tirx.BufferRegion,
     boundary: tuple[bool | None, bool | None] | None = None,
     *,
+    last_k_load: bool | None = None,
     annotations: dict | None = None,
 ):
-    """MLS load from global to shared.
+    """MLS (Matrix Load Store) load from global memory to shared memory.
 
     ``boundary`` is ``(mn, k)`` over the last two logical tile axes.
     Each entry is None (analyze), False (in-range), or True (partial).
+
+    ``last_k_load`` is the older K-only hint: None analyze, False skip, True refresh.
+    Ignored when ``boundary`` is set.
 
     The operation commits its async group by default. Set
     ``no_implicit_async_commit_wait`` in ``annotations`` to group multiple
     MatrixLoad operations under an explicit ``T.ptx_commit_group()``.
     """
     if boundary is None:
-        mn_hint, k_hint = None, None
+        mn_hint = None
+        k_hint = last_k_load
     else:
         if len(boundary) != 2:
             raise ValueError("matrix_load boundary must be (mn, k) over the last two tile axes")
@@ -457,6 +462,7 @@ def copy(
     *,
     coalesced_width: int | None = None,
     disable_tma: bool = False,
+    enable_async: bool = False,
     eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
     prefer_instruction: str | None = None,
     annotations: dict | None = None,
@@ -469,6 +475,11 @@ def copy(
         dst (Union[tirx.Buffer, tirx.BufferLoad, tirx.BufferRegion]): Destination memory region
         coalesced_width (Optional[int], keyword-only): Width for coalesced memory access. Defaults to None.
         disable_tma (bool, keyword-only): Whether to disable TMA acceleration. Defaults to False.
+        enable_async (bool, keyword-only): If True, use explicit asynchronous
+            global-to-shared copy semantics, equivalent to ``T.async_copy``.
+            The backend emits an async copy and a commit group, and does not
+            insert an implicit wait. Completion is user-managed
+            (for example ``T.ptx_wait_group``). Defaults to False.
         eviction_policy (Optional[str], keyword-only): Cache eviction policy. Defaults to None.
         prefer_instruction (Optional[str], keyword-only): Backend-specific preferred lowering
             instruction category. For CUDA, recognized values include "tma", "cp_async", and
@@ -476,8 +487,8 @@ def copy(
             lower through TMA with an automatically allocated barrier and wait when constraints
             are satisfied. HCU additionally recognizes "matrix_load" for explicit MLS lowering.
         annotations (Optional[dict], keyword-only): Additional annotations dict. If provided,
-            coalesced_width, disable_tma, eviction_policy, and prefer_instruction can also
-            be specified here.
+            coalesced_width, disable_tma, enable_async, eviction_policy, and prefer_instruction
+            can also be specified here.
             Values in annotations take precedence over individual arguments.
         loop_layout (Optional[Fragment], keyword-only): A parallel loop layout hint for the SIMT copy
             (only valid for normal SIMT copy; incompatible with TMA/LDSM/STSM/TMem). When provided,
@@ -499,8 +510,9 @@ def copy(
       code. And if some dimensions are 1, unexpected errors may happen.
     - Small Optimization: If both `src` and `dst` are scalar `BufferLoad` without
       region extents, lowers to a direct store: `dst[...] = src[...]`.
-    - Syntactic Sugar: TileLang supports passing the head address of a buffer to represent
-      the whole buffer if there are no ambiguity. For example, T.copy(A, A_shared[i, j]).
+    - Syntactic Sugar: TileLang supports passing the head address of a buffer to
+      represent the whole buffer if there are no ambiguity. For example,
+      T.copy(A, A_shared[i, j]).
       To support this, we need some special shape checking. But remember currently we don't
       support something like "broadcast".
     - The finalized extents are encoded with `tl.region` via `to_buffer_region`
@@ -519,6 +531,12 @@ def copy(
         ann["coalesced_width"] = coalesced_width
     if "disable_tma" not in ann and disable_tma:
         ann["disable_tma"] = disable_tma
+    if "is_async_copy" not in ann and "enable_async" not in ann and enable_async:
+        ann["is_async_copy"] = tirx.IntImm("int32", 1)
+    if "enable_async" in ann:
+        enable_async_ann = ann.pop("enable_async")
+        if enable_async_ann and "is_async_copy" not in ann:
+            ann["is_async_copy"] = tirx.IntImm("int32", 1)
     if "eviction_policy" not in ann and eviction_policy is not None:
         eviction_policy_map = {"evict_normal": 0, "evict_first": 1, "evict_last": 2}
         ann["eviction_policy"] = eviction_policy_map[eviction_policy]
@@ -526,6 +544,8 @@ def copy(
         ann["prefer_instruction"] = prefer_instruction
     if isinstance(ann.get("prefer_instruction"), str):
         ann["prefer_instruction"] = tirx.StringImm(ann["prefer_instruction"])
+    if isinstance(ann.get("is_async_copy"), bool) and ann["is_async_copy"]:
+        ann["is_async_copy"] = tirx.IntImm("int32", 1)
 
     # Parallel loop layout hint (Fragment). Mirrors T.Parallel(loop_layout=...)
     if loop_layout is not None and "parallel_loop_layout" not in ann:
@@ -597,6 +617,9 @@ def async_copy(
 ) -> tirx.PrimExpr | tirx.Stmt:
     """Asynchronous copy primitive lowered through cp.async.
 
+    Equivalent to ``T.copy(..., enable_async=True)``. Kept as an explicit
+    language primitive; both forms share the same backend lowering.
+
     This operator is intended for explicitly asynchronous global->shared copy.
     The backend enforces cp.async constraints and emits:
       `ptx_cp_async(...)` + `ptx_commit_group()`.
@@ -612,22 +635,13 @@ def async_copy(
     Returns:
         tirx.Call: A handle to the async copy operation
     """
-    src, dst = _normalize_copy_regions(src, dst)
-    if isinstance(src, tirx.BufferLoad) and isinstance(dst, tirx.BufferLoad):
-        return tirx.BufferStore(dst.buffer, src, dst.indices)
-
-    ann = annotations.copy() if annotations else {}
-    if "coalesced_width" not in ann and coalesced_width is not None:
-        ann["coalesced_width"] = coalesced_width
-    if loop_layout is not None and "parallel_loop_layout" not in ann:
-        ann["parallel_loop_layout"] = loop_layout
-
-    return tirx.call_intrin(
-        "handle",
-        tirx.op.Op.get("tl.tileop.async_copy"),
+    return copy(
         src,
         dst,
-        annotations=ann if ann else None,
+        coalesced_width=coalesced_width,
+        enable_async=True,
+        annotations=annotations,
+        loop_layout=loop_layout,
     )
 
 

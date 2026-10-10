@@ -77,6 +77,36 @@ def test_lower_tile_op_respects_copy_annotation_for_explicit_async_copy():
     assert calls.get("tirx.ptx_wait_group", 0) == 0
 
 
+def test_lower_tile_op_respects_copy_enable_async_same_as_async_copy():
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
+
+    @T.prim_func
+    def before(
+        A: T.Tensor((16,), T.float32),
+        B: T.Tensor((16,), T.float32),
+    ):
+        T.func_attr({"global_symbol": "main", "target": target})
+        T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 16)
+        S = T.alloc_buffer((16,), dtype=T.float32, scope="shared")
+        T.copy(
+            A[0:16],
+            S,
+            enable_async=True,
+            annotations={"no_implicit_async_commit_wait": T.int32(1)},
+        )
+        B[tx] = S[tx]
+
+    mod = tvm.IRModule.from_expr(before)
+    with target:
+        mod = tl.transform.LowerTileOp()(mod)
+    calls = _count_calls(mod["main"])
+
+    assert calls.get("tl.ptx_cp_async", 0) > 0
+    assert calls.get("tirx.ptx_commit_group", 0) == 0
+    assert calls.get("tirx.ptx_wait_group", 0) == 0
+
+
 def test_lower_tile_op_respects_parallel_loop_async_annotation_without_pipeline_context():
     target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
 

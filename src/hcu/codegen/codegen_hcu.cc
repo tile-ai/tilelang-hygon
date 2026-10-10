@@ -151,6 +151,77 @@ bool IsValidCPAsyncTransferBytes(int64_t bytes) {
   return bytes == 4 || bytes == 8 || bytes == 16;
 }
 
+std::optional<int64_t> TryEvalConstInt(const PrimExpr &expr) {
+  if (const auto *imm = expr.as<IntImmNode>()) {
+    return imm->value;
+  }
+  if (const auto *cast = expr.as<CastNode>()) {
+    return TryEvalConstInt(cast->value);
+  }
+  if (const auto *add = expr.as<AddNode>()) {
+    auto a = TryEvalConstInt(add->a);
+    auto b = TryEvalConstInt(add->b);
+    if (a && b) {
+      return *a + *b;
+    }
+  } else if (const auto *sub = expr.as<SubNode>()) {
+    auto a = TryEvalConstInt(sub->a);
+    auto b = TryEvalConstInt(sub->b);
+    if (a && b) {
+      return *a - *b;
+    }
+  } else if (const auto *mul = expr.as<MulNode>()) {
+    auto a = TryEvalConstInt(mul->a);
+    auto b = TryEvalConstInt(mul->b);
+    if (a && b) {
+      return *a * *b;
+    }
+  } else if (const auto *mod = expr.as<FloorModNode>()) {
+    auto a = TryEvalConstInt(mod->a);
+    auto b = TryEvalConstInt(mod->b);
+    if (a && b && *b != 0) {
+      int64_t r = *a % *b;
+      if (r < 0) {
+        r += (*b > 0 ? *b : -*b);
+      }
+      return r;
+    }
+  } else if (const auto *div = expr.as<FloorDivNode>()) {
+    auto a = TryEvalConstInt(div->a);
+    auto b = TryEvalConstInt(div->b);
+    if (a && b && *b != 0) {
+      // TIR floordiv rounds toward negative infinity, C++ `/` truncates
+      // toward zero; correct the quotient when the operands have mixed signs.
+      int64_t q = *a / *b;
+      if (*a % *b != 0 && ((*a < 0) != (*b < 0))) {
+        --q;
+      }
+      return q;
+    }
+  } else if (const auto *call = expr.as<CallNode>()) {
+    if (call->args.size() == 2 && call->op.same_as(builtin::bitwise_and())) {
+      auto a = TryEvalConstInt(call->args[0]);
+      auto b = TryEvalConstInt(call->args[1]);
+      if (a && b) {
+        return *a & *b;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+// Constant residue of linearized LDS element_offset after subtracting the
+// per-thread base. idxen DMA uses m0 = lds_base + SmemOffset (bytes).
+std::optional<int64_t>
+ConstElementResidual(arith::Analyzer *analyzer, const PrimExpr &element_offset,
+                     const PrimExpr &thread_linear_offset) {
+  PrimExpr residual = analyzer->Simplify(element_offset - thread_linear_offset);
+  if (auto value = TryEvalConstInt(residual)) {
+    return value;
+  }
+  return TryEvalConstInt(analyzer->Simplify(residual));
+}
+
 struct Fp4PackedVectorDesc {
   int lanes;
   std::string c_type;
@@ -902,12 +973,17 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
       PrimExpr expected_offset =
           thread_x.value() *
           make_const(thread_x.value().dtype(), transaction_bytes / elem_bytes);
-      if (!analyzer.CanProveEqual(destination->element_offset, expected_offset))
+      auto residual_elems = ConstElementResidual(
+          &analyzer, destination->element_offset, expected_offset);
+      if (!residual_elems.has_value() || residual_elems.value() < 0)
         return;
+      const int64_t dest_alias_offset =
+          alias->second.byte_offset +
+          residual_elems.value() * static_cast<int64_t>(elem_bytes);
       const int64_t destination_size = thread_x_extent * transaction_bytes;
       if (wrap_config.lds_offset_bits <= 0 || destination_size <= 0 ||
-          alias->second.byte_offset < 0 ||
-          alias->second.byte_offset + destination_size >
+          dest_alias_offset < 0 ||
+          dest_alias_offset + destination_size >
               (int64_t{1} << wrap_config.lds_offset_bits))
         return;
 
@@ -925,20 +1001,19 @@ void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
       }
       Call call_ref = GetRef<Call>(call);
       if (!group) {
-        lds_groups.push_back(
-            LdsBaseGroup{alias->second.root,
-                         transaction_bytes,
-                         wrap_offset,
-                         wrap_idx_mask,
-                         alias->second.byte_offset,
-                         destination->buffer_var,
-                         call_ref,
-                         {{call_ref, alias->second.byte_offset}}});
+        lds_groups.push_back(LdsBaseGroup{alias->second.root,
+                                          transaction_bytes,
+                                          wrap_offset,
+                                          wrap_idx_mask,
+                                          dest_alias_offset,
+                                          destination->buffer_var,
+                                          call_ref,
+                                          {{call_ref, dest_alias_offset}}});
         return;
       }
-      group->calls.emplace_back(call_ref, alias->second.byte_offset);
-      if (alias->second.byte_offset < group->base_alias_offset) {
-        group->base_alias_offset = alias->second.byte_offset;
+      group->calls.emplace_back(call_ref, dest_alias_offset);
+      if (dest_alias_offset < group->base_alias_offset) {
+        group->base_alias_offset = dest_alias_offset;
         group->base_alias = destination->buffer_var;
         group->base_call = call_ref;
       }
@@ -2434,7 +2509,6 @@ void CodeGenTileLangHCU::PrintStorageSync(const CallNode *op) {
       this->stream << "tl::ebarrier_sync_cnt(" << barrier_id->value << ", "
                    << thread_count->value / warp_size << ");\n";
     } else {
-      // Preserve the existing behavior on HCU targets without EBarrier.
       this->stream << "__syncthreads();\n";
     }
   }
@@ -2817,7 +2891,30 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string func_name = "tl::cp_async_wait<" + std::to_string(n) + ">";
     print_extern_call_stmt(func_name, 1);
   } else if (op->op.same_as(tl::async_gld_sld_fence())) {
-    print_extern_call_stmt("tl::async_gld_sld_fence");
+    int fence_num = 0;
+    if (!op->args.empty()) {
+      if (const auto *imm = op->args[0].as<IntImmNode>()) {
+        fence_num = static_cast<int>(imm->value);
+      }
+    }
+    if (fence_num < 0) {
+      fence_num = 0;
+    } else if (fence_num > 15) {
+      fence_num = 15;
+    }
+    this->PrintIndent();
+    this->stream << "tl::async_gld_sld_fence(" << fence_num << ");\n";
+  } else if (op->op.same_as(tl::async_gld_fence())) {
+    int fence_num = 0;
+    if (!op->args.empty()) {
+      if (const auto *imm = op->args[0].as<IntImmNode>()) {
+        fence_num = static_cast<int>(imm->value);
+      }
+    }
+    this->PrintIndent();
+    this->stream << "tl::async_gld_fence(" << fence_num << ");\n";
+  } else if (op->op.same_as(tl::wave_barrier())) {
+    print_extern_call_stmt("tl::wave_barrier");
   } else if (op->op.same_as(builtin::create_barriers())) {
     this->PrintIndent();
     int barrier_count = Downcast<IntImm>(op->args[0])->value;
