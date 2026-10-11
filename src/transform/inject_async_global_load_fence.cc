@@ -88,14 +88,6 @@ bool IsSBarrierStmt(const Stmt &stmt) {
   return IsWaveBarrierStmt(stmt) || IsSyncWarpStmt(stmt);
 }
 
-Stmt MakeAsyncGldFenceStmt(int wait_count) {
-  if (wait_count < 0) {
-    wait_count = 0;
-  }
-  return Evaluate(
-      Call(DataType::Void(), async_gld_fence(), {Integer(wait_count)}));
-}
-
 Stmt MakePtxWaitGroupStmt(int wait_count) {
   if (wait_count < 0) {
     wait_count = 0;
@@ -136,10 +128,11 @@ void AppendGldWaitSync(Array<Stmt> &result) {
   }
 }
 
-bool IsSharedToLocalCopy(const Stmt &stmt) {
-  if (StmtContainsMma(stmt)) {
-    return false;
-  }
+// Reads shared memory and issues no async copy of its own: the consumer side
+// of a pipeline stage. Matches plain LDS-read copies; unlike
+// IsSharedToLocalCopy it also matches blocks that mix reads with MMA, which is
+// what the consumer region of a pipelined GEMM looks like.
+bool ReadsSharedWithoutAsyncCopy(const Stmt &stmt) {
   struct Checker : public StmtExprVisitor {
     bool has_shared_src{false};
     bool has_async_copy{false};
@@ -166,6 +159,47 @@ bool IsSharedToLocalCopy(const Stmt &stmt) {
   Checker checker;
   checker(stmt);
   return checker.has_shared_src && !checker.has_async_copy;
+}
+
+bool IsSharedToLocalCopy(const Stmt &stmt) {
+  return !StmtContainsMma(stmt) && ReadsSharedWithoutAsyncCopy(stmt);
+}
+
+// True when the function issues at least one async copy (or commits a group).
+// A pipelined kernel whose copies are plain synchronous reads staged through
+// shared memory has nothing for a wait plan to order: base emitted no wait
+// there, and a wait plus its paired barrier per iteration is pure overhead.
+bool HasAsyncCopies(const Stmt &root) {
+  struct Scanner : public StmtExprVisitor {
+    bool found{false};
+
+    void VisitStmt_(const AttrStmtNode *op) override {
+      if (IsCommitAttr(op)) {
+        found = true;
+        return;
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+
+    void VisitStmt_(const EvaluateNode *op) override {
+      if (IsPtxCommitStmt(GetRef<Evaluate>(op))) {
+        found = true;
+        return;
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+
+    void VisitExpr_(const CallNode *op) override {
+      if (IsAsyncCopyCall(op)) {
+        found = true;
+        return;
+      }
+      ExprVisitor::VisitExpr_(op);
+    }
+  };
+  Scanner scanner;
+  scanner(root);
+  return scanner.found;
 }
 
 Stmt UnwrapWaitAttrs(Stmt stmt) {
@@ -272,6 +306,9 @@ struct SharedPipelineWaitPlan {
   int commits_per_tile{0};
   int main_wait{0};
   int num_stages{0};
+  // False when the function issues no async copy at all (see HasAsyncCopies):
+  // there is nothing to wait for, so the pass leaves the kernel untouched.
+  bool has_async_copies{false};
   bool register_pipeline{false};
   // T.Pipelined / InjectSoftwarePipeline with depth >= 2, or register pipeline.
   bool compiler_pipeline{false};
@@ -429,6 +466,7 @@ SharedPipelineWaitPlan MakeWaitPlan(const Stmt &root) {
   if (loops.empty()) {
     return plan;
   }
+  plan.has_async_copies = HasAsyncCopies(root);
   const ForNode *k_loop = loops.front();
   // NOTE: the plan is derived from the first GEMM K loop and applies to the
   // whole function. The pipelined kernels this pass serves have a single GEMM
@@ -493,6 +531,7 @@ public:
     if (is_k) {
       phase_ = PipelinePhase::kMainLoop;
       outstanding_ = plan_.main_wait;
+      k_iter_gld_fence_done_ = false;
     }
     if (lds_for) {
       ++suppress_inner_lds_insert_;
@@ -551,6 +590,12 @@ public:
       }
 
       const bool lds = IsSharedToLocalCopy(cur);
+      // Consumer region: reads shared memory and issues no async copy of its
+      // own. Wider than lds: it also matches the wrapper that holds a stage's
+      // LDS-read clusters together with its MMA.
+      const bool consumer_region = ReadsSharedWithoutAsyncCopy(cur);
+      const bool mma_region = !lds && consumer_region && StmtContainsMma(cur);
+      bool inserted_here = false;
       if (plan_.register_pipeline) {
         if (phase_ == PipelinePhase::kPrologue) {
           if (lds && !in_lds_cluster) {
@@ -568,13 +613,36 @@ public:
             in_lds_cluster = true;
           }
         }
-      } else if (lds && !in_lds_cluster) {
+      } else if (phase_ == PipelinePhase::kMainLoop) {
+        // One wait per K-loop iteration, placed before the consumer region as
+        // a whole: no DMA is issued after its first LDS-read cluster, so a wait
+        // per cluster adds nothing but a barrier inside the compute and splits
+        // the LDS wait ladder the backend schedules across the clusters.
+        if (consumer_region && !k_iter_gld_fence_done_) {
+          MaybeInsertGldFence(result);
+          k_iter_gld_fence_done_ = true;
+          inserted_here = true;
+        }
+      } else if (mma_region || (lds && !in_lds_cluster)) {
+        // One wait per consumer block (the epilogue's per-stage compute
+        // blocks each wait on their own stage); adjacent blocks are not
+        // coalesced because each of them covers a different stage's DMA.
         MaybeInsertGldFence(result);
+        inserted_here = true;
+      }
+      if (lds) {
         in_lds_cluster = true;
-      } else if (!lds) {
+      } else {
         in_lds_cluster = false;
       }
+      // The region the wait was emitted for needs no further wait inside it.
+      if (inserted_here) {
+        ++suppress_inner_lds_insert_;
+      }
       append_stmt(VisitStmt(cur));
+      if (inserted_here) {
+        --suppress_inner_lds_insert_;
+      }
       if (plan_.num_stages >= 2 && phase_ == PipelinePhase::kPrologue &&
           plan_.commits_per_tile > 0 && IsOutermostCommitStmt(cur)) {
         prologue_stage_commits += 1;
@@ -662,7 +730,7 @@ private:
   }
 
   void MaybeInsertGldFence(Array<Stmt> &result) {
-    if (!plan_.compiler_pipeline) {
+    if (!plan_.compiler_pipeline || !plan_.has_async_copies) {
       return;
     }
     if (suppress_inner_lds_insert_ > 0) {
@@ -676,17 +744,20 @@ private:
       // No planned wait count left for this cluster (see NextWaitCount).
       return;
     }
-    if (plan_.register_pipeline) {
-      result.push_back(MakePtxWaitGroupStmt(wait_count));
-      AppendGldWaitSync(result);
-    } else {
-      result.push_back(MakeAsyncGldFenceStmt(wait_count));
-      AppendWaveBarrierIfNeeded(result);
-    }
+    // The wait plan counts outstanding commit groups, so the wait must be
+    // issued with the group-tracking instruction; a raw s_waitcnt vmcnt(N)
+    // would read N as an instruction count and stall until nearly all
+    // outstanding DMA has landed.
+    result.push_back(MakePtxWaitGroupStmt(wait_count));
+    // sync_warp rather than wave_barrier: this call site is in the K loop,
+    // where the opaque asm form is a scheduling barrier the AMDGPU machine
+    // scheduler cannot see through. Both encode to the same s_barrier.
+    AppendGldWaitSync(result);
   }
 
   SharedPipelineWaitPlan plan_;
   PipelinePhase phase_{PipelinePhase::kPrologue};
+  bool k_iter_gld_fence_done_{false};
   int outstanding_{0};
   int suppress_inner_lds_insert_{0};
   int epilogue_gld_insert_idx_{0};
