@@ -8,7 +8,7 @@ so ``T.gemm`` lowers through ``_gemm_mls_mls`` -> ``ds_read_format_tensor_a/b``
 kernel uses). Constraint: with ``trans_B=True`` the B MLS atom is the trans
 b8 tile (tile_k 64/128) so ``block_K`` must be a multiple of 64.
 
-Run: HIP_VISIBLE_DEVICES=2 python perf/gemm/fp8_mls_channelwise_bench.py
+Run: HIP_VISIBLE_DEVICES=2 python perf/gemm/fp8_channelwise_mls_bench.py
 """
 import os
 import sys

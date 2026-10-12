@@ -4,7 +4,7 @@
 """Correctness test for the fp8 channelwise GEMM on the MLS (matrix-LDS-read)
 producer path.
 
-Kernel: ``perf/gemm/fp8_mls_channelwise.py``. Semantics:
+Kernel: ``perf/gemm/fp8_channelwise_mls.py``. Semantics:
 ``C[m, n] = scale_a[m] * scale_b[n] * sum_k A[m, k] * B[n, k]`` with A (M, K)
 fp8, B (N, K) fp8 (N-major), fp32 per-token / per-channel scales. Validated
 configuration on HCU (gfx938): block 256x256x64, num_stages=1, 512 threads.
@@ -21,7 +21,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from perf.gemm.fp8_mls_channelwise import fp8_mls_channelwise  # noqa: E402
+from perf.gemm.fp8_channelwise_mls import fp8_mls_channelwise  # noqa: E402
 
 
 pytestmark = [
