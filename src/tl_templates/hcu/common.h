@@ -109,8 +109,7 @@ TL_DEVICE bfloat16_t hcu_habs(bfloat16_t a) {
 // __shfl overload for _Float16/half_t
 // There is no half_t version of __shfl in HIP, so we implement it ourselves
 // here.
-TL_DEVICE half_t __shfl(half_t var, int src_lane,
-                        int width = __AMDGCN_WAVEFRONT_SIZE) {
+TL_DEVICE half_t __shfl(half_t var, int src_lane, int width = 64) {
   static_assert(sizeof(half_t) == sizeof(unsigned short), "");
   // Bit-preserving shuffle: use union to preserve exact bit pattern.
   union {
