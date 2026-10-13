@@ -166,9 +166,12 @@ TL_DEVICE int get_warp_idx(int warp_size = detail::default_warp_size()) {
 
 TL_DEVICE void sync_warp(unsigned long long mask = ~0ull) {
   (void)mask;
-#if defined(__HIP_DEVICE_COMPILE__)
+  // The builtin encodes to the same s_barrier as `asm volatile("s_barrier")`,
+  // but the opaque asm form is a scheduling barrier that the AMDGPU machine
+  // scheduler cannot see through, which blocks software pipelining of the LDS
+  // DMA at every call site inside the K loop. TL_DEVICE keeps this body out of
+  // the host pass, so no __HIP_DEVICE_COMPILE__ guard is needed.
   __builtin_amdgcn_s_barrier();
-#endif
 }
 
 TL_DEVICE unsigned long long activemask() {

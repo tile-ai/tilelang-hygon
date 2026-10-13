@@ -131,3 +131,9 @@ The [`examples/`](./examples/) tree is inherited from upstream TileLang and is a
 ## Acknowledgments
 
 We thank the [TileLang](https://github.com/tile-ai/tilelang) and [TVM](https://github.com/apache/tvm) communities. tilelang-hygon is derived from TileLang and adapted for Hygon HCU.
+
+## Contributors
+
+System Software Group, High Performance Computer Research Center, Institute of Computing Technology (ICT), Chinese Academy of Sciences (CAS)
+
+[dtk@ncic.ac.cn](mailto:dtk@ncic.ac.cn)

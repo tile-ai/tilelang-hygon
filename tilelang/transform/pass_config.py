@@ -106,7 +106,8 @@ class PassConfigKey(str, Enum):
 
     When True (default), TileLang may lower:
     - `T.copy(global -> shared, ...)` to `ptx_cp_async + commit + wait`
-    - `T.async_copy(global -> shared, ...)` to `ptx_cp_async + commit` (no wait)
+    - `T.copy(..., enable_async=True)` or `T.async_copy(global -> shared, ...)`
+      to `ptx_cp_async + commit` (no wait)
     - plain user-written global->shared copy stores (e.g. in `T.Parallel`) to
       `ptx_cp_async + commit + wait`
 
@@ -120,10 +121,15 @@ class PassConfigKey(str, Enum):
     `T.Parallel(..., prefer_async=True)`.
 
     When False, TileLang will avoid the cp.async lowering path for `T.copy`.
-    Explicit `T.async_copy` still requires cp.async support and may error if
-    it cannot be lowered.
+    Explicit `T.copy(..., enable_async=True)` and `T.async_copy` still require
+    cp.async support and may error if they cannot be lowered.
 
     Default: True
+    """
+
+    TL_PIPELINED_K_UNROLL_FACTOR = "tl.pipelined_k_unroll_factor"
+    """Unroll factor for the GEMM K loop after software pipelining (HCU only;
+    consumed by UnrollPipelinedKLoop). Default: 4. Set to 1 to disable.
     """
 
     TL_ENABLE_HCU_WDRA = "tl.enable_hcu_wdra"

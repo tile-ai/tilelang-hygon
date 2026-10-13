@@ -914,6 +914,8 @@ class HCUMatrixCoreIntrinEmitter:
         C_local_buf,
         k_inner: PrimExpr | int = 0,
         trans_c: bool = False,
+        a_ptr_base: PrimExpr | int = 0,
+        b_ptr_base: PrimExpr | int = 0,
     ):
         warp_rows = self.warp_rows
         warp_cols = self.warp_cols
@@ -968,9 +970,9 @@ class HCUMatrixCoreIntrinEmitter:
                         compute_a_dtype_imm,
                         compute_out_dtype_imm,
                         B_local_buf.data,
-                        (b_local_stride + (j * k_pack + kp) * local_size_b) // b_index_div,
+                        (b_ptr_base + b_local_stride + (j * k_pack + kp) * local_size_b) // b_index_div,
                         A_local_buf.data,
-                        (a_local_stride + (i * k_pack + kp) * local_size_a) // a_index_div,
+                        (a_ptr_base + a_local_stride + (i * k_pack + kp) * local_size_a) // a_index_div,
                         C_local_buf.data,
                         (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
                         annotations=mmac_annotations,
@@ -986,9 +988,9 @@ class HCUMatrixCoreIntrinEmitter:
                         compute_b_dtype_imm,
                         compute_out_dtype_imm,
                         A_local_buf.data,
-                        (a_local_stride + (i * k_pack + kp) * local_size_a) // a_index_div,
+                        (a_ptr_base + a_local_stride + (i * k_pack + kp) * local_size_a) // a_index_div,
                         B_local_buf.data,
-                        (b_local_stride + (j * k_pack + kp) * local_size_b) // b_index_div,
+                        (b_ptr_base + b_local_stride + (j * k_pack + kp) * local_size_b) // b_index_div,
                         C_local_buf.data,
                         (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
                         annotations=mmac_annotations,

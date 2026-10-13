@@ -22,6 +22,8 @@
 
 #include <tl_templates/hcu/mls/tile_window_mls.h>
 
+#include <cstdint>
+
 namespace tl {
 namespace mls {
 
@@ -553,13 +555,15 @@ public:
 /*
  * mls_load_tile: one-shot MLS load (no hoist).
  * Flow: construct -> set_window_origin(mn, k) -> async_mls_load_asm.
- * refresh_k / refresh_mn are established results (user or proof).
+ * KBoundary / MNBoundary: -1 analyze, 0 skip, 1 refresh; a one-shot load
+ * refreshes unless the axis is skip. TIR boundary=(mn, k) is encoded as int8
+ * modes after DstBits on mls_load_tile.
  */
 template <typename BlockSize, typename MlsTileSize, ::tl::index_t WarpMN,
           ::tl::index_t WarpK, typename DataType, ::tl::index_t Alt, bool Trans,
           ::tl::hcu_target_enum HcuArch,
           ::tl::index_t DstBits = mls_elem_bits_v<DataType>,
-          bool refresh_k = true, bool refresh_mn = true>
+          int8_t KBoundary = -1, int8_t MNBoundary = -1>
 TL_DEVICE void
 mls_load_tile(DataType *p_data, ::tl::index_t mls_stride,
               ::tl::index_t mn_length_raw, ::tl::index_t k_length_raw,
@@ -571,6 +575,10 @@ mls_load_tile(DataType *p_data, ::tl::index_t mls_stride,
   mls.set_window_origin(
       ::tl::make_array<::tl::index_t>(block_mn_base, block_k_base));
   auto *typed_smem = reinterpret_cast<TL_LDS_ADDR DataType *>(smem);
+  // KBoundary/MNBoundary: -1 analyze, 0 skip, 1 refresh. One-shot load
+  // refreshes unless the axis is skip (matches MlsOneShotRefresh).
+  constexpr bool refresh_k = KBoundary != 0;
+  constexpr bool refresh_mn = MNBoundary != 0;
   mls.template async_mls_load_asm<DataType, refresh_k, refresh_mn>(
       typed_smem, block_k_base, block_mn_base);
 }

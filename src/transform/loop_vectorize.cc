@@ -728,25 +728,43 @@ private:
       transformed_indices = layout->Forward(indices);
       // Reshape transformed_indices to match buffer->shape dimensions if needed
       if (transformed_indices.size() != buffer->shape.size()) {
-        // Step 1: Compute linear offset using layout->OutputShape()
+        // Layout::Forward keeps extra leading indices (register-pipeline
+        // version slots) in front of the layout output. Linearize only the
+        // spatial tail, then prepend those leading coords onto the buffer
+        // shape decomposition.
         auto output_shape = layout->OutputShape();
-        ICHECK_EQ(transformed_indices.size(), output_shape.size())
+        ICHECK_GE(transformed_indices.size(), output_shape.size())
             << "Forward indices size " << transformed_indices.size()
-            << " != OutputShape size " << output_shape.size();
+            << " < OutputShape size " << output_shape.size();
+        const size_t n_extra = transformed_indices.size() - output_shape.size();
+        ICHECK_GE(buffer->shape.size(), n_extra)
+            << "Buffer rank " << buffer->shape.size()
+            << " is smaller than extra leading coords " << n_extra;
         PrimExpr linear_offset = 0;
         PrimExpr stride = 1;
-        for (int i = output_shape.size() - 1; i >= 0; --i) {
-          linear_offset = linear_offset + transformed_indices[i] * stride;
+        for (int i = static_cast<int>(output_shape.size()) - 1; i >= 0; --i) {
+          linear_offset =
+              linear_offset +
+              transformed_indices[n_extra + static_cast<size_t>(i)] * stride;
           stride = stride * output_shape[i];
         }
-        // Step 2: Decompose linear_offset into buffer->shape dimensions
-        Array<PrimExpr> new_indices;
-        for (int i = buffer->shape.size() - 1; i >= 0; --i) {
-          new_indices.push_back(FloorMod(linear_offset, buffer->shape[i]));
-          linear_offset = FloorDiv(linear_offset, buffer->shape[i]);
+        Array<PrimExpr> trailing_indices;
+        const int trailing = static_cast<int>(buffer->shape.size() - n_extra);
+        for (int i = trailing - 1; i >= 0; --i) {
+          trailing_indices.push_back(
+              FloorMod(linear_offset, buffer->shape[n_extra + i]));
+          linear_offset = FloorDiv(linear_offset, buffer->shape[n_extra + i]);
         }
-        transformed_indices =
-            Array<PrimExpr>{new_indices.rbegin(), new_indices.rend()};
+        Array<PrimExpr> new_indices;
+        new_indices.reserve(buffer->shape.size());
+        for (size_t i = 0; i < n_extra; ++i) {
+          new_indices.push_back(transformed_indices[i]);
+        }
+        for (auto it = trailing_indices.rbegin(); it != trailing_indices.rend();
+             ++it) {
+          new_indices.push_back(*it);
+        }
+        transformed_indices = std::move(new_indices);
       }
     }
     return transformed_indices;

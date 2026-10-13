@@ -684,60 +684,53 @@ private:
     PrimExpr physical_offset = analyzer_.Simplify(
         (transaction * block_threads + local_thread) * transaction_elements +
         intra_transaction);
+    Array<PrimExpr> tile_indices = {
+        floordiv(physical_offset, Integer(inner_extent)),
+        floormod(physical_offset, Integer(inner_extent))};
     // Address the remapped buffer directly so the enclosing layout lowering
     // does not apply the final LDS storage layout to this pre-wrap address.
     Optional<Buffer> physical_buffer = buffer_remap_.Get(buffer);
-    if (!physical_buffer.defined()) {
-      // Match LowerTileOpPass::FindRemapBuffer: layout lowering may rebuild a
-      // scoped/versioned access Buffer (for example k_stages[stage, :, :]),
-      // so Buffer object identity alone is insufficient even when every view
-      // uses the same LDS layout.
-      for (const auto &[logical, physical] : buffer_remap_) {
-        bool same_logical_signature =
-            logical->name == buffer->name && logical->dtype == buffer->dtype &&
-            logical.scope() == buffer.scope() &&
-            logical->shape.size() == buffer->shape.size();
-        if (same_logical_signature) {
-          for (size_t i = 0; i < logical->shape.size(); ++i) {
-            if (!analyzer_.CanProveEqual(logical->shape[i], buffer->shape[i])) {
-              same_logical_signature = false;
-              break;
-            }
-          }
-        }
-        if ((logical->data.same_as(buffer->data) || same_logical_signature) &&
-            physical->shape.size() == dst_base_load->indices.size()) {
-          physical_buffer = physical;
-          break;
-        }
-      }
-    }
     ICHECK(physical_buffer.defined())
         << "HCU GEMM " << operand
         << " strategy requires a remapped physical LDS buffer for "
         << buffer->name;
-    const size_t physical_rank = physical_buffer.value()->shape.size();
-    ICHECK_GE(physical_rank, 2U)
-        << "HCU GEMM " << operand
-        << " strategy requires an LDS buffer with at least two dimensions";
-    ICHECK_EQ(dst_base_load->indices.size(), physical_rank)
-        << "HCU GEMM " << operand
-        << " destination access rank must match the remapped LDS buffer rank";
-
-    // The strategy remaps the innermost matrix row/column dimensions. Preserve
-    // every outer index, including software-pipeline version dimensions.
-    Array<PrimExpr> physical_indices;
-    physical_indices.reserve(physical_rank);
-    for (size_t i = 0; i + 2 < physical_rank; ++i) {
-      physical_indices.push_back(dst_base_load->indices[i]);
-    }
-    physical_indices.push_back(
-        floordiv(physical_offset, Integer(inner_extent)));
-    physical_indices.push_back(
-        floormod(physical_offset, Integer(inner_extent)));
+    // Software pipelining prepends a version dimension to shared buffers.
+    // Keep those leading indices; only the trailing 2-D tile is rewritten.
+    Array<PrimExpr> physical_indices = PrependLeadingIndices(
+        dst_base_load->indices, tile_indices,
+        physical_buffer.value()->shape.size(), buffer->name, operand);
     return MakeAccessPtrFromLoad(
         BufferLoad(physical_buffer.value(), physical_indices), num_elems,
         /*rw_mask=*/2);
+  }
+
+  static Array<PrimExpr>
+  PrependLeadingIndices(const Array<PrimExpr> &src_indices,
+                        const Array<PrimExpr> &tile_indices, size_t dst_ndim,
+                        const String &buffer_name, const char *operand) {
+    ICHECK_GE(dst_ndim, tile_indices.size())
+        << "HCU GEMM " << operand << " physical buffer " << buffer_name
+        << " has rank " << dst_ndim << ", expected at least "
+        << tile_indices.size();
+    const size_t extra = dst_ndim - tile_indices.size();
+    ICHECK_GE(src_indices.size(), extra)
+        << "HCU GEMM " << operand << " async-copy to " << buffer_name
+        << " needs " << extra
+        << " leading index(es) for the pipelined "
+           "buffer, but the store only has "
+        << src_indices.size();
+    if (extra == 0) {
+      return tile_indices;
+    }
+    Array<PrimExpr> full_indices;
+    full_indices.reserve(dst_ndim);
+    for (size_t i = 0; i < extra; ++i) {
+      full_indices.push_back(src_indices[i]);
+    }
+    for (const PrimExpr &index : tile_indices) {
+      full_indices.push_back(index);
+    }
+    return full_indices;
   }
 
   Optional<Stmt> MakeCPAsyncStmtFromLoads(const BufferStoreNode *store,
