@@ -8,6 +8,13 @@ winning M<=16 decode config (block 16x32x256, num_stages=1, 256 threads)
 extended to M=32..128 via block_M=pow2 tiles. Reports effective bandwidth
 vs the 1800 GB/s peak.
 
+NOTE on timing (2026-10-13): this stack's `do_bench_cudagraph` returns
+**milliseconds** and divides n_repeat out of a single unrolled-graph replay,
+which inflates utilization (it produced the old "94%" figures). Use
+`graph_replay_time` below (explicit per-call CUDA-graph capture + replay with
+event timing) — the box's measured pure-read ceiling is ~1646 GB/s (91.5% of
+1800), so any reported % above ~91 is not physical.
+
 Run: HIP_VISIBLE_DEVICES=2 python perf/gemm/fp8_channelwise_decode_bench.py
 """
 import os
@@ -18,7 +25,6 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import torch
-from tilelang.profiler import do_bench_cudagraph
 from perf.gemm.fp8_channelwise_mls import fp8_mls_channelwise
 
 PEAK = 1800.0  # GB/s, HCU gfx938 HBM
@@ -29,6 +35,33 @@ SHAPES = {
     "o":       (5120, 8192),
     "down":    (5120, 25600),
 }
+
+
+def graph_replay_time(fn, reps=3, iters=50):
+    """Per-call latency via explicit CUDA-graph capture + replay, event timing.
+    Returns min and median of `reps` medians-of-`iters` (us)."""
+    for _ in range(10):
+        fn()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+    torch.cuda.synchronize()
+    meds = []
+    for _ in range(reps):
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        lat = []
+        for _ in range(iters):
+            s.record()
+            g.replay()
+            e.record()
+            torch.cuda.synchronize()
+            lat.append(s.elapsed_time(e) * 1e3)
+        lat.sort()
+        meds.append(lat[len(lat) // 2])
+    meds.sort()
+    return meds[0], meds[len(meds) // 2]
 
 
 def bench(name, N, K, M, bm):
@@ -44,10 +77,10 @@ def bench(name, N, K, M, bm):
     rel = (C - ref).abs().max().item() / ref.abs().max().item()
     assert rel < 1e-3, f"{name} M={M} rel={rel:.4f}"
 
-    lat = do_bench_cudagraph(lambda: kern(A, B, sa, sb))
-    eff = N * K / lat * 1e-3  # GB/s
-    print(f"{name:8s} M={M:>3} (bm={bm:>3}): {lat:8.1f}us  {eff:6.0f} GB/s  {eff / PEAK * 100:5.1f}%  rel={rel:.5f}", flush=True)
-    return lat, eff
+    tmin, tmed = graph_replay_time(lambda: kern(A, B, sa, sb))
+    eff = N * K / tmin * 1e-3  # GB/s
+    print(f"{name:8s} M={M:>3} (bm={bm:>3}): {tmin:7.1f}/{tmed:7.1f}us  {eff:6.0f} GB/s  {eff / PEAK * 100:5.1f}%  rel={rel:.5f}", flush=True)
+    return tmin, eff
 
 
 def main():

@@ -129,7 +129,7 @@ struct gfx938_mls_64x16_b8 {
                              ::tl::bool_constant<r>) {
     __builtin_hcu_matrix_load_64x16_b8(rsrc,
                                        reinterpret_cast<uint32_t *>(lds_addr),
-                                       moffset, false, r, false, false);
+                                       moffset, false, r, false, true);
   }
 };
 
@@ -144,7 +144,7 @@ struct gfx938_mls_16x64_trans_b8 {
         rsrc,
         reinterpret_cast<uint32_t *>(lds_addr |
                                      TL_MATRIX_LOAD_TRANS_EXTRA_CONFIG),
-        moffset, true, r, false, false);
+        moffset, true, r, false, true);
   }
 };
 
@@ -157,7 +157,7 @@ struct gfx938_mls_64x32_b8 {
                              ::tl::bool_constant<r>) {
     __builtin_hcu_matrix_load_64x32_b8(rsrc,
                                        reinterpret_cast<uint32_t *>(lds_addr),
-                                       moffset, false, r, false, false);
+                                       moffset, false, r, false, true);
   }
 };
 
@@ -172,7 +172,7 @@ struct gfx938_mls_32x64_trans_b8 {
         rsrc,
         reinterpret_cast<uint32_t *>(lds_addr |
                                      TL_MATRIX_LOAD_TRANS_EXTRA_CONFIG),
-        moffset, true, r, false, false);
+        moffset, true, r, false, true);
   }
 };
 
@@ -185,7 +185,7 @@ struct gfx938_mls_128x16_b8 {
                              ::tl::bool_constant<r>) {
     __builtin_hcu_matrix_load_128x16_b8(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
-                                        moffset, false, r, false, false);
+                                        moffset, false, r, false, true);
   }
 };
 
@@ -200,7 +200,7 @@ struct gfx938_mls_16x128_trans_b8 {
         rsrc,
         reinterpret_cast<uint32_t *>(lds_addr |
                                      TL_MATRIX_LOAD_TRANS_EXTRA_CONFIG),
-        moffset, true, r, false, false);
+        moffset, true, r, false, true);
   }
 };
 
