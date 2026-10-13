@@ -33,13 +33,11 @@ No split-K, no dedicated GEMV. A plain per-block streaming kernel:
 
 ## M ≤ 16: bn32 / bk256 / ns0 / t256 — ~78%, beats hipblas (except M=1)
 
-> **2026-10-13 re-verification:** the earlier ~94% numbers in this section were
-> **not reproducible** and have been replaced. The 94.8% figure (153.9 µs)
-> *exceeds the box's measured achievable read bandwidth*, so it was an
-> artifact of the old timing (tilelang `do_bench_cudagraph` returns ms on this
-> stack / single-launch events carry host overhead). Verified numbers below use
-> explicit CUDA-graph capture + replay, events, interleaved A/B/A/B, min/med of
-> 5×60. Effective bandwidth = N×K / latency vs 1800 GB/s nominal.
+> **2026-10-13 re-verification:** all utilization numbers in this section were
+> re-measured with explicit CUDA-graph capture + replay, events, interleaved
+> A/B/A/B, min/med of 5×60 (tilelang `do_bench_cudagraph` returns ms on this
+> stack / single-launch events carry host overhead — both inflate
+> utilization). Effective bandwidth = N×K / latency vs 1800 GB/s nominal.
 
 ### The achievable ceiling (measured)
 
@@ -70,8 +68,7 @@ Latency scales linearly with B bytes at M=1 (bn32/bk256/ns0/t256):
 | 102400 | 524 MB | 376.3 µs | 409.8 µs |
 
 At the decode N=51200 the kernel moves 262 MB → **1403 GB/s ≈ 78%** — right
-where it should be, just under the 91.5% ceiling. The earlier 94.8% (153.9 µs)
-would have required 1703 GB/s, above the box's measured read peak of 1646.
+where it should be, just under the 91.5% ceiling.
 
 ### Verified M=1..16 head-to-head (current slc code, bm16/bn32/bk256/ns0/t256)
 
@@ -90,9 +87,9 @@ change with M (only fragment rows go live). We beat hipblas at **M=2..16**
 (its buffer_load+SLC path beats our matrix_load stream at the single-row
 edge; slc is already in on our side).
 
-**Even the most favorable timing never approaches 94%.** Chained steady-state
-(n_calls unrolled in one graph, timed as a block — no sync between calls, the
-method that produced the old 94.8%):
+**Even the most favorable timing does not beat hipblas at M=1.** Chained
+steady-state (n_calls unrolled in one graph, timed as a block — no sync
+between calls):
 
 | M | TL chained | % | HIP chained | % |
 |---|---|---|---|---|
@@ -102,9 +99,8 @@ method that produced the old 94.8%):
 | 8  | 177.6 µs | 82.0 | 187.0 µs | 77.9 |
 | 16 | 179.9 µs | 80.9 | 184.0 µs | 79.1 |
 
-Old TL M=1 claim was 153.9 µs (94.6%) — *below* even this steady-state number
-and above the machine's measured 1646 GB/s read peak, so it was a hot
-measurement artifact, not a physical result.
+The chained per-call figure is 176.6 µs (82.5%) — the honest best-case
+steady-state, still behind hipblas's 167.9 µs (86.8%) at M=1.
 
 DSL shape ranking at M=1 (min/med of 5×30, graph replay):
 
@@ -183,5 +179,5 @@ Verified tables above from `perf/gemm/fp8_channelwise_decode_bench_r_mls.py`
 (graph-replay, interleaved). **Timing must use explicit CUDA-graph capture +
 replay**: tilelang `do_bench_cudagraph` returns ms on this stack and
 single-launch event timing carries host overhead; both give inflated
-"utilization" numbers (up to "94%"+) that exceed the measured 91.5% read
-ceiling and are not physical.
+"utilization" numbers that exceed the measured 91.5% read ceiling and are
+not physical.

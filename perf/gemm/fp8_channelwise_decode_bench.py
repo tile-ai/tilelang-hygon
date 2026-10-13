@@ -10,10 +10,10 @@ vs the 1800 GB/s peak.
 
 NOTE on timing (2026-10-13): this stack's `do_bench_cudagraph` returns
 **milliseconds** and divides n_repeat out of a single unrolled-graph replay,
-which inflates utilization (it produced the old "94%" figures). Use
-`graph_replay_time` below (explicit per-call CUDA-graph capture + replay with
-event timing) — the box's measured pure-read ceiling is ~1646 GB/s (91.5% of
-1800), so any reported % above ~91 is not physical.
+which inflates utilization (it produced the old inflated figures, since
+removed). Use `graph_replay_time` below (explicit per-call CUDA-graph capture
++ replay with event timing) — the box's measured pure-read ceiling is ~1646
+GB/s (91.5% of 1800), so any reported % above ~91 is not physical.
 
 Run: HIP_VISIBLE_DEVICES=2 python perf/gemm/fp8_channelwise_decode_bench.py
 """
