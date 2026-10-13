@@ -37,6 +37,12 @@
 namespace tl {
 namespace hcu {
 
+// Model m0 as a named physical register so that scale MMAC's implicit m0 use
+// forms a scheduler-visible dependency on this write.
+__device__ register unsigned int scale_m0_reg asm("m0");
+
+TL_DEVICE void set_scale_m0(unsigned int value) { scale_m0_reg = value; }
+
 template <char OpCtrl, char Offset0 = 0, char Offset1 = 0>
 TL_DEVICE void ds_scale_copy_ds2buf(TL_LDS_ADDR int *lds_data, int soffset) {
   __builtin_hcu_ds_scale_copy_ds2buf(lds_data, soffset, OpCtrl, Offset0,
@@ -575,8 +581,7 @@ TL_DEVICE void mmac_scale_fp4_body(const void *a, const void *b, float *c,
   static_assert(rows_mn_a > 0 && rows_mn_b > 0,
                 "each MMAC wave must consume at least one scale MN row");
 
-  asm volatile("s_mov_b32 m0, %0\n s_nop 0\n" ::"s"(m0_wave_base));
-  __builtin_amdgcn_sched_barrier(0);
+  set_scale_m0(m0_wave_base);
 
   using a_vec_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
   using b_vec_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
