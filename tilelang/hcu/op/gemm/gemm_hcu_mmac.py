@@ -400,6 +400,8 @@ class GemmHCUMMAC(GemmBase):
         row_base_b = _ann_expr(annotations, "tl.scale_b_row_base")
         scale_format_a = _ann_int(annotations, "tl.scale_a_format")
         scale_format_b = _ann_int(annotations, "tl.scale_b_format")
+        scale_row_order_a = _ann_int(annotations, "tl.scale_a_row_order", 0)
+        scale_row_order_b = _ann_int(annotations, "tl.scale_b_row_order", 0)
 
         thread_nums = int(thread_bounds.extent)
         meta = _resolve_hcu_mls_meta(self.gemm_node, self.A, self.B, thread_nums, target)
@@ -501,6 +503,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -530,6 +534,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -559,6 +565,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -591,6 +599,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -623,6 +633,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -654,6 +666,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -685,6 +699,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -713,6 +729,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 

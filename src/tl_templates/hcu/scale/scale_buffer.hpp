@@ -76,6 +76,11 @@ enum class DsScaleFormat : int {
   kMN4Interleave = 5,
 };
 
+enum class ScaleBufferRowOrder : int {
+  kKInner = 0,
+  kMNInner = 1,
+};
+
 /*! Local row inside one MN segment (relative to segment base / m0). */
 template <int ScaleMNIdx, int ScaleKIdx, int GranularityMN, int ScaleShapeK,
           int GranularityK, int MmacK = 64>
@@ -111,6 +116,72 @@ struct ScaleFormatLogicalToRow {
     }
   }();
 };
+
+/*! Canonical scale-buffer row mapping shared by copy and MMAC.
+ *
+ * ScaleFormat fixes the atom shape and inner byte/row order.  RowOrder only
+ * transposes the two outer atom coordinates; it never splits an atom.  The
+ * identity format uses a K2 consumption atom for MmacK=64 even though
+ * op_ctrl=0 writes its two rows with separate instructions.
+ */
+template <int ScaleFormatId, int RowOrderId, int RowsMNPerSeg, int ScaleMNIdx,
+          int ScaleKIdx, int GranularityMN, int ScaleShapeK, int GranularityK,
+          int MmacK = 64>
+struct ScaleBufferLogicalToRow {
+  static constexpr DsScaleFormat format =
+      static_cast<DsScaleFormat>(ScaleFormatId);
+  static constexpr ScaleBufferRowOrder order =
+      static_cast<ScaleBufferRowOrder>(RowOrderId);
+  static constexpr int mn_row = ScaleMNToRow<ScaleMNIdx, GranularityMN>::value;
+  static constexpr int k_dup =
+      ScalePhysK<ScaleShapeK, GranularityK, MmacK>::k_dup;
+  static constexpr int phys_k =
+      ScalePhysK<ScaleShapeK, GranularityK, MmacK>::value;
+  static constexpr int k_phys = ScaleKIdx * k_dup;
+  static constexpr int atom_mn =
+      format == DsScaleFormat::kMN4Interleave
+          ? 4
+          : ((format == DsScaleFormat::kMN2Interleave ||
+              format == DsScaleFormat::kK2MN2Interleave)
+                 ? 2
+                 : 1);
+  static constexpr int atom_k =
+      format == DsScaleFormat::kK4Interleave
+          ? 4
+          : ((format == DsScaleFormat::kK2Interleave ||
+              format == DsScaleFormat::kK2MN2Interleave ||
+              (format == DsScaleFormat::kIdentity && MmacK == 64))
+                 ? 2
+                 : 1);
+  static_assert(RowsMNPerSeg % atom_mn == 0,
+                "scale MN segment must contain complete atoms");
+  static_assert(phys_k % atom_k == 0,
+                "scale K extent must contain complete atoms");
+  static constexpr int mn_atoms = RowsMNPerSeg / atom_mn;
+  static constexpr int k_atoms = phys_k / atom_k;
+  static constexpr int mn_atom = mn_row / atom_mn;
+  static constexpr int k_atom = k_phys / atom_k;
+  static constexpr int inner_mn = mn_row % atom_mn;
+  static constexpr int inner_k = k_phys % atom_k;
+  static constexpr int inner = inner_mn * atom_k + inner_k;
+  static constexpr int atom_ordinal = order == ScaleBufferRowOrder::kMNInner
+                                          ? k_atom * mn_atoms + mn_atom
+                                          : mn_atom * k_atoms + k_atom;
+  static constexpr int value = atom_ordinal * atom_mn * atom_k + inner;
+};
+
+template <int RowOrderId>
+TL_DEVICE void DecodeScaleAtomOrdinal(int ordinal, int mn_atoms, int k_atoms,
+                                      int *mn_atom, int *k_atom) {
+  if constexpr (static_cast<ScaleBufferRowOrder>(RowOrderId) ==
+                ScaleBufferRowOrder::kMNInner) {
+    *k_atom = ordinal / mn_atoms;
+    *mn_atom = ordinal % mn_atoms;
+  } else {
+    *mn_atom = ordinal / k_atoms;
+    *k_atom = ordinal % k_atoms;
+  }
+}
 
 /*!
  * Per-scenario fill policies: specialize fill_batch → (dst_row, lds_byte).
@@ -151,7 +222,7 @@ struct ScaleLdsLinearLayout {
 // base; origin_mn/origin_k identify the copied tile inside that plane.
 template <int ParentScaleMN, int ParentScaleK, int ScaleShapeMN,
           int ScaleShapeK, int GranularityMN, int GranularityK, int ScaleKMajor,
-          int MmacK, typename StorageLayout>
+          int MmacK, int RowOrder, typename StorageLayout>
 struct DsScaleLdsOpctrl0Linear {
   static constexpr int kOpCtrl = 0;
   static constexpr int kRowsPerFill = 1;
@@ -161,12 +232,18 @@ struct DsScaleLdsOpctrl0Linear {
       ScalePhysK<ScaleShapeK, GranularityK, MmacK>::k_dup;
 
   TL_DEVICE static void Map(int fill_batch, int seg_row_base, int mn_row0,
-                            int tx16, int origin_mn, int origin_k, int *dst_row,
-                            int *lds_byte) {
+                            int rows_mn_per_seg, int tx16, int origin_mn,
+                            int origin_k, int *dst_row, int *lds_byte) {
     *dst_row = seg_row_base + fill_batch;
-    const int mn_idx =
-        ScaleMnIdx<GranularityMN>(mn_row0 + fill_batch / kPhysK, tx16);
-    const int k_rel = (fill_batch % kPhysK) / kDup;
+    constexpr int atom_k = MmacK == 64 ? 2 : 1;
+    constexpr int k_atoms = kPhysK / atom_k;
+    const int atom_ordinal = fill_batch / atom_k;
+    const int inner = fill_batch % atom_k;
+    int mn_local = 0, k_atom = 0;
+    DecodeScaleAtomOrdinal<RowOrder>(atom_ordinal, rows_mn_per_seg, k_atoms,
+                                     &mn_local, &k_atom);
+    const int mn_idx = ScaleMnIdx<GranularityMN>(mn_row0 + mn_local, tx16);
+    const int k_rel = (k_atom * atom_k + inner) / kDup;
     *lds_byte = StorageLayout::CalculateOffset(origin_k + k_rel,
                                                origin_mn + mn_idx, 0, 0, 0);
   }
@@ -176,7 +253,7 @@ struct DsScaleLdsOpctrl0Linear {
 // LDS: m0k0 m0k1 | m1k0 m1k1 | ... then next k_atom: m0k2 m0k3 | ...
 template <int ParentScaleMN, int ParentScaleK, int ScaleShapeMN,
           int ScaleShapeK, int GranularityMN, int GranularityK, int MmacK,
-          typename StorageLayout>
+          int RowOrder, typename StorageLayout>
 struct DsScaleLdsOpctrl1K2Interleave {
   static_assert(ScaleShapeK % 2 == 0,
                 "op_ctrl=1 K2 interleave requires scaleShapeK % 2 == 0");
@@ -187,22 +264,15 @@ struct DsScaleLdsOpctrl1K2Interleave {
   static constexpr int kAtoms = kPhysK / kRowsPerFill;
 
   TL_DEVICE static void Map(int fill_batch, int seg_row_base, int mn_row0,
-                            int tx16, int origin_mn, int origin_k, int *dst_row,
-                            int *lds_byte) {
-    if constexpr (kAtoms == 1) {
-      // scaleShapeK==2: one K-atom per MN; fill_batch == mn_local.
-      *dst_row = seg_row_base + fill_batch * kPhysK;
-      const int mn_idx = ScaleMnIdx<GranularityMN>(mn_row0 + fill_batch, tx16);
-      *lds_byte = StorageLayout::CalculateOffset(origin_k / 2,
-                                                 origin_mn + mn_idx, 0, 0, 0);
-    } else {
-      const int mn_local = fill_batch / kAtoms;
-      const int k_atom = fill_batch % kAtoms;
-      *dst_row = seg_row_base + mn_local * kPhysK + k_atom * kRowsPerFill;
-      const int mn_idx = ScaleMnIdx<GranularityMN>(mn_row0 + mn_local, tx16);
-      *lds_byte = StorageLayout::CalculateOffset(origin_k / 2 + k_atom,
-                                                 origin_mn + mn_idx, 0, 0, 0);
-    }
+                            int rows_mn_per_seg, int tx16, int origin_mn,
+                            int origin_k, int *dst_row, int *lds_byte) {
+    int mn_local = 0, k_atom = 0;
+    DecodeScaleAtomOrdinal<RowOrder>(fill_batch, rows_mn_per_seg, kAtoms,
+                                     &mn_local, &k_atom);
+    *dst_row = seg_row_base + fill_batch * kRowsPerFill;
+    const int mn_idx = ScaleMnIdx<GranularityMN>(mn_row0 + mn_local, tx16);
+    *lds_byte = StorageLayout::CalculateOffset(origin_k / 2 + k_atom,
+                                               origin_mn + mn_idx, 0, 0, 0);
   }
 };
 
@@ -210,7 +280,7 @@ struct DsScaleLdsOpctrl1K2Interleave {
 // LDS: m0k0 m16k0 | m1k0 m17k0 | ...  — each thread +2B from pair slot.
 template <int ParentScaleMN, int ParentScaleK, int ScaleShapeMN,
           int ScaleShapeK, int GranularityMN, int GranularityK, int MmacK,
-          typename StorageLayout>
+          int RowOrder, typename StorageLayout>
 struct DsScaleLdsOpctrl1MN2Interleave {
   static constexpr int kOpCtrl = 1;
   static constexpr int kRowsPerFill = 2;
@@ -218,10 +288,11 @@ struct DsScaleLdsOpctrl1MN2Interleave {
       ScalePhysK<ScaleShapeK, GranularityK, MmacK>::value;
 
   TL_DEVICE static void Map(int fill_batch, int seg_row_base, int mn_row0,
-                            int tx16, int origin_mn, int origin_k, int *dst_row,
-                            int *lds_byte) {
-    const int mn_pair = fill_batch / kPhysK;
-    const int k_rel = fill_batch % kPhysK;
+                            int rows_mn_per_seg, int tx16, int origin_mn,
+                            int origin_k, int *dst_row, int *lds_byte) {
+    int mn_pair = 0, k_rel = 0;
+    DecodeScaleAtomOrdinal<RowOrder>(fill_batch, rows_mn_per_seg / 2, kPhysK,
+                                     &mn_pair, &k_rel);
     *dst_row = seg_row_base + fill_batch * kRowsPerFill;
     *lds_byte = StorageLayout::CalculateOffset(
         origin_k + k_rel,
@@ -234,7 +305,7 @@ struct DsScaleLdsOpctrl1MN2Interleave {
 // group). LDS: m0k0..k3 | m1k0..k3 | ... then next group.
 template <int ParentScaleMN, int ParentScaleK, int ScaleShapeMN,
           int ScaleShapeK, int GranularityMN, int GranularityK, int MmacK,
-          typename StorageLayout>
+          int RowOrder, typename StorageLayout>
 struct DsScaleLdsOpctrl2K4Interleave {
   static_assert(ScaleShapeK % 4 == 0,
                 "op_ctrl=2 K4 interleave requires scaleShapeK % 4 == 0");
@@ -245,22 +316,15 @@ struct DsScaleLdsOpctrl2K4Interleave {
   static constexpr int kGroups = kPhysK / kRowsPerFill;
 
   TL_DEVICE static void Map(int fill_batch, int seg_row_base, int mn_row0,
-                            int tx16, int origin_mn, int origin_k, int *dst_row,
-                            int *lds_byte) {
-    if constexpr (kGroups == 1) {
-      // scaleShapeK==4: one 4-row group per MN; fill_batch == mn_local.
-      *dst_row = seg_row_base + fill_batch * kPhysK;
-      const int mn_idx = ScaleMnIdx<GranularityMN>(mn_row0 + fill_batch, tx16);
-      *lds_byte = StorageLayout::CalculateOffset(origin_k / 4,
-                                                 origin_mn + mn_idx, 0, 0, 0);
-    } else {
-      const int mn_local = fill_batch / kGroups;
-      const int k_group = fill_batch % kGroups;
-      *dst_row = seg_row_base + mn_local * kPhysK + k_group * kRowsPerFill;
-      const int mn_idx = ScaleMnIdx<GranularityMN>(mn_row0 + mn_local, tx16);
-      *lds_byte = StorageLayout::CalculateOffset(origin_k / 4 + k_group,
-                                                 origin_mn + mn_idx, 0, 0, 0);
-    }
+                            int rows_mn_per_seg, int tx16, int origin_mn,
+                            int origin_k, int *dst_row, int *lds_byte) {
+    int mn_local = 0, k_group = 0;
+    DecodeScaleAtomOrdinal<RowOrder>(fill_batch, rows_mn_per_seg, kGroups,
+                                     &mn_local, &k_group);
+    *dst_row = seg_row_base + fill_batch * kRowsPerFill;
+    const int mn_idx = ScaleMnIdx<GranularityMN>(mn_row0 + mn_local, tx16);
+    *lds_byte = StorageLayout::CalculateOffset(origin_k / 4 + k_group,
+                                               origin_mn + mn_idx, 0, 0, 0);
   }
 };
 
@@ -268,7 +332,7 @@ struct DsScaleLdsOpctrl2K4Interleave {
 // LDS: m0k0 m0k1 m16k0 m16k1 | m1... — each thread +4B.
 template <int ParentScaleMN, int ParentScaleK, int ScaleShapeMN,
           int ScaleShapeK, int GranularityMN, int GranularityK, int MmacK,
-          typename StorageLayout>
+          int RowOrder, typename StorageLayout>
 struct DsScaleLdsOpctrl2K2MN2Interleave {
   static_assert(ScaleShapeK % 2 == 0,
                 "op_ctrl=2 K2MN2 interleave requires even scaleShapeK");
@@ -279,10 +343,11 @@ struct DsScaleLdsOpctrl2K2MN2Interleave {
   static constexpr int kAtoms = kPhysK / 2;
 
   TL_DEVICE static void Map(int fill_batch, int seg_row_base, int mn_row0,
-                            int tx16, int origin_mn, int origin_k, int *dst_row,
-                            int *lds_byte) {
-    const int mn_pair = fill_batch / kAtoms;
-    const int k_atom = fill_batch % kAtoms;
+                            int rows_mn_per_seg, int tx16, int origin_mn,
+                            int origin_k, int *dst_row, int *lds_byte) {
+    int mn_pair = 0, k_atom = 0;
+    DecodeScaleAtomOrdinal<RowOrder>(fill_batch, rows_mn_per_seg / 2, kAtoms,
+                                     &mn_pair, &k_atom);
     *dst_row = seg_row_base + fill_batch * kRowsPerFill;
     const int pair =
         origin_mn / 2 + ScaleMnIdx<GranularityMN>(mn_row0 / 2 + mn_pair, tx16);
@@ -295,7 +360,7 @@ struct DsScaleLdsOpctrl2K2MN2Interleave {
 // LDS: m0k0 m16k0 m32k0 m48k0 | m1... — each thread +4B.
 template <int ParentScaleMN, int ParentScaleK, int ScaleShapeMN,
           int ScaleShapeK, int GranularityMN, int GranularityK, int MmacK,
-          typename StorageLayout>
+          int RowOrder, typename StorageLayout>
 struct DsScaleLdsOpctrl2MN4Interleave {
   static constexpr int kOpCtrl = 2;
   static constexpr int kRowsPerFill = 4;
@@ -303,10 +368,11 @@ struct DsScaleLdsOpctrl2MN4Interleave {
       ScalePhysK<ScaleShapeK, GranularityK, MmacK>::value;
 
   TL_DEVICE static void Map(int fill_batch, int seg_row_base, int mn_row0,
-                            int tx16, int origin_mn, int origin_k, int *dst_row,
-                            int *lds_byte) {
-    const int mn_quad = fill_batch / kPhysK;
-    const int k_rel = fill_batch % kPhysK;
+                            int rows_mn_per_seg, int tx16, int origin_mn,
+                            int origin_k, int *dst_row, int *lds_byte) {
+    int mn_quad = 0, k_rel = 0;
+    DecodeScaleAtomOrdinal<RowOrder>(fill_batch, rows_mn_per_seg / 4, kPhysK,
+                                     &mn_quad, &k_rel);
     *dst_row = seg_row_base + fill_batch * kRowsPerFill;
     *lds_byte = StorageLayout::CalculateOffset(
         origin_k + k_rel,
@@ -368,8 +434,8 @@ TL_DEVICE void DsScaleCopyFill(const void *lds_scale, int dst_row_base,
     }
     int dst_row = 0;
     int lds_byte = 0;
-    Policy::Map(fill_batch, seg_row_base, mn_row0, tx16, origin_mn, origin_k,
-                &dst_row, &lds_byte);
+    Policy::Map(fill_batch, seg_row_base, mn_row0, rows_mn_per_seg, tx16,
+                origin_mn, origin_k, &dst_row, &lds_byte);
     auto *lds_ptr = reinterpret_cast<TL_LDS_ADDR int *>(
         const_cast<uint8_t *>(src_u8 + lds_byte));
     ds_scale_copy_ds2buf<static_cast<char>(Policy::kOpCtrl)>(lds_ptr, dst_row);
@@ -397,7 +463,7 @@ template <int OpCtrl, int ScaleFormatId, int ParentScaleMN, int ParentScaleK,
           int GranularityK, int ScaleKMajor, int MnWarps, int TotalWarps,
           typename StorageLayout =
               ScaleLdsLinearLayout<ParentScaleMN, ParentScaleK, ScaleKMajor>,
-          int MmacK = 64>
+          int MmacK = 64, int RowOrder = 0>
 TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
                              int warp_id, int origin_mn, int origin_k) {
   static_assert(OpCtrl >= 0 && OpCtrl <= 2, "OpCtrl must be 0/1/2");
@@ -421,7 +487,7 @@ TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
     using Policy =
         DsScaleLdsOpctrl0Linear<ParentScaleMN, ParentScaleK, ScaleShapeMN,
                                 ScaleShapeK, GranularityMN, GranularityK,
-                                ScaleKMajor, MmacK, StorageLayout>;
+                                ScaleKMajor, MmacK, RowOrder, StorageLayout>;
     DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
                     MnWarps, TotalWarps, MmacK, Policy>(
         lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
@@ -432,17 +498,16 @@ TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
     using Policy =
         DsScaleLdsOpctrl1K2Interleave<ParentScaleMN, ParentScaleK, ScaleShapeMN,
                                       ScaleShapeK, GranularityMN, GranularityK,
-                                      MmacK, StorageLayout>;
+                                      MmacK, RowOrder, StorageLayout>;
     DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
                     MnWarps, TotalWarps, MmacK, Policy>(
         lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
   } else if constexpr (ScaleFormat == DsScaleFormat::kMN2Interleave) {
     static_assert(OpCtrl == 1 && MmacK == 32,
                   "MN2 format requires OpCtrl==1 and MmacK==32");
-    using Policy =
-        DsScaleLdsOpctrl1MN2Interleave<ParentScaleMN, ParentScaleK,
-                                       ScaleShapeMN, ScaleShapeK, GranularityMN,
-                                       GranularityK, MmacK, StorageLayout>;
+    using Policy = DsScaleLdsOpctrl1MN2Interleave<
+        ParentScaleMN, ParentScaleK, ScaleShapeMN, ScaleShapeK, GranularityMN,
+        GranularityK, MmacK, RowOrder, StorageLayout>;
     DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
                     MnWarps, TotalWarps, MmacK, Policy>(
         lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
@@ -453,7 +518,7 @@ TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
     using Policy =
         DsScaleLdsOpctrl2K4Interleave<ParentScaleMN, ParentScaleK, ScaleShapeMN,
                                       ScaleShapeK, GranularityMN, GranularityK,
-                                      MmacK, StorageLayout>;
+                                      MmacK, RowOrder, StorageLayout>;
     DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
                     MnWarps, TotalWarps, MmacK, Policy>(
         lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
@@ -463,17 +528,16 @@ TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
                   "K2MN2 format requires even ScaleShapeK");
     using Policy = DsScaleLdsOpctrl2K2MN2Interleave<
         ParentScaleMN, ParentScaleK, ScaleShapeMN, ScaleShapeK, GranularityMN,
-        GranularityK, MmacK, StorageLayout>;
+        GranularityK, MmacK, RowOrder, StorageLayout>;
     DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
                     MnWarps, TotalWarps, MmacK, Policy>(
         lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
   } else if constexpr (ScaleFormat == DsScaleFormat::kMN4Interleave) {
     static_assert(OpCtrl == 2 && MmacK == 32,
                   "MN4 format requires OpCtrl==2 and MmacK==32");
-    using Policy =
-        DsScaleLdsOpctrl2MN4Interleave<ParentScaleMN, ParentScaleK,
-                                       ScaleShapeMN, ScaleShapeK, GranularityMN,
-                                       GranularityK, MmacK, StorageLayout>;
+    using Policy = DsScaleLdsOpctrl2MN4Interleave<
+        ParentScaleMN, ParentScaleK, ScaleShapeMN, ScaleShapeK, GranularityMN,
+        GranularityK, MmacK, RowOrder, StorageLayout>;
     DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
                     MnWarps, TotalWarps, MmacK, Policy>(
         lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
@@ -494,7 +558,8 @@ template <int WarpRows, int WarpCols, int NumKAtoms, int GranularityM,
           int GranularityK_A, int GranularityN, int GranularityK_B,
           int ScaleShapeM, int ScaleShapeKA, int ScaleShapeN, int ScaleShapeKB,
           int ScaleFormatA = 0, int ScaleFormatB = 0, int KPack = 1,
-          int MmacK = 64, int RealABType = 24>
+          int MmacK = 64, int RealABType = 24, int RowOrderA = 0,
+          int RowOrderB = 0>
 TL_DEVICE void mmac_scale_fp4_body(const void *a, const void *b, float *c,
                                    int m0_wave_base) {
   constexpr int MMAC_MN = 16;
@@ -503,6 +568,12 @@ TL_DEVICE void mmac_scale_fp4_body(const void *a, const void *b, float *c,
   static_assert(MMAC_K == 32 || MMAC_K == 64, "scale MMAC K must be 32/64");
   static_assert(GranularityK_A % 32 == 0 && GranularityK_B % 32 == 0,
                 "granularity_k % 32 == 0");
+  constexpr int rows_mn_a =
+      GranularityM >= MMAC_MN ? (WarpRows * MMAC_MN / GranularityM) : WarpRows;
+  constexpr int rows_mn_b =
+      GranularityN >= MMAC_MN ? (WarpCols * MMAC_MN / GranularityN) : WarpCols;
+  static_assert(rows_mn_a > 0 && rows_mn_b > 0,
+                "each MMAC wave must consume at least one scale MN row");
 
   asm volatile("s_mov_b32 m0, %0\n s_nop 0\n" ::"s"(m0_wave_base));
   __builtin_amdgcn_sched_barrier(0);
@@ -528,14 +599,12 @@ TL_DEVICE void mmac_scale_fp4_body(const void *a, const void *b, float *c,
           constexpr int scale_ka = (k_atom * MMAC_K) / GranularityK_A;
           constexpr int scale_n = (jj * MMAC_MN) / GranularityN;
           constexpr int scale_kb = (k_atom * MMAC_K) / GranularityK_B;
-          constexpr int off_a =
-              ScaleFormatLogicalToRow<ScaleFormatA, scale_m, scale_ka,
-                                      GranularityM, ScaleShapeKA,
-                                      GranularityK_A, MMAC_K>::value;
-          constexpr int off_b =
-              ScaleFormatLogicalToRow<ScaleFormatB, scale_n, scale_kb,
-                                      GranularityN, ScaleShapeKB,
-                                      GranularityK_B, MMAC_K>::value;
+          constexpr int off_a = ScaleBufferLogicalToRow<
+              ScaleFormatA, RowOrderA, rows_mn_a, scale_m, scale_ka,
+              GranularityM, ScaleShapeKA, GranularityK_A, MMAC_K>::value;
+          constexpr int off_b = ScaleBufferLogicalToRow<
+              ScaleFormatB, RowOrderB, rows_mn_b, scale_n, scale_kb,
+              GranularityN, ScaleShapeKB, GranularityK_B, MMAC_K>::value;
           a_vec_t a_vec = a_v[(kii * WarpRows + ii) * KPack + kpp];
           b_vec_t b_vec = b_v[(kii * WarpCols + jj) * KPack + kpp];
           if constexpr (MMAC_K == 64) {
