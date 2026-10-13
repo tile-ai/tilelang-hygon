@@ -107,6 +107,11 @@ def InjectAsyncGlobalLoadFence():
     return _ffi_api.InjectAsyncGlobalLoadFence()  # type: ignore
 
 
+def MarkFencePlannerOwnership():
+    """Record whether the fence planner will own this kernel's async waits."""
+    return _ffi_api.MarkFencePlannerOwnership()  # type: ignore
+
+
 def UnrollPipelinedKLoop():
     """Unroll a pipelined GEMM K loop and fold stage indices."""
     return _ffi_api.UnrollPipelinedKLoop()  # type: ignore

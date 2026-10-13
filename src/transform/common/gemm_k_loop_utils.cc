@@ -1,5 +1,6 @@
 #include "gemm_k_loop_utils.h"
 
+#include "hcu/utils/extern_call_checker.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "pipeline_utils.h"
@@ -46,6 +47,18 @@ bool StmtContainsAsyncCopy(const Stmt &stmt) {
   PostOrderVisit(stmt, [&found](const ObjectRef &node) {
     if (const auto *call = node.as<CallNode>()) {
       if (IsAsyncCopyCall(call)) {
+        found = true;
+      }
+    }
+  });
+  return found;
+}
+
+bool StmtContainsMlsAsyncLoad(const Stmt &stmt) {
+  bool found = false;
+  PostOrderVisit(stmt, [&found](const ObjectRef &node) {
+    if (const auto *call = node.as<CallNode>()) {
+      if (IsMlsAsyncLoadExternCall(call)) {
         found = true;
       }
     }
@@ -178,10 +191,30 @@ std::vector<const ForNode *> CollectGemmKLoops(const Stmt &stmt) {
   return collector.loops;
 }
 
+bool FuncHasRegisterPipeline(const Stmt &stmt) {
+  for (const ForNode *loop : CollectGemmKLoops(stmt)) {
+    if (LoopHasRegisterPipeline(loop)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool FencePlannerOwnsWaitPlan(const Stmt &stmt) {
   std::vector<const ForNode *> loops = CollectGemmKLoops(stmt);
-  if (loops.empty()) {
+  if (loops.empty() || loops.size() != 1) {
     return false;
+  }
+  for (const ForNode *loop : loops) {
+    // The plan derives its wait counts from the commit groups it can count in
+    // the K loop body, which holds only while every producer it accounts for is
+    // one it recognized. A matrix-load producer commits its DMA into the same
+    // group counter but is issued by its own lowering, so a K loop carrying one
+    // has no wait plan this pass can author: decline ownership and let the
+    // in-place lowering of the commit/wait attrs stand.
+    if (StmtContainsMlsAsyncLoad(loop->body)) {
+      return false;
+    }
   }
   const ForNode *k_loop = loops.front();
   if (LoopHasRegisterPipeline(k_loop)) {

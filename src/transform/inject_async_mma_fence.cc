@@ -355,6 +355,9 @@ tirx::transform::Pass InjectAsyncMmaFence() {
       return f;
     }
     auto *n = f.CopyOnWrite();
+    if (!FuncHasRegisterPipeline(n->body)) {
+      return f;
+    }
     MMABarrierMutator mutator(n->body);
     n->body = mutator(std::move(n->body));
     return f;

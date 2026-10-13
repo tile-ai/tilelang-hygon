@@ -28,15 +28,6 @@ namespace {
 // tl_templates/hcu call sched_barrier(0) around s_barrier the same way).
 constexpr int kAmdgcnSchedBarrierFull = 0;
 
-bool FuncHasRegisterPipeline(const Stmt &root) {
-  for (const ForNode *loop : CollectGemmKLoops(root)) {
-    if (LoopHasRegisterPipeline(loop)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 Stmt MakeSchedBarrierStmt() {
   return Evaluate(Call(DataType::Void(), builtin::call_extern(),
                        {StringImm("__builtin_amdgcn_sched_barrier"),

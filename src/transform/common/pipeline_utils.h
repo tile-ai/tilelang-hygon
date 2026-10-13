@@ -158,8 +158,8 @@ inline ffi::Optional<Integer> GetPipelineNumStages(const ForNode *loop) {
 /*!
  * \brief Stage count from T.Pipelined / InjectSoftwarePipeline only.
  *
- * Ignores software_pipeline_stage so handwritten K loops that happen to
- * carry that annotation are not treated as compiler-managed pipelines.
+ * Reads num_stages / tl_pipelined_num_stages; does not use
+ * software_pipeline_stage.
  */
 inline ffi::Optional<Integer>
 GetExplicitPipelinedNumStages(const ForNode *loop) {

@@ -1,10 +1,6 @@
 /*!
  * \file inject_async_global_load_fence.cc
  * \brief Lower async wait scopes and insert G2S barriers.
- *
- * On HCU, tl::wave_barrier and tl::sync_warp both lower to s_barrier. Prefetch
- * (prologue) inserts run only when T.Pipelined depth is >= 2, so handwritten
- * K loops that already have T.sync_warp are left alone.
  */
 
 #include "common/gemm_k_loop_utils.h"
@@ -13,12 +9,15 @@
 #include "op/builtin.h"
 #include "op/utils.h"
 
+#include <tvm/runtime/logging.h>
 #include <tvm/s_tir/stmt.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace tvm {
@@ -96,22 +95,18 @@ Stmt MakePtxWaitGroupStmt(int wait_count) {
                        {Integer(wait_count)}));
 }
 
-Stmt MakeWaveBarrierStmt() {
-  return Evaluate(Call(DataType::Void(), wave_barrier(), {}));
-}
-
 Stmt MakeSyncWarpStmt() {
   return Evaluate(Call(DataType::Void(), sync_warp(), {}));
 }
 
 void AppendWaveBarrierIfNeeded(Array<Stmt> &result) {
   if (result.empty() || !IsSBarrierStmt(result.back())) {
-    result.push_back(MakeWaveBarrierStmt());
+    result.push_back(MakeSyncWarpStmt());
   }
 }
 
 void DropTrailingWaveBarrier(Array<Stmt> &result) {
-  if (result.empty() || !IsWaveBarrierStmt(result.back())) {
+  if (result.empty() || !IsSBarrierStmt(result.back())) {
     return;
   }
   Array<Stmt> trimmed;
@@ -165,10 +160,81 @@ bool IsSharedToLocalCopy(const Stmt &stmt) {
   return !StmtContainsMma(stmt) && ReadsSharedWithoutAsyncCopy(stmt);
 }
 
+void CollectSharedVarsInExpr(const PrimExpr &expr,
+                             std::unordered_set<const VarNode *> *out) {
+  PostOrderVisit(expr, [out](const ObjectRef &node) {
+    if (const auto *load = node.as<BufferLoadNode>()) {
+      if (IsSharedBuffer(load->buffer, true)) {
+        out->insert(load->buffer->data.get());
+      }
+    }
+    if (const auto *call = node.as<CallNode>()) {
+      if (call->op.same_as(builtin::tvm_access_ptr()) &&
+          call->args.size() >= 2) {
+        if (const auto *var = call->args[1].as<VarNode>()) {
+          out->insert(var);
+        }
+      }
+      if (call->op.same_as(access_ptr()) && !call->args.empty()) {
+        CollectSharedVarsInExpr(call->args[0], out);
+      }
+    }
+  });
+}
+
+void CollectAsyncDstVars(const Stmt &stmt,
+                         std::unordered_set<const VarNode *> *out) {
+  PostOrderVisit(stmt, [out](const ObjectRef &node) {
+    const auto *call = node.as<CallNode>();
+    if (call == nullptr || !IsAsyncCopyCall(call) || call->args.empty()) {
+      return;
+    }
+    CollectSharedVarsInExpr(call->args[0], out);
+  });
+}
+
+void CollectSharedReadVars(const Stmt &stmt,
+                           std::unordered_set<const VarNode *> *out) {
+  PostOrderVisit(stmt, [out](const ObjectRef &node) {
+    if (const auto *load = node.as<BufferLoadNode>()) {
+      if (IsSharedBuffer(load->buffer, true)) {
+        out->insert(load->buffer->data.get());
+      }
+    }
+    if (const auto *call = node.as<CallNode>()) {
+      if (call->op.same_as(ds_read_vector()) ||
+          call->op.same_as(ds_read_tr16_b64()) ||
+          call->op.same_as(ds_read_tr8_b64())) {
+        for (const PrimExpr &arg : call->args) {
+          CollectSharedVarsInExpr(arg, out);
+        }
+      }
+    }
+  });
+}
+
+std::unordered_set<const VarNode *> CollectPipelinedAsyncBuffers(const Stmt &body) {
+  std::unordered_set<const VarNode *> out;
+  CollectAsyncDstVars(body, &out);
+  return out;
+}
+
+bool ReadsPipelinedAsync(const Stmt &stmt,
+                         const std::unordered_set<const VarNode *> &pipelined) {
+  if (pipelined.empty() || !ReadsSharedWithoutAsyncCopy(stmt)) {
+    return false;
+  }
+  std::unordered_set<const VarNode *> reads;
+  CollectSharedReadVars(stmt, &reads);
+  for (const VarNode *var : reads) {
+    if (pipelined.count(var)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // True when the function issues at least one async copy (or commits a group).
-// A pipelined kernel whose copies are plain synchronous reads staged through
-// shared memory has nothing for a wait plan to order: base emitted no wait
-// there, and a wait plus its paired barrier per iteration is pure overhead.
 bool HasAsyncCopies(const Stmt &root) {
   struct Scanner : public StmtExprVisitor {
     bool found{false};
@@ -211,6 +277,51 @@ Stmt UnwrapWaitAttrs(Stmt stmt) {
     stmt = attr->body;
   }
   return stmt;
+}
+
+bool TryGetWaitInflight(const Stmt &stmt, int *wait_count) {
+  const AttrStmtNode *attr = stmt.as<AttrStmtNode>();
+  bool found = false;
+  while (attr != nullptr && IsWaitAttr(attr)) {
+    if (attr->attr_key == s_tir::attr::async_wait_inflight_count) {
+      if (const auto *imm = attr->value.as<IntImmNode>()) {
+        *wait_count = static_cast<int>(imm->value);
+        found = true;
+      }
+    }
+    attr = attr->body.as<AttrStmtNode>();
+  }
+  return found;
+}
+
+bool TryGetPtxWaitCount(const Stmt &stmt, int *wait_count) {
+  Stmt inner = UnwrapWaitAttrs(stmt);
+  const auto *eval = inner.as<EvaluateNode>();
+  if (eval == nullptr) {
+    return false;
+  }
+  const auto *call = eval->value.as<CallNode>();
+  if (call == nullptr || !call->op.same_as(builtin::ptx_wait_group()) ||
+      call->args.empty()) {
+    return false;
+  }
+  if (const auto *imm = call->args[0].as<IntImmNode>()) {
+    *wait_count = static_cast<int>(imm->value);
+    return true;
+  }
+  return false;
+}
+
+bool IsWaitPlaceholder(const Stmt &stmt) {
+  int unused = 0;
+  if (TryGetPtxWaitCount(stmt, &unused)) {
+    return true;
+  }
+  if (!TryGetWaitInflight(stmt, &unused)) {
+    return false;
+  }
+  Stmt inner = UnwrapWaitAttrs(stmt);
+  return inner.as<EvaluateNode>() != nullptr;
 }
 
 bool IsOutermostCommitStmt(const Stmt &stmt) {
@@ -302,17 +413,212 @@ int CountOutermostCommitsBeforeLds(const Stmt &body, bool stop_at_lds) {
   return scanner.commits;
 }
 
+enum class PipelineEventKind { kCommit, kConsumer };
+
+std::vector<PipelineEventKind> CollectPipelineEvents(
+    const Stmt &body, const std::unordered_set<const VarNode *> &pipelined) {
+  struct Collector : public StmtVisitor {
+    std::vector<PipelineEventKind> events;
+    int commit_depth{0};
+    const std::unordered_set<const VarNode *> *pipelined{nullptr};
+
+    bool IsConsumer(const Stmt &stmt) const {
+      if (pipelined != nullptr && !pipelined->empty()) {
+        return ReadsPipelinedAsync(stmt, *pipelined);
+      }
+      return ReadsSharedWithoutAsyncCopy(stmt);
+    }
+
+    void VisitStmt_(const AttrStmtNode *op) override {
+      if (IsWaitAttr(op)) {
+        VisitStmt(UnwrapWaitAttrs(GetRef<AttrStmt>(op)));
+        return;
+      }
+      if (IsCommitAttr(op)) {
+        if (commit_depth == 0) {
+          events.push_back(PipelineEventKind::kCommit);
+        }
+        ++commit_depth;
+        VisitStmt(op->body);
+        --commit_depth;
+        return;
+      }
+      StmtVisitor::VisitStmt_(op);
+    }
+
+    void VisitStmt_(const SeqStmtNode *op) override {
+      Stmt flattened = SeqStmt::Flatten(GetRef<Stmt>(op));
+      const auto *seq = flattened.as<SeqStmtNode>();
+      if (seq == nullptr) {
+        VisitStmt(flattened);
+        return;
+      }
+      for (const Stmt &s : seq->seq) {
+        Stmt cur = UnwrapWaitAttrs(s);
+        if (commit_depth == 0 && IsOutermostCommitStmt(cur)) {
+          events.push_back(PipelineEventKind::kCommit);
+          ++commit_depth;
+          VisitStmt(cur);
+          --commit_depth;
+          continue;
+        }
+        if (commit_depth == 0 && IsConsumer(cur)) {
+          events.push_back(PipelineEventKind::kConsumer);
+          continue;
+        }
+        VisitStmt(cur);
+      }
+    }
+
+    void VisitStmt_(const ForNode *op) override { VisitStmt(op->body); }
+
+    void VisitStmt_(const EvaluateNode *op) override {
+      if (commit_depth == 0 && IsPtxCommitStmt(GetRef<Evaluate>(op))) {
+        events.push_back(PipelineEventKind::kCommit);
+      }
+    }
+  };
+  Collector collector;
+  collector.pipelined = &pipelined;
+  collector(body);
+  return collector.events;
+}
+
+int CountCommitRuns(const std::vector<PipelineEventKind> &events) {
+  int runs = 0;
+  bool in_run = false;
+  for (PipelineEventKind kind : events) {
+    if (kind == PipelineEventKind::kCommit) {
+      if (!in_run) {
+        ++runs;
+        in_run = true;
+      }
+    } else {
+      in_run = false;
+    }
+  }
+  return runs;
+}
+
+struct ConsumerGroupPlan {
+  std::vector<int> needs;
+  std::vector<int> consumer_counts;
+  bool model_ok{true};
+};
+
+ConsumerGroupPlan
+MakeConsumerGroupPlan(const std::vector<PipelineEventKind> &events) {
+  const int n = static_cast<int>(events.size());
+  ConsumerGroupPlan plan;
+  for (int i = 0; i < n;) {
+    if (events[i] != PipelineEventKind::kConsumer) {
+      ++i;
+      continue;
+    }
+    int consumers = 0;
+    while (i < n && events[i] == PipelineEventKind::kConsumer) {
+      ++consumers;
+      ++i;
+    }
+    int need = 0;
+    int k = i;
+    for (int steps = 0; steps < n; ++steps) {
+      if (k >= n) {
+        k = 0;
+      }
+      if (events[k] == PipelineEventKind::kConsumer) {
+        break;
+      }
+      if (events[k] == PipelineEventKind::kCommit) {
+        ++need;
+      }
+      ++k;
+    }
+    if (need <= 0) {
+      DLOG(WARNING) << "consumer group has no producer commit in the K loop; "
+                       "the wait values fall back to a drain";
+      plan.model_ok = false;
+    }
+    plan.needs.push_back(need);
+    plan.consumer_counts.push_back(consumers);
+  }
+  if (!plan.needs.empty() &&
+      static_cast<int>(plan.needs.size()) != CountCommitRuns(events)) {
+    DLOG(WARNING) << "consumer groups do not line up with the commit runs in "
+                     "the K loop; the wait values fall back to a drain";
+    plan.model_ok = false;
+  }
+  return plan;
+}
+
+struct MainLoopWaitSim {
+  std::vector<int> waits;
+  int outstanding_end{0};
+  bool model_ok{true};
+};
+
+MainLoopWaitSim SimulateMainLoopWaits(const std::vector<PipelineEventKind> &events,
+                                      const std::vector<int> &needs,
+                                      int outstanding) {
+  MainLoopWaitSim sim;
+  size_t g = 0;
+  const int n = static_cast<int>(events.size());
+  for (int i = 0; i < n;) {
+    if (events[i] == PipelineEventKind::kCommit) {
+      ++outstanding;
+      ++i;
+      continue;
+    }
+    if (g >= needs.size()) {
+      sim.model_ok = false;
+      break;
+    }
+    const int need = needs[g++];
+    if (need <= 0) {
+      sim.model_ok = false;
+      break;
+    }
+    int wait_count = outstanding - need;
+    if (wait_count < 0) {
+      wait_count = 0;
+    }
+    if (outstanding != 0 && wait_count >= outstanding) {
+      sim.model_ok = false;
+      break;
+    }
+    sim.waits.push_back(wait_count);
+    outstanding = wait_count;
+    while (i < n && events[i] == PipelineEventKind::kConsumer) {
+      ++i;
+    }
+  }
+  if (g != needs.size()) {
+    sim.model_ok = false;
+  }
+  sim.outstanding_end = outstanding;
+  return sim;
+}
+
 struct SharedPipelineWaitPlan {
   int commits_per_tile{0};
   int main_wait{0};
+  int outstanding_after_main{0};
   int num_stages{0};
-  // False when the function issues no async copy at all (see HasAsyncCopies):
-  // there is nothing to wait for, so the pass leaves the kernel untouched.
   bool has_async_copies{false};
   bool register_pipeline{false};
-  // T.Pipelined / InjectSoftwarePipeline with depth >= 2, or register pipeline.
   bool compiler_pipeline{false};
+  // False when consumer groups and commit runs in the K loop do not line up,
+  // or the prologue does not fill a whole number of pipeline tiles.
+  bool model_ok{true};
+  // Drain every outstanding commit group instead of using a planned depth.
+  bool conservative{false};
   std::vector<int> epilogue_gld_fence_values;
+  std::vector<int> main_loop_wait_counts;
+  std::vector<int> consumer_group_needs;
+  std::vector<int> group_consumer_counts;
+  std::unordered_set<const VarNode *> pipelined_buffers;
+  // Reuse inflight counts already attached by InjectSoftwarePipeline.
+  bool reuse_pipeline_waits{false};
 };
 
 // Collect epilogue async_wait_inflight values after the K loop.
@@ -375,9 +681,6 @@ std::vector<int> ScaleWaitCountsToCommitUnits(const std::vector<int> &counts,
 // Synthesize the epilogue wait counts from the main-loop plan, used when the
 // epilogue carries no explicit wait counts: start at `main_wait` outstanding
 // commits and drop by `commits_per_tile` per iteration until none are left.
-// Precondition: the epilogue runs the same K-loop body with a shorter trip
-// count, so its outstanding-commit window shrinks by one tile per iteration.
-// This is a schedule derived from the plan, not an analysis of the epilogue IR.
 std::vector<int> SynthesizeEpilogueWaitCounts(int main_wait,
                                               int commits_per_tile) {
   std::vector<int> counts;
@@ -473,21 +776,93 @@ SharedPipelineWaitPlan MakeWaitPlan(const Stmt &root) {
   // K loop (unroll_pipelined_k_loop.cc guards with the same loops.size() != 1
   // assumption); a second K loop would share the first loop's plan.
   plan.register_pipeline = LoopHasRegisterPipeline(k_loop);
-  int cpt = CountOutermostCommitsBeforeLds(k_loop->body, /*stop_at_lds=*/true);
+  int cpt = CountOutermostCommitsBeforeLds(k_loop->body, /*stop_at_lds=*/false);
   plan.commits_per_tile = cpt;
+  plan.pipelined_buffers = CollectPipelinedAsyncBuffers(k_loop->body);
 
   if (auto ns = GetExplicitPipelinedNumStages(k_loop)) {
     plan.num_stages = static_cast<int>(ns.value().IntValue());
   }
   plan.compiler_pipeline = FencePlannerOwnsWaitPlan(root);
-  if (plan.num_stages >= 2 && cpt > 0) {
-    if (plan.register_pipeline) {
-      plan.main_wait = (plan.num_stages - 2) * cpt;
-    } else {
-      plan.main_wait = (plan.num_stages - 1) * cpt;
+  const int prologue = CountPrologueOutermostCommits(root);
+  if (plan.register_pipeline && plan.num_stages >= 2 && cpt > 0) {
+    plan.main_wait = (plan.num_stages - 2) * cpt;
+  } else if (prologue > 0) {
+    if (cpt > 0 && plan.num_stages >= 2) {
+      const int filled_minus_one = (plan.num_stages - 1) * cpt;
+      const int filled_all = plan.num_stages * cpt;
+      plan.model_ok = plan.model_ok &&
+                      (prologue == filled_minus_one || prologue == filled_all);
+      DLOG_IF(WARNING, !plan.model_ok)
+          << "prologue commit count " << prologue
+          << " is not a whole number of pipeline tiles (cpt=" << cpt
+          << ", num_stages=" << plan.num_stages
+          << "); the wait values fall back to a drain";
     }
-  } else {
-    plan.main_wait = CountPrologueOutermostCommits(root);
+    plan.main_wait = prologue;
+  } else if (plan.num_stages >= 2 && cpt > 0) {
+    plan.main_wait = (plan.num_stages - 1) * cpt;
+  }
+  plan.outstanding_after_main = plan.main_wait;
+  if (!plan.register_pipeline) {
+    auto events = CollectPipelineEvents(k_loop->body, plan.pipelined_buffers);
+    ConsumerGroupPlan groups = MakeConsumerGroupPlan(events);
+    plan.consumer_group_needs = groups.needs;
+    plan.group_consumer_counts = groups.consumer_counts;
+    const std::vector<int> pipeline_waits = CollectEpilogueWaitCounts(root);
+    std::vector<int> k_loop_waits;
+    {
+      struct RootWaitCollector : public StmtVisitor {
+        std::vector<int> *counts{nullptr};
+        bool in_k{false};
+        void VisitStmt_(const ForNode *op) override {
+          const bool k = IsGemmKLoop(op);
+          const bool prev = in_k;
+          if (k) {
+            in_k = true;
+          }
+          VisitStmt(op->body);
+          in_k = prev;
+        }
+        void VisitStmt_(const AttrStmtNode *op) override {
+          if (in_k &&
+              op->attr_key == s_tir::attr::async_wait_inflight_count) {
+            if (const auto *imm = op->value.as<IntImmNode>()) {
+              counts->push_back(static_cast<int>(imm->value));
+            }
+          }
+          StmtVisitor::VisitStmt_(op);
+        }
+        void VisitStmt_(const EvaluateNode *op) override {
+          if (!in_k) {
+            return;
+          }
+          int wait_count = 0;
+          if (TryGetPtxWaitCount(GetRef<Stmt>(op), &wait_count)) {
+            counts->push_back(wait_count);
+          }
+        }
+      };
+      RootWaitCollector collector;
+      collector.counts = &k_loop_waits;
+      collector(root);
+    }
+    plan.reuse_pipeline_waits =
+        plan.compiler_pipeline &&
+        (!k_loop_waits.empty() || !pipeline_waits.empty());
+    MainLoopWaitSim sim =
+        SimulateMainLoopWaits(events, groups.needs, plan.main_wait);
+    if (plan.reuse_pipeline_waits && !k_loop_waits.empty()) {
+      plan.main_loop_wait_counts = std::move(k_loop_waits);
+      plan.outstanding_after_main = plan.main_wait;
+    } else {
+      plan.main_loop_wait_counts = std::move(sim.waits);
+      plan.outstanding_after_main = sim.outstanding_end;
+      plan.model_ok = plan.model_ok && groups.model_ok && sim.model_ok;
+    }
+    plan.conservative =
+        !plan.model_ok && plan.compiler_pipeline && plan.has_async_copies &&
+        plan.pipelined_buffers.empty() && !plan.reuse_pipeline_waits;
   }
   if (plan.main_wait < 0) {
     plan.main_wait = 0;
@@ -510,11 +885,29 @@ public:
   explicit InjectAsyncGlobalLoadFenceMutator(const Stmt &root)
       : plan_(MakeWaitPlan(root)), outstanding_(plan_.main_wait) {}
 
+  bool IsPipelinedConsumer(const Stmt &stmt) const {
+    if (!plan_.pipelined_buffers.empty()) {
+      return ReadsPipelinedAsync(stmt, plan_.pipelined_buffers);
+    }
+    return ReadsSharedWithoutAsyncCopy(stmt);
+  }
+
+  // True when this pass rewrites the kernel's waits (K loop owned and async DMA
+  // present). Otherwise the IR is left to the earlier lowering.
+  bool OwnsWaitPlan() const {
+    return plan_.compiler_pipeline && plan_.has_async_copies;
+  }
+
   Stmt VisitStmt_(const AttrStmtNode *op) override {
     if (IsWaitAttr(op)) {
-      if (!plan_.compiler_pipeline ||
-          (phase_ == PipelinePhase::kPrologue && !plan_.register_pipeline)) {
+      if (phase_ == PipelinePhase::kPrologue && !plan_.register_pipeline) {
         return StmtMutator::VisitStmt_(op);
+      }
+      if (plan_.reuse_pipeline_waits) {
+        int wait_count = 0;
+        if (TryGetWaitInflight(GetRef<Stmt>(op), &wait_count)) {
+          pending_pipeline_waits_.push_back(wait_count);
+        }
       }
       const auto *inner = op->body.as<AttrStmtNode>();
       if (inner && IsWaitAttr(inner)) {
@@ -532,6 +925,7 @@ public:
       phase_ = PipelinePhase::kMainLoop;
       outstanding_ = plan_.main_wait;
       k_iter_gld_fence_done_ = false;
+      main_loop_wait_idx_ = 0;
     }
     if (lds_for) {
       ++suppress_inner_lds_insert_;
@@ -541,8 +935,17 @@ public:
       --suppress_inner_lds_insert_;
     }
     if (is_k) {
+      if (!plan_.register_pipeline && !plan_.reuse_pipeline_waits &&
+          !plan_.conservative && plan_.model_ok &&
+          !plan_.main_loop_wait_counts.empty()) {
+        ICHECK_EQ(main_loop_wait_idx_,
+                  static_cast<int>(plan_.main_loop_wait_counts.size()))
+            << "main-loop wait inserts must match the planned wait count";
+      }
       phase_ = PipelinePhase::kEpilogue;
-      outstanding_ = plan_.main_wait;
+      outstanding_ = plan_.outstanding_after_main;
+      epi_group_idx_ = 0;
+      epi_consumers_in_group_ = 0;
       body = InsertLoopEntryReleaseBarrier(body);
     }
     return For(op->loop_var, op->min, op->extent, op->kind, body,
@@ -573,27 +976,40 @@ public:
     for (size_t i = 0; i < seq_op->seq.size(); ++i) {
       const Stmt &s = seq_op->seq[i];
       Stmt cur = UnwrapWaitAttrs(s);
-      if (plan_.register_pipeline &&
-          (IsAsyncGldFenceStmt(cur) || IsPtxWaitGroupStmt(cur))) {
+      // Drop pipeline wait placeholders and re-emit them at the next pipelined
+      // consumer, using the inflight count already on the placeholder.
+      if (plan_.reuse_pipeline_waits && phase_ != PipelinePhase::kPrologue) {
+        int wait_count = 0;
+        if (TryGetWaitInflight(s, &wait_count) ||
+            TryGetPtxWaitCount(s, &wait_count)) {
+          pending_pipeline_waits_.push_back(wait_count);
+        }
+        if (IsWaitPlaceholder(s)) {
+          continue;
+        }
+      }
+      if (IsAsyncGldFenceStmt(cur) || IsPtxWaitGroupStmt(cur)) {
         continue;
       }
 
       if (cur.as<SeqStmtNode>()) {
-        in_lds_cluster = false;
-        append_stmt(VisitStmt(cur));
-        if (plan_.num_stages >= 2 && phase_ == PipelinePhase::kPrologue &&
-            i + 1 < seq_op->seq.size() &&
-            IsSBarrierStmt(UnwrapWaitAttrs(seq_op->seq[i + 1]))) {
-          DropTrailingWaveBarrier(result);
+        const bool consumer_seq = IsPipelinedConsumer(cur);
+        if (!(consumer_seq && !plan_.register_pipeline &&
+              (phase_ == PipelinePhase::kMainLoop ||
+               phase_ == PipelinePhase::kEpilogue))) {
+          in_lds_cluster = false;
+          append_stmt(VisitStmt(cur));
+          if (plan_.num_stages >= 2 && phase_ == PipelinePhase::kPrologue &&
+              i + 1 < seq_op->seq.size() &&
+              IsSBarrierStmt(UnwrapWaitAttrs(seq_op->seq[i + 1]))) {
+            DropTrailingWaveBarrier(result);
+          }
+          continue;
         }
-        continue;
       }
 
       const bool lds = IsSharedToLocalCopy(cur);
-      // Consumer region: reads shared memory and issues no async copy of its
-      // own. Wider than lds: it also matches the wrapper that holds a stage's
-      // LDS-read clusters together with its MMA.
-      const bool consumer_region = ReadsSharedWithoutAsyncCopy(cur);
+      const bool consumer_region = IsPipelinedConsumer(cur);
       const bool mma_region = !lds && consumer_region && StmtContainsMma(cur);
       bool inserted_here = false;
       if (plan_.register_pipeline) {
@@ -614,19 +1030,46 @@ public:
           }
         }
       } else if (phase_ == PipelinePhase::kMainLoop) {
-        // One wait per K-loop iteration, placed before the consumer region as
-        // a whole: no DMA is issued after its first LDS-read cluster, so a wait
-        // per cluster adds nothing but a barrier inside the compute and splits
-        // the LDS wait ladder the backend schedules across the clusters.
-        if (consumer_region && !k_iter_gld_fence_done_) {
+        if (consumer_region &&
+            FlushPendingPipelineWaits(result)) {
+          k_iter_gld_fence_done_ = true;
+          inserted_here = true;
+        } else if (consumer_region && !plan_.reuse_pipeline_waits &&
+                   !k_iter_gld_fence_done_) {
           MaybeInsertGldFence(result);
           k_iter_gld_fence_done_ = true;
           inserted_here = true;
         }
+      } else if (!plan_.register_pipeline &&
+                 phase_ == PipelinePhase::kEpilogue) {
+        if (consumer_region &&
+            FlushPendingPipelineWaits(result)) {
+          inserted_here = true;
+        } else if (plan_.conservative) {
+          if (consumer_region && suppress_inner_lds_insert_ == 0) {
+            MaybeInsertGldFence(result);
+            inserted_here = true;
+          }
+        } else if (consumer_region && suppress_inner_lds_insert_ == 0 &&
+                   !plan_.reuse_pipeline_waits) {
+          if (!plan_.model_ok || plan_.group_consumer_counts.empty()) {
+            MaybeInsertGldFence(result);
+            inserted_here = true;
+          } else {
+            if (epi_consumers_in_group_ == 0) {
+              MaybeInsertGldFence(result);
+              inserted_here = true;
+            }
+            ++epi_consumers_in_group_;
+            const int g = epi_group_idx_ %
+                          static_cast<int>(plan_.group_consumer_counts.size());
+            if (epi_consumers_in_group_ >= plan_.group_consumer_counts[g]) {
+              ++epi_group_idx_;
+              epi_consumers_in_group_ = 0;
+            }
+          }
+        }
       } else if (mma_region || (lds && !in_lds_cluster)) {
-        // One wait per consumer block (the epilogue's per-stage compute
-        // blocks each wait on their own stage); adjacent blocks are not
-        // coalesced because each of them covers a different stage's DMA.
         MaybeInsertGldFence(result);
         inserted_here = true;
       }
@@ -642,6 +1085,10 @@ public:
       append_stmt(VisitStmt(cur));
       if (inserted_here) {
         --suppress_inner_lds_insert_;
+      }
+      if (!plan_.register_pipeline && phase_ == PipelinePhase::kMainLoop &&
+          IsOutermostCommitStmt(cur)) {
+        k_iter_gld_fence_done_ = false;
       }
       if (plan_.num_stages >= 2 && phase_ == PipelinePhase::kPrologue &&
           plan_.commits_per_tile > 0 && IsOutermostCommitStmt(cur)) {
@@ -683,8 +1130,11 @@ private:
   // to the same s_barrier as wave_barrier but is visible to the AMDGPU machine
   // scheduler, which matters for a call site inside the K loop.
   Stmt InsertLoopEntryReleaseBarrier(const Stmt &body) {
-    if (!plan_.compiler_pipeline || plan_.register_pipeline ||
-        plan_.num_stages < 2 || plan_.commits_per_tile <= 0) {
+    // Only the stage-wise compiler pipeline reuses a slot this way; a register
+    // pipeline keeps its own release discipline and a loop without commits per
+    // tile has no producer to release.
+    if (plan_.register_pipeline || plan_.num_stages < 2 ||
+        plan_.commits_per_tile <= 0) {
       return body;
     }
     Stmt flattened = SeqStmt::Flatten(body);
@@ -706,33 +1156,93 @@ private:
 
   int NextWaitCount() {
     int wait_count = 0;
-    if (phase_ == PipelinePhase::kMainLoop ||
-        phase_ == PipelinePhase::kPrologue) {
+    if (plan_.conservative) {
+      if (phase_ == PipelinePhase::kMainLoop && !plan_.register_pipeline &&
+          !plan_.main_loop_wait_counts.empty()) {
+        ++main_loop_wait_idx_;
+      }
+      return wait_count;
+    }
+    if (!plan_.model_ok && !plan_.register_pipeline &&
+        phase_ != PipelinePhase::kPrologue) {
+      if (outstanding_ == 0) {
+        return -1;
+      }
+      int need = plan_.commits_per_tile > 0 ? plan_.commits_per_tile : 1;
+      wait_count = outstanding_ - need;
+      if (wait_count < 0) {
+        wait_count = 0;
+      }
+      outstanding_ = wait_count;
+      return wait_count;
+    }
+    if (phase_ == PipelinePhase::kMainLoop && !plan_.register_pipeline &&
+        !plan_.main_loop_wait_counts.empty()) {
+      ICHECK_LT(main_loop_wait_idx_,
+                static_cast<int>(plan_.main_loop_wait_counts.size()))
+          << "main-loop wait insert exceeds the planned wait count";
+      wait_count = plan_.main_loop_wait_counts[main_loop_wait_idx_++];
+    } else if (phase_ == PipelinePhase::kMainLoop ||
+               phase_ == PipelinePhase::kPrologue) {
       wait_count = plan_.main_wait;
     } else if (plan_.register_pipeline) {
       if (epilogue_gld_insert_idx_ >=
           static_cast<int>(plan_.epilogue_gld_fence_values.size())) {
-        // Plan exhausted: epilogue_gld_fence_values holds one wait count per
-        // planned fence and is consumed in order. Any further insert point is
-        // beyond the planned fence count and is left without a synthesized
-        // fence (no diagnostic is emitted).
+        ICHECK(!plan_.epilogue_gld_fence_values.empty() &&
+               plan_.epilogue_gld_fence_values.back() == 0)
+            << "register-pipeline epilogue wait insert exceeds the planned "
+               "fence count before drain";
         return -1;
       }
       wait_count = plan_.epilogue_gld_fence_values[epilogue_gld_insert_idx_++];
     } else {
-      wait_count = outstanding_ - plan_.commits_per_tile;
+      ICHECK(!plan_.consumer_group_needs.empty())
+          << "compiler-pipeline epilogue wait has no consumer-group needs";
+      const int g = epi_group_idx_ %
+                    static_cast<int>(plan_.consumer_group_needs.size());
+      const int need = plan_.consumer_group_needs[g];
+      ICHECK_GT(need, 0);
+      wait_count = outstanding_ - need;
       if (wait_count < 0) {
         wait_count = 0;
       }
+      if (outstanding_ == 0) {
+        return -1;
+      }
+      ICHECK(wait_count < outstanding_);
       outstanding_ = wait_count;
     }
     return wait_count;
   }
 
-  void MaybeInsertGldFence(Array<Stmt> &result) {
-    if (!plan_.compiler_pipeline || !plan_.has_async_copies) {
-      return;
+  void EmitWaitWithBarrier(Array<Stmt> &result, int wait_count) {
+    result.push_back(MakePtxWaitGroupStmt(wait_count));
+    if (plan_.register_pipeline) {
+      AppendGldWaitSync(result);
+    } else {
+      AppendWaveBarrierIfNeeded(result);
     }
+  }
+
+  bool FlushPendingPipelineWaits(Array<Stmt> &result) {
+    if (!plan_.reuse_pipeline_waits || pending_pipeline_waits_.empty()) {
+      return false;
+    }
+    if (suppress_inner_lds_insert_ > 0) {
+      return false;
+    }
+    if (phase_ == PipelinePhase::kPrologue && !plan_.register_pipeline) {
+      pending_pipeline_waits_.clear();
+      return false;
+    }
+    for (int wait_count : pending_pipeline_waits_) {
+      EmitWaitWithBarrier(result, wait_count);
+    }
+    pending_pipeline_waits_.clear();
+    return true;
+  }
+
+  void MaybeInsertGldFence(Array<Stmt> &result) {
     if (suppress_inner_lds_insert_ > 0) {
       return;
     }
@@ -748,19 +1258,19 @@ private:
     // issued with the group-tracking instruction; a raw s_waitcnt vmcnt(N)
     // would read N as an instruction count and stall until nearly all
     // outstanding DMA has landed.
-    result.push_back(MakePtxWaitGroupStmt(wait_count));
-    // sync_warp rather than wave_barrier: this call site is in the K loop,
-    // where the opaque asm form is a scheduling barrier the AMDGPU machine
-    // scheduler cannot see through. Both encode to the same s_barrier.
-    AppendGldWaitSync(result);
+    EmitWaitWithBarrier(result, wait_count);
   }
 
   SharedPipelineWaitPlan plan_;
   PipelinePhase phase_{PipelinePhase::kPrologue};
   bool k_iter_gld_fence_done_{false};
+  int main_loop_wait_idx_{0};
+  int epi_group_idx_{0};
+  int epi_consumers_in_group_{0};
   int outstanding_{0};
   int suppress_inner_lds_insert_{0};
   int epilogue_gld_insert_idx_{0};
+  std::vector<int> pending_pipeline_waits_;
 };
 
 } // namespace
@@ -775,17 +1285,36 @@ Pass InjectAsyncGlobalLoadFence() {
       return f;
     }
     auto *n = f.CopyOnWrite();
+    if (!FencePlannerOwnsWaitPlan(n->body) || !HasAsyncCopies(n->body)) {
+      return f;
+    }
     InjectAsyncGlobalLoadFenceMutator mutator(n->body);
+    if (!mutator.OwnsWaitPlan()) {
+      return f;
+    }
     n->body = mutator(std::move(n->body));
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectAsyncGlobalLoadFence", {});
 }
 
+Pass MarkFencePlannerOwnership() {
+  auto pass_func = [](PrimFunc f, IRModule, PassContext) {
+    Target target = f->GetAttr<Target>(tvm::attr::kTarget).value_or(Target());
+    if (!target.defined() || !TargetIsHCU(target)) {
+      return f;
+    }
+    const bool owns = FencePlannerOwnsWaitPlan(f->body);
+    return WithAttr(std::move(f), attr::kFencePlannerOwnsWaits, Bool(owns));
+  };
+  return CreatePrimFuncPass(pass_func, 0, "tl.MarkFencePlannerOwnership", {});
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.InjectAsyncGlobalLoadFence",
-                        InjectAsyncGlobalLoadFence);
+  refl::GlobalDef()
+      .def("tl.transform.InjectAsyncGlobalLoadFence", InjectAsyncGlobalLoadFence)
+      .def("tl.transform.MarkFencePlannerOwnership", MarkFencePlannerOwnership);
 }
 } // namespace transform
 } // namespace tl

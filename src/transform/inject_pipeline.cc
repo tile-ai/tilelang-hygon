@@ -519,6 +519,43 @@ Stmt LowerAsyncCommitWaitAttrs(const Stmt &stmt) {
 }
 
 /*!
+ * \brief Check that the kernel never commits async copies without waiting.
+ *
+ * \param stmt The statement to inspect.
+ */
+void VerifyAsyncCommitWaits(const Stmt &stmt) {
+  class Counter : public StmtExprVisitor {
+  public:
+    int commits{0};
+    int waits{0};
+
+  private:
+    void VisitExpr_(const CallNode *op) final {
+      if (op->op.same_as(builtin::ptx_commit_group())) {
+        commits += 1;
+      } else if (op->op.same_as(builtin::ptx_wait_group()) ||
+                 op->op.same_as(tl::async_gld_fence())) {
+        waits += 1;
+        if (!op->args.empty()) {
+          if (const auto *imm = op->args[0].as<IntImmNode>()) {
+            ICHECK_GE(imm->value, 0) << "async wait count must be non-negative";
+          }
+        }
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+  };
+  Counter counter;
+  counter(stmt);
+  ICHECK(counter.commits == 0 || counter.waits > 0)
+      << "async copies are committed but never waited on: this kernel has "
+      << counter.commits
+      << " commit group(s) and no wait. InjectAsyncGlobalLoadFence owns the "
+         "waits of the K loops it recognizes and the pipeline lowering covers "
+         "every other kernel, so losing all waits means one of them failed.";
+}
+
+/*!
  * \brief Build the dependency graph among a array of blocks.
  * \param[in] blocks The array of blocks.
  * \param[out] dep_src2dst Optional, a map to store dependency edges from the
@@ -3869,20 +3906,9 @@ private:
     for (const auto &kv : rewrite_result.buffer_remap) {
       pending_buffer_remap_.Set(kv.first, kv.second);
     }
-    // HCU shared pipelines with at least two stages keep their commit/wait
-    // pairs in attribute form so that InjectAsyncGlobalLoadFence can replace
-    // them with a static wait plan; the other pipelines lower the attributes
-    // here, which ThreadSync relies on to place the barrier after a wait.
-    int explicit_num_stages = 0;
-    if (auto ns = GetExplicitPipelinedNumStages(op)) {
-      explicit_num_stages = static_cast<int>(ns.value()->value);
-    }
-    const bool delay_wait_attr_lower =
-        kind_ == PipelineKind::kShared && explicit_num_stages >= 2 &&
-        target_.defined() && TargetIsHCU(target_.value());
-    if (!delay_wait_attr_lower) {
-      pipeline = LowerAsyncCommitWaitAttrs(pipeline);
-    }
+    // Lower commit/wait here. InjectAsyncGlobalLoadFence may replace them for
+    // K loops it owns; other kernels keep this lowering for ThreadSync.
+    pipeline = LowerAsyncCommitWaitAttrs(pipeline);
 
     return pipeline;
   }
@@ -4160,6 +4186,7 @@ tirx::transform::Pass LowerAsyncCommitWait() {
   auto pass_func = [=](PrimFunc f, const IRModule &, const PassContext &) {
     auto *fptr = f.CopyOnWrite();
     fptr->body = software_pipeline::LowerAsyncCommitWaitAttrs(fptr->body);
+    software_pipeline::VerifyAsyncCommitWaits(fptr->body);
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.LowerAsyncCommitWait", {});

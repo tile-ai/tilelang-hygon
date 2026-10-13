@@ -92,6 +92,11 @@ static constexpr const char *kMlsActualSizeBytesMap =
 // it without depending on the backend-specific source of the override.
 static constexpr const char *kSharedMemoryAllocationSizeBytesMap =
     "tl.shared_memory_allocation_size_bytes_map";
+// PrimFunc-level Bool: InjectAsyncGlobalLoadFence will own this kernel's
+// async waits and their pairing barriers. ThreadSync reads it so the two
+// passes do not each re-evaluate FencePlannerOwnsWaitPlan.
+static constexpr const char *kFencePlannerOwnsWaits =
+    "tl.fence_planner_owns_waits";
 } // namespace attr
 
 inline ffi::Optional<PrimExpr> GetAnnotatedMbarPhaseExpr(

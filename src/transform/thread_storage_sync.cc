@@ -2057,8 +2057,14 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
   // with every fence, so the pipelines it owns skip the generic barrier after a
   // wait_group; the others still need it, as wait_asyncmark only orders the
   // waiting wave's own copies while shared memory is consumed block-wide.
-  const bool fence_planner_owns_waits =
-      is_hcu && FencePlannerOwnsWaitPlan(stmt);
+  bool fence_planner_owns_waits = false;
+  if (is_hcu) {
+    if (auto marked = func->GetAttr<Bool>(attr::kFencePlannerOwnsWaits)) {
+      fence_planner_owns_waits = marked.value()->value;
+    } else {
+      fence_planner_owns_waits = FencePlannerOwnsWaitPlan(stmt);
+    }
+  }
   if (sync_scope.rank == StorageRank::kShared && sync_scope.tag.empty() &&
       !fence_planner_owns_waits) {
     stmt = ThreadSyncAfterWaitGroupInserter(sync_scope)(stmt);

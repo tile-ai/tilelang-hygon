@@ -854,8 +854,21 @@ private:
     return true;
   }
 
-  bool HasOnlyGemmReadersAfterCall(const Buffer &buffer,
-                                   const CallNode *after_site_call) const {
+  /*!
+   * \brief Whether every reader of `buffer` after this copy is one whose
+   * mls_trans ComputeSharedDstMlsTrans() can resolve.
+   *
+   * The matrix-load transpose of a shared destination is derived from its
+   * consumers, and that derivation understands exactly two reader forms: a GEMM
+   * that takes the buffer as an operand, and a ds_read_format that relays the
+   * buffer through its fragment into a GEMM.  Any other reader consumes a
+   * matrix-load destination without knowing the layout it was written in, and
+   * would be skipped silently by the derivation -- so the copy is rejected here
+   * instead of being lowered with a transpose only some of its consumers agree
+   * with.
+   */
+  bool HasResolvableMlsReadersAfterCall(const Buffer &buffer,
+                                        const CallNode *after_site_call) const {
     if (collector_ == nullptr) {
       return false;
     }
@@ -868,9 +881,20 @@ private:
         continue;
       }
       has_reader = true;
-      if (!IsGemmTileOpCall(reader.call)) {
-        return false;
+      if (IsGemmTileOpCall(reader.call)) {
+        continue;
       }
+      Optional<TileOperator> reader_op =
+          ParseOperator(tvm::ffi::GetRef<Call>(reader.call));
+      if (reader_op.defined() &&
+          reader_op->GetTypeKey() == std::string("tl.DsReadFormat")) {
+        const DsReadFormat &ds = Downcast<DsReadFormat>(reader_op);
+        if (PropagateToFindGemmConsumerOpWithInputAfterCall(ds->dst, collector_,
+                                                            reader.call)) {
+          continue;
+        }
+      }
+      return false;
     }
     return has_reader;
   }
@@ -1078,10 +1102,12 @@ private:
             Call(call->dtype, call->op, call->args, annotations, call->span));
       }
       if (IsMatrixLoadPreferredCopy(*copy.get())) {
-        ICHECK(HasOnlyGemmReadersAfterCall(copy->dst, call))
+        ICHECK(HasResolvableMlsReadersAfterCall(copy->dst, call))
             << "Explicit prefer_instruction=\"matrix_load\" requires every "
                "downstream reader of buffer "
-            << copy->dst->name << " after this copy to be tl.tileop.gemm.";
+            << copy->dst->name
+            << " after this copy to be a tl.tileop.gemm, or a "
+               "tl.tileop.ds_read_format that feeds one.";
         bool trans = true;
         LookupSharedMlsTrans(copy->dst, &trans);
         auto annotations = call->annotations;

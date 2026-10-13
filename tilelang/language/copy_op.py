@@ -40,7 +40,6 @@ def matrix_load(
     dst: tirx.Buffer | tirx.BufferLoad | tirx.BufferRegion,
     boundary: tuple[bool | None, bool | None] | None = None,
     *,
-    last_k_load: bool | None = None,
     annotations: dict | None = None,
 ):
     """MLS (Matrix Load Store) load from global memory to shared memory.
@@ -48,16 +47,12 @@ def matrix_load(
     ``boundary`` is ``(mn, k)`` over the last two logical tile axes.
     Each entry is None (analyze), False (in-range), or True (partial).
 
-    ``last_k_load`` is the older K-only hint: None analyze, False skip, True refresh.
-    Ignored when ``boundary`` is set.
-
     The operation commits its async group by default. Set
     ``no_implicit_async_commit_wait`` in ``annotations`` to group multiple
     MatrixLoad operations under an explicit ``T.ptx_commit_group()``.
     """
     if boundary is None:
-        mn_hint = None
-        k_hint = last_k_load
+        mn_hint, k_hint = None, None
     else:
         if len(boundary) != 2:
             raise ValueError("matrix_load boundary must be (mn, k) over the last two tile axes")

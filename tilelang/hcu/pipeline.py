@@ -91,6 +91,7 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge, disable_reuse=disable_reuse)(mod)
 
     mod = tilelang.transform.HoistMlsResource()(mod)
+    mod = tilelang.transform.MarkFencePlannerOwnership()(mod)
     mod = tilelang.transform.ThreadSync("shared")(mod)
     mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
     mod = tilelang.transform.ResolveHcuEBarrier()(mod)

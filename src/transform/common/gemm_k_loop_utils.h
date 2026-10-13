@@ -39,6 +39,13 @@ bool StmtContainsMma(const tirx::Stmt &stmt);
 bool StmtContainsAsyncCopy(const tirx::Stmt &stmt);
 
 /*!
+ * \brief Check whether a statement contains a matrix-load async producer.
+ * \param stmt The statement to search.
+ * \return True if at least one tl::mls::async_load extern call is found.
+ */
+bool StmtContainsMlsAsyncLoad(const tirx::Stmt &stmt);
+
+/*!
  * \brief Check whether a statement is an MMA cluster.
  *
  * A cluster is a compute-only statement that contains an MMA and no async
@@ -95,11 +102,20 @@ bool IsGemmKLoop(const tirx::ForNode *loop);
 std::vector<const tirx::ForNode *> CollectGemmKLoops(const tirx::Stmt &stmt);
 
 /*!
+ * \brief Check whether any GEMM K loop in `stmt` runs a register pipeline.
+ * \param stmt The statement to search.
+ * \return True if at least one GEMM K loop carries the register pipeline
+ * annotations.
+ */
+bool FuncHasRegisterPipeline(const tirx::Stmt &stmt);
+
+/*!
  * \brief Check whether InjectAsyncGlobalLoadFence owns the wait plan of `stmt`.
  *
  * The fence planner replaces a pipeline's commit/wait pairs -- barriers
  * included -- when the first GEMM K loop is a register pipeline or a compiler
- * pipeline with at least two stages.
+ * pipeline with at least two stages, and no GEMM K loop issues matrix-load
+ * async producers, whose commits the plan's accounting does not cover.
  *
  * \param stmt The statement to inspect.
  * \return True if the fence planner owns the wait plan.
