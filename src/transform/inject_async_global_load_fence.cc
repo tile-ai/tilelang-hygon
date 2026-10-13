@@ -213,7 +213,8 @@ void CollectSharedReadVars(const Stmt &stmt,
   });
 }
 
-std::unordered_set<const VarNode *> CollectPipelinedAsyncBuffers(const Stmt &body) {
+std::unordered_set<const VarNode *>
+CollectPipelinedAsyncBuffers(const Stmt &body) {
   std::unordered_set<const VarNode *> out;
   CollectAsyncDstVars(body, &out);
   return out;
@@ -415,8 +416,9 @@ int CountOutermostCommitsBeforeLds(const Stmt &body, bool stop_at_lds) {
 
 enum class PipelineEventKind { kCommit, kConsumer };
 
-std::vector<PipelineEventKind> CollectPipelineEvents(
-    const Stmt &body, const std::unordered_set<const VarNode *> &pipelined) {
+std::vector<PipelineEventKind>
+CollectPipelineEvents(const Stmt &body,
+                      const std::unordered_set<const VarNode *> &pipelined) {
   struct Collector : public StmtVisitor {
     std::vector<PipelineEventKind> events;
     int commit_depth{0};
@@ -557,9 +559,9 @@ struct MainLoopWaitSim {
   bool model_ok{true};
 };
 
-MainLoopWaitSim SimulateMainLoopWaits(const std::vector<PipelineEventKind> &events,
-                                      const std::vector<int> &needs,
-                                      int outstanding) {
+MainLoopWaitSim
+SimulateMainLoopWaits(const std::vector<PipelineEventKind> &events,
+                      const std::vector<int> &needs, int outstanding) {
   MainLoopWaitSim sim;
   size_t g = 0;
   const int n = static_cast<int>(events.size());
@@ -825,8 +827,7 @@ SharedPipelineWaitPlan MakeWaitPlan(const Stmt &root) {
           in_k = prev;
         }
         void VisitStmt_(const AttrStmtNode *op) override {
-          if (in_k &&
-              op->attr_key == s_tir::attr::async_wait_inflight_count) {
+          if (in_k && op->attr_key == s_tir::attr::async_wait_inflight_count) {
             if (const auto *imm = op->value.as<IntImmNode>()) {
               counts->push_back(static_cast<int>(imm->value));
             }
@@ -1030,8 +1031,7 @@ public:
           }
         }
       } else if (phase_ == PipelinePhase::kMainLoop) {
-        if (consumer_region &&
-            FlushPendingPipelineWaits(result)) {
+        if (consumer_region && FlushPendingPipelineWaits(result)) {
           k_iter_gld_fence_done_ = true;
           inserted_here = true;
         } else if (consumer_region && !plan_.reuse_pipeline_waits &&
@@ -1042,8 +1042,7 @@ public:
         }
       } else if (!plan_.register_pipeline &&
                  phase_ == PipelinePhase::kEpilogue) {
-        if (consumer_region &&
-            FlushPendingPipelineWaits(result)) {
+        if (consumer_region && FlushPendingPipelineWaits(result)) {
           inserted_here = true;
         } else if (plan_.conservative) {
           if (consumer_region && suppress_inner_lds_insert_ == 0) {
@@ -1198,8 +1197,8 @@ private:
     } else {
       ICHECK(!plan_.consumer_group_needs.empty())
           << "compiler-pipeline epilogue wait has no consumer-group needs";
-      const int g = epi_group_idx_ %
-                    static_cast<int>(plan_.consumer_group_needs.size());
+      const int g =
+          epi_group_idx_ % static_cast<int>(plan_.consumer_group_needs.size());
       const int need = plan_.consumer_group_needs[g];
       ICHECK_GT(need, 0);
       wait_count = outstanding_ - need;
@@ -1313,7 +1312,8 @@ Pass MarkFencePlannerOwnership() {
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
-      .def("tl.transform.InjectAsyncGlobalLoadFence", InjectAsyncGlobalLoadFence)
+      .def("tl.transform.InjectAsyncGlobalLoadFence",
+           InjectAsyncGlobalLoadFence)
       .def("tl.transform.MarkFencePlannerOwnership", MarkFencePlannerOwnership);
 }
 } // namespace transform
