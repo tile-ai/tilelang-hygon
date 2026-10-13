@@ -59,7 +59,7 @@ enum struct memory_operation_enum : std::uint16_t
     add
 };
 
-TL_HOST_DEVICE constexpr index_t get_warp_size()
+TL_DEVICE index_t get_warp_size()
 {
     // warpSize is defined by HIP
     return warpSize;
