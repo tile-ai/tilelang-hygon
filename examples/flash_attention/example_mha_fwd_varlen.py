@@ -12,6 +12,28 @@ from varlen_utils import generate_random_padding_mask, generate_qkv
 import itertools
 
 
+def ref_program_torch(q, k, v, query_padding_mask, key_padding_mask, causal):
+    output = torch.zeros_like(q)
+    scale = q.shape[-1] ** -0.5
+    for batch_idx in range(q.shape[0]):
+        query = q[batch_idx, query_padding_mask[batch_idx]].transpose(0, 1).float()
+        key = k[batch_idx, key_padding_mask[batch_idx]].transpose(0, 1).float()
+        value = v[batch_idx, key_padding_mask[batch_idx]].transpose(0, 1).float()
+        scores = torch.matmul(query, key.transpose(-1, -2)) * scale
+        if causal:
+            q_idx = torch.arange(query.shape[1], device=q.device)[:, None]
+            k_idx = torch.arange(key.shape[1], device=q.device)[None, :]
+            visible = k_idx <= q_idx + key.shape[1] - query.shape[1]
+            scores = scores.masked_fill(~visible, float("-inf"))
+            valid_query = (q_idx[:, 0] + key.shape[1] - query.shape[1]) >= 0
+            scores[:, ~valid_query, :] = 0
+        out = torch.matmul(torch.softmax(scores, dim=-1), value)
+        if causal:
+            out[:, ~valid_query, :] = 0
+        output[batch_idx, query_padding_mask[batch_idx]] = out.transpose(0, 1).to(q.dtype)
+    return output
+
+
 def get_configs():
     iter_params = dict(block_M=[64, 128], block_N=[64, 128], num_stages=[0, 1, 2, 3], threads=[128, 256])
     return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
@@ -198,6 +220,10 @@ def main(batch: int = 8, heads: int = 64, seq_len: int = 2048, dim: int = 128, c
     out_unpad = kernel(q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q)
     out = output_pad_fn(out_unpad)
 
+    torch_out = ref_program_torch(q, k, v, query_padding_mask, key_padding_mask, causal)
+    torch.testing.assert_close(out, torch_out, rtol=1e-2, atol=1e-2)
+
+    """
     import flash_attn
 
     fla_out_unpad = flash_attn.flash_attn_varlen_func(
@@ -213,6 +239,7 @@ def main(batch: int = 8, heads: int = 64, seq_len: int = 2048, dim: int = 128, c
     )
     fla_out = output_pad_fn(fla_out_unpad)
     torch.testing.assert_close(out, fla_out, rtol=1e-2, atol=1e-2)
+    """
 
     print("All checks passed.✅")
 
@@ -220,6 +247,7 @@ def main(batch: int = 8, heads: int = 64, seq_len: int = 2048, dim: int = 128, c
     t = do_bench(lambda: kernel(q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q))
     print(f"Tilelang time: {t} ms")
     print(f"Tilelang: {total_flops / t * 1e-9} TFlops")
+    """
     t = do_bench(
         lambda: flash_attn.flash_attn_varlen_func(
             q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, 0.0, causal=causal
@@ -227,6 +255,7 @@ def main(batch: int = 8, heads: int = 64, seq_len: int = 2048, dim: int = 128, c
     )
     print(f"FA2 time: {t} ms")
     print(f"FA2: {total_flops / t * 1e-9} TFlops")
+    """
 
 
 def run_regression_perf(batch: int = 8, heads: int = 64, seq_len: int = 2048, dim: int = 128, causal: bool = False):
