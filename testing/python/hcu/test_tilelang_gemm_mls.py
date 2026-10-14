@@ -1771,7 +1771,7 @@ def test_mls_ds_read_format_b4_copy_to_global(M, K, block_M, block_K, num_thread
         pytest.param(256, 128, 64, True, False, 256, 128, 64, 64, id="an_bt_m256_n128_k64_t64"),
         pytest.param(256, 128, 128, True, False, 256, 128, 128, 128, id="an_bt_256x16_single_mn_multi_k"),
         pytest.param(512, 128, 64, True, False, 512, 128, 64, 128, id="an_bt_256x16_slot_fallback"),
-        pytest.param(512, 128, 128, True, False, 512, 128, 128, 128, id="an_bt_256x16_multi_k"),
+        pytest.param(384, 128, 128, True, False, 384, 128, 128, 128, id="an_bt_256x16_multi_k"),
         pytest.param(256, 256, 128, True, False, 128, 128, 64, 128, id="an_bt_m256_n256_k128_t128"),
         pytest.param(32, 64, 256, False, True, 32, 64, 256, 128, id="at_bn_16x256_slot_fallback"),
         pytest.param(32, 64, 512, False, True, 32, 64, 512, 128, id="at_bn_16x256_multi_k"),

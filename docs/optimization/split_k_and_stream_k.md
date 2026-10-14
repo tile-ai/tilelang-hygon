@@ -26,6 +26,7 @@ In TileLang, you can implement Split-K by adding a `split_k` dimension to your g
 ```python
 import tilelang.language as T
 
+
 @T.prim_func
 def matmul_splitk(A: T.Tensor, B: T.Tensor, C: T.Tensor):
     # Standard grid (M/block_M, N/block_N) + Split-K dimension
@@ -40,7 +41,7 @@ def matmul_splitk(A: T.Tensor, B: T.Tensor, C: T.Tensor):
 
         # Final accumulation requires atomics because multiple blocks write to C[by, bx]
         for i, j in T.Parallel(block_M, block_N):
-             T.atomic_add(C[by * block_M + i, bx * block_N + j], C_local[i, j])
+            T.atomic_add(C[by * block_M + i, bx * block_N + j], C_local[i, j])
 ```
 
 ## 2. Stream-K Optimization

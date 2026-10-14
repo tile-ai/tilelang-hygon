@@ -110,3 +110,12 @@ __device__ void debug_print_msg(const char *msg) {
          blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y,
          threadIdx.z);
 }
+
+__device__ inline void device_assert(bool cond) { assert(cond); }
+
+__device__ inline void device_assert_with_msg(bool cond, const char *msg) {
+  if (!cond) {
+    printf("Device assert failed: %s\n", msg);
+    assert(0);
+  }
+}

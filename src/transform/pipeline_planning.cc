@@ -7,6 +7,7 @@
 #include <tvm/runtime/logging.h>
 #include <tvm/s_tir/stmt.h>
 #include <tvm/target/target.h>
+#include <tvm/target/target_kind.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt.h>
@@ -17,14 +18,10 @@
 #include <utility>
 #include <vector>
 
-#include "../hcu/op/ds_read_format.h"
-#include "../hcu/op/mls.h"
-#include "../hcu/utils/gemm_lds_strategy_utils.h"
 #include "../op/builtin.h"
 #include "../op/copy.h"
 #include "../op/operator.h"
 #include "../op/parallel.h"
-#include "../op/region.h"
 #include "../op/utils.h"
 #include "backend/common/target_utils.h"
 #include "common/bind_utils.h"
@@ -37,6 +34,15 @@ namespace tl {
 using namespace tirx;
 using namespace ffi;
 
+Optional<String> GetAsyncCopyPromotionAnnotation(const Target &target) {
+  auto attr_map =
+      TargetKind::GetAttrMap<String>(attr::kAsyncCopyPromotionAnnotation);
+  if (attr_map.count(target->kind)) {
+    return attr_map[target->kind];
+  }
+  return Optional<String>();
+}
+
 class BufferRegionCollector : public StmtExprVisitor {
 public:
   BufferRegionCollector(Map<Var, Buffer> buffer_data_to_buffer, Target target);
@@ -45,8 +51,7 @@ public:
   Array<BufferRegion> GetWrites() const;
   bool GetGlobalCopyPattern() const;
   bool GetTmaCopyPattern() const;
-  bool HasMatrixLoadPreferredCopy() const;
-  bool HasHcuAsyncPromotableCopy() const;
+  bool HasAsyncCopyPromotionAnnotation() const;
   bool HasNonCopyTileOp() const;
 
 private:
@@ -66,8 +71,7 @@ private:
   bool is_global_read_ = false;
   bool is_global_copy_pattern_ = false;
   bool is_tma_copy_ = false;
-  bool has_matrix_load_preferred_copy_ = false;
-  bool has_hcu_async_promotable_copy_ = false;
+  bool has_async_copy_promotion_annotation_ = false;
   bool has_non_copy_tile_op_ = false;
   bool within_condition_expr_ = false;
 };
@@ -106,12 +110,8 @@ bool BufferRegionCollector::GetGlobalCopyPattern() const {
 
 bool BufferRegionCollector::GetTmaCopyPattern() const { return is_tma_copy_; }
 
-bool BufferRegionCollector::HasMatrixLoadPreferredCopy() const {
-  return has_matrix_load_preferred_copy_;
-}
-
-bool BufferRegionCollector::HasHcuAsyncPromotableCopy() const {
-  return has_hcu_async_promotable_copy_;
+bool BufferRegionCollector::HasAsyncCopyPromotionAnnotation() const {
+  return has_async_copy_promotion_annotation_;
 }
 
 bool BufferRegionCollector::HasNonCopyTileOp() const {
@@ -123,25 +123,16 @@ bool BufferRegionCollector::IsGlobalLikeBuffer(const Buffer &buffer) {
 }
 
 void BufferRegionCollector::VisitStmt_(const ForNode *op) {
-  if (TargetIsHCU(target_)) {
-    if (auto prefer_async = op->annotations.Get(attr::kLoopPreferAsync)) {
-      if (auto value = prefer_async.value().try_cast<Bool>();
-          value && value.value()->value) {
-        // A preferred Parallel copy is lowered to HCU async-copy only after
-        // software-pipeline planning.  Record that late-lowering capability
-        // here so the outer pipeline owns its commit/wait placement, just as
-        // it does for a pipeline-managed T.copy.
-        has_hcu_async_promotable_copy_ = true;
-      }
+  if (auto prefer_async = op->annotations.Get(attr::kLoopPreferAsync)) {
+    if (auto value = prefer_async.value().try_cast<Bool>();
+        value && value.value()->value) {
+      has_async_copy_promotion_annotation_ = true;
     }
   }
   StmtExprVisitor::VisitStmt_(op);
 }
 
 void BufferRegionCollector::HandleTileOp(const TileOperator &tile_op) {
-  if (tile_op.as<RegionOpNode>()) {
-    return;
-  }
   if (const auto *parallel = tile_op.as<ParallelOpNode>()) {
     BufferRegionCollector nested(buffer_data_to_buffer_, target_);
     nested(parallel->GetRoot());
@@ -152,10 +143,9 @@ void BufferRegionCollector::HandleTileOp(const TileOperator &tile_op) {
     is_global_copy_pattern_ =
         is_global_copy_pattern_ || nested.GetGlobalCopyPattern();
     is_tma_copy_ = is_tma_copy_ || nested.GetTmaCopyPattern();
-    has_matrix_load_preferred_copy_ =
-        has_matrix_load_preferred_copy_ || nested.HasMatrixLoadPreferredCopy();
-    has_hcu_async_promotable_copy_ =
-        has_hcu_async_promotable_copy_ || nested.HasHcuAsyncPromotableCopy();
+    has_async_copy_promotion_annotation_ =
+        has_async_copy_promotion_annotation_ ||
+        nested.HasAsyncCopyPromotionAnnotation();
     has_non_copy_tile_op_ = has_non_copy_tile_op_ || nested.HasNonCopyTileOp();
     return;
   }
@@ -166,22 +156,11 @@ void BufferRegionCollector::HandleTileOp(const TileOperator &tile_op) {
     if (IsGlobalLikeBuffer(copy->src) && IsSharedBuffer(copy->dst)) {
       is_global_copy_pattern_ = true;
     }
-    has_matrix_load_preferred_copy_ =
-        has_matrix_load_preferred_copy_ || IsMatrixLoadPreferredCopy(*copy);
-    if (copy->annotations.count(attr::kHcuCopyAsyncPromotable)) {
-      has_hcu_async_promotable_copy_ = true;
+    if (auto annotation_key = GetAsyncCopyPromotionAnnotation(target_)) {
+      if (copy->annotations.count(annotation_key.value())) {
+        has_async_copy_promotion_annotation_ = true;
+      }
     }
-  }
-  if (const auto *matrix_load = tile_op.as<MatrixLoadNode>()) {
-    if (IsGlobalLikeBuffer(matrix_load->src) &&
-        IsSharedBuffer(matrix_load->dst)) {
-      is_global_copy_pattern_ = true;
-    }
-    return;
-  }
-  if (tile_op.as<DsReadFormatNode>()) {
-    has_non_copy_tile_op_ = true;
-    return;
   }
   // Im2Col always uses TMA on Hopper.
   if (const auto *im2col = tile_op.as<Im2ColOpNode>()) {
@@ -258,6 +237,27 @@ void BufferRegionCollector::VisitExpr_(const CallNode *op) {
       // because we only care about the buffer itself instead of indices
       reads_.push_back(buffer_region);
     }
+  } else if (op->op.same_as(tl::access_ptr())) {
+    ICHECK_EQ(op->args.size(), 3U);
+    const auto *load = op->args[0].as<BufferLoadNode>();
+    ICHECK(load) << "tl.access_ptr base must be a BufferLoad";
+    const BufferRegion buffer_region = BufferRegion::FullRegion(load->buffer);
+    const int access_mask = GetConservativeAccessMask(op->args[2]);
+    // because we only care about the buffer itself instead of indices
+    if (access_mask & kAccessRead) {
+      reads_.push_back(buffer_region);
+    }
+    if (access_mask & kAccessWrite) {
+      writes_.push_back(buffer_region);
+    }
+    for (const PrimExpr &index : load->indices) {
+      this->VisitExpr(index);
+    }
+    if (load->predicate.defined()) {
+      this->VisitExpr(load->predicate.value());
+    }
+    this->VisitExpr(op->args[1]);
+    this->VisitExpr(op->args[2]);
   } else if (op->op.same_as(builtin::tvm_access_ptr())) {
     const VarNode *buffer_var = op->args[1].as<VarNode>();
     ICHECK(buffer_var);
@@ -265,8 +265,19 @@ void BufferRegionCollector::VisitExpr_(const CallNode *op) {
     if (it != buffer_data_to_buffer_.end()) {
       const Buffer &buffer = (*it).second;
       const BufferRegion buffer_region = BufferRegion::FullRegion(buffer);
+      const int access_mask = op->args.size() == 5U
+                                  ? GetConservativeAccessMask(op->args[4])
+                                  : kAccessReadWrite;
       // because we only care about the buffer itself instead of indices
-      reads_.push_back(buffer_region);
+      if (access_mask & kAccessRead) {
+        reads_.push_back(buffer_region);
+      }
+      if (access_mask & kAccessWrite) {
+        writes_.push_back(buffer_region);
+      }
+    }
+    for (size_t i = 2; i < op->args.size(); ++i) {
+      this->VisitExpr(op->args[i]);
     }
   } else if (op->op.same_as(builtin::if_then_else())) {
     within_condition_expr_ = true;
@@ -436,7 +447,6 @@ private:
  * pipeline after reordering (-1 if not yet assigned) \param stage Pipeline
  * stage number this operation belongs to (-1 if not yet assigned) \param
  * copy_stage Whether this stage is a memory copy operation \param
- * matrix_load_copy_stage Whether this T.copy requests HCU MatrixLoad \param
  * last_use_stmt_index Index of the last statement (in original order) that
  * uses the results of this stage (-1 if not yet determined). This field is
  * crucial for pipeline optimization:
@@ -455,8 +465,7 @@ struct PipelineStageInfo {
   int original_stmt_index{};
   int order = -1, stage = -1;
   bool copy_stage = false;
-  bool matrix_load_copy_stage = false;
-  bool hcu_async_promotable_copy_stage = false;
+  bool has_async_copy_promotion_annotation = false;
   bool tma_copy = false; // true if this copy stage uses TMA (not cp.async)
   bool conditional_execution = false;
   bool producer_for_copy = false;
@@ -466,7 +475,9 @@ struct PipelineStageInfo {
 public:
   bool IsFirstStage() const { return copy_stage || producer_for_copy; }
   bool IsCopyStage() const { return copy_stage; }
-  bool IsMatrixLoadCopyStage() const { return matrix_load_copy_stage; }
+  bool HasAsyncCopyPromotionAnnotation() const {
+    return has_async_copy_promotion_annotation;
+  }
   bool IsTmaCopy() const { return tma_copy; }
   bool IsProducerForCopy() const { return producer_for_copy; }
   bool IsLastUseStmtIndexValid() const { return last_use_stmt_index != -1; }
@@ -528,11 +539,9 @@ public:
     if (pinfo.IsTmaCopy()) {
       return false;
     }
-    if (pinfo.IsMatrixLoadCopyStage()) {
-      return true;
-    }
-    if (TargetIsHCU(target_)) {
-      return pinfo.IsCopyStage() && pinfo.hcu_async_promotable_copy_stage;
+    if (GetAsyncCopyPromotionAnnotation(target_) &&
+        !pinfo.HasAsyncCopyPromotionAnnotation()) {
+      return false;
     }
     return pinfo.IsCopyStage();
   }
@@ -577,9 +586,6 @@ public:
       if (!tile_op.defined()) {
         return;
       }
-      if (tile_op.as<RegionOpNode>()) {
-        return;
-      }
       if (const auto *parallel = tile_op.as<ParallelOpNode>()) {
         if (IsPureCopyStmt(parallel->GetRoot())) {
           saw_copy = true;
@@ -588,8 +594,7 @@ public:
         }
         return;
       }
-      if (tile_op.as<CopyNode>() || tile_op.as<MatrixLoadNode>() ||
-          tile_op.as<Im2ColOpNode>()) {
+      if (tile_op.as<CopyNode>() || tile_op.as<Im2ColOpNode>()) {
         saw_copy = true;
       } else {
         saw_non_copy_tile_op = true;
@@ -614,11 +619,7 @@ public:
       if (!tile_op.defined()) {
         return;
       }
-      if (tile_op.as<RegionOpNode>()) {
-        return;
-      }
-      if (tile_op.as<CopyNode>() || tile_op.as<MatrixLoadNode>() ||
-          tile_op.as<Im2ColOpNode>()) {
+      if (tile_op.as<CopyNode>() || tile_op.as<Im2ColOpNode>()) {
         if (copy_tile_op.defined()) {
           saw_multiple_copy_ops = true;
           copy_tile_op = Optional<TileOperator>();
@@ -658,15 +659,6 @@ public:
 
     if (const auto *copy = copy_tile_op.value().as<CopyNode>()) {
       if (!IsGlobalLikeBuffer(copy->src) || !IsSharedBuffer(copy->dst)) {
-        return;
-      }
-      pinfo->copy_stage = true;
-      return;
-    }
-
-    if (const auto *matrix_load = copy_tile_op.value().as<MatrixLoadNode>()) {
-      if (!IsGlobalLikeBuffer(matrix_load->src) ||
-          !IsSharedBuffer(matrix_load->dst)) {
         return;
       }
       pinfo->copy_stage = true;
@@ -1038,10 +1030,8 @@ public:
     bool pure_copy_stage =
         collector.GetGlobalCopyPattern() && IsPureCopyStmt(block->body);
     pinfo.copy_stage = pure_copy_stage;
-    pinfo.matrix_load_copy_stage =
-        pure_copy_stage && collector.HasMatrixLoadPreferredCopy();
-    pinfo.hcu_async_promotable_copy_stage =
-        pure_copy_stage && collector.HasHcuAsyncPromotableCopy();
+    pinfo.has_async_copy_promotion_annotation =
+        pure_copy_stage && collector.HasAsyncCopyPromotionAnnotation();
     pinfo.tma_copy = pure_copy_stage && !pinfo.conditional_execution &&
                      collector.GetTmaCopyPattern();
     ClassifyCopyLikeStage(block->body, &pinfo);
@@ -1207,7 +1197,10 @@ private:
     // async-copy hardware but the software pipeline for that target has not
     // been validated yet, so it falls back to a plain sequential loop as well.
     // RDNA targets have no async-copy support at all and also fall back.
-    // HCU is excluded: users control multi-stage at the kernel level.
+    // HCU shares kDLROCM for runtime interoperability, but owns a separately
+    // validated software-pipeline implementation.  The ROCm backend gate
+    // below must therefore not classify an HCU target as an unsupported ROCm
+    // architecture merely from its device type.
     if (TargetIsRocm(target_) && !TargetIsHCU(target_) &&
         !TargetIsGfx950(target_) && num_stages >= 1) {
       // Strip the "num_stages" annotation before recursing so that downstream
@@ -1391,7 +1384,7 @@ private:
     Stmt new_body = MakePipelineBody(flat_stmts);
 
     return For(loop->loop_var, loop->min, loop->extent, loop->kind, new_body,
-               loop->thread_binding, annotations);
+               loop->thread_binding, annotations, loop->step, loop->span);
   }
 
   Stmt VisitStmt_(const SBlockNode *op) final {

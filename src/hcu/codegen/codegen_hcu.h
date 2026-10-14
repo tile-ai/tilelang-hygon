@@ -65,6 +65,8 @@ public:
   void VisitExpr_(const FloatImmNode *op, std::ostream &os) final;
   void VisitExpr_(const CallNode *op, std::ostream &os) final;
   void VisitExpr_(const CastNode *op, std::ostream &os) final;
+  void VisitExpr_(const NotNode *op, std::ostream &os) final;
+  void VisitExpr_(const SelectNode *op, std::ostream &os) final;
   void VisitExpr_(const FloorDivNode *op, std::ostream &os) final; // NOLINT(*)
   void VisitExpr_(const FloorModNode *op, std::ostream &os) final; // NOLINT(*)
   void VisitStmt_(const AllocBufferNode *op) final;

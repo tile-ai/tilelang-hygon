@@ -2,6 +2,8 @@
  * \file hcu/target_utils.cc
  */
 #include "hcu/target_utils.h"
+#include "hcu/utils/gemm_lds_strategy_utils.h"
+#include "op/builtin.h"
 #include "support/check.h"
 
 #include <tvm/ffi/reflection/registry.h>
@@ -202,6 +204,8 @@ TVM_REGISTER_TARGET_KIND("hcu", kDLROCM)
                               refl::DefaultValue(int64_t{65536}))
     .add_attr_option<int64_t>("thread_warp_size",
                               refl::DefaultValue(int64_t{64}))
+    .set_attr<ffi::String>(attr::kAsyncCopyPromotionAnnotation,
+                           ffi::String(attr::kHcuCopyAsyncPromotable))
     .set_default_keys({"hcu", "gpu"});
 
 TVM_FFI_STATIC_INIT_BLOCK() {

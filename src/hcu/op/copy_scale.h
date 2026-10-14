@@ -33,7 +33,9 @@ public:
   int granularity_mn_{1};
   int granularity_k_{1};
   int scale_k_major_{0};
-  int role_{0}; // 0=A(M), 1=B(N)
+  int role_{0};      // 0=A(M), 1=B(N)
+  int row_order_{0}; // ScaleBufferRowOrder, compiler-selected.
+  int lds_from_async_copy_{0};
   // Deferred ComputeWarpPartitionHCU clues (not precomputed WarpM/N).
   int gemm_m_{0};
   int gemm_n_{0};
@@ -67,6 +69,8 @@ public:
         .def_ro("granularity_k_", &CopyScaleNode::granularity_k_)
         .def_ro("scale_k_major_", &CopyScaleNode::scale_k_major_)
         .def_ro("role_", &CopyScaleNode::role_)
+        .def_ro("row_order_", &CopyScaleNode::row_order_)
+        .def_ro("lds_from_async_copy_", &CopyScaleNode::lds_from_async_copy_)
         .def_ro("row_base_", &CopyScaleNode::row_base_);
   }
 

@@ -4,14 +4,13 @@
  */
 
 #include "mls.h"
+#include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/mls_boundary.h"
 #include "hcu/utils/mls_gemm_dep.h"
 #include "layout/layout.h"
-#include "op/builtin.h"
 #include "op/copy.h"
 #include "op/operator.h"
-#include "op/region.h"
 #include "op/utils.h"
 #include "transform/common/pipeline_utils.h"
 #include <algorithm>
@@ -275,26 +274,21 @@ MatrixLoad::MatrixLoad(Array<PrimExpr> args,
                        Map<String, ObjectRef> annotations) {
   ICHECK_EQ(args.size(), 4)
       << "matrix_load expects src_region, dst_region, mn_boundary, k_boundary";
-  auto src_call = args[0].as<CallNode>();
-  auto dst_call = args[1].as<CallNode>();
-  ICHECK(src_call) << "matrix_load args[0] must be region call (src)";
-  ICHECK(dst_call) << "matrix_load args[1] must be region call (dst)";
-
-  auto src_region = RegionOp(src_call->args);
-  auto dst_region = RegionOp(dst_call->args);
-  auto src_ranges = src_region->GetRanges();
-  auto dst_ranges = dst_region->GetRanges();
+  BufferRegion src_region = NormalizeToBufferRegion(args[0]);
+  BufferRegion dst_region = NormalizeToBufferRegion(args[1]);
+  auto src_ranges = src_region->region;
+  auto dst_ranges = dst_region->region;
 
   ICHECK(dst_ranges.size() >= 2) << "matrix_load dst region must be 2D";
   ICHECK(src_ranges.size() >= 2) << "matrix_load src region must have at least "
                                     "2 dims (last 2 match dst MN,K)";
 
-  Buffer dst_buf = dst_region->GetBuffer();
+  Buffer dst_buf = dst_region->buffer;
   ICHECK(dst_buf.scope() == "shared" || dst_buf.scope() == "shared.dyn")
       << "matrix_load dst must be shared memory, got scope=" << dst_buf.scope();
 
   ObjectPtr<MatrixLoadNode> node = tvm::ffi::make_object<MatrixLoadNode>();
-  node->src = src_region->GetBuffer();
+  node->src = src_region->buffer;
   node->dst = dst_buf;
   node->src_ranges = src_ranges;
   node->dst_ranges = dst_ranges;
@@ -322,23 +316,18 @@ MatrixStore::MatrixStore(Array<PrimExpr> args,
   ICHECK_EQ(args.size(), 4)
       << "matrix_store expects src_region, dst_region, mn_boundary, "
          "k_boundary";
-  auto src_call = args[0].as<CallNode>();
-  auto dst_call = args[1].as<CallNode>();
-  ICHECK(src_call) << "matrix_store args[0] must be region call (src)";
-  ICHECK(dst_call) << "matrix_store args[1] must be region call (dst)";
-
-  auto src_region = RegionOp(src_call->args);
-  auto dst_region = RegionOp(dst_call->args);
-  auto src_ranges = src_region->GetRanges();
-  auto dst_ranges = dst_region->GetRanges();
+  BufferRegion src_region = NormalizeToBufferRegion(args[0]);
+  BufferRegion dst_region = NormalizeToBufferRegion(args[1]);
+  auto src_ranges = src_region->region;
+  auto dst_ranges = dst_region->region;
 
   ICHECK(src_ranges.size() >= 2)
       << "matrix_store src region must be at least 2D";
   ICHECK(dst_ranges.size() >= 2)
       << "matrix_store dst region must be at least 2D";
 
-  Buffer src_buf = src_region->GetBuffer();
-  Buffer dst_buf = dst_region->GetBuffer();
+  Buffer src_buf = src_region->buffer;
+  Buffer dst_buf = dst_region->buffer;
   ICHECK(IsFragmentBuffer(src_buf))
       << "matrix_store src must be a local.fragment MMAC result, got scope="
       << src_buf.scope();
@@ -795,8 +784,10 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   call_args.push_back(dst_ptr);
   call_args.push_back(IntImm(DataType::Int(32), warp_id_offset));
 
-  Stmt stmt =
-      Evaluate(Call(DataType::Handle(), builtin::call_extern(), call_args));
+  Map<String, ObjectRef> async_annotations;
+  async_annotations.Set(tl::attr::kAsyncSharedWrite, Integer(1));
+  Stmt stmt = Evaluate(Call(DataType::Handle(), builtin::call_extern(),
+                            call_args, async_annotations));
   if (auto actual_size_bytes = TryGetMlsDstActualSizeBytes(
           dst_buf, tile_mn, tile_k, mls_trans, T.target, lds_physical_bits)) {
     Map<String, PrimExpr> actual_size_bytes_map;

@@ -14,7 +14,7 @@
 #include "hcu/target_utils.h"
 #include "hcu/utils/mls_gemm_dep.h"
 #include "hcu/utils/scale_gemm_dep.h"
-#include "op/gemm.h"
+#include "op/gemm_blockscaled.h"
 #include "op/operator.h"
 
 #include <tvm/ir/transform.h>
@@ -237,9 +237,9 @@ private:
           found_ = true;
           return;
         }
-        if (tir_op == Gemm::Get()) {
-          auto gemm =
-              Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
+        if (tir_op == GemmBlockScaled::Get()) {
+          auto gemm = Downcast<GemmBlockScaled>(
+              ParseOperator(tvm::ffi::GetRef<Call>(call)));
           if (gemm->sfaRegion_.defined()) {
             found_ = true;
             return;
@@ -266,7 +266,7 @@ struct CopyScaleSite {
 
 struct GemmSite {
   Call call;
-  Gemm op;
+  GemmBlockScaled op;
 };
 
 hcu::HcuMmacModeInfo
@@ -311,9 +311,9 @@ private:
           copy_sites.push_back({tvm::ffi::GetRef<Call>(call),
                                 Downcast<CopyScale>(ParseOperator(
                                     tvm::ffi::GetRef<Call>(call)))});
-        } else if (tir_op == Gemm::Get()) {
-          auto gemm =
-              Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
+        } else if (tir_op == GemmBlockScaled::Get()) {
+          auto gemm = Downcast<GemmBlockScaled>(
+              ParseOperator(tvm::ffi::GetRef<Call>(call)));
           if (gemm->sfaRegion_.defined() && gemm->sfbRegion_.defined()) {
             gemm_sites.push_back({tvm::ffi::GetRef<Call>(call), gemm});
           }
@@ -364,7 +364,7 @@ public:
       const Buffer &dst = site.op->dst;
       bool matched = false;
       for (const auto &gemm_site : collector.gemm_sites) {
-        const GemmNode *gemm = gemm_site.op.get();
+        const GemmBlockScaledNode *gemm = gemm_site.op.get();
         const Map<String, ObjectRef> &ann = gemm->annotations_;
         ScaleLdsFormat scale_format_a = ScaleLdsFormat::kIdentity;
         ScaleLdsFormat scale_format_b = ScaleLdsFormat::kIdentity;
@@ -386,9 +386,9 @@ public:
         const int gemm_elem_bits = mmac_mode.element_bits;
         if (gemm->sfaRegion_.defined() &&
             dst.same_as(gemm->sfaRegion_->buffer)) {
-          auto gran_m = GetIntAnn(ann, "sf_a_granularity_m");
+          auto gran_m = GetIntAnn(ann, "tl.hcu.sf_a_granularity_m");
           auto gran_k = GetIntAnn(ann, "sf_a_granularity_k");
-          auto k_major = GetIntAnn(ann, "a_scale_k_major");
+          auto k_major = GetIntAnn(ann, "tl.hcu.a_scale_k_major");
           ICHECK(gran_m && gran_k && k_major)
               << "gemm_blockscaled missing sf_a_granularity_* / "
                  "a_scale_k_major";
@@ -402,9 +402,9 @@ public:
         }
         if (gemm->sfbRegion_.defined() &&
             dst.same_as(gemm->sfbRegion_->buffer)) {
-          auto gran_n = GetIntAnn(ann, "sf_b_granularity_n");
+          auto gran_n = GetIntAnn(ann, "tl.hcu.sf_b_granularity_n");
           auto gran_k = GetIntAnn(ann, "sf_b_granularity_k");
-          auto k_major = GetIntAnn(ann, "b_scale_k_major");
+          auto k_major = GetIntAnn(ann, "tl.hcu.b_scale_k_major");
           ICHECK(gran_n && gran_k && k_major)
               << "gemm_blockscaled missing sf_b_granularity_* / "
                  "b_scale_k_major";
@@ -429,7 +429,7 @@ public:
     std::unordered_map<const CallNode *, std::pair<int, int>>
         gemm_partition_mins;
     for (const auto &gemm_site : collector.gemm_sites) {
-      const GemmNode *gemm = gemm_site.op.get();
+      const GemmBlockScaledNode *gemm = gemm_site.op.get();
       int min_m = 0;
       int min_n = 0;
       if (gemm->sfaRegion_.defined()) {
@@ -530,9 +530,9 @@ private:
                         call->span);
           return Evaluate(new_call);
         }
-        if (tir_op == Gemm::Get()) {
-          auto gemm =
-              Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
+        if (tir_op == GemmBlockScaled::Get()) {
+          auto gemm = Downcast<GemmBlockScaled>(
+              ParseOperator(tvm::ffi::GetRef<Call>(call)));
           if (!gemm->sfaRegion_.defined() || !gemm->sfbRegion_.defined()) {
             return StmtExprMutator::VisitStmt_(op);
           }
@@ -588,8 +588,8 @@ private:
           int min_n = 0;
           for (const auto &kv : gemm_partition_mins_) {
             const auto *gcall = kv.first;
-            auto gemm =
-                Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(gcall)));
+            auto gemm = Downcast<GemmBlockScaled>(
+                ParseOperator(tvm::ffi::GetRef<Call>(gcall)));
             if (gemm->m_ == dep.value()->gemm_m &&
                 gemm->n_ == dep.value()->gemm_n &&
                 gemm->k_ == dep.value()->gemm_k &&

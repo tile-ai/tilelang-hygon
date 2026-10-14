@@ -17,9 +17,9 @@
 #include <limits>
 #include <vector>
 
+#include "hcu/op/builtin.h"
 #include "hcu/transform/async_copy_injector.h"
 #include "hcu/utils/gemm_lds_strategy_utils.h"
-#include "op/builtin.h"
 #include "op/utils.h"
 #include "tir/ir/buffer_common.h"
 

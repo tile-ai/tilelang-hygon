@@ -5,12 +5,12 @@
 
 #include "ds_read_format.h"
 #include "gemm_partition.h"
+#include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
 #include "layout/utils.h"
 #include "mls.h"
-#include "op/builtin.h"
 #include "op/gemm.h"
-#include "op/region.h"
+#include "op/utils.h"
 #include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
@@ -211,21 +211,16 @@ DsReadFormat::DsReadFormat(Array<PrimExpr> args,
                            Map<String, ObjectRef> annotations) {
   ICHECK(args.size() >= 2)
       << "ds_read_format expects at least 2 args: src_region, dst_region";
-  auto src_call = args[0].as<CallNode>();
-  auto dst_call = args[1].as<CallNode>();
-  ICHECK(src_call) << "ds_read_format args[0] must be region call (src)";
-  ICHECK(dst_call) << "ds_read_format args[1] must be region call (dst)";
-
-  auto src_region = RegionOp(src_call->args);
-  auto dst_region = RegionOp(dst_call->args);
-  auto src_ranges = src_region->GetRanges();
-  auto dst_ranges = dst_region->GetRanges();
+  BufferRegion src_region = NormalizeToBufferRegion(args[0]);
+  BufferRegion dst_region = NormalizeToBufferRegion(args[1]);
+  auto src_ranges = src_region->region;
+  auto dst_ranges = dst_region->region;
 
   ICHECK(src_ranges.size() >= 2) << "ds_read_format src region must be 2D";
   ICHECK(dst_ranges.size() >= 2) << "ds_read_format dst region must be 2D";
 
-  Buffer src_buf = src_region->GetBuffer();
-  Buffer dst_buf = dst_region->GetBuffer();
+  Buffer src_buf = src_region->buffer;
+  Buffer dst_buf = dst_region->buffer;
   ICHECK(src_buf.scope() == "shared" || src_buf.scope() == "shared.dyn")
       << "ds_read_format src must be shared memory, got scope="
       << src_buf.scope();
@@ -438,7 +433,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
       ICHECK_EQ(per_warp_mn % 32, 0);
 
       PrimExpr scoped_thread = analyzer->Simplify(
-          T.thread_var - Cast(T.thread_var.dtype(), T.thread_bounds->min));
+          T.thread_index - Cast(T.thread_index.dtype(), T.thread_bounds->min));
       PrimExpr lane =
           FloorMod(scoped_thread, make_const(scoped_thread.dtype(), warp_size));
       PrimExpr warp_id =

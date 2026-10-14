@@ -8,6 +8,7 @@ Numerical check: decode E2M1 / E8M0 on CPU and compare against kernel output
 """
 
 import os
+import re
 from pathlib import Path
 
 # Keep generated .cu under the mounted tilelang tree (host: ~/tilelang/...).
@@ -188,6 +189,8 @@ def matmul_blockscaled(
     scale_stages=1,
     annotate_scale_stage_layout=False,
     explicit_unpacked_ds_read=False,
+    scale_load_mode="copy",
+    scale_copy_threads=None,
     a_dtype="float4_e2m1fn",
     b_dtype=None,
 ):
@@ -201,6 +204,8 @@ def matmul_blockscaled(
     """
     if b_dtype is None:
         b_dtype = a_dtype
+    assert scale_load_mode in {"copy", "async_copy", "parallel_async"}
+    assert scale_copy_threads is None or (scale_load_mode in {"async_copy", "parallel_async"} and 0 < scale_copy_threads <= threads)
     unpack_a = explicit_unpacked_ds_read is True or explicit_unpacked_ds_read == "a"
     unpack_b = explicit_unpacked_ds_read is True or explicit_unpacked_ds_read == "b"
     out_dtype = "float32"
@@ -314,11 +319,57 @@ def matmul_blockscaled(
                     T.copy(B[bx * block_N, k * block_K], B_shared)
                 if selected_scale_format_name == "identity":
                     if scale_stages == 1:
-                        T.copy(ScaleA, ScaleA_lds[k_pad:, mn_pad:])
-                        T.copy(ScaleB, ScaleB_lds[k_pad:, mn_pad:])
+                        if scale_load_mode == "async_copy":
+                            if scale_copy_threads is None:
+                                T.async_copy(ScaleA, ScaleA_lds[k_pad:, mn_pad:])
+                                T.async_copy(ScaleB, ScaleB_lds[k_pad:, mn_pad:])
+                            else:
+                                tx = T.get_thread_binding()
+                                if tx < scale_copy_threads:
+                                    T.async_copy(ScaleA, ScaleA_lds[k_pad:, mn_pad:])
+                                    T.async_copy(ScaleB, ScaleB_lds[k_pad:, mn_pad:])
+                        elif scale_load_mode == "parallel_async":
+                            if scale_copy_threads is None:
+                                with T.Parallel(scale_ka, scale_m, prefer_async=True) as (scale_k, scale_mn):
+                                    ScaleA_lds[scale_k + k_pad, scale_mn + mn_pad] = ScaleA[scale_k, scale_mn]
+                                with T.Parallel(scale_kb, scale_n, prefer_async=True) as (scale_k, scale_mn):
+                                    ScaleB_lds[scale_k + k_pad, scale_mn + mn_pad] = ScaleB[scale_k, scale_mn]
+                            else:
+                                tx = T.get_thread_binding()
+                                if tx < scale_copy_threads:
+                                    with T.Parallel(scale_ka, scale_m, prefer_async=True) as (scale_k, scale_mn):
+                                        ScaleA_lds[scale_k + k_pad, scale_mn + mn_pad] = ScaleA[scale_k, scale_mn]
+                                    with T.Parallel(scale_kb, scale_n, prefer_async=True) as (scale_k, scale_mn):
+                                        ScaleB_lds[scale_k + k_pad, scale_mn + mn_pad] = ScaleB[scale_k, scale_mn]
+                        else:
+                            T.copy(ScaleA, ScaleA_lds[k_pad:, mn_pad:])
+                            T.copy(ScaleB, ScaleB_lds[k_pad:, mn_pad:])
                     else:
-                        T.copy(ScaleA, ScaleA_lds[scale_stage, k_pad:, mn_pad:])
-                        T.copy(ScaleB, ScaleB_lds[scale_stage, k_pad:, mn_pad:])
+                        if scale_load_mode == "async_copy":
+                            if scale_copy_threads is None:
+                                T.async_copy(ScaleA, ScaleA_lds[scale_stage, k_pad:, mn_pad:])
+                                T.async_copy(ScaleB, ScaleB_lds[scale_stage, k_pad:, mn_pad:])
+                            else:
+                                tx = T.get_thread_binding()
+                                if tx < scale_copy_threads:
+                                    T.async_copy(ScaleA, ScaleA_lds[scale_stage, k_pad:, mn_pad:])
+                                    T.async_copy(ScaleB, ScaleB_lds[scale_stage, k_pad:, mn_pad:])
+                        elif scale_load_mode == "parallel_async":
+                            if scale_copy_threads is None:
+                                with T.Parallel(scale_ka, scale_m, prefer_async=True) as (scale_k, scale_mn):
+                                    ScaleA_lds[scale_stage, scale_k + k_pad, scale_mn + mn_pad] = ScaleA[scale_k, scale_mn]
+                                with T.Parallel(scale_kb, scale_n, prefer_async=True) as (scale_k, scale_mn):
+                                    ScaleB_lds[scale_stage, scale_k + k_pad, scale_mn + mn_pad] = ScaleB[scale_k, scale_mn]
+                            else:
+                                tx = T.get_thread_binding()
+                                if tx < scale_copy_threads:
+                                    with T.Parallel(scale_ka, scale_m, prefer_async=True) as (scale_k, scale_mn):
+                                        ScaleA_lds[scale_stage, scale_k + k_pad, scale_mn + mn_pad] = ScaleA[scale_k, scale_mn]
+                                    with T.Parallel(scale_kb, scale_n, prefer_async=True) as (scale_k, scale_mn):
+                                        ScaleB_lds[scale_stage, scale_k + k_pad, scale_mn + mn_pad] = ScaleB[scale_k, scale_mn]
+                        else:
+                            T.copy(ScaleA, ScaleA_lds[scale_stage, k_pad:, mn_pad:])
+                            T.copy(ScaleB, ScaleB_lds[scale_stage, k_pad:, mn_pad:])
                 elif selected_scale_format_name == "k2":
                     if scale_stages == 1:
                         T.copy(ScaleA, ScaleA_lds[k_pad // 2 :, mn_pad:, :])
@@ -344,6 +395,9 @@ def matmul_blockscaled(
                     else:
                         T.copy(ScaleA, ScaleA_lds[scale_stage, :, :, :])
                         T.copy(ScaleB, ScaleB_lds[scale_stage, :, :, :])
+                if scale_load_mode == "async_copy":
+                    T.ptx_wait_group(0)
+                    T.sync_threads()
                 if scale_stages == 1:
                     ScaleA_view = T.scale_view(
                         ScaleA_lds,
@@ -431,6 +485,8 @@ def run_blockscaled_basic_correctness(
     use_mls,
     k_pack=1,
     non_unit_scale: bool = True,
+    scale_load_mode: str = "copy",
+    scale_copy_threads: int | None = None,
 ):
     """MN-major scale MMAC correctness, optionally with both operands via MLS.
 
@@ -452,6 +508,8 @@ def run_blockscaled_basic_correctness(
         num_stages=0,
         use_mls=use_mls,
         k_pack=k_pack,
+        scale_load_mode=scale_load_mode,
+        scale_copy_threads=scale_copy_threads,
     )
     kernel = tl.compile(program, out_idx=[4], verbose=True)
 
@@ -643,12 +701,106 @@ def test_gemm_blockscaled_basic_correctness(M, N, K, block_M, block_N, block_K, 
     )
     source = kernel.get_kernel_source()
     assert f", {expected_mmac_k}," in source and "mmac_scale_fp4_body" in source
+    # A normal T.copy producer keeps the legacy KInner scale-buffer protocol.
+    assert re.search(r"ds_scale_copy<[^>]+, (?:32|64), 0>", source)
+    assert re.search(r"mmac_scale_fp4_body<[^>]+, (?:32|64), -?\d+, 0, 0>", source)
     cache_path = getattr(kernel, "_tilelang_cache_path", None)
     if use_mls and cache_path:
         source = (Path(cache_path) / "device_kernel.cu").read_text()
         assert source.count("async_mls_load_asm<") >= 2
         assert "ds_scale_copy<" in source
         assert "mmac_scale_fp4_body" in source
+
+
+@requires_blockscaled
+def test_gemm_blockscaled_explicit_async_scale_uses_linear_mn_inner():
+    """Explicit async scale loads keep LDS linear and jointly select MNInner."""
+    kernel, _, _ = run_blockscaled_basic_correctness(
+        M=256,
+        N=256,
+        K=128,
+        block_M=256,
+        block_N=256,
+        block_K=128,
+        gran_k=32,
+        threads=256,
+        use_mls=False,
+        scale_load_mode="async_copy",
+    )
+    source = kernel.get_kernel_source()
+    assert "load_async_lds" in source or "cp_async_gs" in source
+    # RowOrder is the final ds_scale_copy template parameter and the final two
+    # mmac_scale_fp4_body parameters (A/B can be selected independently).
+    assert "ds_scale_copy<" in source
+    assert re.search(r"ds_scale_copy<[^>]+, 64, 1>", source)
+    assert "mmac_scale_fp4_body" in source
+    assert re.search(r"mmac_scale_fp4_body<[^>]+, 64, -?\d+, 1, 1>", source)
+
+
+@requires_blockscaled
+@pytest.mark.parametrize("scale_load_mode", ["async_copy", "parallel_async"])
+def test_gemm_blockscaled_async_scale_with_user_thread_scope(scale_load_mode):
+    """A user thread scope lets a small scale tile form 4-byte transfers."""
+    kernel, _, _ = run_blockscaled_basic_correctness(
+        M=64,
+        N=64,
+        K=128,
+        block_M=64,
+        block_N=64,
+        block_K=128,
+        gran_k=32,
+        threads=128,
+        use_mls=False,
+        scale_load_mode=scale_load_mode,
+        scale_copy_threads=64,
+    )
+    source = kernel.get_kernel_source()
+    assert "cp_async_gs<4>" in source
+    assert "threadIdx.x) < 64" in source
+
+
+@requires_blockscaled
+def test_gemm_blockscaled_preferred_async_parallel_scale_uses_linear_mn_inner():
+    """A preferred-async Parallel scale producer participates in the protocol."""
+    kernel, _, _ = run_blockscaled_basic_correctness(
+        M=256,
+        N=256,
+        K=128,
+        block_M=256,
+        block_N=256,
+        block_K=128,
+        gran_k=32,
+        threads=256,
+        use_mls=False,
+        scale_load_mode="parallel_async",
+    )
+    source = kernel.get_kernel_source()
+    assert "load_async_lds" in source or "cp_async_gs" in source
+    assert re.search(r"ds_scale_copy<[^>]+, 64, 1>", source)
+    assert re.search(r"mmac_scale_fp4_body<[^>]+, 64, -?\d+, 1, 1>", source)
+
+
+@requires_blockscaled
+def test_gemm_blockscaled_rejects_non_linear_async_scale_layout():
+    """An async-copy destination cannot carry an explicit swizzled layout."""
+    program = matmul_blockscaled(
+        M=64,
+        N=64,
+        K=64,
+        block_M=64,
+        block_N=64,
+        block_K=64,
+        op_ctrl=0,
+        sf_a_granularity_k=64,
+        sf_b_granularity_k=64,
+        threads=128,
+        scale_format_name="identity",
+        scale_stages=2,
+        annotate_scale_stage_layout="mixed",
+        scale_load_mode="async_copy",
+    )
+    with pytest.raises(tvm.TVMError, match="requires a linear layout"):
+        tl.compile(program, out_idx=[4])
 
 
 @requires_blockscaled
@@ -1161,7 +1313,7 @@ def test_gemm_blockscaled_f8f6f4_operand_combinations(a_dtype, b_dtype, unpack_s
     )
     kernel = tl.compile(program, out_idx=[4], verbose=True)
     source = kernel.get_kernel_source()
-    assert "mmac_scale_fp4_body" in source and f", 32, {real_ab_type}>" in source
+    assert "mmac_scale_fp4_body" in source and f", 32, {real_ab_type}, 0, 0>" in source
 
     A_logical, B_logical, A_fp4, B_fp4 = _make_fp4_inputs(M, N, K)
     A_fp8 = (((torch.arange(M, device="cuda")[:, None] * 3 + torch.arange(K, device="cuda")[None, :]) % 7) - 3).to(torch.float8_e4m3fn)

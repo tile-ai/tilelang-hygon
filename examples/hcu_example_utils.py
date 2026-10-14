@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Literal
 
 import torch
-from tilelang import tvm as tvm
 from tilelang.language.fp8 import determine_fp8_type
 from tilelang.backend.target import determine_target
 from tilelang.hcu.target import target_get_warp_size, target_is_hcu
@@ -19,14 +18,14 @@ def _on_hcu() -> bool:
 
 def warp_size() -> int:
     if _on_hcu():
-        return target_get_warp_size(tvm.target.Target("hip"))
+        return target_get_warp_size(determine_target("auto", return_object=True))
     return 32
 
 
 def block_threads(num_warps: int = 1) -> int:
     """Full wavefront/warp thread count; widens to 64 only on HCU."""
     if _on_hcu():
-        return target_get_warp_size(tvm.target.Target("hip")) * num_warps
+        return target_get_warp_size(determine_target("auto", return_object=True)) * num_warps
     return 32 * num_warps
 
 

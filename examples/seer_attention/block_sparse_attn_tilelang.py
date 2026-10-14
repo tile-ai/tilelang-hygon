@@ -61,7 +61,7 @@ def blocksparse_flashattn(batch, heads, seq_q, seq_kv, dim, downsample_len, is_c
                 V_shared = T.alloc_shared([block_N, dim], dtype)
                 O_shared = T.alloc_shared([block_M, dim], dtype)
                 acc_s = T.alloc_fragment([block_M, block_N], accum_dtype)
-                acc_s_cast = T.alloc_fragment([block_M, block_N], dtype)
+                S_shared = T.alloc_shared([block_M, block_N], dtype)
                 acc_o = T.alloc_fragment([block_M, dim], accum_dtype)
                 scores_max = T.alloc_fragment([block_M], accum_dtype)
                 scores_max_prev = T.alloc_fragment([block_M], accum_dtype)
@@ -110,13 +110,13 @@ def blocksparse_flashattn(batch, heads, seq_q, seq_kv, dim, downsample_len, is_c
                         T.reduce_sum(acc_s, scores_sum, dim=1)
                         for i in T.Parallel(block_M):
                             logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                        T.copy(acc_s, acc_s_cast)
+                        T.copy(acc_s, S_shared)
 
                         for i, j in T.Parallel(block_M, dim):
                             acc_o[i, j] *= scores_scale[i]
 
                         T.copy(V[bz, by, k * block_N : (k + 1) * block_N, :], V_shared)
-                        T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                        T.gemm(S_shared, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
                 for i, j in T.Parallel(block_M, dim):
                     acc_o[i, j] /= logsum[i]
@@ -129,10 +129,11 @@ def blocksparse_flashattn(batch, heads, seq_q, seq_kv, dim, downsample_len, is_c
     return kernel_func(block_M, block_N, num_stages, threads)
 
 
-def test_topk_sparse_attention():
+def test_topk_sparse_attention(batch=4, heads=2, sequence_length=256, topk=2):
+    """Validate causal block-sparse self-attention."""
     # Config
-    BATCH, N_HEADS, SEQ_LEN, D_HEAD = 4, 2, 256, 64
-    TOPK = 2  # Keep top 8 elements per row
+    BATCH, N_HEADS, SEQ_LEN, D_HEAD = batch, heads, sequence_length, 64
+    TOPK = topk  # Keep top 8 elements per row
     BLOCK = 64
     torch.manual_seed(0)
 
@@ -174,11 +175,12 @@ def test_topk_sparse_attention():
     print("Pass topk sparse attention test with qlen == klen")
 
 
-def test_topk_sparse_attention_qlen_lt_klen():
+def test_topk_sparse_attention_qlen_lt_klen(batch=1, heads=1, query_length=128, kv_length=256, topk=1):
+    """Validate causal block-sparse attention when query is shorter than KV."""
     # Config
-    BATCH, N_HEADS = 1, 1
-    Q_LEN, K_LEN, D_HEAD = 128, 256, 64  # qlen < klen; here, past_len = 256 - 128 = 128.
-    TOPK = 1
+    BATCH, N_HEADS = batch, heads
+    Q_LEN, K_LEN, D_HEAD = query_length, kv_length, 64
+    TOPK = topk
     BLOCK = 64  # block size used in downsampling
     torch.manual_seed(0)
 
@@ -190,9 +192,9 @@ def test_topk_sparse_attention_qlen_lt_klen():
 
     downsample_factor = BLOCK
     downsample_len = math.ceil(K_LEN / downsample_factor)  # number of blocks along one dimension
-    x_ds = torch.randn(BATCH, N_HEADS, downsample_len, downsample_len, device="cuda", dtype=torch.float16)
-    # Force the first column to be high so that the first block is always selected.
-    x_ds[:, :, :, 0] = 100
+    x_ds = torch.full((BATCH, N_HEADS, downsample_len, downsample_len), -100, device="cuda", dtype=torch.float16)
+    diagonal = torch.arange(downsample_len, device="cuda")
+    x_ds[:, :, diagonal, diagonal] = 100
     block_mask = get_sparse_attn_mask_from_topk(x_ds, topk=TOPK)
 
     kernel = blocksparse_flashattn(BATCH, N_HEADS, Q_LEN, K_LEN, D_HEAD, downsample_len, is_causal=True)
@@ -206,7 +208,7 @@ def test_topk_sparse_attention_qlen_lt_klen():
     full_mask_full = torch.kron(block_mask.float(), torch.ones(BLOCK, BLOCK, device="cuda")).bool()
     full_mask_full = full_mask_full[..., :K_LEN, :K_LEN]
 
-    effective_mask = full_mask_full[..., past_len:K_LEN, :]  # shape: (B, H, Q_LEN, K_LEN)
+    effective_mask = full_mask_full[..., :Q_LEN, :]  # shape: (B, H, Q_LEN, K_LEN)
 
     i_global = torch.arange(past_len, K_LEN, device=k.device).unsqueeze(1)  # shape: (Q_LEN, 1)
     j_global = torch.arange(K_LEN, device=k.device).unsqueeze(0)  # shape: (1, K_LEN)
