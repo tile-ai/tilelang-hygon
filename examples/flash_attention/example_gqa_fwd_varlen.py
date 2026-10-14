@@ -8,6 +8,28 @@ from tilelang.profiler import do_bench
 from varlen_utils import generate_random_padding_mask, generate_qkv
 
 
+def ref_program_torch(q, k, v, query_padding_mask, key_padding_mask, groups, causal):
+    output = torch.zeros_like(q)
+    scale = q.shape[-1] ** -0.5
+    for batch_idx in range(q.shape[0]):
+        query = q[batch_idx, query_padding_mask[batch_idx]].transpose(0, 1).float()
+        key = k[batch_idx, key_padding_mask[batch_idx]].transpose(0, 1).repeat_interleave(groups, dim=0).float()
+        value = v[batch_idx, key_padding_mask[batch_idx]].transpose(0, 1).repeat_interleave(groups, dim=0).float()
+        scores = torch.matmul(query, key.transpose(-1, -2)) * scale
+        if causal:
+            q_idx = torch.arange(query.shape[1], device=q.device)[:, None]
+            k_idx = torch.arange(key.shape[1], device=q.device)[None, :]
+            visible = k_idx <= q_idx + key.shape[1] - query.shape[1]
+            scores = scores.masked_fill(~visible, float("-inf"))
+            valid_query = (q_idx[:, 0] + key.shape[1] - query.shape[1]) >= 0
+            scores[:, ~valid_query, :] = 0
+        out = torch.matmul(torch.softmax(scores, dim=-1), value)
+        if causal:
+            out[:, ~valid_query, :] = 0
+        output[batch_idx, query_padding_mask[batch_idx]] = out.transpose(0, 1).to(q.dtype)
+    return output
+
+
 @tilelang.jit(
     out_idx=[6],
     pass_configs={
@@ -171,11 +193,15 @@ def main(
     UQ = q_unpad.shape[0]
     UKV = k_unpad.shape[0]
 
-    kernel = flashattn(batch, groups, UQ, UKV, heads, dim, is_causal, block_M=128, block_N=128, num_stages=2, threads=256)
+    kernel = flashattn(batch, groups, UQ, UKV, heads, dim, is_causal, block_M=64, block_N=64, num_stages=1, threads=128)
 
     out_unpad = kernel(q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q)
     out = output_pad_fn(out_unpad)
 
+    torch_out = ref_program_torch(q, k, v, query_padding_mask, key_padding_mask, groups, is_causal)
+    torch.testing.assert_close(out, torch_out, rtol=1e-2, atol=1e-2)
+
+    """
     import flash_attn
 
     fa_out_unpad = flash_attn.flash_attn_varlen_func(
@@ -191,6 +217,7 @@ def main(
     )
     fa_out = output_pad_fn(fa_out_unpad)
     torch.testing.assert_close(out, fa_out, rtol=1e-2, atol=1e-2)
+    """
 
     print("All checks passed.✅")
     latency = do_bench(lambda: kernel(q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q), _n_warmup=5, _n_repeat=5)

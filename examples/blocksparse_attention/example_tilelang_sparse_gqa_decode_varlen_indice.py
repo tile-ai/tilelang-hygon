@@ -301,15 +301,15 @@ def ref_program_torch(query, key, value, block_indices, cache_seqlens, max_cache
     return out
 
 
+"""
 def ref_program_fa(query, key, value, block_indices, cache_seqlens, max_cache_seqlen, num_blocks, block_size):
-    # latency reference
-    # from flash_attn_interface import flash_attn_with_kvcache # fa3
-    from flash_attn import flash_attn_with_kvcache  # fa2
+    from flash_attn import flash_attn_with_kvcache
 
     query = query.unsqueeze(1)
     output = flash_attn_with_kvcache(query, key, value, cache_seqlens=cache_seqlens)
     output = output.squeeze(1)
     return output
+"""
 
 
 def assert_close(name, expect, actual, atol=1e-3, rtol=1e-3):
@@ -355,7 +355,7 @@ def main(batch=8, heads=32, heads_kv=8, max_cache_seqlen=8192, dim=128, dim_v=12
     out = sparse_kernel(Q, K, V, block_indices, cache_seqlens)
     assert_close("output", ref, out, atol=1e-3, rtol=1e-3)
 
-    ## latency reference
+    """
     for _ in range(10):
         ref = ref_program_fa(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, max_num_blocks, block_size)
     torch.cuda.synchronize()
@@ -364,6 +364,7 @@ def main(batch=8, heads=32, heads_kv=8, max_cache_seqlen=8192, dim=128, dim_v=12
         ref = ref_program_fa(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, max_num_blocks, block_size)
     torch.cuda.synchronize()
     print("dense time: ", (time.time() - start) / 100 * 1000)
+    """
 
     for _ in range(10):
         out = sparse_kernel(Q, K, V, block_indices, cache_seqlens)

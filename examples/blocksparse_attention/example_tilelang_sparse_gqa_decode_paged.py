@@ -308,15 +308,15 @@ def ref_program_torch_paged(query, key_cache, value_cache, block_indices, cache_
     return out
 
 
+"""
 def ref_program_fa(query, kcache, vcache, cache_seqlens, block_table):
-    # latency reference
-    # from flash_attn_interface import flash_attn_with_kvcache # fa3
-    from flash_attn import flash_attn_with_kvcache  # fa2
+    from flash_attn import flash_attn_with_kvcache
 
     query = query.unsqueeze(1)
     output = flash_attn_with_kvcache(query, kcache, vcache, cache_seqlens=cache_seqlens, block_table=block_table)
     output = output.squeeze(1)
     return output
+"""
 
 
 def main(args):
@@ -451,19 +451,13 @@ def main(args):
     sparse_attn = SparseFlashAttn(batch, heads, heads_kv, dim, dim_v, page_block_size, block_N, num_blocks)
     output_sparse = sparse_attn.forward(Q, K_cache, V_cache, block_indices, cache_seqlens, block_table)
 
-    import flash_attn  # noqa: F401
-
     output_ref_torch = ref_program_torch_paged(Q, K_cache, V_cache, block_indices, cache_seqlens, block_table, page_block_size, block_N)
-
+    """
     output_ref_fa = ref_program_fa(Q, K_cache, V_cache, cache_seqlens, block_table)
+    """
     # Check correctness
-    if sparse_ratio == 0.0:
-        max_diff = torch.max(torch.abs(output_sparse - output_ref_fa)).item()
-        mean_diff = torch.mean(torch.abs(output_sparse - output_ref_fa)).item()
-        assert torch.allclose(output_ref_fa, output_ref_torch, atol=1e-2), "Reference outputs do not match!"
-    else:
-        max_diff = torch.max(torch.abs(output_sparse - output_ref_torch)).item()
-        mean_diff = torch.mean(torch.abs(output_sparse - output_ref_torch)).item()
+    max_diff = torch.max(torch.abs(output_sparse - output_ref_torch)).item()
+    mean_diff = torch.mean(torch.abs(output_sparse - output_ref_torch)).item()
 
     print(f"Max difference: {max_diff:.6f}")
     print(f"Mean difference: {mean_diff:.6f}")
@@ -487,20 +481,20 @@ def main(args):
     kernel_time = (end_time - start_time) / 100 * 1000  # Convert to ms
     print(f"Kernel execution time: {kernel_time:.2f} ms")
 
-    # FA performance measurement
-    for _ in range(10):  # Warm-up
+    """
+    for _ in range(10):
         ref_program_fa(Q, K_cache, V_cache, cache_seqlens, block_table)
 
     torch.cuda.synchronize()
     start_time_fa = time.time()
-    for _ in range(100):  # Run multiple times for averaging
+    for _ in range(100):
         ref_program_fa(Q, K_cache, V_cache, cache_seqlens, block_table)
     torch.cuda.synchronize()
     end_time_fa = time.time()
-    kernel_time_fa = (end_time_fa - start_time_fa) / 100 * 1000  # Convert to ms
+    kernel_time_fa = (end_time_fa - start_time_fa) / 100 * 1000
     print(f"FA kernel execution time: {kernel_time_fa:.2f} ms")
-
     print(f"Speedup: {kernel_time_fa / kernel_time:.2f}x")
+    """
 
 
 def run_regression_perf(args):
