@@ -55,9 +55,7 @@ def main() -> None:
     print(f"ipc-smoke rank={rank} stage=process-group", flush=True)
     allocator = None
     try:
-        allocator = IpcAllocator(
-            4096, rank=rank, world_size=world_size, device=local_rank, group=dist.group.WORLD
-        )
+        allocator = IpcAllocator(4096, rank=rank, world_size=world_size, device=local_rank, group=dist.group.WORLD)
         print(f"ipc-smoke rank={rank} stage=allocator-created", flush=True)
         allocator.initialize()
         print(f"ipc-smoke rank={rank} stage=allocator-initialized", flush=True)
@@ -75,9 +73,7 @@ def main() -> None:
         # Inject a local failure on rank 1 before handle exchange.  The status
         # collective must make rank 0 fail at the same stage and both ranks
         # must release the allocation made in the preceding stage.
-        failing = IpcAllocator(
-            4096, rank=rank, world_size=world_size, device=local_rank, group=dist.group.WORLD
-        )
+        failing = IpcAllocator(4096, rank=rank, world_size=world_size, device=local_rank, group=dist.group.WORLD)
         failing._runtime = _FailHandleCreationRuntime(failing._runtime, rank)
         error = None
         try:
@@ -95,11 +91,10 @@ def main() -> None:
         print(f"ipc-smoke rank={rank} stage=failure-propagated", flush=True)
         dist.barrier()
 
-        closing = IpcAllocator(
-            4096, rank=rank, world_size=world_size, device=local_rank, group=dist.group.WORLD
-        )
+        closing = IpcAllocator(4096, rank=rank, world_size=world_size, device=local_rank, group=dist.group.WORLD)
         closing.initialize()
         if rank == 1:
+
             def fail_synchronize():
                 raise RuntimeError("injected close synchronization failure")
 
@@ -115,10 +110,7 @@ def main() -> None:
             raise RuntimeError(f"rank {rank}: failed collective close leaked IPC resources")
         close_errors = [None] * world_size
         dist.all_gather_object(close_errors, close_error)
-        if not all(
-            "rank 1: RuntimeError: injected close synchronization failure" in item
-            for item in close_errors
-        ):
+        if not all("rank 1: RuntimeError: injected close synchronization failure" in item for item in close_errors):
             raise RuntimeError(f"ranks observed inconsistent close errors: {close_errors}")
         print(f"ipc-smoke rank={rank} stage=close-failure-propagated", flush=True)
         dist.barrier()

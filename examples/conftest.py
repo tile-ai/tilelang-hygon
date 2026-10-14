@@ -21,9 +21,8 @@ random.seed(0)
 # The opt-in IPC example starts independent HCU ranks through MPI.  Avoid
 # importing torch in the pytest parent: the import initializes HIP state and
 # can prevent pytest from exiting after IPC child teardown.
-_ipc_mpi_example = (
-    os.environ.get("TILELANG_RUN_HCU_IPC_TESTS") == "1"
-    and any("examples/distributed" in arg.replace("\\", "/") for arg in sys.argv)
+_ipc_mpi_example = os.environ.get("TILELANG_RUN_HCU_IPC_TESTS") == "1" and any(
+    "examples/distributed" in arg.replace("\\", "/") for arg in sys.argv
 )
 if not _ipc_mpi_example:
     try:

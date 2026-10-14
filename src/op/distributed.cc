@@ -13,10 +13,10 @@ namespace tl {
 using namespace tirx;
 
 #define TIR_DEFINE_TL_DISTRIBUTED_BUILTIN(OpName)                              \
-  const Op &OpName() {                                                          \
+  const Op &OpName() {                                                         \
     static const Op &op = Op::Get("tl." #OpName);                              \
-    return op;                                                                  \
-  }                                                                              \
+    return op;                                                                 \
+  }                                                                            \
   TVM_REGISTER_OP("tl." #OpName)                                               \
       .set_attr<TScriptPrinterName>("TScriptPrinterName", #OpName)
 

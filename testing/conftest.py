@@ -27,10 +27,7 @@ random.seed(0)
 # This opt-in test launches two independent HCU processes through MPI.  Do not
 # import torch in the pytest parent: on this platform the import initializes
 # HIP state, and the driver can terminate pytest while IPC children tear down.
-_ipc_mpi_test = (
-    os.environ.get("TILELANG_RUN_HCU_IPC_TESTS") == "1"
-    and any("hcu/distributed" in arg.replace("\\", "/") for arg in sys.argv)
-)
+_ipc_mpi_test = os.environ.get("TILELANG_RUN_HCU_IPC_TESTS") == "1" and any("hcu/distributed" in arg.replace("\\", "/") for arg in sys.argv)
 if not _ipc_mpi_test:
     try:
         import torch
