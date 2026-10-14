@@ -20,6 +20,15 @@ enum class ScaleLdsFormat : int {
   kMN4Interleave = 5,
 };
 
+// Compiler-internal scale-buffer row permutation.  This is deliberately not
+// part of the TileLang user API: PlanScaleBufferLayout selects it jointly for
+// copy_scale and every gemm_blockscaled consumer of the same shared.scale
+// buffer.
+enum class ScaleBufferRowOrder : int {
+  kKInner = 0,
+  kMNInner = 1,
+};
+
 constexpr int ScaleLdsFormatId(ScaleLdsFormat format) {
   return static_cast<int>(format);
 }

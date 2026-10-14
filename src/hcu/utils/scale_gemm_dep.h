@@ -19,6 +19,11 @@ static constexpr const char *kScaleARowBase = "tl.hcu.scale_a_row_base";
 static constexpr const char *kScaleBRowBase = "tl.hcu.scale_b_row_base";
 static constexpr const char *kScaleAFormat = "tl.hcu.scale_a_format";
 static constexpr const char *kScaleBFormat = "tl.hcu.scale_b_format";
+static constexpr const char *kScaleRowOrder = "tl.hcu.scale_row_order";
+static constexpr const char *kScaleARowOrder = "tl.hcu.scale_a_row_order";
+static constexpr const char *kScaleBRowOrder = "tl.hcu.scale_b_row_order";
+static constexpr const char *kScaleLdsFromAsync =
+    "tl.hcu.scale_lds_from_async_copy";
 static constexpr const char *kScaleGranularityMN =
     "tl.hcu.scale_granularity_mn";
 static constexpr const char *kScaleGranularityK = "tl.hcu.scale_granularity_k";

@@ -169,6 +169,9 @@ CopyScale::CopyScale(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
       GetIntAnnOrDefault(annotations, attr::kScaleGranularityK, 1);
   node->scale_k_major_ = GetIntAnnOrDefault(annotations, attr::kScaleKMajor, 0);
   node->role_ = GetIntAnnOrDefault(annotations, attr::kScaleRole, 0);
+  node->row_order_ = GetIntAnnOrDefault(annotations, attr::kScaleRowOrder, 0);
+  node->lds_from_async_copy_ =
+      GetIntAnnOrDefault(annotations, attr::kScaleLdsFromAsync, 0);
   node->gemm_m_ = GetIntAnnOrDefault(annotations, attr::kScaleGemmM, 0);
   node->gemm_n_ = GetIntAnnOrDefault(annotations, attr::kScaleGemmN, 0);
   node->gemm_k_ = GetIntAnnOrDefault(annotations, attr::kScaleGemmK, 0);
@@ -216,6 +219,14 @@ LayoutMap CopyScaleNode::InferLayout(const LayoutInferArgs &T,
   // Explicit T.annotate_layout entries seed layout_map before strict inference
   // and always take precedence over automatic selection.
   if (T.layout_map.count(src)) {
+    if (lds_from_async_copy_) {
+      Layout linear = MakeLinearLayout(src->shape);
+      ICHECK(StructuralEqual()(T.layout_map[src], linear))
+          << "copy_scale source LDS `" << src->name
+          << "` is written by async_copy and therefore requires a linear "
+             "layout; an explicit non-linear T.annotate_layout is not "
+             "supported";
+    }
     if (has_scale_view_) {
       const auto format = static_cast<ScaleLdsFormat>(scale_format_);
       const size_t format_rank = ScaleFormatPhysicalRank(format);
@@ -225,7 +236,9 @@ LayoutMap CopyScaleNode::InferLayout(const LayoutInferArgs &T,
     }
     return result;
   }
-  Optional<Layout> automatic = hcu::SelectAutoScaleLdsLayout(this, T);
+  Optional<Layout> automatic = lds_from_async_copy_
+                                   ? Optional<Layout>()
+                                   : hcu::SelectAutoScaleLdsLayout(this, T);
   result.Set(src, automatic.defined() ? automatic.value()
                                       : MakeLinearLayout(src->shape));
   return result;
@@ -476,7 +489,7 @@ Stmt CopyScaleNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
      << ", " << scale_shape_k << ", " << granularity_mn_ << ", "
      << granularity_k_ << ", " << scale_k_major_ << ", " << mn_warps << ", "
      << seg.total_warps << ", " << generated_layout.name << ", " << kMmacK
-     << ">";
+     << ", " << row_order_ << ">";
 
   Array<PrimExpr> call_args;
   call_args.push_back(StringImm(ss.str()));

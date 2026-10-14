@@ -8,6 +8,7 @@
 #ifndef TVM_TL_HCU_UTILS_SCALE_LDS_LAYOUT_H_
 #define TVM_TL_HCU_UTILS_SCALE_LDS_LAYOUT_H_
 
+#include "hcu/op/scale_format.h"
 #include "op/operator.h"
 
 namespace tvm {
@@ -17,6 +18,9 @@ namespace hcu {
 
 ffi::Optional<Layout> SelectAutoScaleLdsLayout(const CopyScaleNode *op,
                                                const LayoutInferArgs &args);
+
+ScaleBufferRowOrder SelectScaleBufferRowOrder(const CopyScaleNode *op,
+                                              int block_size, Target target);
 
 } // namespace hcu
 } // namespace tl

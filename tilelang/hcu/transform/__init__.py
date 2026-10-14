@@ -24,6 +24,11 @@ def AnnotateScaleGemmDep():
     return _ffi_api.AnnotateScaleGemmDep()  # type: ignore
 
 
+def PlanScaleBufferLayout():
+    """Select the internal copy_scale/MMAC row order after pipeline planning."""
+    return _ffi_api.PlanScaleBufferLayout()  # type: ignore
+
+
 def InsertScaleBufferSync():
     """Insert synchronization between copy_scale and its GEMM consumer."""
     return _ffi_api.InsertScaleBufferSync()  # type: ignore
@@ -74,6 +79,7 @@ __all__ = (
     "MaterializeHcuGemmLdsStrategy",
     "InjectHcuCopyIdxen",
     "AnnotateScaleGemmDep",
+    "PlanScaleBufferLayout",
     "InsertScaleBufferSync",
     "AllocateScaleBuffer",
     "PrepareMlsSharedMemoryAllocation",

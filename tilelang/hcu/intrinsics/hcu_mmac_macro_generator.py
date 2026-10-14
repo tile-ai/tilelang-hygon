@@ -1013,6 +1013,8 @@ class HCUMatrixCoreIntrinEmitter:
         scale_shape_kb: int,
         scale_format_a: int,
         scale_format_b: int,
+        scale_row_order_a: int,
+        scale_row_order_b: int,
         real_ab_type: int,
     ):
         """Issue one scale MMAC call_extern (native FP4 or padded F8F6F4)."""
@@ -1033,7 +1035,8 @@ class HCUMatrixCoreIntrinEmitter:
             f"{int(scale_shape_m)}, {int(scale_shape_ka)}, "
             f"{int(scale_shape_n)}, {int(scale_shape_kb)}, "
             f"{int(scale_format_a)}, {int(scale_format_b)}, "
-            f"{int(self.k_pack)}, {int(self.micro_size_k)}, {int(real_ab_type)}>"
+            f"{int(self.k_pack)}, {int(self.micro_size_k)}, {int(real_ab_type)}, "
+            f"{int(scale_row_order_a)}, {int(scale_row_order_b)}>"
         )
 
         @T.macro
