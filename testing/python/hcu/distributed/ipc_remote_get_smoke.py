@@ -1,6 +1,5 @@
 """Two-rank HCU IPC device remote-get smoke, launched by MPI."""
 
-
 import os
 
 import torch
@@ -178,9 +177,7 @@ def main() -> None:
         a = torch.full((GEMM_M, GEMM_K), float(rank + 1), device=f"cuda:{local_rank}")
         b = torch.full((GEMM_K, GEMM_N), 2.0, device=f"cuda:{local_rank}")
         partial = tilelang.tensor((GEMM_M, GEMM_N), torch.float32, allocator=allocator)
-        gemm = tilelang.compile(
-            gemm_kernel(), out_idx=[], target={"kind": "hcu", "mcpu": arch}
-        )
+        gemm = tilelang.compile(gemm_kernel(), out_idx=[], target={"kind": "hcu", "mcpu": arch})
         gemm(a, b, partial)
         torch.cuda.synchronize(local_rank)
         expected_partial = torch.full_like(partial, float((rank + 1) * 2 * GEMM_K))
@@ -208,6 +205,7 @@ def main() -> None:
         del result, expected, gemm_allreduce, partial, expected_partial, gemm, a, b
         del reduced, allreduce, invalid_out, invalid_peer, out, kernel, src
         import gc
+
         gc.collect()
         torch.cuda.synchronize(local_rank)
         dist.barrier()

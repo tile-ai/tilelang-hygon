@@ -34,16 +34,18 @@ public:
   virtual bool Supports(DistributedCapability capability) const = 0;
   virtual std::string EmitRankExpr() const = 0;
   virtual std::string EmitNumRanksExpr() const = 0;
-  virtual std::string EmitBlockGetExpr(const std::string& src, const std::string& dst,
-                                       const std::string& size, const std::string& src_pe) const = 0;
+  virtual std::string EmitBlockGetExpr(const std::string &src,
+                                       const std::string &dst,
+                                       const std::string &size,
+                                       const std::string &src_pe) const = 0;
   virtual std::string ModulePreamble() const = 0;
 };
 
 /*! \brief Returns true when an HCU target explicitly selects a backend. */
-bool TargetHasHcuDistributedBackend(const Target& target);
+bool TargetHasHcuDistributedBackend(const Target &target);
 
 /*! \brief Resolve the selected backend or throw an actionable ValueError. */
-const HcuDistributedBackend& GetHcuDistributedBackend(const Target& target);
+const HcuDistributedBackend &GetHcuDistributedBackend(const Target &target);
 
 } // namespace hcu
 } // namespace tl

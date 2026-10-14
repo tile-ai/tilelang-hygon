@@ -7,13 +7,27 @@ from tilelang.jit.adapter.tvm_ffi import TVMFFIKernelAdapter
 
 
 class FakeRuntime:
-    def __init__(self): self.closed = []; self.freed = []
-    def malloc(self, n): return 0x1000
-    def free(self, p): self.freed.append(p)
-    def create_handle(self, p): return b"local"
-    def open_handle(self, h): return 0x2000 if h == b"peer" else 0x1000
-    def close_handle(self, p): self.closed.append(p)
-    def can_access_peer(self, d, p): return True
+    def __init__(self):
+        self.closed = []
+        self.freed = []
+
+    def malloc(self, n):
+        return 0x1000
+
+    def free(self, p):
+        self.freed.append(p)
+
+    def create_handle(self, p):
+        return b"local"
+
+    def open_handle(self, h):
+        return 0x2000 if h == b"peer" else 0x1000
+
+    def close_handle(self, p):
+        self.closed.append(p)
+
+    def can_access_peer(self, d, p):
+        return True
 
 
 def test_ipc_arena_offsets_metadata_generation_and_close():
@@ -25,7 +39,8 @@ def test_ipc_arena_offsets_metadata_generation_and_close():
     assert allocator.metadata == (0, 2, 0x1000, 0x2000)
     assert allocator.contains(first.ptr, first.nbytes)
     generation = allocator.generation
-    allocator.close(); allocator.close()
+    allocator.close()
+    allocator.close()
     assert runtime.closed == [0x2000] and runtime.freed == [0x1000]
     assert allocator.generation == generation + 1
 
@@ -50,7 +65,12 @@ def test_ipc_collective_close_orders_sync_barrier_unmap_and_free():
             events.append("barrier")
 
     allocator = IpcAllocator(
-        1024, rank=0, world_size=2, device=0, group=Group(), runtime=Runtime(),
+        1024,
+        rank=0,
+        world_size=2,
+        device=0,
+        group=Group(),
+        runtime=Runtime(),
         synchronize=lambda: events.append("sync"),
     )
     allocator.initialize(handles=[b"local", b"peer"], device_ids=[0, 1])
@@ -66,9 +86,7 @@ def test_ipc_collective_close_orders_sync_barrier_unmap_and_free():
         ("peer mapping", [0x2000]),
     ],
 )
-def test_ipc_collective_initialization_propagates_remote_failure_and_cleans_up(
-    failed_stage, expected_closed
-):
+def test_ipc_collective_initialization_propagates_remote_failure_and_cleans_up(failed_stage, expected_closed):
     class Group:
         def all_gather_object(self, value):
             if isinstance(value, tuple):
@@ -82,9 +100,7 @@ def test_ipc_collective_initialization_propagates_remote_failure_and_cleans_up(
             raise AssertionError(f"unexpected exchange value: {value!r}")
 
     runtime = FakeRuntime()
-    allocator = IpcAllocator(
-        1024, rank=0, world_size=2, device=0, group=Group(), runtime=runtime
-    )
+    allocator = IpcAllocator(1024, rank=0, world_size=2, device=0, group=Group(), runtime=runtime)
     with pytest.raises(RuntimeError, match=rf"IPC {failed_stage} failed across ranks"):
         allocator.initialize()
     assert runtime.closed == expected_closed
@@ -108,7 +124,12 @@ def test_ipc_collective_close_propagates_failure_after_cleanup(failed_stage):
 
     runtime = FakeRuntime()
     allocator = IpcAllocator(
-        1024, rank=0, world_size=2, device=0, group=Group(), runtime=runtime,
+        1024,
+        rank=0,
+        world_size=2,
+        device=0,
+        group=Group(),
+        runtime=runtime,
         synchronize=lambda: None,
     )
     allocator.initialize(handles=[b"local", b"peer"], device_ids=[0, 1])
@@ -134,7 +155,12 @@ def test_ipc_collective_close_reports_local_unmap_failure_and_still_frees():
 
     runtime = Runtime()
     allocator = IpcAllocator(
-        1024, rank=0, world_size=2, device=0, group=Group(), runtime=runtime,
+        1024,
+        rank=0,
+        world_size=2,
+        device=0,
+        group=Group(),
+        runtime=runtime,
         synchronize=lambda: None,
     )
     allocator.initialize(handles=[b"local", b"peer"], device_ids=[0, 1])
@@ -164,9 +190,7 @@ def test_ipc_failed_initialization_propagates_secondary_cleanup_failure():
             raise AssertionError(f"unexpected exchange value: {value!r}")
 
     runtime = Runtime()
-    allocator = IpcAllocator(
-        1024, rank=0, world_size=2, device=0, group=Group(), runtime=runtime
-    )
+    allocator = IpcAllocator(1024, rank=0, world_size=2, device=0, group=Group(), runtime=runtime)
     with pytest.raises(RuntimeError, match="cleanup failed.*injected cleanup failure"):
         allocator.initialize()
     assert runtime.freed == [0x1000]
@@ -177,8 +201,10 @@ def test_ipc_failed_initialization_propagates_secondary_cleanup_failure():
 def test_ipc_arena_rejects_bad_requests():
     allocator = IpcAllocator(128, rank=0, world_size=1, device=0, runtime=FakeRuntime())
     allocator.initialize()
-    with pytest.raises(ValueError, match="positive"): allocator.allocate(0)
-    with pytest.raises(MemoryError, match="exhausted"): allocator.allocate(129)
+    with pytest.raises(ValueError, match="positive"):
+        allocator.allocate(0)
+    with pytest.raises(MemoryError, match="exhausted"):
+        allocator.allocate(129)
 
 
 def test_ipc_allocator_factory_is_exported_from_tilelang():
@@ -188,7 +214,9 @@ def test_ipc_allocator_factory_is_exported_from_tilelang():
 
 def test_metadata_initializer_is_generation_aware():
     class Module:
-        def __init__(self): self.calls = []
+        def __init__(self):
+            self.calls = []
+
         def get_function(self, name, query_imports=False):
             assert name == "__tilelang_init_ipc_metadata" and not query_imports
             return lambda tensor, count: self.calls.append((tensor, count))
@@ -238,8 +266,14 @@ def test_jit_kernel_initialize_delegates_to_distributed_adapter():
 def test_tvm_hcu_stream_restores_previous_stream():
     calls = []
     current = {0: 7}
-    def get_stream(device): return current[device]
-    def set_stream(device, stream): calls.append((device, stream)); current[device] = stream
+
+    def get_stream(device):
+        return current[device]
+
+    def set_stream(device, stream):
+        calls.append((device, stream))
+        current[device] = stream
+
     with tvm_hcu_stream(0, 42, get_stream=get_stream, set_stream=set_stream):
         assert current[0] == 42
     assert current[0] == 7
@@ -270,9 +304,16 @@ def test_ipc_adapter_initialization_is_idempotent_per_allocator_generation():
 
 
 def test_ipc_launch_rejects_missing_or_stale_allocator_generation():
-    class Kind: name = "hcu"
-    class Target: kind = Kind(); attrs = {"dist_backend": "ipc"}
-    class Allocator: generation = 3
+    class Kind:
+        name = "hcu"
+
+    class Target:
+        kind = Kind()
+        attrs = {"dist_backend": "ipc"}
+
+    class Allocator:
+        generation = 3
+
     adapter = TVMFFIKernelAdapter.__new__(TVMFFIKernelAdapter)
     adapter.target, adapter._ipc_allocator, adapter._ipc_initialized_generation = Target(), None, None
     with pytest.raises(RuntimeError, match="must be initialized"):

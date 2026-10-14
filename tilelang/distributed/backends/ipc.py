@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
+from collections.abc import Callable
 
 from ..allocator import Allocation, DistributedAllocator
 
@@ -45,12 +46,23 @@ class _FfiIpcRuntime:
         self._close_handle = get("tl.hcu.ipc.close_handle")
         self._can_access_peer = get("tl.hcu.ipc.can_access_peer")
 
-    def malloc(self, nbytes: int) -> int: return int(self._malloc(nbytes))
-    def free(self, ptr: int) -> None: self._free(ptr)
-    def create_handle(self, ptr: int) -> bytes: return bytes(self._create_handle(ptr))
-    def open_handle(self, handle: bytes) -> int: return int(self._open_handle(handle))
-    def close_handle(self, ptr: int) -> None: self._close_handle(ptr)
-    def can_access_peer(self, device: int, peer_device: int) -> bool: return bool(self._can_access_peer(device, peer_device))
+    def malloc(self, nbytes: int) -> int:
+        return int(self._malloc(nbytes))
+
+    def free(self, ptr: int) -> None:
+        self._free(ptr)
+
+    def create_handle(self, ptr: int) -> bytes:
+        return bytes(self._create_handle(ptr))
+
+    def open_handle(self, handle: bytes) -> int:
+        return int(self._open_handle(handle))
+
+    def close_handle(self, ptr: int) -> None:
+        self._close_handle(ptr)
+
+    def can_access_peer(self, device: int, peer_device: int) -> bool:
+        return bool(self._can_access_peer(device, peer_device))
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -66,9 +78,18 @@ class IpcAllocator(DistributedAllocator):
     mappings in different processes.
     """
 
-    def __init__(self, size: int, *, rank: int, world_size: int, device: int,
-                 group: Any = None, alignment: int = 256, runtime: _IpcRuntime | None = None,
-                 synchronize: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        size: int,
+        *,
+        rank: int,
+        world_size: int,
+        device: int,
+        group: Any = None,
+        alignment: int = 256,
+        runtime: _IpcRuntime | None = None,
+        synchronize: Callable[[], None] | None = None,
+    ) -> None:
         if size <= 0 or alignment <= 0:
             raise ValueError("size and alignment must be positive")
         if not 0 <= rank < world_size:
@@ -84,7 +105,8 @@ class IpcAllocator(DistributedAllocator):
         self._closed = False
 
     @property
-    def generation(self) -> int: return self._generation
+    def generation(self) -> int:
+        return self._generation
 
     @property
     def metadata(self) -> tuple[int, ...]:
@@ -108,9 +130,7 @@ class IpcAllocator(DistributedAllocator):
             # PyTorch uses the CUDA namespace for both CUDA and HIP builds.
             import torch
 
-            self._run_initialization_stage(
-                "device selection", lambda: torch.cuda.set_device(self.device), collective
-            )
+            self._run_initialization_stage("device selection", lambda: torch.cuda.set_device(self.device), collective)
 
             def allocate_local() -> None:
                 self._base = self._runtime.malloc(self.size)
@@ -121,13 +141,9 @@ class IpcAllocator(DistributedAllocator):
                 local_handle = self._run_initialization_stage(
                     "handle creation", lambda: self._runtime.create_handle(self._base), collective
                 )
-                handles = self._run_initialization_stage(
-                    "handle exchange", lambda: self._exchange(local_handle), collective
-                )
+                handles = self._run_initialization_stage("handle exchange", lambda: self._exchange(local_handle), collective)
             if device_ids is None:
-                device_ids = self._run_initialization_stage(
-                    "device exchange", lambda: self._exchange(self.device), collective
-                )
+                device_ids = self._run_initialization_stage("device exchange", lambda: self._exchange(self.device), collective)
 
             def map_peers() -> None:
                 if len(handles) != self.world_size or len(device_ids) != self.world_size:
@@ -138,9 +154,7 @@ class IpcAllocator(DistributedAllocator):
                         self._peer_bases[peer] = self._base
                     else:
                         if not self._runtime.can_access_peer(self.device, int(peer_device)):
-                            raise RuntimeError(
-                                f"HCU device {self.device} cannot access peer rank {peer} device {peer_device}"
-                            )
+                            raise RuntimeError(f"HCU device {self.device} cannot access peer rank {peer} device {peer_device}")
                         self._peer_bases[peer] = self._runtime.open_handle(handle)
 
             self._run_initialization_stage("peer mapping", map_peers, collective)
@@ -149,17 +163,13 @@ class IpcAllocator(DistributedAllocator):
             self._closed = True
             cleanup_error = None
             try:
-                self._run_initialization_stage(
-                    "failed initialization cleanup", self._release_local_resources, collective
-                )
+                self._run_initialization_stage("failed initialization cleanup", self._release_local_resources, collective)
             except Exception as exc:
                 cleanup_error = exc
             finally:
                 self._generation += 1
             if cleanup_error is not None:
-                raise RuntimeError(
-                    f"{initialization_error}; cleanup failed: {cleanup_error}"
-                ) from initialization_error
+                raise RuntimeError(f"{initialization_error}; cleanup failed: {cleanup_error}") from initialization_error
             raise
 
     def allocate(self, nbytes: int, alignment: int | None = None) -> Allocation:
@@ -186,9 +196,7 @@ class IpcAllocator(DistributedAllocator):
 
         if collective and self._base:
             try:
-                self._run_initialization_stage(
-                    "close synchronization", self._synchronize, coordinate
-                )
+                self._run_initialization_stage("close synchronization", self._synchronize, coordinate)
             except Exception as exc:
                 failures.append(str(exc))
             if not failures:
@@ -198,9 +206,7 @@ class IpcAllocator(DistributedAllocator):
                     failures.append(str(exc))
 
         try:
-            self._run_initialization_stage(
-                "close resource cleanup", self._release_local_resources, coordinate
-            )
+            self._run_initialization_stage("close resource cleanup", self._release_local_resources, coordinate)
         except Exception as exc:
             failures.append(str(exc))
         finally:
@@ -227,9 +233,7 @@ class IpcAllocator(DistributedAllocator):
         if cleanup_errors:
             raise RuntimeError("; ".join(cleanup_errors))
 
-    def _run_initialization_stage(
-        self, stage: str, operation: Callable[[], Any], collective: bool
-    ) -> Any:
+    def _run_initialization_stage(self, stage: str, operation: Callable[[], Any], collective: bool) -> Any:
         value, error = None, None
         try:
             value = operation()

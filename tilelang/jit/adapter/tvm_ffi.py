@@ -198,11 +198,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         names = set(re.findall(r"^// tilelang_ipc_remote_source: (.+)$", source, flags=re.MULTILINE))
         if not names:
             return set()
-        return {
-            i
-            for i, param in enumerate(self.prim_func.params)
-            if getattr(param, "name_hint", getattr(param, "name", "")) in names
-        }
+        return {i for i, param in enumerate(self.prim_func.params) if getattr(param, "name_hint", getattr(param, "name", "")) in names}
 
     def validate_ipc_remote_sources(self, tensor_list) -> None:
         if not self._ipc_remote_source_indices:

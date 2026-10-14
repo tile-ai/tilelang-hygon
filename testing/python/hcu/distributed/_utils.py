@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Literal
 
@@ -72,15 +73,11 @@ def run_hcu_script(
         if waited_pid == pid:
             exit_code = os.waitstatus_to_exitcode(status)
             if exit_code != 0:
-                raise RuntimeError(
-                    f"{launcher} HCU test exited with status {exit_code}: {' '.join(command)}"
-                )
+                raise RuntimeError(f"{launcher} HCU test exited with status {exit_code}: {' '.join(command)}")
             return
         if time.monotonic() >= deadline:
-            try:
+            with suppress(ProcessLookupError):
                 os.killpg(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
             os.waitpid(pid, 0)
             raise TimeoutError(f"{launcher} HCU test exceeded {timeout} seconds: {script}")
         time.sleep(0.1)

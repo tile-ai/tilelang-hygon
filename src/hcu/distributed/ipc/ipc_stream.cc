@@ -15,13 +15,15 @@ namespace hcu {
 namespace ipc {
 
 int64_t GetTvmStream(int device_id) {
-  return static_cast<int64_t>(reinterpret_cast<intptr_t>(
-      TVMFFIEnvGetStream(kDLROCM, device_id)));
+  return static_cast<int64_t>(
+      reinterpret_cast<intptr_t>(TVMFFIEnvGetStream(kDLROCM, device_id)));
 }
 
 void SetTvmStream(int device_id, int64_t stream) {
-  TVMFFIEnvSetStream(kDLROCM, device_id,
-                     reinterpret_cast<TVMFFIStreamHandle>(static_cast<intptr_t>(stream)), nullptr);
+  TVMFFIEnvSetStream(
+      kDLROCM, device_id,
+      reinterpret_cast<TVMFFIStreamHandle>(static_cast<intptr_t>(stream)),
+      nullptr);
 }
 
 } // namespace ipc

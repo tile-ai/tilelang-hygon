@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from math import prod
-from typing import Sequence
+from collections.abc import Sequence
 
 from .allocator import Allocation, DistributedAllocator
 
@@ -48,9 +48,7 @@ def tensor(
         raise ValueError("allocation is smaller than requested tensor shape")
 
     device = torch.device(f"cuda:{allocator.device}")
-    storage = torch._C._construct_storage_from_data_pointer(
-        allocation.ptr, device, allocation.nbytes
-    )
+    storage = torch._C._construct_storage_from_data_pointer(allocation.ptr, device, allocation.nbytes)
     metadata = {
         "nbytes": allocation.nbytes,
         "data_ptr": allocation.ptr,

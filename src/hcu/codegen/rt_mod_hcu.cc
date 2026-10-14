@@ -56,7 +56,8 @@ ExtractFuncInfo(const IRModule &mod, bool uses_distributed_metadata) {
     // thread/block indices, making this contract explicit and safe.
     fmap.Set("__tilelang_init_ipc_metadata",
              runtime::FunctionInfo("__tilelang_init_ipc_metadata",
-                                   {DataType::Handle(), DataType::Int(64)}, {}, {}));
+                                   {DataType::Handle(), DataType::Int(64)}, {},
+                                   {}));
   }
   return fmap;
 }
@@ -97,9 +98,9 @@ Module BuildTileLangHCU(IRModule mod, Target target) {
 
   Map<String, String> source_map;
   source_map.Set("hip", code);
-  return target::ROCmModuleCreateWithFallback(Bytes(ptx.data(), ptx.size()),
-                                              String(fmt), ExtractFuncInfo(mod, cg.UsesDistributedMetadata()),
-                                              source_map);
+  return target::ROCmModuleCreateWithFallback(
+      Bytes(ptx.data(), ptx.size()), String(fmt),
+      ExtractFuncInfo(mod, cg.UsesDistributedMetadata()), source_map);
 }
 
 Module BuildTileLangHCUWithoutCompile(IRModule mod, Target target) {

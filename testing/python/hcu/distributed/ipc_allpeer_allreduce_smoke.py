@@ -102,12 +102,9 @@ def main() -> None:
             torch.cuda.synchronize(local_rank)
             expected = float(world_size * (world_size + 1) // 2 + iteration * world_size)
             if not torch.all(out == expected):
-                raise RuntimeError(
-                    f"rank {rank}: iteration {iteration} result {out.cpu().tolist()} != {expected}"
-                )
+                raise RuntimeError(f"rank {rank}: iteration {iteration} result {out.cpu().tolist()} != {expected}")
         print(
-            f"ipc-allpeer-allreduce rank={rank} world_size={world_size} "
-            f"tiles={NUM_TILES} iterations={ITERATIONS} value={out[0].item()}",
+            f"ipc-allpeer-allreduce rank={rank} world_size={world_size} tiles={NUM_TILES} iterations={ITERATIONS} value={out[0].item()}",
             flush=True,
         )
         dist.barrier()
@@ -125,9 +122,7 @@ def main() -> None:
         torch.cuda.synchronize(local_rank)
         bf16_expected = float(world_size * (world_size + 1) // 2)
         if not torch.all(bf16_out == bf16_expected):
-            raise RuntimeError(
-                f"rank {rank}: BF16 all-peer result {bf16_out.cpu().tolist()} != {bf16_expected}"
-            )
+            raise RuntimeError(f"rank {rank}: BF16 all-peer result {bf16_out.cpu().tolist()} != {bf16_expected}")
         print(f"ipc-allpeer-bf16 rank={rank} world_size={world_size} value={bf16_out[0].item()}", flush=True)
         dist.barrier()
 
