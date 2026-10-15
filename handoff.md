@@ -1,6 +1,59 @@
 # HCU fp8 Channelwise Decode GEMM — Handoff
 
-Status: **2026-10-13**. Branch `feat/hcu-mqa-fp8`. Goal: beat hipblaslt fp8 on
+Status: **2026-10-15** (overnight update below) / 2026-10-13. Branch
+`feat/hcu-mqa-fp8`. Goal: beat hipblaslt fp8 on
+
+## Overnight findings (2026-10-15) — SASS-verified, same-process head-to-head
+
+- **M=16/32 win CONFIRMED with fresh same-process hipblas** (`/tmp/h2h_sweep_mls.py`,
+  graph-replay timing, GPU 4): M=16 MLS 164.3us (88.6%) vs hipblas 186.6us (78.1%)
+  **→ +11.9%**; M=32 MLS 199.8us (72.9%) vs hipblas 218.4us (66.7%) **→ +8.5%**.
+  rel=0.00000 both. Best config unchanged: bm{M} bn32 bk256 ns1 t256.
+- **Plan B (`b_vgpr_direct`, B global→VGPR direct) is a 4× regression — dead end.**
+  The b_vgpr pipeline (this branch's 5 uncommitted files, gated OFF by default so
+  the MLS baseline is unaffected) runs 860–910us at M=32 (vs MLS 199.8us / hipblas
+  218us). SASS-verified (`/tmp/pipe_upfront.s`): even with all B slice loads issued
+  up-front + one loop-bottom fence, the compiler keeps only **~4 8B loads in flight
+  (rolling `s_waitcnt vmcnt(3)`) and re-drains before each mmac consumer**. A 4-mmac
+  consumer group is far too short to hide ~500-cycle VMEM latency. Config sweep
+  (bn32/64/128, t256/512, M-padded to 128, setprio) — all 16–237% *worse* than hipblas.
+  M-padding to hipblas's 128-row tile is worse still (1786us): the b_vgpr fragment
+  per n-warp grows and the short chain still can't hide latency.
+- **Real hipblas shape decoded** from `/workspace/misc/Cijk_Alik_Bljk_F8BS_MT256x128x128_...WGM8_bias_channelwise.s`
+  (MT256x128x128, TT16x8, 512 thr, **255 VGPR**, 64KB LDS, 288 mmac = 4×72/loop):
+  B = **4× `buffer_load_dwordx4` (16B/lane) per 32-wide k-slice into a rotating
+  register buffer (X0/X1)**, 8 slices = 32 dwordx4 in flight; A = **16× `ds_read_b128`
+  from LDS** (double-buffered via 2 `__syncthreads` at the loop seam); **72-mmac
+  chain** per 32-wide slice as the latency window; **one** `s_waitcnt vmcnt(0)` per
+  2-slice (128-k) chunk. Its 72-mmac window is ~4.5× ours (16/slice), so its single
+  drain hides full VMEM latency where ours cannot. **The 16B dwordx4 (half the
+  instruction count, 2× bytes/inst) + 72-mmac window is the actual win** — neither is
+  reachable through the MMAC templating without a hand-rolled kernel.
+- **M=64/128 breakthrough (2026-10-15, round 8)** — the C++ levers + a config sweep
+  that had never been run (earlier M=64/128 sweeps only tried M-*splitting*, which
+  re-reads B and always loses) close the gap to near-parity. Winning levers:
+  (a) **slc on MLS b8 atoms** (already committed) and (b) **s_setprio(1) around the
+  MLS mmac loop** — new, wired via the `tl.hcu_mmac_setprio` annotation in
+  `gemm_hcu_mmac.py` (header-only `promote_prio`/`restore_prio`, no rebuild). The
+  `s_setprio` only pays off combined with a **never-tried tile shape**: for M=64/128
+  a *single* block that spans the full M (bm=64/128) with **bn64/bn128 + 512 thr**
+  (not the bm=M/bn32/t256 shape used for M≤32). Fresh same-process head-to-head
+  (gate_up 51200×5120, GPU 4, graph-replay, all rel=0.00000):
+
+  | M | committed (old cfg) | new best cfg | new lat | hipblas | new gap |
+  |---|---------------------|--------------|---------|---------|---------|
+  | 16 | +11.9% | bm16 bn32 bk256 ns1 t256 **sp1** | 164.6us | 186.7us | **+11.8%** |
+  | 32 | +8.5%  | bm32 bn32 bk256 ns1 t256 **sp1** | 188.3us | 217.8us | **+13.5%** |
+  | 64 | −89%   | bm64 bn64 bk256 ns1 **t256 sp1** | 246.4us | 229.9us | −7.2% |
+  | 128 | −225%  | bm128 bn128 bk128 ns1 t512 sp0 | 309.4us | 311.0us | **+0.3%** |
+
+  M=64/128 went from **losing 2–4×** to **parity / slight win**. M=16/32 keep the
+  clear win (and sp1 pushes M=32 to +13.5%). M=64 is the only M still short
+  (−7.2%); it needs the 72-mmac window hipblas has (see Plan B / real-shape note)
+  to fully close. Scripts: `/tmp/h2h_sweep64_128_v3.py`, `/tmp/h2h_final_confirm.py`.
+- **M-splitting confirmed wrong** (still): bm=32/by=2 for M=64, bm=16/by=4 for
+  M=128 re-read B and are worse than the single-full-M block above.
+
 qwen3-32B decode GEMM bandwidth utilization (M=1..128, K=5120, N=51200 gate_up)
 on Hygon DCU BW1101 (gfx938, 64 CU, warp 64, HBM peak ≈ 1800 GB/s).
 

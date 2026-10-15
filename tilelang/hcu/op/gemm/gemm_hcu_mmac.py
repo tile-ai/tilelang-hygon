@@ -783,6 +783,9 @@ class GemmHCUMMAC(GemmBase):
 
         use_gemm_mls = (a_from_mls and not is_fragment(self.A)) or (b_from_mls and not is_fragment(self.B))
         use_b_linear_ds_read = b_from_async_copy_linear and not is_fragment(self.B)
+        # s_setprio(1) around the mmac chain (hipblas shape). Default OFF.
+        mmac_setprio = _int_annotation(
+            getattr(self.gemm_node, "annotations", None) or {}, "tl.hcu_mmac_setprio", 0)
         if use_gemm_mls:
             if k_pack != 1:
                 raise ValueError("gemm_mls does not support kPack > 1")
@@ -813,8 +816,12 @@ class GemmHCUMMAC(GemmBase):
                     T.clear(C_buf)
                 emitter.ldmatrix_mls_a(A_local, A_region)
                 emitter.ldmatrix_mls_b(B_local, B_region)
+                if mmac_setprio:
+                    T.evaluate(tirx.call_extern("handle", "tl::promote_prio"))
                 for ki in T.serial(0, inner_k):
                     emitter.mmac(A_local, B_local, C_buf, ki, trans_c=mmac_trans_c)
+                if mmac_setprio:
+                    T.evaluate(tirx.call_extern("handle", "tl::restore_prio"))
 
             return _Simplify(_gemm_mls_mls, inline_let=True)
 

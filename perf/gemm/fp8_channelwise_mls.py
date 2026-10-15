@@ -37,12 +37,19 @@ def fp8_mls_channelwise(
     num_stages=1,
     threads=512,
     accum_dtype="float32",
+    setprio=0,
 ):
     """Channelwise fp8 GEMM using MLS (matrix-LDS-read) A/B producers.
 
     ``block_K`` must be a multiple of 64 (the trans-B fp8 MLS atom width).
+
+    ``setprio=1`` wraps the MLS mmac loop in ``s_setprio(1)``/``s_setprio(0)``
+    (``tl.hcu_mmac_setprio``), matching hipblas's MMA priority bump. It only
+    pays off on the wider decode tiles (M=64: bm64 bn64 t256) — default OFF so
+    the 8192² compute path is unchanged.
     """
     assert block_K % 64 == 0, "fp8 MLS channelwise GEMM requires block_K % 64 == 0"
+    gemm_annotations = {"tl.hcu_mmac_setprio": int(setprio)} if setprio else None
 
     @T.prim_func
     def gemm(
@@ -63,7 +70,7 @@ def fp8_mls_channelwise(
                 if num_stages == 0:
                     T.ptx_wait_group(0)
                     T.sync_warp()
-                T.gemm(A_s, B_s, C_l, False, True, k_pack=1)
+                T.gemm(A_s, B_s, C_l, False, True, k_pack=1, annotations=gemm_annotations)
             for i, j in T.Parallel(block_M, block_N):
                 C_l[i, j] = C_l[i, j] * scale_a[by * block_M + i] * scale_b[bx * block_N + j]
             T.copy(C_l, C[by * block_M, bx * block_N])

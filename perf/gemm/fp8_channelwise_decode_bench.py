@@ -64,7 +64,23 @@ def graph_replay_time(fn, reps=3, iters=50):
     return meds[0], meds[len(meds) // 2]
 
 
-def bench(name, N, K, M, bm):
+def _decode_cfg(M):
+    """Per-M winning config (bm, bn, bk, ns, threads, setprio) for gate_up decode.
+    Measured same-process head-to-head vs hipblas (2026-10-15, GPU 4, graph-replay,
+    all rel=0). M=16/32 keep the narrow bn32 t256 tile; M=64/128 need a wider
+    bn64/bn128 tile spanning the full M (a single block, NOT M-splitting) — with
+    s_setprio (sp1) for M=64. The 8192² compute path uses its own 256² tile and
+    leaves setprio OFF, so these only affect the decode shape."""
+    if M <= 16:
+        return (16, 32, 256, 1, 256, 1)
+    if M <= 32:
+        return (32, 32, 256, 1, 256, 1)
+    if M <= 64:
+        return (64, 64, 256, 1, 256, 1)
+    return (128, 128, 128, 1, 512, 0)
+
+
+def bench(name, N, K, M, bm=None, bn=None, bk=None, ns=None, t=None, sp=None):
     torch.manual_seed(0)
     A = (torch.randn(M, K, device="cuda") * 0.3).to(torch.float8_e4m3fn)
     B = (torch.randn(N, K, device="cuda") * 0.3).to(torch.float8_e4m3fn)
@@ -72,14 +88,17 @@ def bench(name, N, K, M, bm):
     sb = (torch.rand(N, device="cuda") + 0.5)
     ref = (A.float() @ B.float().T) * sa[:, None] * sb[None, :]
 
-    kern = fp8_mls_channelwise(M, N, K, bm, 32, 256, 1, 256)
+    if bm is None:
+        bm, bn, bk, ns, t, sp = _decode_cfg(M)
+    kern = fp8_mls_channelwise(M, N, K, bm, bn, bk, ns, t, setprio=sp)
     C = kern(A, B, sa, sb)
     rel = (C - ref).abs().max().item() / ref.abs().max().item()
     assert rel < 1e-3, f"{name} M={M} rel={rel:.4f}"
 
     tmin, tmed = graph_replay_time(lambda: kern(A, B, sa, sb))
     eff = N * K / tmin * 1e-3  # GB/s
-    print(f"{name:8s} M={M:>3} (bm={bm:>3}): {tmin:7.1f}/{tmed:7.1f}us  {eff:6.0f} GB/s  {eff / PEAK * 100:5.1f}%  rel={rel:.5f}", flush=True)
+    print(f"{name:8s} M={M:>3} (bm={bm:>3},bn={bn:>3},bk={bk:>3},t={t},sp={sp}): "
+          f"{tmin:7.1f}/{tmed:7.1f}us  {eff:6.0f} GB/s  {eff / PEAK * 100:5.1f}%  rel={rel:.5f}", flush=True)
     return tmin, eff
 
 
@@ -87,9 +106,8 @@ def main():
     for name, (N, K) in SHAPES.items():
         print(f"\n== {name} {N}x{K} ==", flush=True)
         for M in [1, 8, 16, 32, 64, 128]:
-            bm = 16 if M <= 16 else (32 if M <= 32 else (64 if M <= 64 else 128))
             try:
-                bench(name, N, K, M, bm)
+                bench(name, N, K, M)
             except Exception as ex:
                 print(f"{name:8s} M={M:>3} ERR {str(ex)[:80]}", flush=True)
 
