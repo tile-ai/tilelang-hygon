@@ -709,6 +709,8 @@ class TLHIPSourceWrapper(TLCUDASourceWrapper):
         "float8_e5m2fnuz": "fp8_e5_t",
         "float8_e4m3fnuz": "fp8_e4_t",
         "e4m3fnuz_float8": "fp8_e4_t",
+        "float8_e8m0fnu": "uint8_t",
+        "float4_e2m1fn": "tl::pk_fp4_t",
         "float64": "double",
         "int64": "int64_t",
         "int32": "int",
