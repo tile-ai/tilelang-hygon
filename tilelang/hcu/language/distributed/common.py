@@ -1,4 +1,4 @@
-"""Backend-neutral distributed scalar intrinsics."""
+"""HCU distributed scalar intrinsics."""
 
 from tvm import tirx
 from tvm.tirx import IntImm, PrimExpr

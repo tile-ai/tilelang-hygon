@@ -24,9 +24,9 @@ from .reduce_op import __all__ as _REDUCE_ALL
 # ``allocate``.  Restore the common DSL function after all HCU submodules have
 # been loaded so ``T.allocate(...)`` remains callable through the facade.
 from tilelang.language.common import allocate as allocate
-from tilelang.language.distributed import get_block as get_block
-from tilelang.language.distributed import get_num_ranks as get_num_ranks
-from tilelang.language.distributed import get_rank as get_rank
+from .distributed import get_block as get_block
+from .distributed import get_num_ranks as get_num_ranks
+from .distributed import get_rank as get_rank
 from .scale_view import (
     ScaleFormat as ScaleFormat,
     ScaleView as ScaleView,
