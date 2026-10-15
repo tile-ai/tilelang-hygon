@@ -23,6 +23,7 @@ cdef class CythonKernelWrapper:
         # Add new cache attributes
         list param_dtypes              # Cache for parameter dtypes
         list param_shapes              # Cache for parameter shapes as native Python lists
+        list param_packing_factors     # Logical elements stored in each byte
         object get_current_device
 
     def __cinit__(self, result_idx, params, lib):
@@ -33,6 +34,7 @@ cdef class CythonKernelWrapper:
         # Convert TVM types to native Python types during initialization
         # Convert tvm.DataType to torch.dtype for tensor creation
         self.param_dtypes = [param.torch_dtype() for param in params]
+        self.param_packing_factors = [max(1, 8 // (param.dtype.bits * param.dtype.lanes)) for param in params]
         # Convert TVM shape arrays to native Python lists
         self.param_shapes = []
         self.get_current_device = torch.cuda.current_device
@@ -198,10 +200,22 @@ cdef class CythonKernelWrapper:
                     if isinstance(s, tirx.Var):
                         for key in self.dynamic_symbolic_map:
                             if(str(s) == str(key)):
-                                ref_id, ref_tensor_idx, ref_shape_idx, _stride_scale = self.dynamic_symbolic_map[key]
-                                shape.append(tensor_list[ref_tensor_idx].shape[ref_shape_idx])
+                                ref_id, ref_tensor_idx, ref_shape_idx, stride_scale = self.dynamic_symbolic_map[key]
+                                if ref_id == 0:
+                                    shape.append(tensor_list[ref_tensor_idx].shape[ref_shape_idx] * stride_scale)
+                                else:
+                                    shape.append(tensor_list[ref_tensor_idx].stride(ref_shape_idx) * stride_scale)
                     else:  # Already converted to Python int during initialization
                         shape.append(s)
+
+                packing_factor = self.param_packing_factors[i]
+                if packing_factor > 1:
+                    if shape[-1] % packing_factor:
+                        raise ValueError(
+                            f"The innermost output dimension must be divisible by its packing factor "
+                            f"({packing_factor}), got {shape[-1]}"
+                        )
+                    shape[-1] //= packing_factor
 
                 if device is None:
                     device = self._infer_output_device(inputs)
@@ -267,7 +281,7 @@ cdef class CythonKernelWrapper:
         # Add dynamic dimension values to kernel arguments
         for _, (ref_id, buffer_idx, shape_idx, stride_scale) in self.dynamic_symbolic_map.items():
             if ref_id == 0:
-                call_args.append(ctypes.c_int64(tensor_list[buffer_idx].shape[shape_idx]))
+                call_args.append(ctypes.c_int64(tensor_list[buffer_idx].shape[shape_idx] * stride_scale))
             else:
                 call_args.append(ctypes.c_int64(tensor_list[buffer_idx].stride(shape_idx) * stride_scale))
 

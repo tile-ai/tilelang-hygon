@@ -62,6 +62,11 @@ def AnnotateScaleGemmDep():
     return _ffi_api.AnnotateScaleGemmDep()  # type: ignore
 
 
+def PlanScaleBufferLayout():
+    """Select the internal copy_scale/MMAC row order after pipeline planning."""
+    return _ffi_api.PlanScaleBufferLayout()  # type: ignore
+
+
 def InsertScaleBufferSync():
     """Insert sync_threads between copy_scale and gemm_blockscaled (skip WS)."""
     return _ffi_api.InsertScaleBufferSync()  # type: ignore

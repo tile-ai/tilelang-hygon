@@ -229,9 +229,11 @@ class CythonKernelAdapter(BaseKernelAdapter):
         for i, param in enumerate(params):
             if param in buffer_map:
                 buffer = buffer_map[param]
+                packing_factor = max(1, 8 // (buffer.dtype.bits * buffer.dtype.lanes))
                 for j, shape in enumerate(buffer.shape):
                     if isinstance(shape, tirx.Var) and (shape not in dynamic_symbolic_map) and (shape not in params):
-                        dynamic_symbolic_map[shape] = (0, i, j, 1)
+                        shape_scale = packing_factor if j == len(buffer.shape) - 1 else 1
+                        dynamic_symbolic_map[shape] = (0, i, j, shape_scale)
         for i, param in enumerate(params):
             if param in buffer_map:
                 buffer = buffer_map[param]
@@ -289,16 +291,42 @@ class CythonKernelAdapter(BaseKernelAdapter):
             if param in buffer_map:
                 buffer = buffer_map[param]
                 static_shape, static_strides = [], []
+                element_bits = buffer.dtype.bits * buffer.dtype.lanes
+                packing_factor = max(1, 8 // element_bits)
+                innermost_dim = len(buffer.shape) - 1
                 for j, s in enumerate(buffer.shape):
                     if isinstance(s, tirx.IntImm):
-                        static_shape.append((j, s.value))
+                        extent = s.value
+                        if j == innermost_dim and packing_factor > 1:
+                            if extent % packing_factor:
+                                raise ValueError(
+                                    f"The innermost dimension of {buffer.dtype} must be divisible by "
+                                    f"its packing factor ({packing_factor}), got {extent}"
+                                )
+                            extent //= packing_factor
+                        static_shape.append((j, extent))
                     elif is_symbolic_expr(s):
                         static_shape.append((j, -1))  # -1 for symbolic
                     else:
                         raise ValueError(f"Unsupported shape type: {type(s)}")
                 for j, s in enumerate(buffer.strides):
+                    if j != innermost_dim and packing_factor > 1 and is_symbolic_expr(s):
+                        raise ValueError(
+                            f"Packed {buffer.dtype} buffers do not support dynamic outer strides; "
+                            f"stride index {j} must be a compile-time storage-aligned value"
+                        )
+                    if j == innermost_dim and packing_factor > 1 and (not isinstance(s, tirx.IntImm) or s.value != 1):
+                        raise ValueError(f"Packed {buffer.dtype} buffers require a static innermost stride of 1")
                     if isinstance(s, tirx.IntImm):
-                        static_strides.append((j, s.value))
+                        stride = s.value
+                        if j != innermost_dim and packing_factor > 1:
+                            if stride % packing_factor:
+                                raise ValueError(
+                                    f"The stride of packed {buffer.dtype} must be divisible by "
+                                    f"its packing factor ({packing_factor}), got {stride}"
+                                )
+                            stride //= packing_factor
+                        static_strides.append((j, stride))
                 is_contiguous, prod = True, 1
                 for dim, stride in reversed(list(zip(buffer.shape, buffer.strides))):
                     is_contiguous &= bool(stride == prod)
