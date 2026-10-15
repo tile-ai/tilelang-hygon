@@ -1,6 +1,6 @@
 from tvm import tirx
 
-from tilelang.language.distributed import get_block, get_num_ranks, get_rank
+from tilelang.hcu.language import get_block, get_num_ranks, get_rank
 
 
 def test_get_rank_builds_distributed_intrinsic():

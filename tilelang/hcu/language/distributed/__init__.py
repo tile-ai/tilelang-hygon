@@ -1,4 +1,4 @@
-"""Backend-neutral distributed kernel-language APIs."""
+"""HCU distributed kernel-language APIs."""
 
 from .common import get_block, get_num_ranks, get_rank
 

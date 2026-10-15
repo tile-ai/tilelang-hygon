@@ -25,8 +25,8 @@ dist*/
 # despite the distribution-artifact glob above.
 !tilelang/distributed/
 !tilelang/distributed/**
-!tilelang/language/distributed/
-!tilelang/language/distributed/**
+!tilelang/hcu/language/distributed/
+!tilelang/hcu/language/distributed/**
 !src/hcu/distributed/
 !src/hcu/distributed/**
 !src/tl_templates/hcu/distributed/
