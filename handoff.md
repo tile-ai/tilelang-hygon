@@ -1,7 +1,89 @@
 # HCU fp8 Channelwise Decode GEMM — Handoff
 
-Status: **2026-10-16** (M=64 root-caused, see top section) / 2026-10-15 / 2026-10-13.
-Branch `feat/hcu-smls-b-vgpr`. Goal: beat hipblaslt fp8 on
+Status: **2026-10-16b** (M=64 reframed: the 70% target is Layout A) / 2026-10-16 /
+2026-10-15 / 2026-10-13. Branch `feat/hcu-smls-b-vgpr`.
+
+## 2026-10-16b — THE 70% TARGET IS "LAYOUT A". Read this before the section below.
+
+The "hipblas reaches ~70% at M=64 after slc-tagging" premise does not survive
+contact with the reference deliverable. Its own README
+(`/workspace/llm-adaptation/qwen3-32b-fp8-rowwise/deliverable_fp8_gemm/README.md`)
+states the M=64 gate_up recipe and what it costs:
+
+| M | kernel | tile | 优化 | 需权重重排 | 基线 → 优化 |
+|---|---|---|---|---|---|
+| 64 | gate_up | MT128x64x256 | **Layout A + vmcnt4** | ✅ | 213.0 → **203.3us** |
+| 64 | down | MT96x64x256 | slc + W2 | ❌ | 131.8 → 117.7us |
+| 128 | gate_up | MT128x128x256 | Layout A + vmcnt4 | ✅ | 310.4 → 288.0us |
+
+203.3us / 262.1 MB = 1289 GB/s = **71.6%** — that is the 70% figure. It is reached
+**only** by Layout A (blocked weight reorder, `reorder_weights.py`), which the user
+explicitly excluded ("Layout A 不要看了先"). **Without the reorder, hipblas's own
+baseline is 213.0us = 68.4%.** So the in-scope gap is ours 247.0us (59.0%) →
+213.0us (68.4%), i.e. **34us**, not 44us to a 71.6% that requires reordering.
+
+**The "A staged once" direction (V1 = 217.0us) is NOT actionable.** Two independent
+proofs, both measured:
+
+- **Grouping does nothing.** Staging A for 2 k-steps at a time into two separate
+  (64,256) buffers (every MLS atom keeps the proven `seq<64,256>`/(2,2)/`axis::mn`
+  shape; B also double-buffered so the pipeline planner accepts it) → **249.3us**,
+  i.e. no gain and 3us slower than the 246.4us baseline. Total instructions and
+  total LDS bytes are unchanged. (`/tmp/m64_astage.py`.) The cost is per-byte of
+  LDS write, not per load group.
+- **The byte count is invariant.** A's LDS write = `M·N·K/bn` — unchanged by `bm`,
+  by `bk`, by split-K (each block keeping one A K-chunk resident still totals
+  `(N/bn)·S × 64·(K/S)`), and by A-hoisting. Only `bn` reduces it, and `bn>64`
+  breaks the MLS partition (section below).
+
+**N-scaling separates the two costs** (`/tmp/m64_scale.py`, same shape
+bm64/bn64/bk256/ns1/t256 at N = 12800/25600/51200/102400):
+
+| N | B MB | ours | GB/s | % | W2 (compute only) |
+|---|---|---|---|---|---|
+| 12800 | 65.5 | 80.3us | 816 | 45.3 | 42.9us |
+| 25600 | 131.1 | 142.2us | 921 | 51.2 | 66.4us |
+| 51200 | 262.1 | 247.0us | 1061 | 59.0 | 113.9us |
+| 102400 | 524.3 | 462.7us | 1133 | 62.9 | 209.8us |
+
+Slope **0.834 us/MB = 1200 GB/s** marginal, intercept **25.7us**. hipblas
+(`torch._scaled_mm`, same timing harness) has slope 0.793 = 1261 GB/s and intercept
+25.4us — **the same structure; the whole difference is 5% of stream efficiency.**
+Perfect overlap of the 114us mmac with a 159us DRAM floor would give 159us; we get
+247us, so compute and stream are largely *serialised*, and prefetch depth is not
+the fix (`ns=2` generates a correct `cp_async_wait<1>` + double-buffered loop —
+verified in `/tmp/src_64_128_2_128.cu` — and is still slower).
+
+**hipblas's tile shape does not transfer.** From the reference .s header, its kernel
+is `Cijk_Alik_Bljk_F8BS_MT128x64x256_TT8_2_WG16_32_1_MFWGS512_WGM1_bias_channelwise`
+— 512 threads on a (128,64) tile vs our 256 on (64,64). Copied into our DSL:
+`bm128 bn64 bk256 t512 ns1` → **589.8us** (partition degrades to (4,2)); `bk128 ns2`
+→ 479.0us. So the shape is not the lever by itself.
+
+**What the reference actually does — and what it does *not* do** (verified by
+disassembling `m64/src/gateup_layoutA_vmcnt4.s`):
+
+- Weights go **global→LDS**, exactly like ours: `buffer_load_dwordx4 v128, s[8:11],
+  0 offen slc lds` (16 B/lane, direct to LDS). There is **no** "weights bypass LDS
+  into VGPR" trick to copy.
+- The `buffer_load_ubyte_d16`/`_d16_hi` + `v_lshlrev 8` + `v_or` + `v_cndmask`
+  clusters are the **channelwise bias/scale gather** in the epilogue, not weights.
+- Its main loop body is 64 `v_mmac_f32_16x16x32_fp8_fp8` + 32 `ds_read_b128` +
+  8 `ds_write_b128` + **1328 address VALU** (`v_add_co_u32`/`v_lshlrev`/`v_cndmask`/
+  `v_cmp_lt`/`v_or`/`v_and`) — Layout A is expensive to address; it buys HBM
+  contiguity. 149 `s_waitcnt` with a fine-grained `vmcnt(1,2,4,5,6,8..14,0)` spread
+  (vs our whole-group `cp_async_wait<0>`).
+- **slc is already in on our side and hipblas's is partial**: only **8 of the 20**
+  weight→LDS loads carry slc in that kernel. Nothing to fix here.
+
+**Bottom line.** Without Layout A the ceiling for this shape is ~68.4% and we are at
+59.0%; the remaining 34us is not A's staging (proven above). The reference's
+`ds_read_b128` (plain 16 B/lane LDS reads) is what lets it hold an arbitrary tile
+shape, whereas our `ds_read_format_tensor_a/b` pins the warp partition and degrades
+to (4,2)/(8,1) with 3–4× LDS read amplification as soon as the shape moves. That
+heuristic — `ComputeMlsWarpPartition` (`src/hcu/op/mls.cc:506`) and
+`AnalyzeResourceAxis` (`src/hcu/transform/hoist_mls_resource.cc:1615`) — is the
+only in-scope lever left, and it needs a C++ rebuild.
 
 ## 2026-10-16 — M=64 gap ROOT-CAUSED: it is A's LDS round-trip, not bandwidth
 
@@ -49,9 +131,11 @@ the MLS path. The only A→VGPR route is r_mls, which lowers to 8-byte
 
 **Where that leaves us**: `bm64 bn64 bk256 ns1 t256 sp1` (245.9us fp32 / 243.4us
 bf16) is a structural local optimum. V1 (217.0us) proves the design would beat
-hipblas by ~6% if A's staging were free, but that is unreachable without either
-(a) a global→VGPR matrix load builtin, or (b) a wide-bn MLS partition that keeps
-the (2,2)/`axis::mn` shape and its 2× LDS read amplification.
+hipblas by ~6% if A's staging were free, but that is unreachable — see the
+2026-10-16b section above for the two measurements that close it off (grouping A's
+loads changes nothing; the byte count is invariant under every restructuring).
+The in-scope target is hipblas's **68.4% baseline (213.0us)**, not the 71.6% that
+requires the excluded Layout A weight reorder.
 
 ## Overnight findings (2026-10-15) — SASS-verified, same-process head-to-head
 

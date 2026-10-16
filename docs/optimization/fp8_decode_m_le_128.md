@@ -198,12 +198,71 @@ the MLS path. The only A→VGPR route is r_mls, which lowers to 8-byte
 `hcu_buffer_load<fp8_t, 8>` — a proven 3.7× loss.
 
 So `bm64 bn64 bk256 ns1 t256 sp1` (245.9 µs fp32 / 243.4 µs bf16) is a structural
-local optimum. V1 shows the design would beat hipblas by ~6% if A's staging were
-free, but that needs either a wide-bn MLS partition that keeps the (2,2)/`axis::mn`
-shape and 2× read amplification (`src/hcu/op/mls.cc:506`,
-`src/hcu/transform/hoist_mls_resource.cc:1615`), or a global→VGPR matrix load.
-This supersedes the earlier split-K / fold-M suggestions for M=64, which target a
-bandwidth wall that measurement shows is not there.
+local optimum. This supersedes the earlier split-K / fold-M suggestions for M=64,
+which target a bandwidth wall that measurement shows is not there.
+
+### The "70% target" is Layout A — which is out of scope
+
+The reference deliverable
+(`/workspace/llm-adaptation/qwen3-32b-fp8-rowwise/deliverable_fp8_gemm/`) states
+its M=64 gate_up recipe in its own README:
+
+| M | kernel | tile | 优化 | 需权重重排 | 基线 → 优化 |
+|---|---|---|---|---|---|
+| 64 | gate_up | MT128x64x256 | **Layout A + vmcnt4** | ✅ | 213.0 → **203.3 µs** |
+| 64 | down | MT96x64x256 | slc + W2 | ❌ | 131.8 → 117.7 µs |
+
+203.3 µs / 262.1 MB = 1289 GB/s = **71.6%** — that is the 70% figure, and it is
+reached **only** via Layout A (blocked weight reorder). Without the reorder
+hipblas's own baseline is **213.0 µs = 68.4%**. So the in-scope gap is
+ours 247.0 µs (59.0%) → 213.0 µs (68.4%): **34 µs**, not 44 µs.
+
+**"A staged once" (V1 = 217.0 µs) is not reachable.** Two measurements:
+
+- Staging A for 2 k-steps at a time into two separate (64,256) buffers — every MLS
+  atom keeps the proven `seq<64,256>`/(2,2)/`axis::mn` shape, B also
+  double-buffered — gives **249.3 µs**, i.e. no gain. Same instruction count, same
+  LDS bytes. The cost is per-byte, not per load group.
+- A's LDS write is `M·N·K/bn`, invariant under `bm`, `bk`, split-K and A-hoisting.
+  Only `bn` reduces it, and `bn>64` breaks the MLS partition.
+
+**N-scaling** (`/tmp/m64_scale.py`) separates fixed from marginal cost:
+
+| N | B MB | ours | GB/s | % | compute-only |
+|---|---|---|---|---|---|
+| 12800 | 65.5 | 80.3 µs | 816 | 45.3 | 42.9 µs |
+| 25600 | 131.1 | 142.2 µs | 921 | 51.2 | 66.4 µs |
+| 51200 | 262.1 | 247.0 µs | 1061 | 59.0 | 113.9 µs |
+| 102400 | 524.3 | 462.7 µs | 1133 | 62.9 | 209.8 µs |
+
+Slope **0.834 µs/MB = 1200 GB/s**, intercept 25.7 µs. hipblas has slope
+0.793 µs/MB = 1261 GB/s, intercept 25.4 µs — the same structure, differing by 5% of
+stream efficiency. Perfect overlap of the 114 µs of mmac with a 159 µs DRAM floor
+would give 159 µs; we get 247 µs, so compute and stream are largely **serialised**.
+Prefetch depth is not the fix: `ns=2` generates a correct `cp_async_wait<1>` with
+double-buffered `A_s`/`B_s` and is still slower.
+
+**hipblas's tile shape does not transfer.** Its kernel is
+`Cijk_Alik_Bljk_F8BS_MT128x64x256_TT8_2_WG16_32_1_MFWGS512_WGM1_bias_channelwise`
+— 512 threads on a (128,64) tile, vs our 256 on (64,64). Copied into our DSL,
+`bm128 bn64 bk256 t512 ns1` → **589.8 µs** (partition degrades to (4,2)).
+
+**What the reference does and does not do** (from disassembling
+`m64/src/gateup_layoutA_vmcnt4.s`): weights go **global→LDS** via
+`buffer_load_dwordx4 ... slc lds`, exactly the path our `matrix_load` uses — there
+is no "weights bypass LDS into VGPR" trick. The `buffer_load_ubyte_d16` clusters
+are the channelwise bias/scale epilogue gather, not weights. Its loop body is
+64 mmac + 32 `ds_read_b128` + 8 `ds_write_b128` + **1328 address VALU** (the price
+of Layout A's blocked addressing), with 149 `s_waitcnt` at fine-grained
+`vmcnt(1..14,0)` granularity. **slc is already in on our side, and hipblas's is
+partial** — only 8 of its 20 weight→LDS loads carry it.
+
+The one in-scope lever left is the MLS partition heuristic
+(`ComputeMlsWarpPartition`, `src/hcu/op/mls.cc:506`; `AnalyzeResourceAxis`,
+`src/hcu/transform/hoist_mls_resource.cc:1615`): the reference's plain
+`ds_read_b128` lets it hold an arbitrary tile shape, while our
+`ds_read_format_tensor_a/b` pins the partition and degrades to (4,2)/(8,1) with
+3–4× LDS read amplification as soon as the shape moves. That needs a C++ rebuild.
 
 ## Reproduce
 
