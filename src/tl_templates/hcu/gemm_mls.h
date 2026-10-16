@@ -62,10 +62,13 @@ public:
                                      AltB, TransB, HcuArch>;
   static constexpr tl::index_t B_local_size = BTraits::GemmTensorSize;
 
-  static_assert(kPack == 1, "gemm_mls currently requires kPack=1");
-  static_assert(A_local_size == inner_k * warp_rows * vec_size,
+  static_assert(micro_size_k * kPack == ATraits::MmacKSize,
+                "GEMM MMAC K * kPack must match A ds_read atom K");
+  static_assert(micro_size_k * kPack == BTraits::MmacKSize,
+                "GEMM MMAC K * kPack must match B ds_read atom K");
+  static_assert(A_local_size == inner_k * warp_rows * kPack * vec_size,
                 "A GemmTensorSize must match gemm body_rr layout");
-  static_assert(B_local_size == inner_k * warp_cols * vec_size,
+  static_assert(B_local_size == inner_k * warp_cols * kPack * vec_size,
                 "B GemmTensorSize must match gemm body_rr layout");
 
   /*
@@ -145,9 +148,11 @@ public:
                                      AltB, TransB, HcuArch>;
   static constexpr tl::index_t B_local_size = BTraits::GemmTensorSize;
 
-  static_assert(kPack == 1, "gemm_mls currently requires kPack=1");
-  static constexpr tl::index_t A_local_size = inner_k * warp_rows * vec_size;
-  static_assert(B_local_size == inner_k * warp_cols * vec_size,
+  static_assert(micro_size_k * kPack == BTraits::MmacKSize,
+                "GEMM MMAC K * kPack must match B ds_read atom K");
+  static constexpr tl::index_t A_local_size =
+      inner_k * warp_rows * kPack * vec_size;
+  static_assert(B_local_size == inner_k * warp_cols * kPack * vec_size,
                 "B GemmTensorSize must match gemm body_rr layout");
 
   /*
@@ -191,14 +196,16 @@ public:
             auto p = GemmOp::reverse_index_map_transposed(lane_id, local_id);
             row = p.first;
             col = p.second;
-            A_local[(ki * warp_rows + i) * vec_size + local_id] =
+            A_local[(ki * warp_rows * kPack + i * kPack) * vec_size +
+                    local_id] =
                 A_shared[GemmOp::template make_swizzle_layout<
                     last_dim_a, sizeof(A_type)>(r + row, l + col)];
           } else {
             auto p = GemmOp::reverse_index_map(lane_id, local_id);
             row = p.first;
             col = p.second;
-            A_local[(ki * warp_rows + i) * vec_size + local_id] =
+            A_local[(ki * warp_rows * kPack + i * kPack) * vec_size +
+                    local_id] =
                 A_shared[GemmOp::template make_swizzle_layout<
                     last_dim_a, sizeof(A_type)>(l + row, r + col)];
           }

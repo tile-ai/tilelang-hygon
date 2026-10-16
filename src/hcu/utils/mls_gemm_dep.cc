@@ -5,6 +5,7 @@
 #include "mls_gemm_dep.h"
 
 #include "hcu/op/ds_read_format.h"
+#include "hcu/op/gemm_partition.h"
 #include "hcu/target_utils.h"
 #include "op/gemm.h"
 #include "op/operator.h"
@@ -15,7 +16,8 @@ namespace tl {
 using namespace tirx;
 
 MlsGemmDepMeta BuildMlsGemmDepMeta(const GemmWithInput &gwi,
-                                   const PropagationTirCollector *collector) {
+                                   const PropagationTirCollector *collector,
+                                   Target target) {
   auto gemm = gwi.gemm;
   auto *g = gemm.get();
   auto node = tvm::ffi::make_object<MlsGemmDepMetaNode>();
@@ -32,6 +34,7 @@ MlsGemmDepMeta BuildMlsGemmDepMeta(const GemmWithInput &gwi,
   node->gemm_n = g->n_;
   node->gemm_k = g->k_;
   node->gemm_k_pack = g->kPack_;
+  node->gemm_mmac_k = hcu::ResolveHcuMmacModeForGemm(g, target).mmac_k;
   node->gemm_trans_a = g->transA_;
   node->gemm_trans_b = g->transB_;
   if (g->policy_.defined()) {
@@ -82,9 +85,6 @@ bool ComputeSharedDstMlsTrans(const Buffer &dst,
       continue;
     }
     if (auto gemm = op.as<GemmNode>()) {
-      ICHECK(gemm->kPack_ == 1)
-          << "MatrixLoad dst Gemm consumer must have kPack=1, got "
-          << gemm->kPack_;
       auto cur = MlsTransFromGemmAndBuffer(gemm, dst);
       if (!cur) {
         continue;

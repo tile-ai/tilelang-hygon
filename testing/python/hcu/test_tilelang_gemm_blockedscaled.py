@@ -193,6 +193,7 @@ def matmul_blockscaled(
     scale_copy_threads=None,
     a_dtype="float4_e2m1fn",
     b_dtype=None,
+    scale_k_major=False,
 ):
     """Block-scaled GEMM with optional ScaleView slicing and MLS operands.
 
@@ -220,6 +221,9 @@ def matmul_blockscaled(
     if scale_format_name is None:
         assert op_ctrl == 0, "interleaved copy_scale cases must select scale_format_name explicitly"
         scale_format_name = "identity"
+    if scale_k_major:
+        assert scale_format_name == "identity", "K-major scales use a linear Identity LDS buffer"
+        assert scale_stages == 1, "K-major scale test path currently expects one LDS stage"
     selected_scale_format_name = scale_format_name
     scale_format = {
         "identity": T.scale_identity,
@@ -230,15 +234,15 @@ def matmul_blockscaled(
         "mn4": T.scale_mn4_interleaved,
     }[selected_scale_format_name]()
 
-    ScaleA_tile = (scale_ka, scale_m)
-    ScaleB_tile = (scale_kb, scale_n)
+    ScaleA_tile = (scale_m, scale_ka) if scale_k_major else (scale_ka, scale_m)
+    ScaleB_tile = (scale_n, scale_kb) if scale_k_major else (scale_kb, scale_n)
     ScaleA_logical_parent = (scale_ka + k_pad, scale_m + mn_pad)
     ScaleB_logical_parent = (scale_kb + k_pad, scale_n + mn_pad)
 
     def physical_scale_shape(logical_shape):
         sk, smn = logical_shape
         if selected_scale_format_name == "identity":
-            return (sk, smn)
+            return (smn, sk) if scale_k_major else (sk, smn)
         if selected_scale_format_name == "k2":
             assert sk % 2 == 0
             return (sk // 2, smn, 2)
@@ -318,7 +322,10 @@ def matmul_blockscaled(
                     T.copy(A[by * block_M, k * block_K], A_shared)
                     T.copy(B[bx * block_N, k * block_K], B_shared)
                 if selected_scale_format_name == "identity":
-                    if scale_stages == 1:
+                    if scale_k_major:
+                        T.copy(ScaleA, ScaleA_lds[mn_pad:, k_pad:])
+                        T.copy(ScaleB, ScaleB_lds[mn_pad:, k_pad:])
+                    elif scale_stages == 1:
                         if scale_load_mode == "async_copy":
                             if scale_copy_threads is None:
                                 T.async_copy(ScaleA, ScaleA_lds[k_pad:, mn_pad:])
@@ -398,7 +405,10 @@ def matmul_blockscaled(
                 if scale_load_mode == "async_copy":
                     T.ptx_wait_group(0)
                     T.sync_threads()
-                if scale_stages == 1:
+                if scale_k_major:
+                    ScaleA_view = ScaleA_lds[mn_pad:, k_pad:]
+                    ScaleB_view = ScaleB_lds[mn_pad:, k_pad:]
+                elif scale_stages == 1:
                     ScaleA_view = T.scale_view(
                         ScaleA_lds,
                         logical_shape=ScaleA_logical_parent,
@@ -442,8 +452,12 @@ def matmul_blockscaled(
                         logical_shape=ScaleB_logical_parent,
                         format=scale_format,
                     )
-                T.copy_scale(ScaleA_view[k_pad:, mn_pad:], ScaleA_sbuf, op_ctrl=op_ctrl)
-                T.copy_scale(ScaleB_view[k_pad:, mn_pad:], ScaleB_sbuf, op_ctrl=op_ctrl)
+                if scale_k_major:
+                    T.copy_scale(ScaleA_view, ScaleA_sbuf, op_ctrl=op_ctrl)
+                    T.copy_scale(ScaleB_view, ScaleB_sbuf, op_ctrl=op_ctrl)
+                else:
+                    T.copy_scale(ScaleA_view[k_pad:, mn_pad:], ScaleA_sbuf, op_ctrl=op_ctrl)
+                    T.copy_scale(ScaleB_view[k_pad:, mn_pad:], ScaleB_sbuf, op_ctrl=op_ctrl)
                 if use_mls:
                     T.ptx_wait_group(0)
                     T.sync_warp()
@@ -464,8 +478,8 @@ def matmul_blockscaled(
                     sf_a_granularity_k=sf_a_granularity_k,
                     sf_b_granularity_n=sf_b_granularity_n,
                     sf_b_granularity_k=sf_b_granularity_k,
-                    a_scale_k_major=False,
-                    b_scale_k_major=False,
+                    a_scale_k_major=scale_k_major,
+                    b_scale_k_major=scale_k_major,
                 )
             T.copy(C_local, C[by * block_M, bx * block_N])
 
@@ -1004,6 +1018,92 @@ def test_gemm_blockscaled_interleaved_k4_correctness(
     )
     _check_blockscaled_out(lib_out, ref)
     print(f"[blockscaled-interleaved] op_ctrl={op_ctrl} origin=({mn_pad}, {k_pad}) max_abs_diff={(lib_out - ref).abs().max().item()}")
+
+
+@requires_blockscaled
+@pytest.mark.parametrize(
+    "op_ctrl,k_pad,explicit_unpacked_ds_read,expected_mmac_k",
+    [
+        pytest.param(1, 2, False, 64, id="native_fp4_opctrl1"),
+        pytest.param(2, 4, False, 64, id="native_fp4_opctrl2"),
+        pytest.param(1, 2, True, 32, id="f8f6f4_opctrl1"),
+        pytest.param(2, 4, True, 32, id="f8f6f4_opctrl2"),
+    ],
+)
+def test_gemm_blockscaled_kmajor_identity_opctrl_correctness(op_ctrl, k_pad, explicit_unpacked_ds_read, expected_mmac_k):
+    """K-major Identity LDS packs consecutive K scales without reformatting."""
+    M = N = 64
+    K = block_K = 128
+    gran_k = 32
+    mn_pad = 16
+    program = matmul_blockscaled(
+        M=M,
+        N=N,
+        K=K,
+        block_M=M,
+        block_N=N,
+        block_K=block_K,
+        mn_pad=mn_pad,
+        k_pad=k_pad,
+        op_ctrl=op_ctrl,
+        sf_a_granularity_m=1,
+        sf_a_granularity_k=gran_k,
+        sf_b_granularity_n=1,
+        sf_b_granularity_k=gran_k,
+        threads=128,
+        num_stages=0,
+        use_mls=explicit_unpacked_ds_read,
+        scale_format_name="identity",
+        explicit_unpacked_ds_read=explicit_unpacked_ds_read,
+        scale_k_major=True,
+    )
+    kernel = tl.compile(program, out_idx=[4], verbose=True)
+    source = kernel.get_kernel_source()
+    assert f"ds_scale_copy<{op_ctrl}, 0," in source
+    assert ", 1, 1, 2, " in source
+    assert f", {expected_mmac_k}, 0>" in source
+
+    A_logical, B_logical, A, B = _make_fp4_inputs(M, N, K)
+    ScaleA, ScaleB = _make_e8m0_scales(K // gran_k, M, N, non_unit_scale=True)
+    ScaleA_kmajor = ScaleA.T.contiguous()
+    ScaleB_kmajor = ScaleB.T.contiguous()
+    lib_out = kernel.get_profiler().func(A, B, ScaleA_kmajor, ScaleB_kmajor).cpu()
+    ref = blockscaled_fp4_cpu_ref(
+        A_logical,
+        B_logical,
+        ScaleA_kmajor,
+        ScaleB_kmajor,
+        sf_a_granularity_m=1,
+        sf_a_granularity_k=gran_k,
+        sf_b_granularity_n=1,
+        sf_b_granularity_k=gran_k,
+        a_scale_k_major=True,
+        b_scale_k_major=True,
+        transpose_B=True,
+    )
+    _check_blockscaled_out(lib_out, ref)
+
+
+@requires_blockscaled
+@pytest.mark.parametrize("op_ctrl", [1, 2])
+def test_gemm_blockscaled_kmajor_opctrl_rejects_reused_scale(op_ctrl):
+    """Packed copy cannot materialize duplicate rows for a reused K scale."""
+    program = matmul_blockscaled(
+        M=64,
+        N=64,
+        K=128,
+        block_M=64,
+        block_N=64,
+        block_K=128,
+        op_ctrl=op_ctrl,
+        sf_a_granularity_k=64,
+        sf_b_granularity_k=64,
+        threads=128,
+        scale_format_name="identity",
+        scale_k_major=True,
+    )
+    with pytest.raises(tvm.TVMError, match="duplicated across MMAC scale rows"):
+        tl.compile(program, out_idx=[4])
 
 
 @requires_blockscaled

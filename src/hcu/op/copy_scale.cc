@@ -158,9 +158,6 @@ CopyScale::CopyScale(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
     node->origin_mn_ = args[7];
     node->tile_k_ = args[8];
     node->tile_mn_ = args[9];
-  } else {
-    ICHECK_EQ(node->op_ctrl_, 0)
-        << "copy_scale op_ctrl>0 requires an explicit ScaleView/ScaleFormat";
   }
 
   node->granularity_mn_ =
@@ -271,8 +268,26 @@ Stmt CopyScaleNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       << gemm_elem_bits_;
   const int kMmacK = gemm_elem_bits_ == 8 ? 32 : 64;
   if (op_ctrl_ != 0) {
-    ICHECK_EQ(scale_k_major_, 0) << "copy_scale op_ctrl=1/2 requires MN-major "
-                                    "scale (scale_k_major=false)";
+    if (scale_k_major_) {
+      ICHECK(!has_scale_view_)
+          << "K-major copy_scale op_ctrl=1/2 requires a plain Identity LDS "
+             "buffer, not a physically interleaved ScaleView";
+      ICHECK_EQ(scale_format, ScaleLdsFormat::kIdentity);
+      ICHECK_EQ(row_order_, static_cast<int>(ScaleBufferRowOrder::kKInner))
+          << "K-major copy_scale op_ctrl=1/2 requires KInner scale-buffer "
+             "row order";
+      ICHECK(!(kMmacK == 64 && granularity_k_ >= 64))
+          << "K-major copy_scale op_ctrl=1/2 cannot be used when one logical "
+             "scale must be duplicated across MMAC scale rows";
+      ICHECK_EQ(scale_shape_k % (1 << op_ctrl_), 0)
+          << "K-major copy_scale op_ctrl=" << op_ctrl_
+          << " requires ScaleShapeK divisible by " << (1 << op_ctrl_)
+          << ", got " << scale_shape_k;
+    } else {
+      ICHECK(has_scale_view_)
+          << "MN-major copy_scale op_ctrl=1/2 requires an explicit physically "
+             "interleaved ScaleView";
+    }
     if (kMmacK == 64) {
       ICHECK_EQ(granularity_k_, 32)
           << "copy_scale mmac_k=64 op_ctrl=1/2 requires granularity_k==32, got "
@@ -345,7 +360,8 @@ Stmt CopyScaleNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     // physical Buffer rank/shape. The StorageLayout functor maps the physical
     // coordinates selected by the format policy to a byte offset.
     ICHECK_EQ(scale_k_major_, 0)
-        << "ScaleView formats currently require MN-major destination scale";
+        << "ScaleView formats require MN-major scale; K-major copy_scale uses "
+           "a plain Identity LDS buffer";
     parent_k_c = as_const_int(parent_k_);
     parent_mn_c = as_const_int(parent_mn_);
     const int64_t *tile_k_c = as_const_int(tile_k_);
@@ -450,6 +466,24 @@ Stmt CopyScaleNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   const int parent_scale_k = static_cast<int>(*parent_k_c);
   ICHECK_LE(scale_shape_mn, parent_scale_mn);
   ICHECK_LE(scale_shape_k, parent_scale_k);
+  if (scale_k_major_ && op_ctrl_ != 0) {
+    const int width = 1 << op_ctrl_;
+    PrimExpr misalignment =
+        FloorMod(origin_k, make_const(origin_k.dtype(), width));
+    PrimExpr zero = make_zero(misalignment.dtype());
+    if (analyzer->CanProve(misalignment != zero)) {
+      LOG(FATAL) << "K-major copy_scale op_ctrl=" << op_ctrl_
+                 << " requires origin_k aligned to " << width << ", got "
+                 << origin_k;
+    }
+    if (!analyzer->CanProveEqual(misalignment, zero)) {
+      LOG(WARNING) << "Cannot prove K-major copy_scale op_ctrl=" << op_ctrl_
+                   << " origin_k=" << origin_k << " is aligned to " << width
+                   << "; continuing because the kernel author is responsible "
+                      "for satisfying the ds_scale_copy LDS address alignment "
+                      "contract";
+    }
+  }
 
   ICHECK(T.layout_map.count(src))
       << "copy_scale requires the resolved layout for LDS buffer `" << src->name

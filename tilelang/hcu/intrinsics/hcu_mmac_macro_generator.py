@@ -125,6 +125,7 @@ class HCUMatrixCoreIntrinEmitter:
         fp4_mmac_mode: str = "native",
         use_lit: bool | None = None,
         use_lts: bool = False,
+        mmac_k_dim: int | None = None,
     ):
         self.a_dtype = _normalize_dtype_str(a_dtype)
         self.b_dtype = _normalize_dtype_str(b_dtype)
@@ -152,7 +153,7 @@ class HCUMatrixCoreIntrinEmitter:
         self.use_lit = self.has_lit_lts if use_lit is None else bool(use_lit)
         if (self.use_lit or self.use_lts) and not self.has_lit_lts:
             raise ValueError("MMAC LIT requested on a target without LIT/LTS support")
-        self._initialize_k_dim(a_dtype)
+        self._initialize_k_dim(a_dtype, mmac_k_dim)
         self._initialize_abbrev(self.a_dtype, self.b_dtype, self.accum_dtype)
         self._initialize_local_size(self.M_DIM, self.N_DIM, self.k_dim, self.WARP_SIZE)
         self._initialize_mmac_prefix(self.k_dim)
@@ -192,13 +193,17 @@ class HCUMatrixCoreIntrinEmitter:
         self.warp_rows = self.block_m // (self.block_row_warps * self.micro_size_x)
         self.warp_cols = self.block_n // (self.block_col_warps_no_recompute * self.micro_size_y)
 
-    def _initialize_k_dim(self, a_dtype="float16"):
-        self.k_dim = hcu_mmac_k_dim_for_operand(
-            self.target,
-            a_dtype,
-            operand_mode=self.fp4_mmac_mode,
-            use_tf32=self.use_tf32,
-        )
+    def _initialize_k_dim(self, a_dtype="float16", mmac_k_dim: int | None = None):
+        if mmac_k_dim is None:
+            mmac_k_dim = hcu_mmac_k_dim_for_operand(
+                self.target,
+                a_dtype,
+                operand_mode=self.fp4_mmac_mode,
+                use_tf32=self.use_tf32,
+            )
+        self.k_dim = int(mmac_k_dim)
+        if self.k_dim <= 0:
+            raise ValueError(f"mmac_k_dim must be positive, got {self.k_dim}")
 
     def _initialize_local_size(self, m_dim=16, n_dim=16, k_dim=16, warp_size=32):
         self.local_size_a = (m_dim * k_dim) // warp_size
@@ -234,7 +239,9 @@ class HCUMatrixCoreIntrinEmitter:
 
         if in_dtype == "float32" and not use_tf32:
             suffix = f"16x16x{self.k_dim}_f32"
-            if has_lit_lts:
+            # The native K4 builtin has no unified lit+lts spelling.  Its
+            # legacy vstep+lts form has a different operand contract.
+            if has_lit_lts and self.k_dim != 4:
                 suffix += "_lit_lts"
             self.mmac_suffix = suffix
             return
