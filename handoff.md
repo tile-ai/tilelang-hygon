@@ -1,7 +1,57 @@
 # HCU fp8 Channelwise Decode GEMM — Handoff
 
-Status: **2026-10-15** (overnight update below) / 2026-10-13. Branch
-`feat/hcu-mqa-fp8`. Goal: beat hipblaslt fp8 on
+Status: **2026-10-16** (M=64 root-caused, see top section) / 2026-10-15 / 2026-10-13.
+Branch `feat/hcu-smls-b-vgpr`. Goal: beat hipblaslt fp8 on
+
+## 2026-10-16 — M=64 gap ROOT-CAUSED: it is A's LDS round-trip, not bandwidth
+
+All numbers GPU 4, graph-replay, same process, M=64 gate_up (N=51200, K=5120,
+B = 262.1 MB). Scripts: `/tmp/m64_decomp.py`, `/tmp/m64_adiag.py`,
+`/tmp/m64_w2.py`, `/tmp/m64_bn128.py`, `/tmp/m64_ntile2.py`, `/tmp/m64_final.py`.
+
+**The kernel is not bandwidth-bound.** Two pinned-address controls keep the exact
+instruction stream and LDS traffic and change only the addresses:
+
+| variant | what changes | time |
+|---|---|---|
+| V0 baseline | — | 246.9us (59.0%) |
+| V1 A staged once | A's per-iteration `matrix_load` removed | **217.0us (67.1%)** |
+| V8 A pinned to one 16 KB | A stays L2-resident; identical instrs/LDS | 246.1us |
+| V9 B pinned to one 16 KB | B's 262 MB of DRAM traffic disappears | 239.0us |
+| W2 pure compute | A_s/B_s filled once, bare `T.gemm` loop, zero global traffic | 114.1us |
+| hipblas `torch._scaled_mm` | — | 226–232us |
+
+- V8 == V0 → A's cost is **not** L2 capacity/bandwidth.
+- V9 saves only 8us for 262 MB of DRAM reads → **the DRAM is essentially idle; the
+  kernel is not bandwidth-limited at all.** (262 MB / 246 us = 1065 GB/s = 59%.)
+- V8 vs V1 differ *only* by A's `matrix_load` and its 262 MB of LDS writes → **29us**.
+  262 MB / 29 us = 9.0 TB/s ≈ LDS write bandwidth (64 CU × 128 B/clk × 1.3 GHz
+  = 10.6 TB/s). **A's LDS write traffic is the whole gap.**
+
+**A's LDS write traffic = M·N·K / bn** — independent of `bm` and of `bk`. Only `bn`
+(N-coverage per block) reduces it, and `bn=64` is the floor for the fast MLS path:
+every wide-bn config is slower because the MLS warp partition changes shape and
+LDS read amplification grows. 10 wide-bn configs measured, all worse than the
+245.9us baseline:
+
+- `bn128 bk256 t256` → 340.3us (VGPR 130, 3 blk/CU; B flips to `axis::k`)
+- `bn128 bk128 t256` → 281.4us (**same** 82 VGPR / 6 blk/CU as the best config, so
+  it is *not* occupancy; partition becomes (4,1) → 3× LDS read amplification)
+- split-gemm `bn128` as 2×(64,bk) B buffers + 2 C fragments → 333.1us, identical to
+  plain bn128 (proves the B_local register cost is not the issue)
+- `nt`-shared-A (2/4 sequential n-tiles sharing one A_s load) → 364–415us
+- `bk512`, `k_pack=2`, `ns=2@bk256`, A-hoisted-into-a-(64,512)-buffer → all worse
+
+**Structural wall**: every `__builtin_hcu_matrix_load_*` builtin is global→LDS;
+there is no register-destination variant, so A cannot skip the LDS round-trip via
+the MLS path. The only A→VGPR route is r_mls, which lowers to 8-byte
+`hcu_buffer_load<fp8_t, 8>` — already a proven 3.7× loss.
+
+**Where that leaves us**: `bm64 bn64 bk256 ns1 t256 sp1` (245.9us fp32 / 243.4us
+bf16) is a structural local optimum. V1 (217.0us) proves the design would beat
+hipblas by ~6% if A's staging were free, but that is unreachable without either
+(a) a global→VGPR matrix load builtin, or (b) a wide-bn MLS partition that keeps
+the (2,2)/`axis::mn` shape and its 2× LDS read amplification.
 
 ## Overnight findings (2026-10-15) — SASS-verified, same-process head-to-head
 
@@ -102,24 +152,32 @@ emulation. The *right* one needs 16-byte VGPR loads (N=16) + slc + non-blocking.
 
 ## Authorized optimization levers (user-approved: may edit C++/pass, M<=64 may use pass changes)
 
-1. **slc on MLS matrix_load atoms** — `src/tl_templates/hcu/mls/tl_mls_atom_gfx938.hpp`:
-   every `__builtin_hcu_matrix_load_*` ends with `..., false, false` — the
-   glc/slc bools. Flip to `slc=true`. (gfx946 twin
-   `tl_mls_atom_gfx946.hpp` shows the store path already passes glc/slc, so the
-   builtin signature supports it.) Check whether slc is legal on gfx938
-   matrix_load or if it belongs on the plain buffer loads instead.
-2. **s_setprio around MMA** — `src/tl_templates/hcu/core/arch/arch.hpp:242-261`
-   already has `promote_prio()` (s_setprio(1)) / `restore_prio()` /
-   `set_prio<Prio>()`. Wire into the mmac loop (`gemm_hcu_mmac.py`) or the atom.
-3. **A direct-to-VGPR with real dwordx4** — if we keep the VGPR-A idea, the load
-   must be 16 B (`hcu_buffer_load<fp8_t, 16>` → `i32x4`), non-blocking/pipelined,
-   with slc — i.e. exactly `buffer_load_dwordx4`. `hcu_buffer_load_impl` at
+**Status 2026-10-16 — levers 1, 2 and 4 are settled:**
+
+1. **slc on MLS matrix_load atoms — DONE, and it was already correct.**
+   The 7th (trailing) argument of `__builtin_hcu_matrix_load_*_b8` *is* the slc
+   bit; the b8 atoms already pass it as `true`. Proof: flipping
+   `", false, true);"` → `", false, false);"` in `tl_mls_atom_gfx938.hpp` and
+   recompiling changes the SASS opcode `E44A2000` (slc) → `E4482000`, Δ = 0x20000
+   = bit17. An A/B on/off test is **within noise** (246.1 vs 245.9us). No change
+   needed; the header was restored (tree clean for that file).
+2. **s_setprio around MMA — DONE** (committed, `tl.hcu_mmac_setprio` annotation,
+   `gemm_hcu_mmac.py:786`).
+3. **A direct-to-VGPR with real dwordx4 — still the only real lever, still open.**
+   It is the one thing that would remove A's 29us of LDS write traffic (see the
+   2026-10-16 section). `hcu_buffer_load_impl` at
    `src/tl_templates/hcu/core/arch/amd_buffer_addressing.hpp:1352` already has a
-   `coherence` template param (glc/slc), and N=16 gives i32x4 = dwordx4.
-   Currently unused for the r_mls path (comes out N=8).
-4. **pipeline depth does NOT help** — ns3/4 measured no better than ns2 at
-   M=64/128; ns4 marginally helps M=32. bk32 is illegal (MLS trans-B b8 tile
-   needs block_K % 64 == 0).
+   `coherence` (glc/slc) template param and N=16 gives i32x4 = dwordx4; the r_mls
+   path currently emits N=8. Blocked by the mmac A-fragment layout: the A operand
+   is `int32x2` = 8 consecutive k per lane per (ki, i), so no lane owns 16
+   consecutive k bytes. Getting dwordx4 needs a wider per-lane A fragment layout
+   (and a matching operand permute), not just a bigger N.
+4. **pipeline depth does NOT help — CONFIRMED** (ns3/4 no better than ns2 at
+   M=64/128; ns4 marginally helps M=32). bk32 is illegal (MLS trans-B b8 tile
+   needs block_K % 64 == 0). Consistent with the LDS-bound diagnosis: a
+   bandwidth wall does not respond to more prefetch depth.
+5. **Wide bn does NOT help either** — see the 2026-10-16 section. 10 configs
+   measured, all worse.
 
 ## Environment / build (for the other machine)
 
@@ -161,15 +219,29 @@ emulation. The *right* one needs 16-byte VGPR loads (N=16) + slc + non-blocking.
 
 ## Next steps (recommended order)
 
-1. **slc injection** on MLS atoms (lever 1) — cheapest, one header, rebuild,
-   measure M=32/64. Watch for compile error on gfx938 builtin slc (fallback:
-   plain buffer-load slc in the MLS path, or per-lever test).
-2. **s_setprio around MMA** (lever 2) with the same rebuild/measure loop.
-3. If still short: **dwordx4 direct-A** experiment (lever 3) — make the r_mls A
-   load 16 B + slc + pipelined, re-run `fp8_channelwise_decode_bench_r_mls.py`
-   to see if the VGPR-A hipblas shape finally wins.
-4. Combine winners; lock configs into `fp8_channelwise_mls.py` +
-   `fp8_channelwise_decode_bench.py`; commit with writeup.
+Levers 1, 2, 4 and 5 are closed (see the levers section). What is left is
+structural, not a config search:
+
+1. **A wide-bn MLS partition that keeps the fast shape.** This is the highest-value
+   compiler-side fix. `ComputeMlsWarpPartition` (`src/hcu/op/mls.cc:506`) and
+   `AnalyzeResourceAxis` (`src/hcu/transform/hoist_mls_resource.cc:1615`) pick
+   (warp_mn, warp_k) and the mn-vs-k resource axis from the tile shape. For
+   `B(64,256)` at 4 warps they land on the optimal (2,2)/`axis::mn`; for
+   `B(128,256)` the axis flips to `k`, and for `bk=128` the partition becomes
+   (4,1). Both raise LDS read amplification from 2× to 3–4×, which costs more than
+   the A-write traffic that wide bn saves. Forcing (2,2)/`axis::mn` for
+   `B(128,256)` would cut A's LDS writes in half — worth ~15us if the read side
+   holds. Measure with `__builtin_hcu_matrix_load_*` unchanged; this is a pure
+   heuristic change.
+2. **A global→VGPR matrix load.** There is no such builtin today (all
+   `__builtin_hcu_matrix_load_*` are global→LDS). If the ISA has one, it removes
+   A's LDS round-trip outright and V1 (217.0us) becomes the real kernel.
+3. Only after 1 or 2: lock configs into `perf/gemm/fp8_channelwise_decode_bench.py`
+   `_decode_cfg` and commit with a writeup. `_decode_cfg` already returns
+   `(64,64,256,1,256,1)` for M<=64 — the measured optimum — so no change is
+   pending there.
+
+Do **not** re-run the wide-bn or nt-shared-A sweeps; they are settled negative.
 
 ## Repo hygiene
 

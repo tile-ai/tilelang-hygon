@@ -156,16 +156,54 @@ LDS/MMA work), and MMA becomes the bottleneck: a 128×128×256 fp8 tile at
 compute-bound. Measured M=32 with the M≤16 winner shape: 246 µs ≈ 59%
 (hipblas ~65%), i.e. the streaming win does not transfer.
 
-The M ≤ 16 win transfers only as far as the per-block B tile stays the
-bottleneck. For M ≥ 32 the fix is to stop pretending it is a streaming GEMM:
+### M=64 root cause (measured 2026-10-16): LDS-bound, not bandwidth-bound
 
-1. **split-K**: each block streams a K-slice (chunk = K / split_k), so the
-   grid grows to 800·split_k blocks and MMA fits under the stream; the
-   partial sums are reduced with an atomic epilogue.
-2. **fold M into the grid** (M_blocks × N_blocks), each block still streams
-   one B tile — the natural M ≤ 16 approach taken to higher M.
+The A-reread intuition above is right in spirit but the mechanism is **LDS write
+bandwidth**, and the kernel is not bandwidth-bound at all. Pinned-address
+controls (same instruction stream and LDS traffic, only addresses changed):
 
-Both are next steps beyond this note.
+| variant | time |
+|---|---|
+| V0 baseline `bm64 bn64 bk256 ns1 t256 sp1` | 246.9 µs (59.0%) |
+| V1 A staged once (A's per-iteration load removed) | **217.0 µs (67.1%)** |
+| V8 A pinned to one 16 KB, so A stays L2-resident | 246.1 µs |
+| V9 B pinned to one 16 KB, so B's 262 MB of DRAM reads vanish | 239.0 µs |
+| W2 pure compute (A_s/B_s filled once, bare `T.gemm` loop) | 114.1 µs |
+| hipblas `torch._scaled_mm` | 226–232 µs |
+
+- **V8 == V0** → A's cost is not L2 capacity or L2 bandwidth.
+- **V9 saves only 8 µs for 262 MB of DRAM reads** → the DRAM is essentially idle;
+  262 MB / 246 µs = 1065 GB/s = 59%, and removing it entirely does not help.
+- **V8 vs V1 differ only by A's `matrix_load` and its 262 MB of LDS writes** → 29 µs.
+  262 MB / 29 µs = 9.0 TB/s, matching LDS write bandwidth
+  (64 CU × 128 B/clk × 1.3 GHz = 10.6 TB/s).
+
+A's LDS write traffic is `M·N·K / bn` — **independent of `bm` and of `bk`** — so
+only `bn` (N-coverage per block) reduces it. But `bn=64` is the floor for the fast
+MLS path: wider tiles change the MLS warp partition and raise LDS *read*
+amplification from 2× to 3–4×, which costs more than the A writes saved. Ten
+wide-bn configs were measured, all worse than the 245.9 µs baseline:
+
+- `bn128 bk256 t256` → 340.3 µs (VGPR 130 → 3 blk/CU; B flips to `axis::k`)
+- `bn128 bk128 t256` → 281.4 µs — **same** 82 VGPR / 6 blk/CU as the best config,
+  so this is *not* occupancy; the partition becomes (4,1)
+- split-gemm `bn128` as 2×(64,bk) B buffers + 2 C fragments → 333.1 µs, identical
+  to plain bn128, which rules out the B_local register cost
+- `nt`-shared-A (2/4 sequential n-tiles sharing one A_s load) → 364–415 µs
+- `bk512`, `k_pack=2`, `ns=2@bk256`, A hoisted into a (64,512) buffer → all worse
+
+**Structural wall.** Every `__builtin_hcu_matrix_load_*` builtin is global→LDS;
+there is no register-destination variant, so A cannot skip the LDS round-trip via
+the MLS path. The only A→VGPR route is r_mls, which lowers to 8-byte
+`hcu_buffer_load<fp8_t, 8>` — a proven 3.7× loss.
+
+So `bm64 bn64 bk256 ns1 t256 sp1` (245.9 µs fp32 / 243.4 µs bf16) is a structural
+local optimum. V1 shows the design would beat hipblas by ~6% if A's staging were
+free, but that needs either a wide-bn MLS partition that keeps the (2,2)/`axis::mn`
+shape and 2× read amplification (`src/hcu/op/mls.cc:506`,
+`src/hcu/transform/hoist_mls_resource.cc:1615`), or a global→VGPR matrix load.
+This supersedes the earlier split-K / fold-M suggestions for M=64, which target a
+bandwidth wall that measurement shows is not there.
 
 ## Reproduce
 
