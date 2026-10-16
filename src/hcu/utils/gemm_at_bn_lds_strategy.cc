@@ -401,10 +401,8 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
     return std::nullopt;
   }
 
-  const hcu::HcuMmacModeInfo mmac_mode = hcu::ResolveHcuMmacMode(
-      gemm.a_->dtype, gemm.b_->dtype, /*a_is_fragment=*/false,
-      /*b_is_fragment=*/false, /*is_blockscaled=*/false, block_k,
-      ScaleLdsFormat::kIdentity, ScaleLdsFormat::kIdentity, target);
+  const hcu::HcuMmacModeInfo mmac_mode =
+      hcu::ResolveHcuMmacModeForGemm(&gemm, target);
   if (element_bits <= 0 || element_bits % 8 != 0 ||
       mmac_mode.element_bits != element_bits || mmac_mode.mmac_k <= 0 ||
       block_k % mmac_mode.mmac_k != 0) {
@@ -418,7 +416,9 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
       /*A_from_mls=*/false,
       /*B_from_mls=*/false,
       /*A_mls_trans=*/false,
-      /*B_mls_trans=*/false);
+      /*B_mls_trans=*/false,
+      /*extra_min_m_per_warp=*/0,
+      /*extra_min_n_per_warp=*/0, mmac_mode.mmac_k);
   const int warp_size = TargetHcuGetWarpSize(target);
   const int warp_mn_count = feeds_a ? policy->m_warp : policy->n_warp;
   const int operand_mn_atom =

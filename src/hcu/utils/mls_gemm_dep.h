@@ -50,6 +50,7 @@ public:
   int gemm_n{0};
   int gemm_k{0};
   int gemm_k_pack{1};
+  int gemm_mmac_k{0};
   bool gemm_trans_a{false};
   bool gemm_trans_b{false};
   bool a_from_mls{false};
@@ -71,6 +72,7 @@ public:
         .def_ro("gemm_n", &MlsGemmDepMetaNode::gemm_n)
         .def_ro("gemm_k", &MlsGemmDepMetaNode::gemm_k)
         .def_ro("gemm_k_pack", &MlsGemmDepMetaNode::gemm_k_pack)
+        .def_ro("gemm_mmac_k", &MlsGemmDepMetaNode::gemm_mmac_k)
         .def_ro("gemm_trans_a", &MlsGemmDepMetaNode::gemm_trans_a)
         .def_ro("gemm_trans_b", &MlsGemmDepMetaNode::gemm_trans_b)
         .def_ro("a_from_mls", &MlsGemmDepMetaNode::a_from_mls)
@@ -89,8 +91,11 @@ public:
                                                 MlsGemmDepMetaNode);
 };
 
+class GemmNode;
+
 MlsGemmDepMeta BuildMlsGemmDepMeta(const GemmWithInput &gwi,
-                                   const PropagationTirCollector *collector);
+                                   const PropagationTirCollector *collector,
+                                   Target target);
 
 bool ComputeSharedDstMlsTrans(const Buffer &dst,
                               const PropagationTirCollector *collector,
@@ -102,7 +107,6 @@ GetMlsGemmDepFromAnnotations(const Map<String, ObjectRef> &annotations);
 Optional<bool>
 GetMlsTransFromAnnotations(const Map<String, ObjectRef> &annotations);
 
-class GemmNode;
 Map<String, ObjectRef>
 AnnotateGemmHcuMlsFlags(const Map<String, ObjectRef> &annotations,
                         const GemmNode *gemm,

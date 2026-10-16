@@ -331,8 +331,6 @@ def copy_scale(
                 raise ValueError("copy_scale K4 ScaleView requires tile K divisible by 4")
             if scale_src.format.name == "k2mn2" and tile_k_value % 2 != 0:
                 raise ValueError("copy_scale K2MN2 ScaleView requires even tile K")
-    elif op_ctrl != 0:
-        raise ValueError("copy_scale op_ctrl>0 requires a ScaleView with an explicit interleaved ScaleFormat")
 
     def _get_extent(data):
         if isinstance(data, tirx.Var) and T.has_let_value(data):
@@ -349,6 +347,8 @@ def copy_scale(
         return None
 
     def _get_buffer(data):
+        if isinstance(data, tirx.Var) and T.has_let_value(data):
+            data = T.get_let_value(data)
         if isinstance(data, tirx.Buffer):
             return data
         if isinstance(data, (tirx.BufferLoad, tirx.BufferRegion)):

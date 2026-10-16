@@ -9,7 +9,6 @@
 
 #include <tl_templates/hcu/mls/mls_ds_traits.hpp>
 #include <tl_templates/hcu/mls/mls_param_traits.hpp>
-#include <tl_templates/hcu/mmac_micro_k.hpp>
 
 namespace tl {
 namespace mls {
@@ -98,16 +97,14 @@ struct ds_read_format_traits {
   // Gemm layout: (ki, Mi) -> offset (ki * warp_rows + Mi) * vec_size
   // Matches gemm.h body_rr: a_ptr = A_local + (ki * warp_rows + Mi) * vec_size
   static constexpr ::tl::index_t MmacMNSize = 16;
-  // FP32 MMAC K is arch-specific (gfx92a/gfx946: 16x16x4; gfx938: 16x16x8).
-  // TF32 is the `int` specialization and stays K=8 on those arches.
-  static constexpr ::tl::index_t MmacKSize =
-      std::is_same_v<::tl::remove_cvref_t<TargetType>, float>
-          ? static_cast<::tl::index_t>(::tl::MmacMicroKDim<float>::value)
-          : (RegBits == 4    ? 64
-             : RegBits == 8  ? 32
-             : RegBits == 16 ? 16
-             : RegBits == 32 ? 8
-                             : 0);
+  // This is the ds_read output atom K, not necessarily one consumer MMAC's K.
+  // In particular, gfx92a/gfx946 native FP32 consumes one b32 K8 atom as two
+  // K4 MMAC instructions (Gemm kPack=2).
+  static constexpr ::tl::index_t MmacKSize = RegBits == 4    ? 64
+                                             : RegBits == 8  ? 32
+                                             : RegBits == 16 ? 16
+                                             : RegBits == 32 ? 8
+                                                             : 0;
   static_assert(MmacKSize != 0, "Unsupported ds_read_format register bitwidth");
   static constexpr ::tl::index_t GemmWarpRows = PerWarpMN / MmacMNSize;
   static constexpr ::tl::index_t GemmInnerK = PerWarpK / MmacKSize;
@@ -186,9 +183,8 @@ ds_read_format_tensor(TL_LDS_ADDR DataType *smem_ptr, void *target,
     auto ret = DsFormatInst{}(reinterpret_cast<TL_LDS_ADDR DataType *>(
                                   smem_bytes + warp_lds_byte_offset),
                               ::tl::number<immed_offset>{});
-    // Copy each MMAC fragment at storage granularity so clang does not
-    // legalize i8 `vec[j]` extracts. gfx92a/gfx946 FP32 fragments are 4B
-    // (K=4); TF32/fp8/bf16/fp16/b4 and gfx938 FP32 are 8B.
+    // Copy each ds_read atom at storage granularity so clang does not legalize
+    // i8 `vec[j]` extracts. The supported atoms occupy 8B per lane.
     // Do not use const thread_buffer::get_as() on 8-bit types (union copy).
     constexpr auto kFragBytes = sizeof(StorageTargetType) * Traits::VecSize;
     static_assert(kFragBytes == 4 || kFragBytes == 8,

@@ -215,14 +215,27 @@ template <int GranularityMN> TL_DEVICE int ScaleMnIdx(int mn_row, int tx16) {
 // ScaleView inputs substitute a generated functor with the same interface.
 template <int ParentScaleMN, int ParentScaleK, int ScaleKMajor>
 struct ScaleLdsLinearLayout {
-  TL_DEVICE static int CalculateOffset(int k, int mn, int, int, int) {
+  TL_DEVICE static int CalculateOffset(int i0, int i1, int, int, int) {
     if constexpr (ScaleKMajor) {
-      return mn * ParentScaleK + k;
+      return i0 * ParentScaleK + i1;
     } else {
-      return k * ParentScaleMN + mn;
+      return i0 * ParentScaleMN + i1;
     }
   }
 };
+
+// StorageLayout follows the physical LDS Buffer dimension order.  Scale copy
+// policies use logical (k, mn) coordinates, so reverse the first two inputs for
+// a plain Identity K-major buffer whose physical shape is [MN, K].
+template <int ScaleKMajor, typename StorageLayout>
+TL_DEVICE int ScaleLdsOffset(int k, int mn, int i2 = 0, int i3 = 0,
+                             int i4 = 0) {
+  if constexpr (ScaleKMajor) {
+    return StorageLayout::CalculateOffset(mn, k, i2, i3, i4);
+  } else {
+    return StorageLayout::CalculateOffset(k, mn, i2, i3, i4);
+  }
+}
 
 // LDS offsets are computed in the parent last-2 plane.  The pointer is its
 // base; origin_mn/origin_k identify the copied tile inside that plane.
@@ -250,8 +263,41 @@ struct DsScaleLdsOpctrl0Linear {
                                      &mn_local, &k_atom);
     const int mn_idx = ScaleMnIdx<GranularityMN>(mn_row0 + mn_local, tx16);
     const int k_rel = (k_atom * atom_k + inner) / kDup;
-    *lds_byte = StorageLayout::CalculateOffset(origin_k + k_rel,
-                                               origin_mn + mn_idx, 0, 0, 0);
+    *lds_byte = ScaleLdsOffset<ScaleKMajor, StorageLayout>(origin_k + k_rel,
+                                                           origin_mn + mn_idx);
+  }
+};
+
+// A linear Identity [MN, K] LDS buffer already places adjacent K scales in
+// consecutive bytes.  op_ctrl=1/2 can therefore transfer 2/4 distinct scales
+// directly, without a K2/K4 physical ScaleView reformat.
+template <int OpCtrl, int ParentScaleMN, int ParentScaleK, int ScaleShapeMN,
+          int ScaleShapeK, int GranularityMN, int GranularityK, int MmacK,
+          int RowOrder, typename StorageLayout>
+struct DsScaleLdsKMajorIdentity {
+  static_assert(OpCtrl == 1 || OpCtrl == 2,
+                "K-major Identity policy requires op_ctrl=1/2");
+  static constexpr int kOpCtrl = OpCtrl;
+  static constexpr int kRowsPerFill = 1 << OpCtrl;
+  static constexpr int kDup =
+      ScalePhysK<ScaleShapeK, GranularityK, MmacK>::k_dup;
+  static_assert(kDup == 1,
+                "K-major op_ctrl=1/2 cannot duplicate a reused K scale");
+  static constexpr int kPhysK = ScaleShapeK;
+  static_assert(ScaleShapeK % kRowsPerFill == 0,
+                "K-major ScaleShapeK must be divisible by op_ctrl width");
+  static constexpr int kGroups = ScaleShapeK / kRowsPerFill;
+
+  TL_DEVICE static void Map(int fill_batch, int seg_row_base, int mn_row0,
+                            int rows_mn_per_seg, int tx16, int origin_mn,
+                            int origin_k, int *dst_row, int *lds_byte) {
+    int mn_local = 0, k_group = 0;
+    DecodeScaleAtomOrdinal<RowOrder>(fill_batch, rows_mn_per_seg, kGroups,
+                                     &mn_local, &k_group);
+    *dst_row = seg_row_base + fill_batch * kRowsPerFill;
+    const int mn_idx = ScaleMnIdx<GranularityMN>(mn_row0 + mn_local, tx16);
+    *lds_byte = ScaleLdsOffset<1, StorageLayout>(
+        origin_k + k_group * kRowsPerFill, origin_mn + mn_idx);
   }
 };
 
@@ -478,8 +524,11 @@ TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
   constexpr DsScaleFormat ScaleFormat =
       static_cast<DsScaleFormat>(ScaleFormatId);
   static_assert(MmacK == 64 || MmacK == 32, "MmacK must be 64 or 32");
-  static_assert(OpCtrl == 0 || ScaleKMajor == 0,
-                "op_ctrl!=0 requires MN-major scale (scale_k_major=false)");
+  static_assert(OpCtrl == 0 || ScaleKMajor == 0 ||
+                    ScaleFormat == DsScaleFormat::kIdentity,
+                "K-major op_ctrl=1/2 requires Identity LDS format");
+  static_assert(ScaleKMajor == 0 || OpCtrl == 0 || RowOrder == 0,
+                "K-major op_ctrl=1/2 requires KInner row order");
   // mmac_k=64 + op_ctrl>0: only gran_k==32 (gran_k>=64 rejects interleave).
   // mmac_k=32 + op_ctrl>0: K-first interleave allowed (gran still %32==0 in
   // Fill).
@@ -489,14 +538,24 @@ TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
                 "parent scale plane must cover the copied tile");
 
   if constexpr (ScaleFormat == DsScaleFormat::kIdentity) {
-    static_assert(OpCtrl == 0, "identity format requires OpCtrl==0");
-    using Policy =
-        DsScaleLdsOpctrl0Linear<ParentScaleMN, ParentScaleK, ScaleShapeMN,
-                                ScaleShapeK, GranularityMN, GranularityK,
-                                ScaleKMajor, MmacK, RowOrder, StorageLayout>;
-    DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
-                    MnWarps, TotalWarps, MmacK, Policy>(
-        lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
+    if constexpr (OpCtrl == 0) {
+      using Policy =
+          DsScaleLdsOpctrl0Linear<ParentScaleMN, ParentScaleK, ScaleShapeMN,
+                                  ScaleShapeK, GranularityMN, GranularityK,
+                                  ScaleKMajor, MmacK, RowOrder, StorageLayout>;
+      DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
+                      MnWarps, TotalWarps, MmacK, Policy>(
+          lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
+    } else {
+      static_assert(ScaleKMajor == 1,
+                    "Identity op_ctrl=1/2 requires K-major scale");
+      using Policy = DsScaleLdsKMajorIdentity<
+          OpCtrl, ParentScaleMN, ParentScaleK, ScaleShapeMN, ScaleShapeK,
+          GranularityMN, GranularityK, MmacK, RowOrder, StorageLayout>;
+      DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
+                      MnWarps, TotalWarps, MmacK, Policy>(
+          lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
+    }
   } else if constexpr (ScaleFormat == DsScaleFormat::kK2Interleave) {
     static_assert(OpCtrl == 1, "K2 format requires OpCtrl==1");
     static_assert(ScaleShapeK % 2 == 0,

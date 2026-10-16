@@ -14,7 +14,6 @@ from tilelang.hcu.intrinsics.hcu_mmac_macro_generator import HCUMatrixCoreIntrin
 from tilelang.layout.swizzle import make_hcu_swizzled_layout, make_linear_layout
 from tilelang.transform.simplify import _Simplify
 from tilelang.utils.language import is_fragment, is_full_region, is_shared, is_shared_dynamic
-from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import hcu_mmac_k_dim_for_operand
 from tilelang.hcu.target import target_has_mmac_lit_lts, target_is_hcu
 from tvm import DataType, tirx
 from tvm.ir import Range
@@ -73,6 +72,28 @@ def _hcu_layout_bits_for_dtype(dtype, *, fp4_mmac_mode: str) -> int:
     return int(dtype.bits)
 
 
+def _resolve_hcu_mmac_lit(
+    annotations,
+    target: Target,
+    a_dtype,
+    b_dtype,
+    mmac_mode: str,
+    mmac_k: int,
+) -> int:
+    target_supports_lit = target_has_mmac_lit_lts(target)
+    native_f32_k4 = mmac_mode == "native" and str(a_dtype) == "float32" and str(b_dtype) == "float32" and int(mmac_k) == 4
+    mmac_lit = _int_annotation(
+        annotations,
+        "tl.hcu_mmac_lit",
+        int(target_supports_lit and not native_f32_k4),
+    )
+    if mmac_lit and not target_supports_lit:
+        raise ValueError("MMAC LIT requested on a target without LIT/LTS support")
+    if native_f32_k4 and mmac_lit:
+        raise ValueError("native float32 K4 MMAC does not support LIT")
+    return mmac_lit
+
+
 def _mls_local_dtype(dtype, *, fp4_mmac_mode: str, use_tf32: bool = False) -> str:
     dtype = DataType(dtype)
     if use_tf32 and str(dtype) == "float32":
@@ -93,7 +114,6 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
     a_at_bn_auto_lds_strategy = _has_annotation(annotations, "tl.hcu_gemm_at_bn_lds_strategy")
     b_from_async_copy_linear = _int_annotation(annotations, "tl.hcu_b_from_async_copy_linear")
     trans_c = _int_annotation(annotations, "trans_c")
-    mmac_lit = _int_annotation(annotations, "tl.hcu_mmac_lit", int(target_has_mmac_lit_lts(target)))
     b_ds_read_alt = _int_annotation(annotations, "tl.hcu_b_ds_read_alt", 1)
     trans_a = bool(gemm_node.transA)
     trans_b = bool(gemm_node.transB)
@@ -110,9 +130,17 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
         _int_annotation(annotations, "tl.scale_a_format", 0),
         _int_annotation(annotations, "tl.scale_b_format", 0),
         target,
+        bool(_int_annotation(annotations, "use_tf32", 0)),
     )
     mmac_mode = "f8f6f4" if int(mode[0]) == 1 else "native"
-
+    mmac_lit = _resolve_hcu_mmac_lit(
+        annotations,
+        target,
+        A.dtype,
+        B.dtype,
+        mmac_mode,
+        int(mode[2]),
+    )
     return SimpleNamespace(
         a_from_mls=a_from_mls,
         b_from_mls=b_from_mls,
@@ -153,7 +181,7 @@ def _compute_hcu_warp_partition(gemm, thread_nums: int, target: Target, meta) ->
         int(element_bits),
         int(thread_nums),
         target,
-        0,  # gemm_inst unused; HCU warp partition is target-gated in C++
+        int(meta.mmac_k),
         bool(meta.a_from_mls),
         bool(meta.b_from_mls or meta.b_from_async_copy_linear),
         bool(meta.a_mls_trans),
@@ -188,7 +216,17 @@ def _make_hcu_emitter(
     thread_bounds_min: int = 0,
     fp4_mmac_mode: str = "native",
     min_n_per_warp: int = 16,
+    mmac_k_dim: int | None = None,
 ) -> HCUMatrixCoreIntrinEmitter:
+    annotations = getattr(gemm.gemm_node, "annotations", None)
+    use_lit = _resolve_hcu_mmac_lit(
+        annotations,
+        target,
+        gemm.a_dtype,
+        gemm.b_dtype,
+        fp4_mmac_mode,
+        int(mmac_k_dim),
+    )
     return HCUMatrixCoreIntrinEmitter(
         a_dtype=gemm.a_dtype,
         b_dtype=gemm.b_dtype,
@@ -208,14 +246,9 @@ def _make_hcu_emitter(
         min_n_per_warp=min_n_per_warp,
         use_tf32=gemm.use_tf32,
         fp4_mmac_mode=fp4_mmac_mode,
-        use_lit=bool(
-            _int_annotation(
-                getattr(gemm.gemm_node, "annotations", None),
-                "tl.hcu_mmac_lit",
-                int(target_has_mmac_lit_lts(target)),
-            )
-        ),
-        use_lts=bool(_int_annotation(getattr(gemm.gemm_node, "annotations", None), "trans_c")) and target_has_mmac_lit_lts(target),
+        mmac_k_dim=mmac_k_dim,
+        use_lit=use_lit,
+        use_lts=bool(_int_annotation(annotations, "trans_c")) and target_has_mmac_lit_lts(target),
     )
 
 
@@ -302,8 +335,7 @@ class GemmHCUMMAC(GemmBase):
         elem_bits_c = int(DataType(self.C.dtype).bits)
         elem_bits_a = _hcu_layout_bits_for_dtype(self.A.dtype, fp4_mmac_mode=fp4_mmac_mode)
         elem_bits_b = _hcu_layout_bits_for_dtype(self.B.dtype, fp4_mmac_mode=fp4_mmac_mode)
-        mmac_k_a = hcu_mmac_k_dim_for_operand(target, self.A.dtype, operand_mode=fp4_mmac_mode, use_tf32=self.use_tf32)
-        mmac_k_b = hcu_mmac_k_dim_for_operand(target, self.B.dtype, operand_mode=fp4_mmac_mode, use_tf32=self.use_tf32)
+        mmac_k = int(meta.mmac_k)
         frag_c = make_gemm_fragment_hcu(
             int(self.M),
             int(self.N),
@@ -340,7 +372,7 @@ class GemmHCUMMAC(GemmBase):
                 elem_bits_a,
                 int(self.k_pack),
                 bool(self.trans_A),
-                mmac_k_dim=mmac_k_a,
+                mmac_k_dim=mmac_k,
             )
         else:
             raise ValueError(f"Unsupported A scope for HCU gemm: {self.A.scope()}")
@@ -366,7 +398,7 @@ class GemmHCUMMAC(GemmBase):
                 int(self.k_pack),
                 bool(self.trans_B),
                 min_n_per_warp,
-                mmac_k_dim=mmac_k_b,
+                mmac_k_dim=mmac_k,
                 interleave=int(meta.b_ds_read_alt),
             )
         else:
@@ -443,6 +475,7 @@ class GemmHCUMMAC(GemmBase):
             _thread_bounds_min(thread_bounds),
             fp4_mmac_mode=fp4_mmac_mode,
             min_n_per_warp=min_n_per_warp,
+            mmac_k_dim=mmac_k,
         )
         # Force full-K local layout so one call_extern covers all K atoms.
         emitter._a_full_k = True
@@ -772,6 +805,7 @@ class GemmHCUMMAC(GemmBase):
             _thread_bounds_min(thread_bounds),
             fp4_mmac_mode=fp4_mmac_mode,
             min_n_per_warp=min_n_per_warp,
+            mmac_k_dim=int(meta.mmac_k),
         )
 
         k_pack = emitter.k_pack
@@ -802,8 +836,10 @@ class GemmHCUMMAC(GemmBase):
         use_gemm_mls = (a_from_mls and not is_fragment(self.A)) or (b_from_mls and not is_fragment(self.B))
         use_b_linear_ds_read = b_from_async_copy_linear and not is_fragment(self.B)
         if use_gemm_mls:
-            if k_pack != 1:
-                raise ValueError("gemm_mls does not support kPack > 1")
+            element_bits = int(meta.gemm_element_bits)
+            ds_atom_k = 256 // element_bits
+            if micro_size_k * k_pack != ds_atom_k:
+                raise ValueError(f"gemm_mls requires mmac_k * kPack to match ds_read atom K={ds_atom_k}, got {micro_size_k} * {k_pack}")
             if warp_k != 1:
                 raise ValueError("gemm_mls does not support warp on K")
         if use_b_linear_ds_read:

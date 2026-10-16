@@ -34,8 +34,8 @@ HcuMmacModeInfo ResolveHcuMmacMode(DataType a_dtype, DataType b_dtype,
                                    bool a_is_fragment, bool b_is_fragment,
                                    bool is_blockscaled, int block_k,
                                    ScaleLdsFormat scale_format_a,
-                                   ScaleLdsFormat scale_format_b,
-                                   Target target) {
+                                   ScaleLdsFormat scale_format_b, Target target,
+                                   bool use_tf32) {
   HcuMmacModeInfo info;
   const bool a_fp4 = a_dtype.is_float4();
   const bool b_fp4 = b_dtype.is_float4();
@@ -94,7 +94,13 @@ HcuMmacModeInfo ResolveHcuMmacMode(DataType a_dtype, DataType b_dtype,
   info.mode =
       use_f8f6f4 ? HcuMmacOperandMode::kF8F6F4 : HcuMmacOperandMode::kNative;
   info.element_bits = use_f8f6f4 ? 8 : a_dtype.bits();
-  info.mmac_k = use_f8f6f4 ? 32 : (has_fp4 ? 64 : 256 / info.element_bits);
+  const bool native_fp32_k4 =
+      !use_tf32 && info.mode == HcuMmacOperandMode::kNative &&
+      info.element_bits == 32 && (arch == "gfx92a" || arch == "gfx946");
+  info.mmac_k =
+      use_f8f6f4
+          ? 32
+          : (has_fp4 ? 64 : (native_fp32_k4 ? 4 : 256 / info.element_bits));
   if (use_f8f6f4) {
     auto type_id = [](DataType dtype) {
       if (dtype.is_float8_e4m3() || dtype.is_float8_e4m3fn() ||
@@ -112,6 +118,32 @@ HcuMmacModeInfo ResolveHcuMmacMode(DataType a_dtype, DataType b_dtype,
     info.real_ab_type = type_id(a_dtype) * 5 + type_id(b_dtype);
   }
   return info;
+}
+
+HcuMmacModeInfo ResolveHcuMmacModeForGemm(const GemmNode *gemm, Target target) {
+  ICHECK(gemm != nullptr);
+  auto get_int_annotation = [&](const char *key, int default_value) {
+    if (auto value = gemm->annotations_.Get(key)) {
+      if (const auto *imm = value.value().as<IntImmNode>()) {
+        return static_cast<int>(imm->value);
+      }
+      LOG(FATAL) << "Annotation `" << key << "` expects IntImm, got "
+                 << value.value()->GetTypeKey();
+    }
+    return default_value;
+  };
+  const bool is_blockscaled = get_int_annotation("tl.hcu_blockscaled", 0) != 0;
+  const auto scale_format_a =
+      static_cast<ScaleLdsFormat>(get_int_annotation("tl.scale_a_format", 0));
+  const auto scale_format_b =
+      static_cast<ScaleLdsFormat>(get_int_annotation("tl.scale_b_format", 0));
+  const bool use_tf32 = get_int_annotation("use_tf32", 0) != 0;
+  const Buffer &a = gemm->aRegion_->buffer;
+  const Buffer &b = gemm->bRegion_->buffer;
+  return ResolveHcuMmacMode(a->dtype, b->dtype, a.scope() == "local.fragment",
+                            b.scope() == "local.fragment", is_blockscaled,
+                            gemm->k_, scale_format_a, scale_format_b, target,
+                            use_tf32);
 }
 
 HcuMnPerWarp ResolveHcuMnPerWarp(int element_bits, bool A_from_mls,
@@ -139,12 +171,8 @@ HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
                                      bool A_from_mls, bool B_from_mls,
                                      bool A_mls_trans, bool B_mls_trans,
                                      int extra_min_m_per_warp,
-                                     int extra_min_n_per_warp) {
-  bool use_mls = A_from_mls || B_from_mls;
-  if (use_mls) {
-    ICHECK(k_pack == 1) << "gemm_mls does not support kPack > 1";
-  }
-
+                                     int extra_min_n_per_warp, int mmac_k) {
+  const bool use_mls = A_from_mls || B_from_mls;
   int num_warps = block_size / TargetHcuGetWarpSize(target);
   int m_warp = 1, n_warp = 1, k_warp = 1;
   HcuMnPerWarp floors = ResolveHcuMnPerWarp(
@@ -174,7 +202,9 @@ HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
   ICHECK(element_bits == 4 || element_bits == 8 || element_bits == 16 ||
          element_bits == 32)
       << "element bitwidth=" << element_bits;
-  int kKPerWarp = k_pack * (256 / element_bits);
+  const int default_instruction_k = 256 / element_bits;
+  const int instruction_k = mmac_k > 0 ? mmac_k : default_instruction_k;
+  const int kKPerWarp = k_pack * instruction_k;
 
   ICHECK(M % kMPerWarp == 0)
       << "M must be divisible by " << kMPerWarp << ", but got " << M;
@@ -376,11 +406,11 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       "tl.ResolveHcuMmacMode",
       [](DataType a_dtype, DataType b_dtype, bool a_is_fragment,
          bool b_is_fragment, bool is_blockscaled, int block_k,
-         int scale_format_a, int scale_format_b, Target target) {
+         int scale_format_a, int scale_format_b, Target target, bool use_tf32) {
         hcu::HcuMmacModeInfo info = hcu::ResolveHcuMmacMode(
             a_dtype, b_dtype, a_is_fragment, b_is_fragment, is_blockscaled,
             block_k, static_cast<ScaleLdsFormat>(scale_format_a),
-            static_cast<ScaleLdsFormat>(scale_format_b), target);
+            static_cast<ScaleLdsFormat>(scale_format_b), target, use_tf32);
         return Array<Integer>{Integer(static_cast<int>(info.mode)),
                               Integer(info.element_bits), Integer(info.mmac_k),
                               Integer(info.real_ab_type)};
@@ -388,15 +418,14 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef().def(
       "tl.GemmWarpPolicyComputeWarpPartitionHCU",
       [](GemmWarpPolicy policy, int M, int N, int K, int k_pack,
-         int element_bits, int block_size, Target target, int gemm_inst,
+         int element_bits, int block_size, Target target, int mmac_k,
          bool A_from_mls, bool B_from_mls, bool A_mls_trans, bool B_mls_trans,
          int extra_min_m_per_warp, int extra_min_n_per_warp) {
-        (void)gemm_inst;
         ICHECK(policy.defined());
         hcu::HcuMnPerWarp floors = hcu::ComputeWarpPartitionHCU(
             *policy.get(), M, N, K, k_pack, element_bits, block_size, target,
             A_from_mls, B_from_mls, A_mls_trans, B_mls_trans,
-            extra_min_m_per_warp, extra_min_n_per_warp);
+            extra_min_m_per_warp, extra_min_n_per_warp, mmac_k);
         return Array<Integer>{Integer(floors.m_per_warp),
                               Integer(floors.n_per_warp)};
       });
