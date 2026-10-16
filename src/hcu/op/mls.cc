@@ -519,24 +519,6 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
   auto try_config = [&](const MlsTileConfig &config) -> bool {
     int tile_mn = config.tile_mn;
     int tile_k = config.tile_k;
-    auto min_block_mn = [&]() -> std::optional<int> {
-      if (elem_bits == 4 && trans && tile_mn == 16 && tile_k >= 128) {
-        return 32;
-      }
-      return std::nullopt;
-    }();
-    auto min_block_k = [&]() -> std::optional<int> {
-      if (elem_bits == 4 && !trans && tile_k == 16 && tile_mn > 64) {
-        return 32;
-      }
-      return std::nullopt;
-    }();
-    if (min_block_mn && block_mn < min_block_mn.value()) {
-      return false;
-    }
-    if (min_block_k && block_k < min_block_k.value()) {
-      return false;
-    }
     if (block_k % tile_k != 0 || block_mn % tile_mn != 0)
       return false;
     const int slots_mn = block_mn / tile_mn;

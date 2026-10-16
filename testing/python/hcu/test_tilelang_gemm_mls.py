@@ -32,6 +32,13 @@ _ASYNC_COMMIT_RE = r"tl::cp_async_commit\(\);"
 _ASYNC_WAIT_RE = r"tl::cp_async_wait<(\d+)>\(\);"
 
 
+def _compile_with_fp8_launch(program, out_idx, *input_dtypes):
+    compile_kwargs = {}
+    if any("float8" in str(dtype) for dtype in input_dtypes):
+        compile_kwargs["execution_backend"] = "cython"
+    return tl.compile(program, out_idx=out_idx, **compile_kwargs)
+
+
 def _assert_allclose_on_cpu(profiler, ref_program, atol=1e-2, rtol=1e-2):
     ins = profiler._get_inputs()
     ref_out = ref_program(*ins)
@@ -572,7 +579,7 @@ def run_gemm_mls_b_only(
         num_stages=num_stages,
         k_pack=k_pack,
     )
-    kernel = tl.compile(program, out_idx=[2])
+    kernel = _compile_with_fp8_launch(program, [2], in_dtype)
     profiler = kernel.get_profiler()
 
     def ref_program(A, B):
@@ -632,7 +639,7 @@ def run_gemm_mls(
         copy_selects_mls=copy_selects_mls,
         group_explicit_mls=group_explicit_mls,
     )
-    kernel = tl.compile(program, out_idx=[2])
+    kernel = _compile_with_fp8_launch(program, [2], in_dtype)
     if verify_source is not None:
         verify_source(kernel.get_kernel_source())
     profiler = kernel.get_profiler()
@@ -693,7 +700,7 @@ def run_gemm_mls_ds_read_format(
         use_tf32=use_tf32,
         copy_selects_mls=copy_selects_mls,
     )
-    kernel = tl.compile(program, out_idx=[2])
+    kernel = _compile_with_fp8_launch(program, [2], in_dtype)
     if verify_source is not None:
         verify_source(kernel.get_kernel_source())
     profiler = kernel.get_profiler()
@@ -750,7 +757,7 @@ def run_gemm_mls_copy_a_mls_b_ds(
         k_pack=k_pack,
         copy_selects_mls=copy_selects_mls,
     )
-    kernel = tl.compile(program, out_idx=[2])
+    kernel = _compile_with_fp8_launch(program, [2], in_dtype)
     if verify_source is not None:
         verify_source(kernel.get_kernel_source())
     profiler = kernel.get_profiler()
@@ -806,7 +813,7 @@ def run_gemm_mls_ds_read_format_mul_scale(
         num_threads,
         k_pack=k_pack,
     )
-    kernel = tl.compile(program, out_idx=[2])
+    kernel = _compile_with_fp8_launch(program, [2], in_dtype)
     profiler = kernel.get_profiler()
 
     def ref_program(A, B):
@@ -1347,7 +1354,7 @@ def run_mls_ds_read_format_copy_to_global(
         out_dtype,
         num_threads,
     )
-    kernel = tl.compile(program, out_idx=[1])
+    kernel = _compile_with_fp8_launch(program, [1], in_dtype)
     profiler = kernel.get_profiler()
 
     def ref_program(A):
@@ -1653,7 +1660,7 @@ def run_gemm_mls_mix_f4f6f8(
         "float32",
         num_threads,
     )
-    kernel = tl.compile(program, out_idx=[2])
+    kernel = _compile_with_fp8_launch(program, [2], a_dtype, b_dtype)
     source = kernel.get_kernel_source()
     arch = current_hcu_arch_string()
     assert "ds_read_format_tensor_a" in source
@@ -1752,7 +1759,7 @@ def run_gemm_mls_n_loop(
         num_threads,
         k_pack=k_pack,
     )
-    kernel = tl.compile(program, out_idx=[2])
+    kernel = _compile_with_fp8_launch(program, [2], in_dtype)
     if verify_source is not None:
         verify_source(kernel.get_kernel_source())
     profiler = kernel.get_profiler()
@@ -1852,6 +1859,7 @@ def test_mls_ds_read_format_b4_copy_to_global(M, K, block_M, block_K, num_thread
         pytest.param(512, 128, 64, True, False, 512, 128, 64, 128, id="an_bt_256x16_slot_fallback"),
         pytest.param(384, 128, 128, True, False, 384, 128, 128, 128, id="an_bt_256x16_multi_k"),
         pytest.param(256, 256, 128, True, False, 128, 128, 64, 128, id="an_bt_m256_n256_k128_t128"),
+        pytest.param(16, 32, 256, False, True, 16, 32, 256, 64, id="at_bn_a_16x256_single"),
         pytest.param(32, 64, 256, False, True, 32, 64, 256, 128, id="at_bn_16x256_slot_fallback"),
         pytest.param(32, 64, 512, False, True, 32, 64, 512, 128, id="at_bn_16x256_multi_k"),
     ],
@@ -2291,6 +2299,47 @@ def test_gemm_wasp_mls_4p4c4c_persistent_matrix_store():
     b = torch.randn((n, k), device="cuda", dtype=torch.float16)
     actual = kernel(a, b).cpu()
     expected = (a.cpu().float() @ b.cpu().float().T).half()
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+def test_gemm_an_bt_linear_ds_read_b_subview():
+    """Read the second half of a compact B LDS tile with its full row stride."""
+    block_m, block_n, block_k, read_n, threads = 64, 128, 32, 64, 128
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((block_k, block_m), "float16"),
+        B: T.Tensor((block_k, block_n), "float16"),
+        C: T.Tensor((block_m, read_n), "float32"),
+    ):
+        with T.Kernel(1, threads=threads):
+            A_shared = T.alloc_shared((block_k, block_m), "float16")
+            B_shared = T.alloc_shared((block_k, block_n), "float16")
+            A_fragment = T.alloc_fragment((block_k, block_m), "float16")
+            B_fragment = T.alloc_fragment((block_k, read_n), "float16")
+            C_local = T.alloc_fragment((block_m, read_n), "float32")
+            T.clear(C_local)
+            T.matrix_load(A, A_shared)
+            for k, n in T.Parallel(block_k, block_n):
+                B_shared[k, n] = B[k, n]
+            T.ptx_wait_group(0)
+            T.sync_threads()
+            T.ds_read_format(A_shared, A_fragment)
+            T.copy(B_shared[:, block_n - read_n : block_n], B_fragment)
+            T.gemm(A_fragment, B_fragment, C_local, True, False)
+            T.copy(C_local, C)
+
+    rt_mod = tl.compile(kernel, target="auto")
+    source = rt_mod.get_kernel_source()
+    assert "ds_read_format_tensor_b_linear<tl::sequence<64, 32>" in source
+
+    torch.manual_seed(0)
+    a = torch.randn((block_k, block_m), dtype=torch.float16)
+    b = torch.randn((block_k, block_n), dtype=torch.float16)
+    output = torch.empty((block_m, read_n), device="cuda", dtype=torch.float32)
+    rt_mod(a.cuda(), b.cuda(), output)
+    actual = output.cpu()
+    expected = a.float().T @ b[:, block_n - read_n :].float()
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
 

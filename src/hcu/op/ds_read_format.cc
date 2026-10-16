@@ -401,15 +401,10 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     size_t dr = dst_ranges.size();
     ICHECK_GE(sr, 2U);
     ICHECK_GE(dr, 2U);
-    PrimExpr src_leading_offset = IntImm(DataType::Int(32), 0);
-    if (sr > 2) {
-      Array<PrimExpr> indices;
-      for (size_t i = 0; i + 2 < sr; ++i)
-        indices.push_back(src_ranges[i]->min);
-      indices.push_back(make_zero(src_buf->DefaultIndexType()));
-      indices.push_back(make_zero(src_buf->DefaultIndexType()));
-      src_leading_offset = src_buf.OffsetOf(indices)[0];
-    }
+    Array<PrimExpr> src_slice_indices;
+    for (size_t i = 0; i < sr; ++i)
+      src_slice_indices.push_back(src_ranges[i]->min);
+    PrimExpr src_slice_offset = src_buf.OffsetOf(src_slice_indices)[0];
     PrimExpr dst_leading_offset = IntImm(DataType::Int(32), 0);
     if (dr > 2) {
       Array<PrimExpr> indices;
@@ -510,9 +505,9 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     std::stringstream ss;
     ss << "tl::mls::ds_read_format_tensor_b_linear<tl::sequence<" << read_mn
        << ", " << read_k << ">, " << total_warp << ", " << warp_mn << ", "
-       << dtype_str << ">";
+       << dtype_str << ", " << src_buf->shape[sr - 1] << ">";
     auto src_ptr =
-        src_buf.access_ptr(1, DataType::Handle(), 1, src_leading_offset);
+        src_buf.access_ptr(1, DataType::Handle(), 1, src_slice_offset);
     auto dst_ptr =
         dst_buf.access_ptr(2, DataType::Handle(), 1, dst_leading_offset);
     return Evaluate(Call(DataType::Handle(), builtin::call_extern(),
