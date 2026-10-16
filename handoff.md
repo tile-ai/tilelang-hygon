@@ -1,7 +1,101 @@
 # HCU fp8 Channelwise Decode GEMM — Handoff
 
-Status: **2026-10-16b** (M=64 reframed: the 70% target is Layout A) / 2026-10-16 /
-2026-10-15 / 2026-10-13. Branch `feat/hcu-smls-b-vgpr`.
+Status: **2026-10-16c** (M=64 is LDS-port-bound; gap to hipblas is 5.8% paired) /
+2026-10-16b / 2026-10-16 / 2026-10-15 / 2026-10-13. Branch `feat/hcu-smls-b-vgpr`.
+
+## 2026-10-16c — M=64 IS LDS-PORT-BOUND, AND THE GAP IS 5.8%. Read this first.
+
+### 0. Methodology: GPU 4 is shared, so only paired ratios count
+
+`rocm-smi --showpower` shows HCU[2]-[7] drawing 360-372 W with no process of ours
+running, **including HCU[4]**, which is the GPU we benchmark on. Co-tenant load moves
+the clocks: the same kernel measures 244us in one invocation and 281us in the next,
+and the *ordering* of two candidate configs flips between runs.
+
+Within one process, repeated rounds agree to ~0.2us — that part is fine. Across
+invocations the whole curve shifts by up to ~15%. **Never compare a number measured
+now against one measured in an earlier run or session.** To compare two kernels, build
+both in one script and interleave the rounds; the paired *ratio* was stable to ~0.1%
+while absolutes moved 15%. Treat any gain under ~3% as unproven unless it is a paired
+ratio. (This bit us: a `bn64/bk128/ns2` config looked 1% faster in one run, was 2%
+slower in the next, and is genuinely slower — see below.)
+
+### 1. The gap, measured properly
+
+Paired and interleaved in one process, 4 rounds, `torch._scaled_mm` (bf16 out) vs our
+`_decode_cfg(64)` = `(64,64,256,1,256,1)`:
+
+| | time (contended) | vs hipblas |
+|---|---|---|
+| hipblas `MT128x64x256` | 257.0us | — |
+| **ours `bn64 bk256 ns1 t256 sp1`** | **272.0us** | **1.058x** |
+| ours `bn64 bk128 ns2 t256 sp1` | 276.3us | 1.076x |
+
+So the gap is **5.8%** — the user's "6%" is exactly right — and `bk256/ns1` is the
+better of the two. The quiet-machine equivalents are ~231.7 vs ~247.0us (62.9% vs
+59.1%). Note the reproducible hipblas baseline is bf16-out; the deliverable's 213.0us
+uses fp16-out + bias and `torch._scaled_mm` rejects fp16 out for rowwise scaling.
+
+### 2. Where the 247us goes (all measured, load-only kernels with no mmac)
+
+| | time | note |
+|---|---|---|
+| B stream alone | **166.1us** | 1578 GB/s = **95.9%** of the 1646 achievable ceiling |
+| A + B through LDS | **196.0us** | A's round trip costs **+30us** for a 327 KB matrix |
+| full kernel | ~247us | ~51us of compute exposed |
+
+The load path is *not* the problem. A's global→LDS→VGPR round trip is the largest
+overhead we own, and it is **not recoverable without a weight reorder**:
+
+- **A→VGPR direct is refuted.** The MMA fragment wants 8 *consecutive-K* fp8 per lane at
+  one row (`A_local[(ki*warp_rows + Mi)*8]`, lane → `m = Mi*16 + (lane&15)`,
+  `k = ki*32 + (lane>>4)*8`). Loading that from global is 8 bytes at a **5120-byte lane
+  stride** — the exact strided pattern that killed the `b_vgpr_direct` experiment. The
+  LDS round trip is the *price* of the fragment layout, not an implementation defect.
+- **`bn` cannot amortize it.** bn 128/256/512 → 253.6 / 275.4 / 382us. Halving the
+  redundant A re-read loses more on the B path than it saves.
+
+### 3. LDS volume is identical to hipblas — the residual is overlap quality
+
+Per warp per k-step the committed config issues 32 `ds_read` of 16 B/lane = 32 KB read,
+plus A(16 KB) + B(16 KB) = 32 KB written, over a 64x64 tile with k=256:
+
+| | LDS bytes / output / k-step |
+|---|---|
+| ours `bn64 bk256 t256` | 160 KB / (4096 x 256) = **0.15625** |
+| ours `bn64 bk128 ns2 t256` | 80 KB / (4096 x 128) = **0.15625** |
+| hipblas `MT128x64x256` | 320 KB / (8192 x 256) = **0.15625** |
+
+Identical, and invariant across `bk`. The 4x read amplification over the tile's unique
+bytes is entirely the per-warp operand duplication the mmac layout requires — the
+`ds_read` volume (512 B/lane) exactly equals the mmac operand volume (32 mmac x 8 B A
++ 8 B B), so there is **no recoverable waste**. Total LDS traffic is 2.56 GB, a
+192-240us floor at 128-160 B/clk/CU: the same order as our 247us, so LDS port pressure
+is a plausible *co*-limiter, but it cannot explain a gap to a kernel moving the identical
+volume.
+
+So the residual 5.8% is **overlap quality**. Our load path alone runs at 95.9% of the
+achievable ceiling, yet in the full kernel B's effective rate falls to ~1062 GB/s.
+hipblas gets the same bytes to DRAM 5.8% sooner through hand-tuned scheduling
+(fine-grained `vmcnt(4)` waits vs our coarser `cp_async_wait`, 4 `s_setprio`
+placements), not through any tile-shape or resource choice reachable from Python.
+
+Occupancy is **not** the lever: 82 VGPR → 6 blocks/CU (24 warps) vs 50 VGPR → the
+thread-capped 10 blocks/CU (40 warps) buys ~1%, and it does not survive re-measurement.
+
+Our wait structure is already clean: the k-loop body contains no `matrix_load`, no
+`s_barrier` and no `vmcnt` wait — the `vmcnt(0); s_barrier` sits *after* the back-edge,
+once, in the epilogue. So there is nothing to relax there.
+
+### 4. Housekeeping
+
+- An uncommitted `gemm_hcu_mmac.py` edit that moved `set_prio` to *before* the LDS reads
+  was a regression (it is the sp2 variant, 281us) and has been **reverted**.
+- The four `b_vgpr` WIP files remain uncommitted and are a confirmed dead end
+  (backup at `/tmp/b_vgpr_deadend_full.patch`).
+- The only untried in-scope lever is the MLS partition heuristic
+  (`src/hcu/op/mls.cc:506`, `src/hcu/transform/hoist_mls_resource.cc:1615`), which
+  needs a C++ rebuild.
 
 ## 2026-10-16b — THE 70% TARGET IS "LAYOUT A". Read this before the section below.
 

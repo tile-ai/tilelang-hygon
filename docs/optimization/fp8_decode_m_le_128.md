@@ -201,6 +201,75 @@ So `bm64 bn64 bk256 ns1 t256 sp1` (245.9 µs fp32 / 243.4 µs bf16) is a structu
 local optimum. This supersedes the earlier split-K / fold-M suggestions for M=64,
 which target a bandwidth wall that measurement shows is not there.
 
+### M=64 is LDS-port-bound; the gap is 5.8% (measured paired)
+
+**Measure paired, or don't measure.** HCU[4] is shared with co-tenants
+(`rocm-smi --showpower` shows HCU[2]-[7] at 360-372 W with nothing of ours running),
+so absolute times drift up to ~15% between invocations and the *ordering* of two
+candidate configs flips. Repeated rounds inside one process agree to ~0.2us. Build
+both kernels in one script, interleave the rounds, and report the ratio.
+
+Doing that, 4 rounds, `torch._scaled_mm` (bf16 out) vs our `(64,64,256,1,256,1)`:
+
+| | time (contended) | vs hipblas |
+|---|---|---|
+| hipblas `MT128x64x256` | 257.0us | — |
+| **ours `bn64 bk256 ns1 t256 sp1`** | **272.0us** | **1.058x** |
+| ours `bn64 bk128 ns2 t256 sp1` | 276.3us | 1.076x |
+
+So the gap is **5.8%**, and `bk256/ns1` — the committed config — is the better one.
+(Quiet-machine equivalents: ~231.7 vs ~247.0us, i.e. 62.9% vs 59.1%.)
+
+**Where the time goes** (load-only kernels, no mmac, so the load path is isolated):
+
+| | time | note |
+|---|---|---|
+| B stream alone | **166.1us** | 1578 GB/s = **95.9%** of the 1646 GB/s achievable ceiling |
+| A + B through LDS | **196.0us** | A's round trip costs **+30us** for a 327 KB matrix |
+| full kernel | ~247us | ~51us of compute exposed |
+
+The load path is not the problem. A's `global → LDS → VGPR` round trip is the largest
+overhead we own, and it is **not recoverable without the excluded weight reorder**:
+
+- **A→VGPR direct is refuted.** The MMA fragment wants 8 *consecutive-K* fp8 per lane at
+  one row — `A_local[(ki*warp_rows + Mi)*8]` with lane → `m = Mi*16 + (lane&15)`,
+  `k = ki*32 + (lane>>4)*8`. Loading that from global means 8-byte requests at a
+  **5120-byte lane stride**, the same strided pattern that killed the `b_vgpr_direct`
+  experiment. The LDS round trip is the *price* of the fragment layout.
+- **`bn` cannot amortize it.** bn 128/256/512 → 253.6 / 275.4 / 382us: halving the
+  redundant A re-read loses more on the B path than it saves.
+
+**LDS volume is not the differentiator — hipblas moves exactly the same bytes.**
+Per warp per k-step the committed config issues 32 `ds_read` of 16 B/lane = 32 KB read,
+plus A(16 KB) + B(16 KB) = 32 KB written, over a 64x64 tile with k=256:
+
+| | LDS bytes / output / k-step |
+|---|---|
+| ours `bn64 bk256 t256` | 160 KB / (4096 x 256) = **0.15625** |
+| ours `bn64 bk128 ns2 t256` | 80 KB / (4096 x 128) = **0.15625** |
+| hipblas `MT128x64x256` | 320 KB / (8192 x 256) = **0.15625** |
+
+Identical, and invariant across `bk`. The 4x read amplification over the tile's unique
+bytes is entirely the per-warp operand duplication that the mmac layout requires: the
+`ds_read` volume (512 B/lane) exactly equals the mmac operand volume (32 mmac x 8 B A
++ 8 B B), so **there is no recoverable waste**. Total LDS traffic is 2.56 GB, which at
+128-160 B/clk/CU is a 192-240us floor — the same order as our 247us, so LDS port
+pressure is a plausible co-limiter, but it cannot explain a gap to a kernel that moves
+the identical volume.
+
+That leaves **overlap quality** as the residual: our load path alone runs at 95.9% of
+the achievable ceiling, yet in the full kernel B's effective rate drops to ~1062 GB/s.
+hipblas gets the same bytes to DRAM 5.8% sooner via hand-tuned scheduling (fine-grained
+`vmcnt(4)` waits instead of our coarser `cp_async_wait`, and 4 `s_setprio` placements),
+not via any tile-shape or resource choice available from Python.
+
+Occupancy is **not** the lever: 82 VGPR → 6 blocks/CU (24 warps) vs 50 VGPR → the
+thread-capped 10 blocks/CU (40 warps) buys ~1%, and that does not survive re-measurement.
+
+Our wait structure is already clean — the k-loop body has no `matrix_load`, no
+`s_barrier` and no `vmcnt` wait; the `vmcnt(0); s_barrier` sits *after* the back-edge,
+once, in the epilogue.
+
 ### The "70% target" is Layout A — which is out of scope
 
 The reference deliverable
