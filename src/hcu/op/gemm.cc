@@ -167,6 +167,37 @@ HcuMnPerWarp ResolveHcuMnPerWarp(int element_bits, bool A_from_mls,
   return floors;
 }
 
+int ResolveMlsConsumerMnAtom(bool from_mls, bool mls_trans, int block_mn,
+                             int block_k, int block_size, Target target,
+                             int element_bits) {
+  if (!from_mls) {
+    return 0;
+  }
+
+  int producer_warp_mn, producer_warp_k, tile_mn, tile_k;
+  ComputeMlsWarpPartition(mls_trans, block_mn, block_k, block_size, target,
+                          element_bits, producer_warp_mn, producer_warp_k,
+                          tile_mn, tile_k, element_bits);
+
+  // Keep GEMM consumer warp boundaries compatible with MLS atoms whose LDS
+  // layout is not additive across an arbitrary MN split.  The large b16/b8/b4
+  // atoms have 4KB discontinuities.  The packed-b4 128x16 fallback is also
+  // sensitive: ds_read_format folds the warp origin into its base and uses
+  // origin-zero immediates, so a 192-row consumer chunk cannot cross its
+  // 128-row atom boundary.  Apply the same rule to transposed counterparts.
+  const bool is_b16_4k =
+      element_bits == 16 &&
+      ((tile_mn == 64 && tile_k == 16) || (tile_mn == 16 && tile_k == 64));
+  const bool is_b8_4k =
+      element_bits == 8 &&
+      ((tile_mn == 128 && tile_k == 16) || (tile_mn == 16 && tile_k == 128));
+  const bool is_b4_partition_sensitive =
+      element_bits == 4 &&
+      (((tile_mn == 128 || tile_mn == 256) && tile_k == 16) ||
+       (tile_mn == 16 && (tile_k == 128 || tile_k == 256)));
+  return is_b16_4k || is_b8_4k || is_b4_partition_sensitive ? tile_mn : 0;
+}
+
 HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
                                      int N, int K, int k_pack, int element_bits,
                                      int block_size, Target target,
@@ -186,25 +217,10 @@ HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
   HcuMnPerWarp floors = ResolveHcuMnPerWarp(
       element_bits, A_from_mls, B_from_mls, A_mls_trans, B_mls_trans,
       extra_min_m_per_warp, extra_min_n_per_warp);
-  int a_nontrans_4k_atom_mn = 0;
-  int b_nontrans_4k_atom_mn = 0;
-  if (GetHcuArchString(target) == "gfx938" && element_bits == 8) {
-    auto resolve_b8_nontrans_4k_atom = [&](bool from_mls, bool mls_trans,
-                                           int block_mn) {
-      if (!from_mls || mls_trans) {
-        return 0;
-      }
-      int producer_warp_mn, producer_warp_k, tile_mn, tile_k;
-      ComputeMlsWarpPartition(false, block_mn, K, block_size, target,
-                              element_bits, producer_warp_mn, producer_warp_k,
-                              tile_mn, tile_k, element_bits);
-      return tile_mn == 128 && tile_k == 16 ? tile_mn : 0;
-    };
-    a_nontrans_4k_atom_mn =
-        resolve_b8_nontrans_4k_atom(A_from_mls, A_mls_trans, M);
-    b_nontrans_4k_atom_mn =
-        resolve_b8_nontrans_4k_atom(B_from_mls, B_mls_trans, N);
-  }
+  int a_consumer_atom_mn = ResolveMlsConsumerMnAtom(
+      A_from_mls, A_mls_trans, M, K, block_size, target, element_bits);
+  int b_consumer_atom_mn = ResolveMlsConsumerMnAtom(
+      B_from_mls, B_mls_trans, N, K, block_size, target, element_bits);
   const int kMPerWarp = floors.m_per_warp;
   const int kNPerWarp = floors.n_per_warp;
   ICHECK(element_bits == 4 || element_bits == 8 || element_bits == 16 ||
@@ -258,7 +274,7 @@ HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
     float best_balance = std::numeric_limits<float>::max();
     int max_no_recompute_warps = (M / kMPerWarp) * (N / kNPerWarp);
     max_no_recompute_warps = std::min(max_no_recompute_warps, num_warps);
-    auto tiles_4k_atom = [](int block_mn, int warp_mn, int atom_mn) {
+    auto tiles_consumer_atom = [](int block_mn, int warp_mn, int atom_mn) {
       if (atom_mn == 0) {
         return true;
       }
@@ -283,8 +299,8 @@ HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
       if (M % (m * kMPerWarp) != 0 || N % (n * kNPerWarp) != 0) {
         continue;
       }
-      if (!tiles_4k_atom(M, m, a_nontrans_4k_atom_mn) ||
-          !tiles_4k_atom(N, n, b_nontrans_4k_atom_mn)) {
+      if (!tiles_consumer_atom(M, m, a_consumer_atom_mn) ||
+          !tiles_consumer_atom(N, n, b_consumer_atom_mn)) {
         continue;
       }
       float balance = std::abs(m_per_warp / n_per_warp - ideal_ratio);

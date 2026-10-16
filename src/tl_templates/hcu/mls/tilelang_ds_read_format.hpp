@@ -299,10 +299,12 @@ TL_DEVICE void ds_read_format_tensor_common(TL_LDS_ADDR void *smem_ptr,
 /* Linear LDS B[K,N] to GEMM-B VGPR layout using independent 32N x 16K panels.
  */
 template <typename BlockSize, ::tl::index_t TotalWarp, ::tl::index_t WarpN,
-          typename DataType>
+          typename DataType,
+          ::tl::index_t LdsStrideN = BlockSize::at(::tl::number<0>{})>
 TL_DEVICE void
-ds_read_format_tensor_b_linear(TL_LDS_ADDR DataType *smem_ptr, DataType *target,
-                               ::tl::index_t warp_id_offset = 0) {
+    ds_read_format_tensor_b_linear(TL_LDS_ADDR DataType *smem_ptr,
+                                   DataType *target,
+                                   ::tl::index_t warp_id_offset = 0) {
   static_assert(sizeof(DataType) == 2);
   static constexpr ::tl::index_t BlockN = BlockSize::at(::tl::number<0>{});
   static constexpr ::tl::index_t BlockK = BlockSize::at(::tl::number<1>{});
@@ -328,8 +330,8 @@ ds_read_format_tensor_b_linear(TL_LDS_ADDR DataType *smem_ptr, DataType *target,
       const ::tl::index_t panel_id = warp_n_idx * (PerWarpN / 32) + n_panel;
       const ::tl::index_t k_addr = k_tile * 16 + (lane >> 2);
       const ::tl::index_t n_addr = panel_id * 32 + (lane & 3) * 8;
-      auto value = ::tl::bit_cast<float32x4>(
-          ds_read_m32x16_b16_builtin(smem_ptr + k_addr * BlockN + n_addr, 0));
+      auto value = ::tl::bit_cast<float32x4>(ds_read_m32x16_b16_builtin(
+          smem_ptr + k_addr * LdsStrideN + n_addr, 0));
       *reinterpret_cast<FragmentType *>(
           target + (k_tile * PerWarpN / 16 + n_panel * 2) * FragmentLength) =
           reinterpret_cast<FragmentType *>(&value)[0];

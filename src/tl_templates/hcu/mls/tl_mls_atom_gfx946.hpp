@@ -373,6 +373,8 @@ struct gfx946_mls_16x256_trans_b4 {
                              const ::tl::int32x4_t &rsrc, ::tl::number<moffset>,
                              ::tl::bool_constant<r>,
                              ::tl::bool_constant<bps> = {}) {
+    // The transposed form has the same LDS destination layout, but t still
+    // selects the global-memory orientation used by resource/moffset.
     __builtin_hcu_matrix_load_256x16_b4(rsrc,
                                         reinterpret_cast<uint32_t *>(lds_addr),
                                         moffset, true, r, false, false, bps);
