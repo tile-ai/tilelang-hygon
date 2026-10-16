@@ -169,27 +169,32 @@ LayoutMap InferLayoutWithGemmDep(const DsReadFormatNode *self,
       *policy.get(), meta->gemm_m, meta->gemm_n, meta->gemm_k,
       meta->gemm_k_pack, element_bits, block_size, T.target, meta->a_from_mls,
       meta->b_from_mls, a_mls_trans, b_mls_trans, meta->min_m_per_warp,
-      meta->min_n_per_warp);
+      meta->min_n_per_warp, meta->gemm_mmac_k);
   int warp_m = policy->m_warp;
   int warp_n = policy->n_warp;
   int warp_k = policy->k_warp;
+  // ds_read_format has a fixed native fragment layout.  GEMM k_pack only
+  // controls how that fragment is consumed by one or more MMAC instructions;
+  // layout inference below must describe the producer rather than adapt it to
+  // the consumer.
+  constexpr int ds_layout_k_pack = 1;
   Fragment fragment;
   if (meta->feeds_slot == 0) {
     ICHECK_EQ(self->alt_, 1)
         << "ds_read_format Alt2 is currently supported only for GEMM B";
     fragment = makeGemmFragmentAHCU(meta->gemm_m, meta->gemm_n, meta->gemm_k,
                                     warp_m, warp_n, warp_k, element_bits,
-                                    meta->gemm_k_pack, meta->gemm_trans_a);
+                                    ds_layout_k_pack, meta->gemm_trans_a);
   } else if (self->alt_ == 2) {
     fragment = makeGemmFragmentBHCUInterleave2(
         meta->gemm_m, meta->gemm_n, meta->gemm_k, warp_m, warp_n, warp_k,
-        element_bits, meta->gemm_k_pack, meta->gemm_trans_b, floors.n_per_warp);
+        element_bits, ds_layout_k_pack, meta->gemm_trans_b, floors.n_per_warp);
   } else {
     ICHECK_EQ(self->alt_, 1)
         << "unsupported GEMM B ds_read_format Alt=" << self->alt_;
     fragment = makeGemmFragmentBHCU(
         meta->gemm_m, meta->gemm_n, meta->gemm_k, warp_m, warp_n, warp_k,
-        element_bits, meta->gemm_k_pack, meta->gemm_trans_b, floors.n_per_warp);
+        element_bits, ds_layout_k_pack, meta->gemm_trans_b, floors.n_per_warp);
   }
   auto layout = fragment->BindThreadRange(T.thread_bounds);
   if (T.layout_map.count(self->dst)) {
@@ -384,7 +389,8 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
         meta->gemm_k_pack, dst->dtype.bits(), block_size, T.target,
         meta->a_from_mls, meta->b_from_mls, !meta->gemm_trans_a,
         meta->gemm_trans_b, meta->min_m_per_warp,
-        feeds_a ? meta->min_n_per_warp : std::max(meta->min_n_per_warp, 32));
+        feeds_a ? meta->min_n_per_warp : std::max(meta->min_n_per_warp, 32),
+        meta->gemm_mmac_k);
     int warp_mn = feeds_a ? policy->m_warp : policy->n_warp;
     int warp_k = policy->k_warp;
     ICHECK_EQ(warp_k, 1) << "linear AN/BT ds_read requires WarpK == 1";
@@ -561,11 +567,11 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     GemmWarpPolicy policy(meta->gemm_policy);
     const bool a_mls_trans = !meta->gemm_trans_a;
     const bool b_mls_trans = meta->gemm_trans_b;
-    hcu::ComputeWarpPartitionHCU(*policy.get(), meta->gemm_m, meta->gemm_n,
-                                 meta->gemm_k, meta->gemm_k_pack, reg_bits,
-                                 block_size, T.target, meta->a_from_mls,
-                                 meta->b_from_mls, a_mls_trans, b_mls_trans,
-                                 meta->min_m_per_warp, meta->min_n_per_warp);
+    hcu::ComputeWarpPartitionHCU(
+        *policy.get(), meta->gemm_m, meta->gemm_n, meta->gemm_k,
+        meta->gemm_k_pack, reg_bits, block_size, T.target, meta->a_from_mls,
+        meta->b_from_mls, a_mls_trans, b_mls_trans, meta->min_m_per_warp,
+        meta->min_n_per_warp, meta->gemm_mmac_k);
     int warp_m = policy->m_warp;
     int warp_n = policy->n_warp;
     int warp_k_part = policy->k_warp;

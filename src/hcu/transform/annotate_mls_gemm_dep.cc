@@ -6,6 +6,7 @@
 
 #include "hcu/op/builtin.h"
 #include "hcu/op/ds_read_format.h"
+#include "hcu/op/gemm_partition.h"
 #include "hcu/op/mls.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/gemm_an_bt_lds_strategy.h"
@@ -302,7 +303,8 @@ bool HaveSameCopyStrategyParameters(const HcuGemmLdsCopyStrategy &lhs,
 }
 
 MlsGemmDepMeta BuildCopyToGemmLinearMeta(const GemmWithInput &consumer,
-                                         bool a_from_mls, bool b_from_mls) {
+                                         bool a_from_mls, bool b_from_mls,
+                                         Target target) {
   const GemmNode *gemm = consumer.gemm.get();
   const bool feeds_a = consumer.input.same_as(gemm->a_);
   ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
@@ -313,6 +315,7 @@ MlsGemmDepMeta BuildCopyToGemmLinearMeta(const GemmWithInput &consumer,
   node->gemm_n = gemm->n_;
   node->gemm_k = gemm->k_;
   node->gemm_k_pack = gemm->kPack_;
+  node->gemm_mmac_k = hcu::ResolveHcuMmacModeForGemm(gemm, target).mmac_k;
   node->gemm_trans_a = gemm->transA_;
   node->gemm_trans_b = gemm->transB_;
   if (gemm->policy_.defined())
@@ -1020,7 +1023,7 @@ private:
       auto gemm_with_input = PropagateToFindGemmConsumerOpWithInputAfterCall(
           ds->dst, collector_, call);
       if (gemm_with_input) {
-        auto meta = BuildMlsGemmDepMeta(*gemm_with_input, collector_);
+        auto meta = BuildMlsGemmDepMeta(*gemm_with_input, collector_, target_);
         auto annotations = call->annotations;
         annotations.Set(attr::kMlsGemmDep, meta);
         Call new_call(call->dtype, call->op, call->args, annotations,
@@ -1095,7 +1098,7 @@ private:
                                 IsLinearDsReadGemmInput(gemm, gemm->b_);
         annotations.Set(attr::kMlsGemmDep,
                         BuildCopyToGemmLinearMeta(consumer.value(), a_from_mls,
-                                                  b_from_mls));
+                                                  b_from_mls, target_));
         annotations.Set(attr::kHcuLinearDsRead, IntImm(DataType::Int(32), 1));
         if (has_layout) {
           annotations.Set(attr::kHcuLayoutDsRead, IntImm(DataType::Int(32), 1));
