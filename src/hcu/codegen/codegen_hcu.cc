@@ -23,10 +23,13 @@
 #include <utility>
 #include <vector>
 
+#include "hcu/distributed/backend.h"
 #include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "hcu/utils/mls_boundary.h"
+#include "op/builtin.h"
+#include "op/distributed.h"
 
 namespace tvm {
 namespace codegen {
@@ -469,6 +472,22 @@ PrimExpr GetBufferLoadLinearizedOffset(const BufferLoadNode *load) {
   return offset;
 }
 
+// Normal TileLang programs express a buffer slice as
+// address_of(BufferLoad), while low-level callers may pass a parameter pointer
+// directly. Both forms refer to the same kernel parameter for IPC validation.
+const VarNode *GetIpcRemoteSourceParameter(const PrimExpr &expr) {
+  if (const auto *var = expr.as<VarNode>()) {
+    return var;
+  }
+  const auto *call = expr.as<CallNode>();
+  if (!call || !call->op.same_as(builtin::address_of()) ||
+      call->args.size() != 1) {
+    return nullptr;
+  }
+  const auto *load = call->args[0].as<BufferLoadNode>();
+  return load ? load->buffer->data.get() : nullptr;
+}
+
 struct CPAsyncSourceInfo {
   const VarNode *buffer_var{nullptr};
   DataType elem_type;
@@ -807,6 +826,15 @@ void CodeGenTileLangHCU::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
 
 std::string CodeGenTileLangHCU::Finish() {
   decl_stream << "#include <hip/hip_runtime.h>\n";
+
+  if (uses_distributed_metadata_) {
+    const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
+    decl_stream << "#include <tl_templates/hcu/distributed/distributed.h>\n";
+    decl_stream << backend.ModulePreamble();
+    for (const auto &name : ipc_remote_source_param_names_) {
+      decl_stream << "// tilelang_ipc_remote_source: " << name << "\n";
+    }
+  }
 
   if (enable_fp8_) {
     decl_stream << "#include <tl_templates/hcu/hcu_fp8.h>\n";
@@ -3538,6 +3566,43 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << wmma_replacer.rewrite(call_wmma_code);
   } else if (op->op.same_as(builtin::thread_return())) {
     os << "return";
+  } else if (op->op.same_as(tl::get_rank())) {
+    const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
+    if (!backend.Supports(tl::hcu::DistributedCapability::kRankAndWorldSize)) {
+      TVM_FFI_THROW(ValueError)
+          << "HCU distributed backend " << backend.name()
+          << " does not support rank/world-size intrinsics";
+    }
+    uses_distributed_metadata_ = true;
+    os << backend.EmitRankExpr();
+  } else if (op->op.same_as(tl::get_num_ranks())) {
+    const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
+    if (!backend.Supports(tl::hcu::DistributedCapability::kRankAndWorldSize)) {
+      TVM_FFI_THROW(ValueError)
+          << "HCU distributed backend " << backend.name()
+          << " does not support rank/world-size intrinsics";
+    }
+    uses_distributed_metadata_ = true;
+    os << backend.EmitNumRanksExpr();
+  } else if (op->op.same_as(tl::get_block())) {
+    const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
+    if (!backend.Supports(tl::hcu::DistributedCapability::kBlockRemoteGet)) {
+      TVM_FFI_THROW(ValueError) << "HCU distributed backend " << backend.name()
+                                << " does not support block remote get";
+    }
+    ICHECK_EQ(op->args.size(), 4U);
+    if (const auto *source = GetIpcRemoteSourceParameter(op->args[0]);
+        source && kernel_param_vars_.count(source)) {
+      ipc_remote_source_param_names_.insert(source->name_hint);
+    } else {
+      TVM_FFI_THROW(ValueError)
+          << "HCU IPC get_block source must be a kernel parameter or "
+             "T.address_of(kernel_parameter[...])";
+    }
+    uses_distributed_metadata_ = true;
+    os << backend.EmitBlockGetExpr(
+        PrintExpr(op->args[0]), PrintExpr(op->args[1]), PrintExpr(op->args[2]),
+        PrintExpr(op->args[3]));
   } else if (op->op.same_as(tl::loop_break())) {
     this->PrintIndent();
     this->stream << "break;\n";
@@ -4200,6 +4265,12 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   buffer_ops_rebase_param_names_.clear();
   block_index_vars_.clear();
   thread_index_vars_.clear();
+  kernel_param_vars_.clear();
+  ipc_remote_source_param_names_.clear();
+  uses_distributed_metadata_ = false;
+  for (const tirx::Var &param : f->params) {
+    kernel_param_vars_.insert(param.get());
+  }
   PostOrderVisit(f->body, [&](const ObjectRef &object) {
     const auto *attr = object.as<AttrStmtNode>();
     if (!attr || attr->attr_key != tirx::attr::thread_extent)

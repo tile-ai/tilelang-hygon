@@ -26,6 +26,7 @@ class CodeGenTileLangHCU final : public CodeGenC {
 public:
   CodeGenTileLangHCU();
   std::string Finish();
+  bool UsesDistributedMetadata() const { return uses_distributed_metadata_; }
   void SetTarget(Target target) { target_ = std::move(target); }
   // override behavior
   void PrintFuncPrefix(std::ostream &os) final;
@@ -213,6 +214,9 @@ private:
   bool need_mma_h_{false};
   // whether need cast_smem_ptr_to_int helper function
   bool need_cast_smem_ptr_to_int_{false};
+  bool uses_distributed_metadata_{false};
+  std::unordered_set<std::string> ipc_remote_source_param_names_;
+  std::unordered_set<const VarNode *> kernel_param_vars_;
   // The name of the barrier array in shared memory
   const std::string barrier_name_ = "barrier";
   // The alignment of the barrier array in shared memory
