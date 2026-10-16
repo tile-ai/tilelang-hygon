@@ -265,6 +265,10 @@ class ThreadPartialSyncRewriter : public IRMutatorWithAnalyzer {
 public:
   static Stmt Rewrite(Stmt stmt, int warp_size = 32) {
     arith::Analyzer analyzer;
+    auto pass_ctx = tvm::transform::PassContext::Current();
+    if (auto cfg = pass_ctx->GetConfig(kZ3RLimit, ffi::Optional<Integer>())) {
+      analyzer.z3_prover.SetRLimit(static_cast<unsigned>(cfg.value()->value));
+    }
     ThreadPartialSyncRewriter rewriter(&analyzer, warp_size);
     return rewriter(std::move(stmt));
   }
