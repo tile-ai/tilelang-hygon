@@ -23,9 +23,9 @@
 #include <utility>
 #include <vector>
 
+#include "hcu/distributed/backend.h"
 #include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
-#include "hcu/distributed/backend.h"
 #include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "hcu/utils/mls_boundary.h"
 #include "op/builtin.h"
@@ -3581,16 +3581,18 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::get_rank())) {
     const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
     if (!backend.Supports(tl::hcu::DistributedCapability::kRankAndWorldSize)) {
-      TVM_FFI_THROW(ValueError) << "HCU distributed backend " << backend.name()
-                                << " does not support rank/world-size intrinsics";
+      TVM_FFI_THROW(ValueError)
+          << "HCU distributed backend " << backend.name()
+          << " does not support rank/world-size intrinsics";
     }
     uses_distributed_metadata_ = true;
     os << backend.EmitRankExpr();
   } else if (op->op.same_as(tl::get_num_ranks())) {
     const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
     if (!backend.Supports(tl::hcu::DistributedCapability::kRankAndWorldSize)) {
-      TVM_FFI_THROW(ValueError) << "HCU distributed backend " << backend.name()
-                                << " does not support rank/world-size intrinsics";
+      TVM_FFI_THROW(ValueError)
+          << "HCU distributed backend " << backend.name()
+          << " does not support rank/world-size intrinsics";
     }
     uses_distributed_metadata_ = true;
     os << backend.EmitNumRanksExpr();
@@ -3610,8 +3612,9 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
              "T.address_of(kernel_parameter[...])";
     }
     uses_distributed_metadata_ = true;
-    os << backend.EmitBlockGetExpr(PrintExpr(op->args[0]), PrintExpr(op->args[1]),
-                                   PrintExpr(op->args[2]), PrintExpr(op->args[3]));
+    os << backend.EmitBlockGetExpr(
+        PrintExpr(op->args[0]), PrintExpr(op->args[1]), PrintExpr(op->args[2]),
+        PrintExpr(op->args[3]));
   } else if (op->op.same_as(tl::loop_break())) {
     this->PrintIndent();
     this->stream << "break;\n";
