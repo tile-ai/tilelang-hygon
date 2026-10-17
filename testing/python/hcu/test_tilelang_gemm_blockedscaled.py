@@ -193,6 +193,7 @@ def matmul_blockscaled(
     scale_copy_threads=None,
     a_dtype="float4_e2m1fn",
     b_dtype=None,
+    scale_k_major=False,
 ):
     """Block-scaled GEMM with optional ScaleView slicing and MLS operands.
 
@@ -220,6 +221,9 @@ def matmul_blockscaled(
     if scale_format_name is None:
         assert op_ctrl == 0, "interleaved copy_scale cases must select scale_format_name explicitly"
         scale_format_name = "identity"
+    if scale_k_major:
+        assert scale_format_name == "identity", "K-major scales use a linear Identity LDS buffer"
+        assert scale_stages == 1, "K-major scale test path currently expects one LDS stage"
     selected_scale_format_name = scale_format_name
     scale_format = {
         "identity": T.scale_identity,
@@ -230,15 +234,15 @@ def matmul_blockscaled(
         "mn4": T.scale_mn4_interleaved,
     }[selected_scale_format_name]()
 
-    ScaleA_tile = (scale_ka, scale_m)
-    ScaleB_tile = (scale_kb, scale_n)
+    ScaleA_tile = (scale_m, scale_ka) if scale_k_major else (scale_ka, scale_m)
+    ScaleB_tile = (scale_n, scale_kb) if scale_k_major else (scale_kb, scale_n)
     ScaleA_logical_parent = (scale_ka + k_pad, scale_m + mn_pad)
     ScaleB_logical_parent = (scale_kb + k_pad, scale_n + mn_pad)
 
     def physical_scale_shape(logical_shape):
         sk, smn = logical_shape
         if selected_scale_format_name == "identity":
-            return (sk, smn)
+            return (smn, sk) if scale_k_major else (sk, smn)
         if selected_scale_format_name == "k2":
             assert sk % 2 == 0
             return (sk // 2, smn, 2)
@@ -318,7 +322,10 @@ def matmul_blockscaled(
                     T.copy(A[by * block_M, k * block_K], A_shared)
                     T.copy(B[bx * block_N, k * block_K], B_shared)
                 if selected_scale_format_name == "identity":
-                    if scale_stages == 1:
+                    if scale_k_major:
+                        T.copy(ScaleA, ScaleA_lds[mn_pad:, k_pad:])
+                        T.copy(ScaleB, ScaleB_lds[mn_pad:, k_pad:])
+                    elif scale_stages == 1:
                         if scale_load_mode == "async_copy":
                             if scale_copy_threads is None:
                                 T.async_copy(ScaleA, ScaleA_lds[k_pad:, mn_pad:])
@@ -398,7 +405,10 @@ def matmul_blockscaled(
                 if scale_load_mode == "async_copy":
                     T.ptx_wait_group(0)
                     T.sync_threads()
-                if scale_stages == 1:
+                if scale_k_major:
+                    ScaleA_view = ScaleA_lds[mn_pad:, k_pad:]
+                    ScaleB_view = ScaleB_lds[mn_pad:, k_pad:]
+                elif scale_stages == 1:
                     ScaleA_view = T.scale_view(
                         ScaleA_lds,
                         logical_shape=ScaleA_logical_parent,
@@ -442,8 +452,12 @@ def matmul_blockscaled(
                         logical_shape=ScaleB_logical_parent,
                         format=scale_format,
                     )
-                T.copy_scale(ScaleA_view[k_pad:, mn_pad:], ScaleA_sbuf, op_ctrl=op_ctrl)
-                T.copy_scale(ScaleB_view[k_pad:, mn_pad:], ScaleB_sbuf, op_ctrl=op_ctrl)
+                if scale_k_major:
+                    T.copy_scale(ScaleA_view, ScaleA_sbuf, op_ctrl=op_ctrl)
+                    T.copy_scale(ScaleB_view, ScaleB_sbuf, op_ctrl=op_ctrl)
+                else:
+                    T.copy_scale(ScaleA_view[k_pad:, mn_pad:], ScaleA_sbuf, op_ctrl=op_ctrl)
+                    T.copy_scale(ScaleB_view[k_pad:, mn_pad:], ScaleB_sbuf, op_ctrl=op_ctrl)
                 if use_mls:
                     T.ptx_wait_group(0)
                     T.sync_warp()
@@ -464,8 +478,8 @@ def matmul_blockscaled(
                     sf_a_granularity_k=sf_a_granularity_k,
                     sf_b_granularity_n=sf_b_granularity_n,
                     sf_b_granularity_k=sf_b_granularity_k,
-                    a_scale_k_major=False,
-                    b_scale_k_major=False,
+                    a_scale_k_major=scale_k_major,
+                    b_scale_k_major=scale_k_major,
                 )
             T.copy(C_local, C[by * block_M, bx * block_N])
 
@@ -780,6 +794,258 @@ def test_gemm_blockscaled_preferred_async_parallel_scale_uses_linear_mn_inner():
     assert re.search(r"mmac_scale_fp4_body<[^>]+, 64, -?\d+, 1, 1>", source)
 
 
+def _make_scale_pipeline_program(num_stages, *, use_scale_view=False, prefer_async=True):
+    m = n = 256
+    k = 512
+    block_k = 128
+    scale_k = block_k // 32
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((m, k), "float4_e2m1fn"),
+        B: T.Tensor((n, k), "float4_e2m1fn"),
+        ScaleA: T.Tensor((k // 32, m), "uint8"),
+        ScaleB: T.Tensor((k // 32, n), "uint8"),
+        C: T.Tensor((m, n), "float32"),
+    ):
+        with T.Kernel(1, threads=256):
+            A_shared = T.alloc_shared((m, block_k), "float4_e2m1fn")
+            B_shared = T.alloc_shared((n, block_k), "float4_e2m1fn")
+            ScaleA_lds = T.alloc_shared((scale_k, m), "uint8")
+            ScaleB_lds = T.alloc_shared((scale_k, n), "uint8")
+            ScaleA_sbuf = T.alloc_scale_buffer((scale_k, m), "uint8")
+            ScaleB_sbuf = T.alloc_scale_buffer((scale_k, n), "uint8")
+            C_local = T.alloc_fragment((m, n), "float32")
+            T.clear(C_local)
+            for ko in T.Pipelined(k // block_k, num_stages=num_stages):
+                T.copy(A[0, ko * block_k], A_shared, prefer_instruction="matrix_load")
+                T.copy(B[0, ko * block_k], B_shared, prefer_instruction="matrix_load")
+                if prefer_async:
+                    with T.Parallel(scale_k, m, prefer_async=True) as (sk, sm):
+                        ScaleA_lds[sk, sm] = ScaleA[ko * scale_k + sk, sm]
+                    with T.Parallel(scale_k, n, prefer_async=True) as (sk, sn):
+                        ScaleB_lds[sk, sn] = ScaleB[ko * scale_k + sk, sn]
+                else:
+                    T.copy(ScaleA[ko * scale_k, 0], ScaleA_lds)
+                    T.copy(ScaleB[ko * scale_k, 0], ScaleB_lds)
+                if use_scale_view:
+                    ScaleA_view = T.scale_view(
+                        ScaleA_lds,
+                        logical_shape=(scale_k, m),
+                        format=T.scale_identity(),
+                    )
+                    ScaleB_view = T.scale_view(
+                        ScaleB_lds,
+                        logical_shape=(scale_k, n),
+                        format=T.scale_identity(),
+                    )
+                    T.copy_scale(ScaleA_view, ScaleA_sbuf)
+                    T.copy_scale(ScaleB_view, ScaleB_sbuf)
+                else:
+                    T.copy_scale(ScaleA_lds, ScaleA_sbuf)
+                    T.copy_scale(ScaleB_lds, ScaleB_sbuf)
+                T.gemm_blockscaled(
+                    A_shared,
+                    B_shared,
+                    C_local,
+                    ScaleA_sbuf,
+                    ScaleB_sbuf,
+                    transpose_B=True,
+                    sf_a_granularity_m=1,
+                    sf_a_granularity_k=32,
+                    sf_b_granularity_n=1,
+                    sf_b_granularity_k=32,
+                )
+            T.copy(C_local, C)
+
+    return main
+
+
+@requires_blockscaled
+@pytest.mark.parametrize("use_scale_view", [False, True], ids=["plain", "scale_view"])
+@pytest.mark.parametrize("num_stages", [1, 2], ids=["stage1", "stage2"])
+def test_gemm_blockscaled_preferred_async_scale_pipeline_syncs(use_scale_view, num_stages):
+    """Managed scale copies have the expected waits/syncs and numerical result."""
+    m = n = 256
+    k = 512
+    gran_k = 32
+    main = _make_scale_pipeline_program(num_stages, use_scale_view=use_scale_view)
+    captures = {}
+
+    @tvm.ir.instrument.pass_instrument
+    class CapturePipelineIR:
+        def run_after_pass(self, mod, info):
+            if info.name in {
+                "tl.PipelinePlanning",
+                "tl.InsertScaleBufferSync",
+                "tl.ThreadSync",
+            }:
+                captures[info.name] = str(mod)
+
+    target = tvm.target.Target({"kind": "hcu", "mcpu": "gfx946"})
+    with target, tvm.transform.PassContext(instruments=[CapturePipelineIR()]):
+        tl.lower(main, target=target)
+
+    planned = captures["tl.PipelinePlanning"]
+    assert 'software_pipeline_async_producers": [1, 1, 1, 1, 0, 0, 0]' in planned
+    assert 'software_pipeline_async_producer_groups": [2, 2, 0, 1, -1, -1, -1]' in planned
+
+    synchronized = captures["tl.InsertScaleBufferSync"]
+    gemm_count = synchronized.count("T.gemm_blockscaled(")
+    copy_scale_count = synchronized.count("T.copy_scale(")
+    assert gemm_count > 0
+    assert copy_scale_count > 0
+    assert (
+        len(
+            re.findall(
+                r"T\.ptx_wait_group\(\d+\)(?:(?!T\.copy_scale|T\.gemm_blockscaled).)*T\.copy_scale\(",
+                synchronized,
+                re.S,
+            )
+        )
+        == copy_scale_count
+    )
+    assert (
+        len(
+            re.findall(
+                r'T\.tvm_storage_sync\("shared"\)(?:(?!T\.gemm_blockscaled).)*T\.gemm_blockscaled\(',
+                synchronized,
+                re.S,
+            )
+        )
+        == gemm_count
+    )
+
+    # Merged shared-memory aliases retain their byte offsets.  In particular,
+    # disjoint A/B MLS destinations must not gain a barrier between the two
+    # loads merely because they share the final shared.dyn allocation.
+    thread_synchronized = captures["tl.ThreadSync"]
+    assert not re.search(
+        r'"_tl_mls_h_0"(?:(?!tl::mls::async_load).)*'
+        r'T\.tvm_storage_sync\("shared\.dyn"\)(?:(?!tl::mls::async_load).)*'
+        r'"_tl_mls_h_1"',
+        thread_synchronized,
+        re.S,
+    )
+
+    kernel = tl.compile(main, out_idx=[4])
+    A_logical, B_logical, A, B = _make_fp4_inputs(m, n, k)
+    ScaleA, ScaleB = _make_e8m0_scales(k // gran_k, m, n)
+    scale_m = torch.arange(m, device=ScaleA.device)
+    scale_n = torch.arange(n, device=ScaleB.device)
+    for ki in range(k // gran_k):
+        ScaleA[ki] = (125 + (ki * 2 + scale_m * 3) % 5).to(torch.uint8)
+        ScaleB[ki] = (125 + (ki * 3 + scale_n * 2) % 5).to(torch.uint8)
+
+    profiler = kernel.get_profiler()
+    torch.cuda.synchronize()
+    lib_out = profiler.func(A, B, ScaleA, ScaleB)
+    torch.cuda.synchronize()
+    ref = blockscaled_fp4_cpu_ref(
+        A_logical,
+        B_logical,
+        ScaleA,
+        ScaleB,
+        sf_a_granularity_m=1,
+        sf_a_granularity_k=gran_k,
+        sf_b_granularity_n=1,
+        sf_b_granularity_k=gran_k,
+    )
+    _check_blockscaled_out(lib_out.cpu(), ref)
+
+
+@requires_blockscaled
+def test_gemm_blockscaled_scale_view_sync_copy_pipeline_keeps_auto_layout():
+    """A non-async staged ScaleView still receives a searched plane layout."""
+    main = _make_scale_pipeline_program(num_stages=2, use_scale_view=True, prefer_async=False)
+    captures = {}
+
+    @tvm.ir.instrument.pass_instrument
+    class CapturePipelineIR:
+        def run_after_pass(self, mod, info):
+            if info.name in {"tl.PipelinePlanning", "tl.InsertScaleBufferSync"}:
+                captures[info.name] = str(mod)
+
+    target = tvm.target.Target({"kind": "hcu", "mcpu": "gfx946"})
+    with target, tvm.transform.PassContext(instruments=[CapturePipelineIR()]):
+        tl.lower(main, target=target)
+
+    planned = captures["tl.PipelinePlanning"]
+    assert 'software_pipeline_async_producers": [1, 1, 0, 0, 0, 0, 0]' in planned
+    assert 'software_pipeline_async_producer_groups": [0, 0, -1, -1, -1, -1, -1]' in planned
+
+    synchronized = captures["tl.InsertScaleBufferSync"]
+    gemm_count = synchronized.count("T.gemm_blockscaled(")
+    copy_scale_count = synchronized.count("T.copy_scale(")
+    assert gemm_count > 0
+    assert copy_scale_count == gemm_count * 2
+    assert not re.search(
+        r"T\.ptx_wait_group\(\d+\)(?:(?!T\.copy_scale|T\.gemm_blockscaled).)*T\.copy_scale\(",
+        synchronized,
+        re.S,
+    )
+    assert (
+        len(
+            re.findall(
+                r'T\.tvm_storage_sync\("shared"\)(?:(?!T\.gemm_blockscaled).)*T\.gemm_blockscaled\(',
+                synchronized,
+                re.S,
+            )
+        )
+        == gemm_count
+    )
+
+    kernel = tl.compile(main, out_idx=[4])
+    source = kernel.get_kernel_source()
+    assert "TLGeneratedScaleLdsLayout_" in source
+    assert re.search(r"CalculateOffset\([^)]*\).*?return [^;]*\^", source, re.S)
+
+    m = n = 256
+    k = 512
+    gran_k = 32
+    A_logical, B_logical, A, B = _make_fp4_inputs(m, n, k)
+    ScaleA, ScaleB = _make_e8m0_scales(k // gran_k, m, n)
+    scale_m = torch.arange(m, device=ScaleA.device)
+    scale_n = torch.arange(n, device=ScaleB.device)
+    for ki in range(k // gran_k):
+        ScaleA[ki] = (125 + (ki * 2 + scale_m * 3) % 5).to(torch.uint8)
+        ScaleB[ki] = (125 + (ki * 3 + scale_n * 2) % 5).to(torch.uint8)
+    lib_out = kernel.get_profiler().func(A, B, ScaleA, ScaleB).cpu()
+    ref = blockscaled_fp4_cpu_ref(
+        A_logical,
+        B_logical,
+        ScaleA,
+        ScaleB,
+        sf_a_granularity_m=1,
+        sf_a_granularity_k=gran_k,
+        sf_b_granularity_n=1,
+        sf_b_granularity_k=gran_k,
+    )
+    _check_blockscaled_out(lib_out, ref)
+
+
+@requires_blockscaled
+def test_gemm_blockscaled_scale_sync_respects_disabled_thread_storage_sync():
+    """The HCU-specific scale sync follows the common auto-sync switch."""
+    captures = {}
+
+    @tvm.ir.instrument.pass_instrument
+    class CaptureScaleSyncIR:
+        def run_after_pass(self, mod, info):
+            if info.name == "tl.InsertScaleBufferSync":
+                captures[info.name] = str(mod)
+
+    target = tvm.target.Target({"kind": "hcu", "mcpu": "gfx946"})
+    config = {tl.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True}
+    main = _make_scale_pipeline_program(num_stages=2)
+    with target, tvm.transform.PassContext(config=config, instruments=[CaptureScaleSyncIR()]):
+        tl.lower(main, target=target)
+
+    synchronized = captures["tl.InsertScaleBufferSync"]
+    assert "T.gemm_blockscaled(" in synchronized
+    assert 'T.tvm_storage_sync("shared")' not in synchronized
+
+
 @requires_blockscaled
 def test_gemm_blockscaled_rejects_non_linear_async_scale_layout():
     """An async-copy destination cannot carry an explicit swizzled layout."""
@@ -1004,6 +1270,92 @@ def test_gemm_blockscaled_interleaved_k4_correctness(
     )
     _check_blockscaled_out(lib_out, ref)
     print(f"[blockscaled-interleaved] op_ctrl={op_ctrl} origin=({mn_pad}, {k_pad}) max_abs_diff={(lib_out - ref).abs().max().item()}")
+
+
+@requires_blockscaled
+@pytest.mark.parametrize(
+    "op_ctrl,k_pad,explicit_unpacked_ds_read,expected_mmac_k",
+    [
+        pytest.param(1, 2, False, 64, id="native_fp4_opctrl1"),
+        pytest.param(2, 4, False, 64, id="native_fp4_opctrl2"),
+        pytest.param(1, 2, True, 32, id="f8f6f4_opctrl1"),
+        pytest.param(2, 4, True, 32, id="f8f6f4_opctrl2"),
+    ],
+)
+def test_gemm_blockscaled_kmajor_identity_opctrl_correctness(op_ctrl, k_pad, explicit_unpacked_ds_read, expected_mmac_k):
+    """K-major Identity LDS packs consecutive K scales without reformatting."""
+    M = N = 64
+    K = block_K = 128
+    gran_k = 32
+    mn_pad = 16
+    program = matmul_blockscaled(
+        M=M,
+        N=N,
+        K=K,
+        block_M=M,
+        block_N=N,
+        block_K=block_K,
+        mn_pad=mn_pad,
+        k_pad=k_pad,
+        op_ctrl=op_ctrl,
+        sf_a_granularity_m=1,
+        sf_a_granularity_k=gran_k,
+        sf_b_granularity_n=1,
+        sf_b_granularity_k=gran_k,
+        threads=128,
+        num_stages=0,
+        use_mls=explicit_unpacked_ds_read,
+        scale_format_name="identity",
+        explicit_unpacked_ds_read=explicit_unpacked_ds_read,
+        scale_k_major=True,
+    )
+    kernel = tl.compile(program, out_idx=[4], verbose=True)
+    source = kernel.get_kernel_source()
+    assert f"ds_scale_copy<{op_ctrl}, 0," in source
+    assert ", 1, 1, 2, " in source
+    assert f", {expected_mmac_k}, 0>" in source
+
+    A_logical, B_logical, A, B = _make_fp4_inputs(M, N, K)
+    ScaleA, ScaleB = _make_e8m0_scales(K // gran_k, M, N, non_unit_scale=True)
+    ScaleA_kmajor = ScaleA.T.contiguous()
+    ScaleB_kmajor = ScaleB.T.contiguous()
+    lib_out = kernel.get_profiler().func(A, B, ScaleA_kmajor, ScaleB_kmajor).cpu()
+    ref = blockscaled_fp4_cpu_ref(
+        A_logical,
+        B_logical,
+        ScaleA_kmajor,
+        ScaleB_kmajor,
+        sf_a_granularity_m=1,
+        sf_a_granularity_k=gran_k,
+        sf_b_granularity_n=1,
+        sf_b_granularity_k=gran_k,
+        a_scale_k_major=True,
+        b_scale_k_major=True,
+        transpose_B=True,
+    )
+    _check_blockscaled_out(lib_out, ref)
+
+
+@requires_blockscaled
+@pytest.mark.parametrize("op_ctrl", [1, 2])
+def test_gemm_blockscaled_kmajor_opctrl_rejects_reused_scale(op_ctrl):
+    """Packed copy cannot materialize duplicate rows for a reused K scale."""
+    program = matmul_blockscaled(
+        M=64,
+        N=64,
+        K=128,
+        block_M=64,
+        block_N=64,
+        block_K=128,
+        op_ctrl=op_ctrl,
+        sf_a_granularity_k=64,
+        sf_b_granularity_k=64,
+        threads=128,
+        scale_format_name="identity",
+        scale_k_major=True,
+    )
+    with pytest.raises(tvm.TVMError, match="duplicated across MMAC scale rows"):
+        tl.compile(program, out_idx=[4])
 
 
 @requires_blockscaled

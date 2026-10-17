@@ -267,6 +267,7 @@ template <>
 struct mls_atom_for_tile<16, 16, true, 32, 32, ::tl::hcu_target_enum::gfx92a> {
   using Type = tl::mls::gfx946_mls_16x16_trans_b32;
 };
+
 #endif
 
 // Primary: no specialization

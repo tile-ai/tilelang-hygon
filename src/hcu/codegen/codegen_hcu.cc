@@ -3202,6 +3202,18 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
         use_lts = imm && imm->value != 0;
       }
       lts = use_lts ? ", 1" : ", 0";
+    } else if (prefix == "16x16x4_f32") {
+      // The unified native-f32 K4 builtin exposes LTS as an optional argument
+      // instead of encoding it in the builtin name.  Emit the argument
+      // explicitly so generated code always shows whether transposition is
+      // enabled.
+      bool use_lts = false;
+      auto lts_hint = op->annotations.find("tl.hcu_use_lts");
+      if (lts_hint != op->annotations.end()) {
+        const auto *imm = (*lts_hint).second.as<IntImmNode>();
+        use_lts = imm && imm->value != 0;
+      }
+      lts = use_lts ? ", 1" : ", 0";
     }
     if (prefix.find("_f8f6f4") != std::string::npos) {
       auto real_a_dtype =
