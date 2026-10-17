@@ -108,8 +108,8 @@ void ValidateScaleStageBroadcastLayout(const Layout &layout,
       FlattenLayoutOffset(layout, zx) + FlattenLayoutOffset(layout, z0);
   interaction = analyzer->Simplify(interaction);
   ICHECK(analyzer->CanProveEqual(interaction, make_zero(interaction.dtype())))
-      << "copy_scale ScaleView stage dimensions must be broadcast-only in "
-         "annotated layout; stage/plane coordinates may not be mixed, got "
+      << "copy_scale stage dimensions must be broadcast-only in annotated "
+         "layout; stage/plane coordinates may not be mixed, got "
       << interaction << " from layout " << layout->DebugOutput();
 }
 
@@ -230,13 +230,12 @@ LayoutMap CopyScaleNode::InferLayout(const LayoutInferArgs &T,
              "layout; an explicit non-linear T.annotate_layout is not "
              "supported";
     }
-    if (has_scale_view_) {
-      const auto format = static_cast<ScaleLdsFormat>(scale_format_);
-      const size_t format_rank = ScaleFormatPhysicalRank(format);
-      ICHECK_GE(src->shape.size(), format_rank);
-      ValidateScaleStageBroadcastLayout(
-          T.layout_map[src], src->shape.size() - format_rank, T.analyzer);
-    }
+    const auto format = static_cast<ScaleLdsFormat>(scale_format_);
+    const size_t plane_rank =
+        has_scale_view_ ? ScaleFormatPhysicalRank(format) : 2;
+    ICHECK_GE(src->shape.size(), plane_rank);
+    ValidateScaleStageBroadcastLayout(
+        T.layout_map[src], src->shape.size() - plane_rank, T.analyzer);
     return result;
   }
   Optional<Layout> automatic = lds_from_async_copy_
@@ -354,10 +353,19 @@ Stmt CopyScaleNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   ICHECK_EQ(src->shape.size(), sr)
       << "copy_scale physical src buffer rank must match its access region";
 
+  const size_t plane_rank =
+      has_scale_view_ ? ScaleFormatPhysicalRank(scale_format) : 2;
+  ICHECK_GE(sr, plane_rank);
+  size_t leading_stage_dims = sr - plane_rank;
+  for (size_t i = 0; i < leading_stage_dims; ++i) {
+    const int64_t *extent = as_const_int(src_ranges[i]->extent);
+    ICHECK(extent && *extent == 1)
+        << "copy_scale leading stage dimensions must be single indices";
+  }
+
   PrimExpr origin_mn;
   PrimExpr origin_k;
   PrimExpr src_elem_offset;
-  size_t leading_stage_dims = 0;
   const int64_t *parent_mn_c = nullptr;
   const int64_t *parent_k_c = nullptr;
 
@@ -376,21 +384,6 @@ Stmt CopyScaleNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         << "ScaleView Parent/Tile shapes must be static";
     ICHECK_EQ(*tile_k_c, scale_shape_k);
     ICHECK_EQ(*tile_mn_c, scale_shape_mn);
-    size_t format_rank = 0;
-    if (scale_format == ScaleLdsFormat::kIdentity) {
-      format_rank = 2;
-    } else if (scale_format == ScaleLdsFormat::kK2MN2Interleave) {
-      format_rank = 5;
-    } else {
-      format_rank = 3;
-    }
-    ICHECK_GE(sr, format_rank);
-    leading_stage_dims = sr - format_rank;
-    for (size_t i = 0; i < leading_stage_dims; ++i) {
-      const int64_t *extent = as_const_int(src_ranges[i]->extent);
-      ICHECK(extent && *extent == 1)
-          << "ScaleView leading stage dimensions must be single indices";
-    }
     if (scale_format == ScaleLdsFormat::kIdentity) {
       ICHECK_EQ(op_ctrl_, 0)
           << "identity ScaleView requires copy_scale op_ctrl=0";
@@ -499,7 +492,7 @@ Stmt CopyScaleNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       << "copy_scale resolved layout input shape must match the true physical "
          "LDS Buffer shape; layout="
       << resolved_layout->DebugOutput() << ", buffer shape=" << src->shape;
-  if (has_scale_view_ && leading_stage_dims != 0) {
+  if (leading_stage_dims != 0) {
     Array<PrimExpr> layout_inputs;
     DataType idx_dtype = src->DefaultIndexType();
     for (size_t i = 0; i < sr; ++i) {
@@ -518,7 +511,13 @@ Stmt CopyScaleNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     }
     src_elem_offset = analyzer->Simplify(src_elem_offset);
   }
-  auto src_ptr = src_phys.access_ptr(1, DataType::Handle(), 1, src_elem_offset);
+  PrimExpr src_plane_extent = make_const(src_elem_offset.dtype(), 1);
+  for (size_t i = leading_stage_dims; i < sr; ++i) {
+    src_plane_extent =
+        src_plane_extent * Cast(src_plane_extent.dtype(), src->shape[i]);
+  }
+  auto src_ptr = src_phys.access_ptr(1, DataType::Handle(), 1, src_elem_offset,
+                                     src_plane_extent);
   hcu::GeneratedLayoutFunctor generated_layout = hcu::MakeLayoutOffsetFunctor(
       resolved_layout, src->dtype, analyzer, "TLGeneratedScaleLdsLayout_",
       leading_stage_dims);
