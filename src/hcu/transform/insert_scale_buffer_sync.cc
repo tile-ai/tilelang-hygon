@@ -50,6 +50,12 @@ bool ContainsWarpSpecialization(const Stmt &body) {
 }
 
 bool IsSharedStorageSync(const Stmt &stmt) {
+  if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
+    return IsSharedStorageSync(realize->block->body);
+  }
+  if (const auto *block = stmt.as<SBlockNode>()) {
+    return IsSharedStorageSync(block->body);
+  }
   const auto *eval = stmt.as<EvaluateNode>();
   if (eval == nullptr) {
     return false;
@@ -79,6 +85,19 @@ bool IsBlockscaledGemmEvaluate(const EvaluateNode *op) {
   return gemm->sfaRegion_.defined() && gemm->sfbRegion_.defined();
 }
 
+bool IsBlockscaledGemmStmt(const Stmt &stmt) {
+  if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
+    return IsBlockscaledGemmStmt(realize->block->body);
+  }
+  if (const auto *block = stmt.as<SBlockNode>()) {
+    return IsBlockscaledGemmStmt(block->body);
+  }
+  if (const auto *eval = stmt.as<EvaluateNode>()) {
+    return IsBlockscaledGemmEvaluate(eval);
+  }
+  return false;
+}
+
 Stmt MakeSharedSync() {
   return Evaluate(Call(DataType::Int(32), builtin::tvm_storage_sync(),
                        {StringImm("shared")}));
@@ -97,16 +116,14 @@ private:
     bool seq_changed = false;
     for (size_t i = 0; i < op->seq.size(); ++i) {
       Stmt cur = StmtExprMutator::VisitStmt(op->seq[i]);
-      if (const auto *eval = cur.as<EvaluateNode>()) {
-        if (IsBlockscaledGemmEvaluate(eval)) {
-          bool need_sync = true;
-          if (!seq.empty() && IsSharedStorageSync(seq.back())) {
-            need_sync = false;
-          }
-          if (need_sync) {
-            seq.push_back(MakeSharedSync());
-            seq_changed = true;
-          }
+      if (IsBlockscaledGemmStmt(cur)) {
+        bool need_sync = true;
+        if (!seq.empty() && IsSharedStorageSync(seq.back())) {
+          need_sync = false;
+        }
+        if (need_sync) {
+          seq.push_back(MakeSharedSync());
+          seq_changed = true;
         }
       }
       seq.push_back(cur);
@@ -127,7 +144,11 @@ tvm::transform::Pass InsertScaleBufferSync() {
   using namespace tirx::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     (void)m;
-    (void)ctx;
+    bool disable_thread_storage_sync =
+        ctx->GetConfig(kDisableThreadStorageSync, Bool(false)).value()->value;
+    if (disable_thread_storage_sync) {
+      return f;
+    }
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
     if (!target.defined() || !TargetIsHCU(target.value())) {
       return f;
