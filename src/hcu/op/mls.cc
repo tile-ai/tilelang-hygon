@@ -213,6 +213,23 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
   return Integer(leading_count * packed_bytes);
 }
 
+static Integer MlsDstActualPlaneExtentElems(const Buffer &dst,
+                                            Integer actual_size_bytes) {
+  int64_t leading_count = 1;
+  for (size_t i = 0; i + 2 < dst->shape.size(); ++i) {
+    const int64_t *dim = as_const_int(dst->shape[i]);
+    ICHECK(dim != nullptr)
+        << "MLS actual LDS footprint requires static leading dimensions";
+    leading_count *= *dim;
+  }
+  const int64_t bits_per_elem = DTypeStorageBits(dst->dtype);
+  ICHECK_EQ((actual_size_bytes->value * 8) % (leading_count * bits_per_elem), 0)
+      << "MLS actual LDS footprint must be representable in access_ptr "
+         "element units";
+  return Integer((actual_size_bytes->value * 8) /
+                 (leading_count * bits_per_elem));
+}
+
 Optional<PrimExpr> TryGetMlsPackedLeadingElemOffset(
     const Buffer &buffer, const Array<Range> &ranges, int mls_tile_mn,
     int mls_tile_k, bool trans, Target target, int lds_physical_bits) {
@@ -770,8 +787,16 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
     }
   }
 
-  auto dst_ptr =
-      dst_buf.access_ptr(2, DataType::Handle(), 1, dst_leading_elem_offset);
+  Optional<Integer> actual_size_bytes = TryGetMlsDstActualSizeBytes(
+      dst_buf, tile_mn, tile_k, mls_trans, T.target, lds_physical_bits);
+  PrimExpr dst_plane_extent = dst_buf->shape[dr - 2] * dst_buf->shape[dr - 1];
+  if (actual_size_bytes) {
+    dst_plane_extent =
+        cast(dst_leading_elem_offset.dtype(),
+             MlsDstActualPlaneExtentElems(dst_buf, actual_size_bytes.value()));
+  }
+  auto dst_ptr = dst_buf.access_ptr(2, DataType::Handle(), 1,
+                                    dst_leading_elem_offset, dst_plane_extent);
 
   Array<PrimExpr> call_args;
   call_args.push_back(StringImm(ss.str()));
@@ -788,8 +813,7 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
   async_annotations.Set(tl::attr::kAsyncSharedWrite, Integer(1));
   Stmt stmt = Evaluate(Call(DataType::Handle(), builtin::call_extern(),
                             call_args, async_annotations));
-  if (auto actual_size_bytes = TryGetMlsDstActualSizeBytes(
-          dst_buf, tile_mn, tile_k, mls_trans, T.target, lds_physical_bits)) {
+  if (actual_size_bytes) {
     Map<String, PrimExpr> actual_size_bytes_map;
     actual_size_bytes_map.Set(dst_buf->data->name_hint,
                               actual_size_bytes.value());
