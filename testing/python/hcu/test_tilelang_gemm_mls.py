@@ -8,6 +8,8 @@ import tilelang as tl
 import tilelang.language as T
 import tilelang.testing
 import torch
+from tilelang import tvm
+from tilelang.hcu.transform import HoistMlsResource
 from perf.gemm.gemm_wasp import gemm_wasp_mls_4p4c4c_persistent
 from hcu_test_utils import (
     current_hcu_arch_string,
@@ -2496,6 +2498,314 @@ def test_gemm_mls_n_major_b_ds_read_alt2_packed_b16_matrix_store_b32(
     actual = output.cpu()
     expected = (a.float() @ b.float()).to(torch_dtype)
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+# MLS hoisting regressions: constant origins and WDRA forward-delta paths.
+MLS_LOAD = (
+    "tl::mls::mls_load_tile<tl::sequence<256, 64>, tl::sequence<16, 64>, 4, 1, half_t, 1, true, tl::hcu_target_enum::gfx946, 16, 0, -1>"
+)
+
+
+def _hoist(func):
+    mod = tvm.IRModule.from_expr(func.with_attr("global_symbol", "main"))
+    # Exercise the absolute rebase path independently of forward-delta policy.
+    with tvm.transform.PassContext(config={"tl.enable_hcu_wdra": False}):
+        return HoistMlsResource()(mod)["main"].script()
+
+
+def test_moving_mn_preserves_distinct_constant_k_origins():
+    @T.prim_func
+    def before(A: T.Tensor((1024, 128), "float16"), S: T.Tensor((256, 64), "float16")):
+        for block_iter in T.serial(4):
+            T.call_extern("handle", MLS_LOAD, A.data, 128, 1024, 128, block_iter * 256, 0, S.data)
+            T.call_extern("handle", MLS_LOAD, A.data, 128, 1024, 128, block_iter * 256, 64, S.data)
+
+    script = _hoist(before)
+    assert script.count('"tl::mls::set_window_origin"') == 2
+    assert '"tl::mls::update_mn_base<' not in script
+    assert script.index('"tl::mls::set_window_origin"') > script.index("for block_iter")
+    assert "block_iter * 256, 64" in script
+
+
+@pytest.mark.parametrize("mn_tiles", [2, 3, 4])
+def test_k_outer_unrolled_mn_keeps_each_origin(mn_tiles):
+    @T.prim_func
+    def before(A: T.Tensor((mn_tiles * 256, 512), "float16"), S: T.Tensor((256, 64), "float16")):
+        for k_iter in T.serial(8):
+            for mn_iter in T.unroll(mn_tiles):
+                T.call_extern("handle", MLS_LOAD, A.data, 512, mn_tiles * 256, 512, mn_iter * 256, k_iter * 64, S.data)
+
+    mod = tvm.IRModule.from_expr(before.with_attr("global_symbol", "main"))
+    mod = tvm.tirx.transform.UnrollLoop()(mod)
+    mod = tvm.tirx.transform.Simplify()(mod)
+    script = _hoist(mod["main"])
+    assert "for mn_iter" not in script
+    assert script.count('"tl::mls::resource_init<') == mn_tiles
+    assert script.count('"tl::mls::set_window_origin"') == mn_tiles
+    assert script.count('"tl::mls::update_k_base<') == mn_tiles
+    assert '"tl::mls::update_mn_base<' not in script
+
+
+@pytest.mark.parametrize("pairs", [2, 3, 4])
+def test_shared_mn_keeps_k_only_rebase(pairs):
+    k = pairs * 128
+
+    @T.prim_func
+    def before(A: T.Tensor((1024, k), "float16"), S: T.Tensor((256, 64), "float16")):
+        for block_iter in T.serial(4):
+            for k_pair in T.serial(pairs):
+                T.call_extern("handle", MLS_LOAD, A.data, k, 1024, k, block_iter * 256, k_pair * 128, S.data)
+                T.call_extern("handle", MLS_LOAD, A.data, k, 1024, k, block_iter * 256, k_pair * 128 + 64, S.data)
+
+    script = _hoist(before)
+    assert script.count('"tl::mls::set_window_origin"') == 1
+    assert script.count('"tl::mls::update_k_base<') == 2
+    assert script.index('"tl::mls::set_window_origin"') < script.index("for k_pair")
+
+
+def test_shared_constant_k_keeps_mn_only_rebase():
+    @T.prim_func
+    def before(A: T.Tensor((1024, 128), "float16"), S: T.Tensor((256, 64), "float16")):
+        for block_iter in T.serial(4):
+            T.call_extern("handle", MLS_LOAD, A.data, 128, 1024, 128, block_iter * 256, 64, S.data)
+
+    script = _hoist(before)
+    assert script.count('"tl::mls::set_window_origin"') == 1
+    assert '"tl::mls::update_mn_base<' in script
+
+
+def _forward_ir(func, unroll=False):
+    mod = tvm.IRModule.from_expr(func.with_attr("global_symbol", "main"))
+    if unroll:
+        mod = tvm.tirx.transform.UnrollLoop()(mod)
+        mod = tvm.tirx.transform.Simplify()(mod)
+    with tvm.transform.PassContext(config={"tl.enable_hcu_wdra": True}):
+        return HoistMlsResource()(mod)["main"].script()
+
+
+@pytest.mark.parametrize("pairs", [2, 3, 4, 7])
+@pytest.mark.parametrize("origin", [0, 64])
+def test_forward_k_pingpong_two_sources(pairs, origin):
+    extent = pairs * 128 + origin
+
+    @T.prim_func
+    def before(
+        A: T.Tensor((1024, extent), "float16"),
+        B: T.Tensor((1024, extent), "float16"),
+        P: T.Tensor((256, 64), "float16"),
+        Q: T.Tensor((256, 64), "float16"),
+    ):
+        for mn in T.serial(4):
+            for k in T.serial(pairs):
+                T.call_extern("handle", MLS_LOAD, A.data, extent, 1024, extent, mn * 256, origin + k * 128, P.data)
+                T.call_extern("handle", MLS_LOAD, B.data, extent, 1024, extent, mn * 256, origin + k * 128, P.data)
+                T.call_extern("handle", MLS_LOAD, A.data, extent, 1024, extent, mn * 256, origin + k * 128 + 64, Q.data)
+                T.call_extern("handle", MLS_LOAD, B.data, extent, 1024, extent, mn * 256, origin + k * 128 + 64, Q.data)
+
+    script = _forward_ir(before)
+    assert script.count('"tl::mls::resource_init<') == 2
+    assert script.count('"tl::mls::move_k_base<') == 4
+    assert '"tl::mls::update_k_base<' not in script
+    assert script.count('"tl::mls::set_window_origin"') == 2
+
+
+@pytest.mark.parametrize("tiles", [2, 3, 5])
+@pytest.mark.parametrize("unroll", [False, True])
+def test_forward_mn_or_unrolled_separate_resources(tiles, unroll):
+    @T.prim_func
+    def before(A: T.Tensor((tiles * 256, 512), "float16"), P: T.Tensor((256, 64), "float16")):
+        for k in T.serial(8):
+            for mn in T.unroll(tiles) if unroll else T.serial(tiles):
+                T.call_extern("handle", MLS_LOAD, A.data, 512, tiles * 256, 512, mn * 256, k * 64, P.data)
+
+    script = _forward_ir(before, unroll=unroll)
+    if unroll:
+        assert script.count('"tl::mls::resource_init<') == tiles
+        assert script.count('"tl::mls::move_k_base<') == tiles
+    else:
+        assert script.count('"tl::mls::resource_init<') == 1
+        assert script.count('"tl::mls::move_mn_base<') == 1
+
+
+@pytest.mark.parametrize("pairs", [1, 2, 3, 4])
+def test_fully_unrolled_k_uses_complete_windows(pairs):
+    extent = pairs * 128
+
+    @T.prim_func
+    def before(A: T.Tensor((1024, extent), "float16"), P: T.Tensor((256, 64), "float16")):
+        for mn in T.serial(4):
+            for k in T.unroll(pairs * 2):
+                T.call_extern("handle", MLS_LOAD, A.data, extent, 1024, extent, mn * 256, k * 64, P.data)
+
+    script = _forward_ir(before, unroll=True)
+    assert '"tl::mls::move_k_base<' not in script
+    assert '"tl::mls::move_mn_base<' not in script, script
+    assert script.count('"tl::mls::set_window_origin"') == pairs * 2
+
+
+def _integer_inputs(m, n, k):
+    generator = torch.Generator().manual_seed(321 + m + n + k)
+    a = torch.randint(-3, 4, (m, k), generator=generator).half()
+    b = torch.randint(-3, 4, (k, n), generator=generator).half()
+    return a, b
+
+
+def _check_exact(actual, expected, label):
+    actual = actual.cpu().float()
+    diff = (actual - expected).abs()
+    bad = (diff != 0) | ~torch.isfinite(actual)
+    print(f"{label} max_abs={diff.max().item()} atol=0 rtol=0 mismatches={bad.sum().item()}/{bad.numel()}", flush=True)
+    if bad.any():
+        index = tuple(bad.nonzero()[0].tolist())
+        print(f"first_mismatch={index} actual={actual[index].item()} expected={expected[index].item()}", flush=True)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(current_hcu_arch_string() != "gfx946", reason="gfx946 model regression")
+@pytest.mark.parametrize(
+    "kind", ["k_inner", "mn_inner", "prefetch", "reverse", "unroll_k", "unroll_mn", "early_unroll_k", "early_unroll_mn"]
+)
+@pytest.mark.parametrize("tiles", [2, 3, 5])
+def test_forward_delta_copy(kind, tiles):
+    m, k = 768, tiles * 64
+
+    @T.prim_func
+    def program(A: T.Tensor((m, k), "float16"), C: T.Tensor((m, k), "float16")):
+        with T.Kernel(1, threads=512):
+            tx = T.get_thread_binding()
+            S = T.alloc_shared((256, 64), "float16")
+            F = T.alloc_fragment((256, 64), "float16")
+            if tx < 256:
+                T.set_max_nreg(124, 0)
+                if kind in ("mn_inner", "unroll_mn", "early_unroll_mn"):
+                    for ki in T.serial(tiles):
+                        for mi in T.unroll(3) if kind in ("unroll_mn", "early_unroll_mn") else T.serial(3):
+                            T.matrix_load(A[mi * 256, ki * 64], S)
+                            T.ptx_wait_group(0)
+                            T.ebarrier_sync_cnt(0, 4)
+                            T.ds_read_format(S, F)
+                            T.copy(F, C[mi * 256, ki * 64])
+                            T.ebarrier_sync_cnt(0, 4)
+                else:
+                    for mi in T.serial(3):
+                        if kind == "prefetch":
+                            T.matrix_load(A[mi * 256, 0], S)
+                            T.ptx_wait_group(0)
+                            T.ebarrier_sync_cnt(0, 4)
+                            T.ds_read_format(S, F)
+                            T.copy(F, C[mi * 256, 0])
+                            T.ebarrier_sync_cnt(0, 4)
+                        for ki in (
+                            T.unroll(tiles)
+                            if kind in ("unroll_k", "early_unroll_k")
+                            else T.serial(tiles - (1 if kind == "prefetch" else 0))
+                        ):
+                            kk = (tiles - 1 - ki) if kind == "reverse" else ki + (1 if kind == "prefetch" else 0)
+                            T.matrix_load(A[mi * 256, kk * 64], S)
+                            T.ptx_wait_group(0)
+                            T.ebarrier_sync_cnt(0, 4)
+                            T.ds_read_format(S, F)
+                            T.copy(F, C[mi * 256, kk * 64])
+                            T.ebarrier_sync_cnt(0, 4)
+            else:
+                T.set_max_nreg(4, 0)
+
+    if kind.startswith("early_unroll"):
+        mod = tvm.IRModule.from_expr(program.with_attr("global_symbol", "main"))
+        program = tvm.tirx.transform.Simplify()(tvm.tirx.transform.UnrollLoop()(mod))["main"]
+    kernel = tl.compile(
+        program,
+        out_idx=[1],
+        pass_configs={
+            tl.PassConfigKey.TL_ENABLE_HCU_WDRA: True,
+            tl.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+            tl.PassConfigKey.TL_DEVICE_COMPILE_FLAGS: ["-mllvm=-turn-off-wdra-trap-handler=true"],
+        },
+    )
+    source = kernel.get_kernel_source()
+    print(
+        f"COPY {kind} tiles={tiles} move_k={source.count('move_k_base')} move_mn={source.count('move_mn_base')} set_window={source.count('set_window_origin')}",
+        flush=True,
+    )
+    if kind == "reverse":
+        assert "move_k_base" not in source
+        assert "update_k_base" in source
+    elif kind == "mn_inner":
+        assert "move_mn_base" in source
+    elif kind == "k_inner" or (kind == "prefetch" and tiles > 2):
+        assert "move_k_base" in source
+    a = ((torch.arange(m * k).reshape(m, k) * 13 + 7) % 1999 - 999).half()
+    actual = kernel(a.cuda()).cpu()
+    if not torch.equal(actual, a):
+        print(f"repeats_first_k_tile={torch.equal(actual, a[:, :64].repeat(1, tiles))}", flush=True)
+    _check_exact(actual, a.float(), f"{kind} {m, k}")
+
+
+@pytest.mark.skipif(current_hcu_arch_string() != "gfx946", reason="gfx946 WASP regression")
+@pytest.mark.parametrize("matrix_store", [False, True])
+@pytest.mark.parametrize("k", [64, 128, 192, 256, 320, 384, 448, 512, 576, 960, 1024])
+def test_forward_wasp_signed_pingpong(k, matrix_store):
+    _run_wasp_signed(768, 768, k, 4, matrix_store, check_path=True)
+
+
+@pytest.mark.skipif(current_hcu_arch_string() != "gfx946", reason="gfx946 WASP regression")
+@pytest.mark.parametrize("m,n", [(768, 256), (256, 768)])
+@pytest.mark.parametrize("k", [128, 192, 256])
+@pytest.mark.parametrize("matrix_store", [False, True])
+def test_forward_wasp_linear_mn(m, n, k, matrix_store):
+    # A one-column/one-row output grid gives a linear persistent MN walk.
+    _run_wasp_signed(m, n, k, 1, matrix_store, check_path=False)
+
+
+def _run_wasp_signed(m, n, k, persistent, matrix_store, check_path):
+    kernel = gemm_wasp_mls_4p4c4c_persistent(m, n, k, num_persistent_blocks=persistent, use_matrix_store=matrix_store)
+    source = kernel.get_kernel_source()
+    print(
+        f"WASP_SOURCE {m, n, k} persistent={persistent} move_k={source.count('move_k_base')} move_mn={source.count('move_mn_base')} set_window={source.count('set_window_origin')}",
+        flush=True,
+    )
+    if check_path and k >= 256:
+        assert "move_k_base" in source
+        assert "update_k_base" not in source
+    elif check_path and k in (128, 192):
+        assert "move_k_base" not in source
+        assert source.count("set_window_origin") == 2 * (k // 64)
+    a, b = _integer_inputs(m, n, k)
+    expected = (a.float() @ b.float()).half().float()
+    _check_exact(kernel(a.cuda(), b.T.contiguous().cuda()), expected, f"WASP {m, n, k} persistent={persistent} matrix={matrix_store}")
+
+
+@pytest.mark.skipif(current_hcu_arch_string() != "gfx946", reason="requires gfx946 WDRA/MLS")
+@pytest.mark.parametrize("matrix_store", [False, True], ids=["copy", "matrix"])
+@pytest.mark.parametrize(
+    "m,n,k,persistent",
+    [
+        # The K sweep is covered by test_forward_wasp_signed_pingpong.
+        (1792, 2048, 128, 48),  # original packaged reproducer
+    ],
+)
+def test_gemm_wasp_packaged_constant_k_regression(m, n, k, persistent, matrix_store):
+    # Generate on CPU so the model runs only the GEMM, not RNG/reference
+    # kernels. Both reference and device receive exactly the same FP16 data.
+    inner = torch.arange(k)[None, :]
+    a = (((torch.arange(m)[:, None] * 17 + inner * 13) % 1024).float() / 1023).half()
+    b = (((torch.arange(n)[:, None] * 19 + inner * 23) % 1024).float() / 1023).half()
+    expected = (a.float() @ b.float().T).half().float()
+    kernel = gemm_wasp_mls_4p4c4c_persistent(m, n, k, num_persistent_blocks=persistent, use_matrix_store=matrix_store)
+    actual = kernel(a.cuda(), b.cuda()).cpu().float()
+    absolute = (actual - expected).abs()
+    denominator = actual.abs() + expected.abs()
+    relative = absolute / denominator.clamp_min(torch.finfo(torch.float32).tiny)
+    threshold = 2**-11
+    mismatches = int((relative > threshold).sum())
+    nonfinite = int((~torch.isfinite(actual)).sum())
+    summary = (
+        f"M={m} N={n} K={k} persistent={persistent} matrix_store={matrix_store} "
+        f"max_abs={absolute.max().item()} max_symmetric_relative={relative.max().item()} "
+        f"threshold={threshold} mismatches={mismatches}/{actual.numel()} nonfinite={nonfinite}"
+    )
+    print(summary, flush=True)
+    assert nonfinite == 0 and mismatches == 0, summary
 
 
 if __name__ == "__main__":
