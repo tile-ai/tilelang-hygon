@@ -339,9 +339,7 @@ def _hcu_device_lib_probe(rocm_root: str, device_lib_override: str, code_object_
         # New aicc (clang 22) defaults to code-object ABI 6, while some DTK
         # versions only ship oclc_abi_version_{400,500}.bc: pin COV 5 when the
         # device library we point at has no ABI-6 bitcode.
-        has_abi6 = device_lib_path is not None and os.path.isfile(
-            os.path.join(device_lib_path, "oclc_abi_version_6.bc")
-        )
+        has_abi6 = device_lib_path is not None and os.path.isfile(os.path.join(device_lib_path, "oclc_abi_version_6.bc"))
         code_object_version = None if has_abi6 or device_lib_path is None else 5
 
     probe = HcuDeviceLibProbe(

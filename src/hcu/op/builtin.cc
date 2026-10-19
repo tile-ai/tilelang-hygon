@@ -55,8 +55,9 @@ TIR_DEFINE_HCU_BUILTIN(hcu_wmma_store, -1, kOpaque);
 #undef TIR_DEFINE_HCU_BUILTIN
 
 namespace {
-// Tell backend-agnostic passes that a wait on the HCU side is tl.async_gld_fence.
-// Defined after the op itself so registration order inside this unit is fixed.
+// Tell backend-agnostic passes that a wait on the HCU side is
+// tl.async_gld_fence. Defined after the op itself so registration order inside
+// this unit is fixed.
 const bool async_gld_fence_registered = [] {
   RegisterAsyncWaitOp(async_gld_fence());
   return true;

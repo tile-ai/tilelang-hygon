@@ -75,33 +75,19 @@ def Pipelined(
     ann: dict[str, Any] = dict(annotations) if annotations is not None else {}
     if register_stages is not None:
         if type(register_stages) is not int or register_stages < 2:
-            raise ValueError(
-                f"register_stages must be an int >= 2, but got {register_stages!r}."
-            )
+            raise ValueError(f"register_stages must be an int >= 2, but got {register_stages!r}.")
         existing = ann.get("num_register_stages")
         if existing is not None and int(existing) != register_stages:
-            raise ValueError(
-                "register_stages conflicts with annotations['num_register_stages'] "
-                f"({register_stages} vs {existing})."
-            )
+            raise ValueError(f"register_stages conflicts with annotations['num_register_stages'] ({register_stages} vs {existing}).")
         ann["num_register_stages"] = register_stages
     if warp_divergence is not None:
         if not isinstance(warp_divergence, bool):
-            raise TypeError(
-                f"warp_divergence must be a bool, but got {type(warp_divergence)}."
-            )
+            raise TypeError(f"warp_divergence must be a bool, but got {type(warp_divergence)}.")
         if warp_divergence and not _loop_requests_register_pipeline(ann):
-            raise ValueError(
-                "warp_divergence requires a register pipeline; pass "
-                "register_stages (>= 2) on the same loop."
-            )
+            raise ValueError("warp_divergence requires a register pipeline; pass register_stages (>= 2) on the same loop.")
         existing = ann.get("enable_warp_divergence")
         if existing is not None and bool(existing) != warp_divergence:
-            raise ValueError(
-                "warp_divergence conflicts with "
-                "annotations['enable_warp_divergence'] "
-                f"({warp_divergence} vs {existing})."
-            )
+            raise ValueError(f"warp_divergence conflicts with annotations['enable_warp_divergence'] ({warp_divergence} vs {existing}).")
         ann["enable_warp_divergence"] = 1 if warp_divergence else 0
     return _common_Pipelined(
         start,

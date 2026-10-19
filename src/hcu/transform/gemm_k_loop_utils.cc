@@ -4,8 +4,8 @@
 #include "hcu/utils/extern_call_checker.h"
 #include "op/builtin.h"
 #include "op/utils.h"
-#include "transform/common/pipeline_utils.h"
 #include "rocm/op/builtin.h"
+#include "transform/common/pipeline_utils.h"
 
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>

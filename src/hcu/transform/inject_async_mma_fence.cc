@@ -9,13 +9,13 @@
  * participating waves.
  */
 
-#include "hcu/transform/gemm_k_loop_utils.h"
-#include "transform/common/pipeline_utils.h"
 #include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
+#include "hcu/transform/gemm_k_loop_utils.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "rocm/op/builtin.h"
+#include "transform/common/pipeline_utils.h"
 
 #include <algorithm>
 

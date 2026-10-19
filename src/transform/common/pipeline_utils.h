@@ -101,7 +101,8 @@ inline bool LoopAnnotationIsTruthy(const ForNode *loop, const char *key) {
  * enable_register_pipeline flag asking for the default depth.
  */
 inline bool LoopRequestsRegisterPipeline(const ForNode *loop) {
-  if (auto num_register_stages = ReadLoopAnnotationAsInt(loop, kNumRegisterStages)) {
+  if (auto num_register_stages =
+          ReadLoopAnnotationAsInt(loop, kNumRegisterStages)) {
     return num_register_stages.value() > 1;
   }
   return LoopAnnotationIsTruthy(loop, kEnableRegisterPipeline);

@@ -3,12 +3,12 @@
  * \brief Split a register-pipelined K loop across two warp groups.
  */
 
-#include "hcu/transform/gemm_k_loop_utils.h"
-#include "transform/common/pipeline_utils.h"
 #include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
+#include "hcu/transform/gemm_k_loop_utils.h"
 #include "op/builtin.h"
 #include "tir/transforms/ir_utils.h"
+#include "transform/common/pipeline_utils.h"
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/builtin.h>
