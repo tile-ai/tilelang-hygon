@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 import tilelang as tl
-from tilelang.profiler import do_bench_cudagraph
+from tilelang.profiler import do_bench
 
 from perf.gemm.kernel_registry import dispatch_kernel, get_kernel_config
 from perf.utils.device import get_free_devices
@@ -76,7 +76,7 @@ def _bench_candidate(
         def ref_program(a, b):
             return a @ b
 
-    latency = do_bench_cudagraph(tilelang_run)
+    latency = do_bench(tilelang_run, backend="cudagraph")
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
     tflops = 2 * M * N * K / latency * 1e-9
     return latency, tflops

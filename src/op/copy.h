@@ -32,18 +32,21 @@ public:
   Buffer src, dst;                   // Source and destination buffers
   Array<Range> src_range, dst_range; // Ranges for each dimension in src and dst
   Optional<PrimExpr> dst_block;      // Destination block index for cluster copy
+  // Annotated source OOB fallback value resolved from the enclosing block.
+  Optional<PrimExpr> src_oob_safe_value;
   Map<String, ObjectRef> annotations; // Backend/pass-specific annotations.
   // Common SIMT annotation keys:
   //   - "coalesced_width": IntImm, width for coalesced memory access.
   //   - "dst_block": PrimExpr, destination CTA rank for cluster copy.
-  //   - attr::kIsAsyncCopy ("is_async_copy"): IntImm, explicit async copy.
   //   - attr::kParallelLoopLayout ("parallel_loop_layout"): Fragment, loop
   //     layout hint applied to the outermost generated parallel loop of this
   //     copy's SIMT loop nest.
 
   mutable ParallelOp par_op_; // Optional associated parallelization operator
 
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Copy", CopyNode, TileOperatorNode);
+  // Non-final so dialects can extend the copy with typed backend state
+  // (e.g. AscendCopyNode in src/ascend/op/copy.h).
+  TVM_FFI_DECLARE_OBJECT_INFO("tl.Copy", CopyNode, TileOperatorNode);
 
   static void RegisterReflection() {
     namespace refl = reflection;
@@ -53,6 +56,7 @@ public:
         .def_ro("src_range", &CopyNode::src_range)
         .def_ro("dst_range", &CopyNode::dst_range)
         .def_ro("dst_block", &CopyNode::dst_block)
+        .def_ro("src_oob_safe_value", &CopyNode::src_oob_safe_value)
         .def_ro("annotations", &CopyNode::annotations);
   }
 
@@ -165,43 +169,6 @@ public:
   static const Op &Get();
 };
 
-inline bool GetCopyBoolAnnotation(const Map<String, ObjectRef> &annotations,
-                                  const char *key) {
-  if (auto val = annotations.Get(key)) {
-    if (auto int_val = val->as<IntImmNode>()) {
-      return int_val->value != 0;
-    }
-  }
-  return false;
-}
-
-inline bool
-HasExplicitAsyncCopySemantics(const Map<String, ObjectRef> &annotations) {
-  if (GetCopyBoolAnnotation(annotations, attr::kIsAsyncCopy)) {
-    return true;
-  }
-  return GetCopyBoolAnnotation(annotations, "force_cp_async");
-}
-
-inline bool HasExplicitAsyncCopySemantics(const CopyNode &op) {
-  return HasExplicitAsyncCopySemantics(op.annotations);
-}
-
-inline bool HasExplicitAsyncCopySemantics(const Call &call) {
-  if (!call->op.as<OpNode>()) {
-    return false;
-  }
-  Op tir_op = Downcast<Op>(call->op);
-  static const Op &async_copy = Op::Get("tl.tileop.async_copy");
-  if (tir_op.same_as(async_copy)) {
-    return true;
-  }
-  if (!tir_op.same_as(Copy::Get())) {
-    return false;
-  }
-  return HasExplicitAsyncCopySemantics(call->annotations);
-}
-
 /*!
  * \brief Special operator for Im2Col transformation.
  *
@@ -217,7 +184,7 @@ public:
   int padding_;  // Padding amount
   int dilation_; // Dilation factor
   int kernel_;   // Kernel size
-  int eviction_policy_;                // Cache eviction policy
+  int eviction_policy_ = 0;            // Cache eviction policy (annotation)
   PrimExpr nhw_step_;                  // Step size in NHW dimensions
   PrimExpr c_step_;                    // Step size in channel dimension
   Map<String, ObjectRef> annotations_; // Annotations from Call node

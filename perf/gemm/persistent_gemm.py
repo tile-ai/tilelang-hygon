@@ -5,35 +5,7 @@ Persistent GEMM implementation.
 import torch
 import tilelang as tl
 import tilelang.language as T
-from tilelang.intrinsics import get_swizzle_layout
-from tvm import DataType
 from perf.gemm.utils import _generate_configs_from_product, _run_autotuner
-
-
-def make_block_swizzle_layout(buffer, block_m, block_n, swizzle_bytes=128):
-    """Create a layout that applies the swizzle inside each block tile.
-
-    The transform splits a global index (i, j) into tile and local indices,
-    applies make_mmac_swizzle_layout to the local indices (within block_m x block_n),
-    and maps back to global coordinates.
-    If the block tile isn't swizzleable for the given dtype, return identity.
-    """
-    dtype = buffer.dtype
-    shape = buffer.shape
-    # Check if swizzle is possible for the block width
-    can_swizzle = (block_n * DataType(dtype).bits) % 512 == 0
-    if not can_swizzle:
-        return T.Layout(shape, lambda *args: args)
-
-    def transform(i, j):
-        tile_i = i // block_m
-        tile_j = j // block_n
-        local_i = i % block_m
-        local_j = j % block_n
-        new_local_i, new_local_j = get_swizzle_layout(local_i, local_j, block_n, dtype, swizzle_bytes)
-        return tile_i * block_m + new_local_i, tile_j * block_n + new_local_j
-
-    return T.Layout(shape, transform)
 
 
 def get_persistent_configs(M, N, K):

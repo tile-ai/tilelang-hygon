@@ -5,6 +5,8 @@ import example_gemm_autotune
 import example_gemm_persistent
 
 
+# Uses tl.ptx_ldmatrix, which is NVIDIA PTX-only.
+@tilelang.testing.requires_cuda
 def test_example_gemm_intrinsics():
     example_gemm_intrinsics.main(M=1024, N=1024, K=1024)
 

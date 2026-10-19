@@ -30,24 +30,22 @@ def _gemm_async_copy_vanilla(
 
     @T.macro
     def async_copy_a(A, A_shared, by, k_tile):
-        T.copy(
+        T.async_copy(
             A[
                 by * block_M : (by + 1) * block_M,
                 k_tile * block_K : (k_tile + 1) * block_K,
             ],
             A_shared,
-            enable_async=True,
         )
 
     @T.macro
     def async_copy_b(B, B_shared, bx, k_tile):
-        T.copy(
+        T.async_copy(
             B[
                 k_tile * block_K : (k_tile + 1) * block_K,
                 bx * block_N : (bx + 1) * block_N,
             ],
             B_shared,
-            enable_async=True,
         )
 
     @T.prim_func

@@ -16,6 +16,7 @@ tilelang-hygon supports almost all upstream TileLang syntax.
 
 ## Latest News
 
+- **v0.1.15-release** — Based on TileLang v0.1.15 for Hygon HCU. Use `build.sh` for source builds.
 - **v0.1.12-release** — Based on TileLang v0.1.12 for Hygon HCU. Use `build.sh` for source builds.
 - **v0.1.9-release** — Based on TileLang v0.1.9 for Hygon HCU. Use `build.sh` for source builds.
 
@@ -61,17 +62,19 @@ Below is the upstream GEMM example with layout annotation, pipelining, and optio
 import tilelang
 import tilelang.language as T
 
+
 # Default / auto selects HCU on Hygon HCU; or pass target="hcu" explicitly.
 @tilelang.jit
 def matmul_relu(
-    A, B,
+    A,
+    B,
     block_M: int = 64,
     block_N: int = 64,
     block_K: int = 64,
     dtype: T.dtype = T.float16,
     accum_dtype: T.dtype = T.float32,
 ):
-    M, N, K = T.const('M, N, K')
+    M, N, K = T.const("M, N, K")
 
     A: T.Tensor[[M, K], dtype]
     B: T.Tensor[[K, N], dtype]

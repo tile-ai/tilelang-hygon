@@ -5,12 +5,12 @@
 
 #include "ds_read_format.h"
 #include "gemm_partition.h"
+#include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
 #include "layout/utils.h"
 #include "mls.h"
-#include "op/builtin.h"
 #include "op/gemm.h"
-#include "op/region.h"
+#include "op/utils.h"
 #include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
@@ -26,42 +26,26 @@ using namespace ffi;
 
 namespace {
 
-// Pipeline versioning keeps logical regions as [stage, ...spatial], while
-// LowerTileOp remaps fragments onto layout OutputShape (often dropping the
-// spatial rank). Offset the remapped buffer with an index vector that matches
-// its rank: leading extras from the region, remaining axes zero.
+// The m32x16/linear specialization may see a shared stage dimension in front
+// of the K×MN tile. That dimension is a stage only when the buffer and the
+// region both carry it.
 PrimExpr LeadingPipelineElemOffset(const Buffer &buf,
                                    const Array<Range> &ranges) {
   const size_t region_rank = ranges.size();
   const size_t buf_rank = buf->shape.size();
   ICHECK_GE(region_rank, 2U);
-  ICHECK_GE(buf_rank, 1U);
+  ICHECK_EQ(buf_rank, region_rank)
+      << "linear ds_read leading offset requires buffer `" << buf->name
+      << "` to have the same rank as its region, got buffer rank " << buf_rank
+      << " and region rank " << region_rank;
   Array<PrimExpr> indices;
   indices.reserve(buf_rank);
   const DataType idx_dtype = buf->DefaultIndexType();
-  const size_t extra = region_rank - 2;
-  if (buf_rank == region_rank) {
-    for (size_t i = 0; i + 2 < region_rank; ++i) {
-      indices.push_back(ranges[i]->min);
-    }
-    indices.push_back(make_zero(idx_dtype));
-    indices.push_back(make_zero(idx_dtype));
-  } else if (buf_rank < region_rank) {
-    const size_t n_lead = extra < buf_rank ? extra : buf_rank;
-    for (size_t i = 0; i < n_lead; ++i) {
-      indices.push_back(ranges[i]->min);
-    }
-    while (indices.size() < buf_rank) {
-      indices.push_back(make_zero(idx_dtype));
-    }
-  } else {
-    for (size_t i = 0; i + 2 < region_rank; ++i) {
-      indices.push_back(ranges[i]->min);
-    }
-    while (indices.size() < buf_rank) {
-      indices.push_back(make_zero(idx_dtype));
-    }
+  for (size_t i = 0; i + 2 < region_rank; ++i) {
+    indices.push_back(ranges[i]->min);
   }
+  indices.push_back(make_zero(idx_dtype));
+  indices.push_back(make_zero(idx_dtype));
   Array<PrimExpr> offs = buf.OffsetOf(indices);
   ICHECK_EQ(offs.size(), 1u);
   return offs[0];
@@ -252,21 +236,16 @@ DsReadFormat::DsReadFormat(Array<PrimExpr> args,
                            Map<String, ObjectRef> annotations) {
   ICHECK(args.size() >= 2)
       << "ds_read_format expects at least 2 args: src_region, dst_region";
-  auto src_call = args[0].as<CallNode>();
-  auto dst_call = args[1].as<CallNode>();
-  ICHECK(src_call) << "ds_read_format args[0] must be region call (src)";
-  ICHECK(dst_call) << "ds_read_format args[1] must be region call (dst)";
-
-  auto src_region = RegionOp(src_call->args);
-  auto dst_region = RegionOp(dst_call->args);
-  auto src_ranges = src_region->GetRanges();
-  auto dst_ranges = dst_region->GetRanges();
+  BufferRegion src_region = NormalizeToBufferRegion(args[0]);
+  BufferRegion dst_region = NormalizeToBufferRegion(args[1]);
+  auto src_ranges = src_region->region;
+  auto dst_ranges = dst_region->region;
 
   ICHECK(src_ranges.size() >= 2) << "ds_read_format src region must be 2D";
   ICHECK(dst_ranges.size() >= 2) << "ds_read_format dst region must be 2D";
 
-  Buffer src_buf = src_region->GetBuffer();
-  Buffer dst_buf = dst_region->GetBuffer();
+  Buffer src_buf = src_region->buffer;
+  Buffer dst_buf = dst_region->buffer;
   ICHECK(src_buf.scope() == "shared" || src_buf.scope() == "shared.dyn")
       << "ds_read_format src must be shared memory, got scope="
       << src_buf.scope();
@@ -320,7 +299,15 @@ LayoutMap DsReadFormatNode::InferLayout(const LayoutInferArgs &T,
     result = InferLayoutWithGemmDep(this, gemm_dep_.get(), T);
   } else {
     const bool trans = true;
-    auto [block_mn, block_k] = MlsBlockDims(dst, trans);
+    // Traditional MLS path: the destination fragment carries the [MN, K]
+    // spatial dims directly. Versioned views belong to the m32x16
+    // specialization below, which reaches this op through gemm_dep.
+    ICHECK_EQ(dst->shape.size(), 2U)
+        << "traditional ds_read_format expects a rank-2 destination "
+           "fragment, got rank "
+        << dst->shape.size();
+    int64_t block_mn = *as_const_int(dst->shape[0]);
+    int64_t block_k = *as_const_int(dst->shape[1]);
     int block_size = static_cast<int>(*as_const_int(T.thread_bounds->extent));
     DsReadMlsPhysicalInfo info =
         InferDsReadMlsPhysicalInfo(src, trans, block_size, T.target);
@@ -396,7 +383,15 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   int64_t read_mn = *read_mn_c;
   int64_t read_k = *read_k_c;
 
-  auto [frag_mn, frag_k] = MlsBlockDims(dst, ds_trans);
+  // Fragment / gemm tile must match the read extent. The dst fragment is the
+  // rank-2 spatial tile; a versioned view is not a valid dst here.
+  ICHECK_EQ(dst->shape.size(), 2U)
+      << "ds_read_format expects a rank-2 destination fragment, got rank "
+      << dst->shape.size();
+  int64_t frag_mn =
+      ds_trans ? *as_const_int(dst->shape[0]) : *as_const_int(dst->shape[1]);
+  int64_t frag_k =
+      ds_trans ? *as_const_int(dst->shape[1]) : *as_const_int(dst->shape[0]);
   ICHECK_EQ(frag_mn, read_mn)
       << "ds_read_format dst fragment MN must match src read extent MN, got "
       << frag_mn << " vs " << read_mn;
@@ -446,18 +441,14 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     }
 
     if (hcu_layout_ds_read_) {
-      // Software pipeline Expand()s a rank-2 [K,MN] layout with a leading
-      // identity stage dim, so InputDim may be 2 (unexpanded) or src rank
-      // (expanded). Spatial mapping always lives in the last two dims.
       ICHECK(T.layout_map.count(src))
           << "layout-aware AN/BT ds_read requires annotate_layout";
       Layout layout = T.layout_map.at(src);
-      ICHECK_GE(layout->InputDim(), 2U);
+      // The pipeline expands the annotated [K,MN] layout to the full buffer
+      // rank before lowering, so the layout must match the source region.
+      ICHECK_EQ(layout->InputDim(), sr)
+          << "layout-aware AN/BT ds_read layout rank must match input rank";
       ICHECK_GE(layout->OutputDim(), 2U);
-      ICHECK(layout->InputDim() == 2U || layout->InputDim() == sr)
-          << "layout-aware AN/BT ds_read layout InputDim must be 2 ([K,MN]) "
-             "or match src rank (pipelined), got InputDim="
-          << layout->InputDim() << " src rank=" << sr;
 
       int warp_size = TargetHcuGetWarpSize(T.target);
       int total_warp = block_size / warp_size;
@@ -470,7 +461,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
       ICHECK_EQ(per_warp_mn % 32, 0);
 
       PrimExpr scoped_thread = analyzer->Simplify(
-          T.thread_var - Cast(T.thread_var.dtype(), T.thread_bounds->min));
+          T.thread_index - Cast(T.thread_index.dtype(), T.thread_bounds->min));
       PrimExpr lane =
           FloorMod(scoped_thread, make_const(scoped_thread.dtype(), warp_size));
       PrimExpr warp_id =
@@ -510,33 +501,17 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
           Array<PrimExpr> logical_idx_last = logical_idx;
           logical_idx_last.Set(logical_idx_last.size() - 1,
                                logical_n + make_const(logical_n.dtype(), 7));
-          auto forward_load = [&](const Array<PrimExpr> &logical) {
-            if (layout->InputDim() == sr) {
-              return layout->Forward(logical);
-            }
-            ICHECK_EQ(layout->InputDim(), 2U);
-            Array<PrimExpr> spatial = {logical[logical.size() - 2],
-                                       logical[logical.size() - 1]};
-            Array<PrimExpr> physical = layout->Forward(spatial);
-            Array<PrimExpr> full;
-            full.reserve(sr - 2 + physical.size());
-            for (size_t i = 0; i + 2 < sr; ++i) {
-              full.push_back(logical[i]);
-            }
-            for (const auto &p : physical) {
-              full.push_back(p);
-            }
-            return full;
-          };
-          Array<PrimExpr> physical = forward_load(logical_idx);
-          Array<PrimExpr> physical_last = forward_load(logical_idx_last);
+          Array<PrimExpr> physical = layout->Forward(logical_idx);
+          Array<PrimExpr> physical_last = layout->Forward(logical_idx_last);
           ICHECK_EQ(physical.size(), physical_last.size());
-          ICHECK_GE(physical.size(), 2U);
-          const size_t p0 = physical.size() - 2;
-          const size_t p1 = physical.size() - 1;
-          ICHECK(analyzer->CanProveEqual(physical[p0], physical_last[p0]) &&
-                 analyzer->CanProveEqual(physical[p1] + 7, physical_last[p1]))
-              << "each B ds_read 8-half segment must remain contiguous";
+          for (size_t i = 0; i + 1 < physical.size(); ++i) {
+            ICHECK(analyzer->CanProveEqual(physical[i], physical_last[i]))
+                << "each AN/BT ds_read 8-half segment must remain in one "
+                   "physical row";
+          }
+          ICHECK(analyzer->CanProveEqual(physical.back() + 7,
+                                         physical_last.back()))
+              << "each AN/BT ds_read 8-half segment must remain contiguous";
           PrimExpr local_offset = analyzer->Simplify(
               dst_leading_offset +
               make_const(dst_leading_offset.dtype(),
@@ -679,15 +654,32 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   Buffer dst_buf = T.buffer_remap.count(dst) ? T.buffer_remap[dst] : dst;
 
   // Leading dims only; last-2 are handled via logical origin and full LdsDesc.
+  // The traditional MLS path keeps the strict rank contract: the remapped
+  // buffer must still match the region so OffsetOf sees one index per axis.
   PrimExpr src_leading_elem_offset = IntImm(DataType::Int(32), 0);
   if (sr > 2) {
+    ICHECK_EQ(src_buf->shape.size(), sr)
+        << "ds_read_format src buffer rank must match src region rank, got "
+           "shape.size()="
+        << src_buf->shape.size() << " vs region rank=" << sr;
     if (auto packed_offset = TryGetMlsPackedLeadingElemOffset(
             src_buf, this->src_ranges, tile_mn, tile_k, ds_trans, T.target,
             lds_physical_bits)) {
       src_leading_elem_offset = packed_offset.value();
     } else {
-      src_leading_elem_offset =
-          LeadingPipelineElemOffset(src_buf, this->src_ranges);
+      Array<PrimExpr> src_idx_leading;
+      DataType idx_dtype = src_buf->DefaultIndexType();
+      for (size_t j = 0; j + 2 < sr; ++j) {
+        src_idx_leading.push_back(this->src_ranges[j]->min);
+      }
+      src_idx_leading.push_back(make_const(idx_dtype, 0));
+      src_idx_leading.push_back(make_const(idx_dtype, 0));
+      Array<PrimExpr> src_offs = src_buf.OffsetOf(src_idx_leading);
+      ICHECK_EQ(src_offs.size(), 1u)
+          << "ds_read_format src OffsetOf expects a single flat offset, got "
+             "size="
+          << src_offs.size();
+      src_leading_elem_offset = src_offs[0];
     }
   }
 
@@ -695,8 +687,23 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   ICHECK(dr >= 2) << "ds_read_format dst region must be at least 2D";
   PrimExpr dst_leading_elem_offset = IntImm(DataType::Int(32), 0);
   if (dr > 2) {
-    dst_leading_elem_offset =
-        LeadingPipelineElemOffset(dst_buf, this->dst_ranges);
+    ICHECK_EQ(dst_buf->shape.size(), dr)
+        << "ds_read_format dst buffer rank must match dst region rank, got "
+           "shape.size()="
+        << dst_buf->shape.size() << " vs region rank=" << dr;
+    Array<PrimExpr> dst_idx_leading;
+    DataType dst_idx_dtype = dst_buf->DefaultIndexType();
+    for (size_t j = 0; j + 2 < dr; ++j) {
+      dst_idx_leading.push_back(this->dst_ranges[j]->min);
+    }
+    dst_idx_leading.push_back(make_const(dst_idx_dtype, 0));
+    dst_idx_leading.push_back(make_const(dst_idx_dtype, 0));
+    Array<PrimExpr> dst_offs = dst_buf.OffsetOf(dst_idx_leading);
+    ICHECK_EQ(dst_offs.size(), 1u)
+        << "ds_read_format dst OffsetOf expects a single flat offset, got "
+           "size="
+        << dst_offs.size();
+    dst_leading_elem_offset = dst_offs[0];
   }
 
   auto src_ptr =

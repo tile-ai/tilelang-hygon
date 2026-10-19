@@ -8,9 +8,9 @@
 #include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ir/cast.h>
 
+#include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
 #include "layout/layout.h"
-#include "op/builtin.h"
 #include "op/utils.h"
 #include "transform/common/loop_fusion_utils.h"
 #include "transform/loop_partition.h"
@@ -30,6 +30,13 @@ using namespace ffi;
 namespace hcu {
 
 namespace {
+
+Var RequireHcuThreadVar(const LowerArgs &args) {
+  const auto *var = args.thread_index.as<VarNode>();
+  ICHECK(var)
+      << "HCU atomic_add lowering requires a bound threadIdx.x variable";
+  return GetRef<Var>(var);
+}
 
 bool UseTMA(const AtomicAddNode &op) {
   if (auto val = op.annotations.Get("use_tma")) {
@@ -222,17 +229,19 @@ struct AtomicAdd {
                            lower_args.thread_bounds,
                            lower_args.layout_map,
                            analyzer,
-                           false,
                            lower_args.buffer_remap,
-                           {}},
+                           {},
+                           false,
+                           {},
+                           0},
                           level);
     }
     auto loop_layout = par_op->GetLoopLayout();
-    return LowerParallelLoop(fused_loop, loop_layout, lower_args.thread_var,
-                             analyzer, lower_args.layout_map,
-                             par_op->GetPredicate(lower_args.thread_var),
-                             /*parallel_loop=*/true, /*should_vectorize=*/true,
-                             par_op->LoopLayoutRequiresPaddingGuard());
+    Var thread_var = RequireHcuThreadVar(lower_args);
+    return LowerParallelLoop(
+        fused_loop, loop_layout, thread_var, analyzer, lower_args.layout_map,
+        par_op->GetPredicate(thread_var),
+        /*parallel_loop=*/true, par_op->LoopLayoutRequiresPaddingGuard());
   }
 
   static LayoutMap InferLayout(const AtomicAddNode &op,

@@ -24,6 +24,10 @@ inline bool IsDeviceMainBlock(const tirx::SBlockNode *node) {
   return node->name_hint == DeviceMainBlockName;
 }
 
+// The kernel-launch frame no longer needs a per-backend marker annotation:
+// KernelLaunchFrame exposes its grid_vars/thread_vars explicitly and each
+// backend pipeline decides what the launch means (MaterializeKernelLaunch).
+
 namespace attr {
 // Attributes to mark CUDA sync calls
 constexpr const char *kHasTriggerLaunch = "has_cuda_pdl_trigger";
@@ -33,6 +37,19 @@ constexpr const char *kHasGridSync = "has_cuda_pdl_sync";
 constexpr const char *volatile_scope = "volatile_scope";
 constexpr const char *coproc_scope = "coproc_scope";
 constexpr const char *pipeline_exec_scope = "pipeline_exec_scope";
+// Marks user-authored assumptions that require a host runtime check. The
+// corresponding tl.assume remains in the IR as an optimizer fact.
+constexpr const char *kAssumeRequiresRuntimeCheck =
+    "tl.assume_requires_runtime_check";
+
+// Compiler-internal physical buffer version count.
+constexpr const char *kBufferVersion = "tl.buffer_version";
+
+// Marks a loop whose cross-thread synchronization a backend lowering owns.
+// The owner pairs every wait it emits with a block-wide barrier, so ThreadSync
+// leaves the accesses inside that scope to it; edges that cross the scope's
+// boundary keep the conservative handling.
+constexpr const char *kSyncOwnedScope = "tl.sync_owned_scope";
 
 // Attributes to implement SourceCodeBlock
 constexpr const char *kCodeBlockSource = "code_block_source";

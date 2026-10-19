@@ -5,7 +5,7 @@ from tilelang import language as T, tvm
 
 @tilelang.jit
 def _compile_kernel_without_inplace():
-    num_tokens = T.symbolic("num_tokens")
+    num_tokens = T.dynamic("num_tokens")
 
     @T.prim_func
     def buggy_kernel(x: T.Tensor[(num_tokens,), T.float]):
@@ -26,7 +26,7 @@ def _compile_kernel_without_inplace():
     },
 )
 def _compile_kernel_with_inplace():
-    num_tokens = T.symbolic("num_tokens")
+    num_tokens = T.dynamic("num_tokens")
 
     @T.prim_func
     def buggy_kernel(x: T.Tensor[(num_tokens,), T.float]):
@@ -51,6 +51,7 @@ def _get_device_kernel_script(detect_inplace: bool) -> str:
     return artifact.kernel_source
 
 
+@tilelang.testing.requires_cuda
 def test_storage_rewrite_detect_inplace_toggle():
     script_off = _get_device_kernel_script(detect_inplace=False)
     script_on = _get_device_kernel_script(detect_inplace=True)

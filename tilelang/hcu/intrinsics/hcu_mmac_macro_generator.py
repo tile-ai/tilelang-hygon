@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-import tilelang.language as T
+import tilelang.language.common as T
 from tilelang import tvm as tvm
 from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import (
     block_col_warps_no_recompute,
@@ -914,8 +914,6 @@ class HCUMatrixCoreIntrinEmitter:
         C_local_buf,
         k_inner: PrimExpr | int = 0,
         trans_c: bool = False,
-        a_ptr_base: PrimExpr | int = 0,
-        b_ptr_base: PrimExpr | int = 0,
     ):
         warp_rows = self.warp_rows
         warp_cols = self.warp_cols
@@ -938,7 +936,7 @@ class HCUMatrixCoreIntrinEmitter:
             mmac_annotations["tl.hcu_mmac_a_dtype"] = tirx.StringImm(str(self.a_dtype))
             mmac_annotations["tl.hcu_mmac_b_dtype"] = tirx.StringImm(str(self.b_dtype))
         mmac_annotations = mmac_annotations or None
-        mmac_op = tirx.op.Op.get("tl.tvm_mfma")
+        mmac_op = tirx.op.Op.get("tl.hcu_mmac")
 
         a_is_fragment = is_fragment(A_local_buf)
         b_is_fragment = is_fragment(B_local_buf)
@@ -970,9 +968,9 @@ class HCUMatrixCoreIntrinEmitter:
                         compute_a_dtype_imm,
                         compute_out_dtype_imm,
                         B_local_buf.data,
-                        (b_ptr_base + b_local_stride + (j * k_pack + kp) * local_size_b) // b_index_div,
+                        (b_local_stride + (j * k_pack + kp) * local_size_b) // b_index_div,
                         A_local_buf.data,
-                        (a_ptr_base + a_local_stride + (i * k_pack + kp) * local_size_a) // a_index_div,
+                        (a_local_stride + (i * k_pack + kp) * local_size_a) // a_index_div,
                         C_local_buf.data,
                         (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
                         annotations=mmac_annotations,
@@ -988,9 +986,9 @@ class HCUMatrixCoreIntrinEmitter:
                         compute_b_dtype_imm,
                         compute_out_dtype_imm,
                         A_local_buf.data,
-                        (a_ptr_base + a_local_stride + (i * k_pack + kp) * local_size_a) // a_index_div,
+                        (a_local_stride + (i * k_pack + kp) * local_size_a) // a_index_div,
                         B_local_buf.data,
-                        (b_ptr_base + b_local_stride + (j * k_pack + kp) * local_size_b) // b_index_div,
+                        (b_local_stride + (j * k_pack + kp) * local_size_b) // b_index_div,
                         C_local_buf.data,
                         (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
                         annotations=mmac_annotations,
@@ -1015,6 +1013,8 @@ class HCUMatrixCoreIntrinEmitter:
         scale_shape_kb: int,
         scale_format_a: int,
         scale_format_b: int,
+        scale_row_order_a: int,
+        scale_row_order_b: int,
         real_ab_type: int,
     ):
         """Issue one scale MMAC call_extern (native FP4 or padded F8F6F4)."""
@@ -1035,7 +1035,8 @@ class HCUMatrixCoreIntrinEmitter:
             f"{int(scale_shape_m)}, {int(scale_shape_ka)}, "
             f"{int(scale_shape_n)}, {int(scale_shape_kb)}, "
             f"{int(scale_format_a)}, {int(scale_format_b)}, "
-            f"{int(self.k_pack)}, {int(self.micro_size_k)}, {int(real_ab_type)}>"
+            f"{int(self.k_pack)}, {int(self.micro_size_k)}, {int(real_ab_type)}, "
+            f"{int(scale_row_order_a)}, {int(scale_row_order_b)}>"
         )
 
         @T.macro

@@ -23,11 +23,13 @@ def matmul(A, B, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float
         for k in T.Pipelined(
             T.ceildiv(K, block_K),
             num_stages=4,
-            enable_register_pipeline=True,
-            enable_warp_divergence=True,
+            annotations={
+                "enable_register_pipeline": 1,
+                "enable_warp_divergence": 1,
+            },
         ):
-            T.copy(A[by * block_M, k * block_K], A_shared, enable_async=True)
-            T.copy(B[k * block_K, bx * block_N], B_shared, enable_async=True)
+            T.async_copy(A[by * block_M, k * block_K], A_shared)
+            T.async_copy(B[k * block_K, bx * block_N], B_shared)
             T.copy(A_shared, A_local)
             T.copy(B_shared, B_local)
             T.gemm(A_local, B_local, C_local, transpose_B=False, annotations={"trans_c": True})

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import re
 import shlex
@@ -10,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import warnings
+from dataclasses import dataclass
 
 import tvm_ffi
 from tvm.base import py_str
@@ -19,6 +21,9 @@ from tvm.target import Target
 from tilelang.engine.callback import register_hcu_postproc_callback
 from tilelang.env import TILELANG_TEMPLATE_PATH, env
 from tilelang.transform.pass_config import PassConfigKey
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_hcu_compiler() -> str:
@@ -247,27 +252,132 @@ def get_hcu_device_compile_flags(pass_configs: dict | None = None) -> list[str]:
     return tokens
 
 
-def _hcu_amdgcn_bitcode_dir() -> str | None:
-    """Return DTK amdgcn bitcode dir if it exists."""
-    try:
-        root = find_hcu_path()
-    except RuntimeError:
-        root = os.environ.get("ROCM_PATH", "/opt/dtk")
-    bitcode = os.path.join(root, "amdgcn", "bitcode")
-    return bitcode if os.path.isdir(bitcode) else None
-
-
-def _hcu_has_abi6_device_lib(bitcode_dir: str | None) -> bool:
-    if not bitcode_dir:
+def _hcu_uses_toolchain_defaults() -> bool:
+    """Whether the DTK toolchain owns flag selection on this host."""
+    if get_hcu_compiler() == "aicc":
         return False
-    return os.path.isfile(os.path.join(bitcode_dir, "oclc_abi_version_6.bc"))
+    rocm_path = os.environ.get("ROCM_PATH", "")
+    return "dtk" in rocm_path.lower() or os.path.isdir("/opt/dtk")
+
+
+def _hcu_rocm_root() -> str:
+    """Root of the toolchain whose device library the HCU compiler reads."""
+    try:
+        return find_hcu_path()
+    except RuntimeError:
+        return os.environ.get("ROCM_PATH", "/opt/dtk")
+
+
+@dataclass(frozen=True)
+class HcuDeviceLibProbe:
+    """Device library and code-object ABI an HCU compile is pointed at.
+
+    Both facts are probed from the host installation, so two machines with the
+    same target compile the same kernel with different flags. The probe is
+    cached and its result is logged and fed into the kernel cache key, and
+    TILELANG_HCU_DEVICE_LIB_PATH / TILELANG_HCU_CODE_OBJECT_VERSION override it
+    when the probe does not match the toolchain the user wants.
+    """
+
+    rocm_root: str
+    #: Directory of the probed device library, when the installation has one.
+    bitcode_dir: str | None
+    #: Value for --rocm-device-lib-path; None to leave the flag out.
+    device_lib_path: str | None
+    #: Value for -mcode-object-version; None to keep the compiler default.
+    code_object_version: int | None
+    #: Where device_lib_path came from: "installation", "configured" or "none".
+    source: str
+
+    def describe(self) -> str:
+        device_lib = self.device_lib_path or "compiler default"
+        code_object = "compiler default" if self.code_object_version is None else str(self.code_object_version)
+        return f"device lib {device_lib} ({self.source}), code-object version {code_object}"
+
+    def cache_key_extra(self) -> dict[str, str]:
+        """Stable description of the probe for the kernel cache key."""
+        return {
+            "compiler": get_hcu_compiler(),
+            "flags": "toolchain-defaults" if _hcu_uses_toolchain_defaults() else "llvm-tuning",
+            "device_lib_path": self.device_lib_path or "-",
+            "code_object_version": "-" if self.code_object_version is None else str(self.code_object_version),
+        }
+
+
+#: Values of TILELANG_HCU_DEVICE_LIB_PATH that suppress --rocm-device-lib-path.
+_DEVICE_LIB_DISABLED = ("0", "none", "off", "false")
+
+
+@functools.cache
+def _hcu_device_lib_probe(rocm_root: str, device_lib_override: str, code_object_override: str) -> HcuDeviceLibProbe:
+    """Resolve the device library and code-object version once per toolchain."""
+    bitcode_dir = os.path.join(rocm_root, "amdgcn", "bitcode")
+    bitcode_dir = bitcode_dir if os.path.isdir(bitcode_dir) else None
+
+    device_lib_override = device_lib_override.strip()
+    source = "installation"
+    if device_lib_override.lower() in _DEVICE_LIB_DISABLED:
+        device_lib_path, source = None, "none"
+    elif device_lib_override:
+        device_lib_path, source = device_lib_override, "configured"
+        if not os.path.isdir(device_lib_path):
+            warnings.warn(
+                f"TILELANG_HCU_DEVICE_LIB_PATH points at {device_lib_path!r}, which is not a directory.",
+                stacklevel=2,
+            )
+    else:
+        device_lib_path = bitcode_dir
+        if device_lib_path is None:
+            source = "none"
+
+    if code_object_override.strip():
+        try:
+            code_object_version = int(code_object_override)
+        except ValueError as err:
+            raise ValueError(f"TILELANG_HCU_CODE_OBJECT_VERSION must be an integer, got {code_object_override!r}") from err
+    else:
+        # New aicc (clang 22) defaults to code-object ABI 6, while some DTK
+        # versions only ship oclc_abi_version_{400,500}.bc: pin COV 5 when the
+        # device library we point at has no ABI-6 bitcode.
+        has_abi6 = device_lib_path is not None and os.path.isfile(
+            os.path.join(device_lib_path, "oclc_abi_version_6.bc")
+        )
+        code_object_version = None if has_abi6 or device_lib_path is None else 5
+
+    probe = HcuDeviceLibProbe(
+        rocm_root=rocm_root,
+        bitcode_dir=bitcode_dir,
+        device_lib_path=device_lib_path,
+        code_object_version=code_object_version,
+        source=source,
+    )
+    logger.info(f"HCU toolchain probe under {rocm_root}: {probe.describe()}")
+    return probe
+
+
+def hcu_device_lib_probe() -> HcuDeviceLibProbe:
+    """The probe result for the active toolchain and overrides."""
+    return _hcu_device_lib_probe(
+        _hcu_rocm_root(),
+        env.TILELANG_HCU_DEVICE_LIB_PATH,
+        env.TILELANG_HCU_CODE_OBJECT_VERSION,
+    )
+
+
+def hcu_cache_key_extra() -> dict[str, str]:
+    """Host-dependent HCU toolchain facts for the kernel cache key.
+
+    get_hcu_compile_flags picks the flag set and the device library from the
+    host, so the same target and config produce different artifacts on
+    different machines. Feeding the probe into the cache key keeps them apart.
+    """
+    return hcu_device_lib_probe().cache_key_extra()
 
 
 def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
     # DTK toolchain (e.g. ROCM_PATH=/opt/dtk/...) uses its own defaults; do not inject LLVM hacks.
     # If get_hcu_compiler() resolves to aicc (on PATH), still apply the LLVM tuning flags below.
-    rocm_path = os.environ.get("ROCM_PATH", "")
-    if ("dtk" in rocm_path.lower() or os.path.isdir("/opt/dtk")) and get_hcu_compiler() != "aicc":
+    if _hcu_uses_toolchain_defaults():
         return []
     if arch in ["gfx928", "gfx936", "gfx938", "gfx92a", "gfx946"]:
         flags = [
@@ -293,11 +403,11 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
         # versions only ship oclc_abi_version_{400,500}.bc: point the device
         # library path at the DTK bitcode dir and pin COV 5 when it has no
         # ABI-6 device lib.
-        bitcode_dir = _hcu_amdgcn_bitcode_dir()
-        if bitcode_dir:
-            flags.append(f"--rocm-device-lib-path={bitcode_dir}")
-            if not _hcu_has_abi6_device_lib(bitcode_dir):
-                flags.append("-mcode-object-version=5")
+        probe = hcu_device_lib_probe()
+        if probe.device_lib_path:
+            flags.append(f"--rocm-device-lib-path={probe.device_lib_path}")
+            if probe.code_object_version is not None:
+                flags.append(f"-mcode-object-version={probe.code_object_version}")
         # Clang 22 aicc no longer predefines __AMDGCN_WAVEFRONT_SIZE, but DTK
         # HIP 6.2 headers still require it. gfx9 HCU is wave64.
         flags.append("-D__AMDGCN_WAVEFRONT_SIZE=64")

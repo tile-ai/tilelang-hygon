@@ -8,8 +8,8 @@
 #include <tvm/ir/cast.h>
 #include <tvm/runtime/logging.h>
 
-#include "op/builtin.h"
 #include "op/utils.h"
+#include "rocm/op/builtin.h"
 #include "rocm/target_utils.h"
 #include "rocm/transform/async_copy_injector.h"
 #include "transform/common/loop_fusion_utils.h"
@@ -40,7 +40,10 @@ bool GetBoolAnnotation(const CopyNode &op, const char *key) {
 }
 
 bool GetIsAsyncCopy(const CopyNode &op) {
-  return HasExplicitAsyncCopySemantics(op);
+  if (GetBoolAnnotation(op, "is_async_copy")) {
+    return true;
+  }
+  return GetBoolAnnotation(op, "force_cp_async");
 }
 
 bool GetNoImplicitAsyncCommitWait(const CopyNode &op) {
@@ -120,17 +123,15 @@ private:
                            lower_args.thread_bounds,
                            lower_args.layout_map,
                            analyzer,
-                           false,
                            lower_args.buffer_remap,
                            {}},
                           level);
     }
     auto loop_layout = par_op->GetLoopLayout();
     Stmt lowered_loop = LowerParallelLoop(
-        par_op->GetRoot(), loop_layout, lower_args.thread_var, analyzer,
-        lower_args.layout_map, par_op->GetPredicate(lower_args.thread_var),
-        /*parallel_loop=*/true,
-        /*should_vectorize=*/true, par_op->LoopLayoutRequiresPaddingGuard());
+        par_op->GetRoot(), loop_layout, lower_args.thread_index, analyzer,
+        lower_args.layout_map, par_op->GetPredicate(lower_args.thread_index),
+        /*parallel_loop=*/true, par_op->LoopLayoutRequiresPaddingGuard());
 
     auto inject_result =
         InjectROCmAsyncCopy(lowered_loop, /*async_without_async_commit_wait=*/

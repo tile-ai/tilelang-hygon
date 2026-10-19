@@ -16,49 +16,20 @@ from tilelang.transform.simplify import _Simplify
 from tilelang.utils.language import is_fragment, is_full_region, is_shared, is_shared_dynamic
 from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import hcu_mmac_k_dim_for_operand
 from tilelang.hcu.target import target_has_mmac_lit_lts, target_is_hcu
-from tvm import DataType, tirx
+from tvm import DataType, arith, tirx
 from tvm.ir import Range
 from tvm.target import Target
 
 from tilelang.tileop.gemm.gemm_base import GemmBase
+from tilelang.tileop.gemm_blockscaled.gemm_blockscaled_base import GemmBlockScaledMixin
 
 GEMM_INST_HCU_MMAC = "hcu.mmac"
+GEMM_INST_HCU_MMAC_BLOCKSCALED = "hcu.mmac.blockscaled"
 logger = logging.getLogger(__name__)
 
 
-def _is_pipeline_version_region(buffer_region) -> bool:
-    """True when the region is one pipeline stage of an otherwise full buffer."""
-    buf = buffer_region.buffer
-    ranges = buffer_region.region
-    if len(buf.shape) != len(ranges) or len(ranges) < 2:
-        return False
-    expr_equal = tirx.analysis.expr_deep_equal
-    if not expr_equal(ranges[0].extent, 1):
-        return False
-    return all(expr_equal(r.min, 0) and expr_equal(r.extent, dim) for dim, r in zip(buf.shape[1:], ranges[1:]))
-
-
-def _is_full_fragment_region(buffer_region) -> bool:
-    return is_full_region(buffer_region) or _is_pipeline_version_region(buffer_region)
-
-
-def _fragment_pipeline_ptr_base(buffer_region, elems_per_version):
-    if is_full_region(buffer_region):
-        return 0
-    if _is_pipeline_version_region(buffer_region):
-        return buffer_region.region[0].min * elems_per_version
-    raise ValueError("Fragment operand must be a full region or a single pipeline version")
-
-
 def _check_scale_fp4_fragment_region(buffer_region, name: str) -> None:
-    """Validate a fragment operand of mmac_scale_fp4 (FP4 blocked-scaled).
-
-    Unlike ``mmac``, ``mmac_scale_fp4`` has no ``a_ptr_base``/``b_ptr_base``
-    parameter, so a register-pipeline version slice cannot be addressed here:
-    reject it instead of silently reading version 0.
-    """
-    if _is_pipeline_version_region(buffer_region):
-        raise NotImplementedError(f"Register-pipeline version slice is not supported for hcu.mmac_scale_fp4 operand {name}")
+    """Validate a fragment operand of mmac_scale_fp4 (FP4 blocked-scaled)."""
     assert is_full_region(buffer_region), f"Fragment input {name} must be a full region"
 
 
@@ -143,8 +114,8 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
         bool(is_fragment(B)),
         bool(getattr(gemm_node, "sfaRegion", None) is not None and getattr(gemm_node, "sfbRegion", None) is not None),
         int(gemm_node.k),
-        _int_annotation(annotations, "tl.scale_a_format", 0),
-        _int_annotation(annotations, "tl.scale_b_format", 0),
+        _int_annotation(annotations, "tl.hcu.scale_a_format", 0),
+        _int_annotation(annotations, "tl.hcu.scale_b_format", 0),
         target,
     )
     mmac_mode = "f8f6f4" if int(mode[0]) == 1 else "native"
@@ -176,8 +147,8 @@ def _compute_hcu_warp_partition(gemm, thread_nums: int, target: Target, meta) ->
     """
     element_bits = int(meta.gemm_element_bits)
     annotations = getattr(gemm.gemm_node, "annotations", None) or {}
-    min_m = _int_annotation(annotations, "tl.scale_min_m_per_warp", 0)
-    min_n = _int_annotation(annotations, "tl.scale_min_n_per_warp", 0)
+    min_m = _int_annotation(annotations, "tl.hcu.scale_min_m_per_warp", 0)
+    min_n = _int_annotation(annotations, "tl.hcu.scale_min_n_per_warp", 0)
     if meta.b_from_async_copy_linear:
         min_n = max(min_n, 32)
     floors = _ffi_api.GemmWarpPolicyComputeWarpPartitionHCU(
@@ -325,6 +296,10 @@ class GemmHCUMMAC(GemmBase):
     """HCU matrix core GEMM: layout and lowering via Python ``HCUMatrixCoreIntrinEmitter``."""
 
     @property
+    def use_tf32(self) -> bool:
+        return bool(_int_annotation(getattr(self.gemm_node, "annotations", None), "tl.hcu.use_tf32", 0))
+
+    @property
     def allow_f8f6f4_mixed_dtypes(self) -> bool:
         return True
 
@@ -426,16 +401,18 @@ class GemmHCUMMAC(GemmBase):
         if not target_has_mmac_lit_lts(target):
             raise ValueError("HCU gemm_blockscaled requires lit/lts target support")
 
-        gran_m = _ann_int(annotations, "sf_a_granularity_m", 1)
+        gran_m = _ann_int(annotations, "tl.hcu.sf_a_granularity_m", 1)
         gran_ka = _ann_int(annotations, "sf_a_granularity_k")
-        gran_n = _ann_int(annotations, "sf_b_granularity_n", 1)
+        gran_n = _ann_int(annotations, "tl.hcu.sf_b_granularity_n", 1)
         gran_kb = _ann_int(annotations, "sf_b_granularity_k")
-        a_k_major = bool(_ann_int(annotations, "a_scale_k_major", 0))
-        b_k_major = bool(_ann_int(annotations, "b_scale_k_major", 0))
-        row_base_a = _ann_expr(annotations, "tl.scale_a_row_base")
-        row_base_b = _ann_expr(annotations, "tl.scale_b_row_base")
-        scale_format_a = _ann_int(annotations, "tl.scale_a_format")
-        scale_format_b = _ann_int(annotations, "tl.scale_b_format")
+        a_k_major = bool(_ann_int(annotations, "tl.hcu.a_scale_k_major", 0))
+        b_k_major = bool(_ann_int(annotations, "tl.hcu.b_scale_k_major", 0))
+        row_base_a = _ann_expr(annotations, "tl.hcu.scale_a_row_base")
+        row_base_b = _ann_expr(annotations, "tl.hcu.scale_b_row_base")
+        scale_format_a = _ann_int(annotations, "tl.hcu.scale_a_format")
+        scale_format_b = _ann_int(annotations, "tl.hcu.scale_b_format")
+        scale_row_order_a = _ann_int(annotations, "tl.hcu.scale_a_row_order", 0)
+        scale_row_order_b = _ann_int(annotations, "tl.hcu.scale_b_row_order", 0)
 
         thread_nums = int(thread_bounds.extent)
         meta = _resolve_hcu_mls_meta(self.gemm_node, self.A, self.B, thread_nums, target)
@@ -537,6 +514,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -566,6 +545,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -595,6 +576,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -627,6 +610,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -659,6 +644,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -690,6 +677,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -721,6 +710,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -749,6 +740,8 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
+                    scale_row_order_a=scale_row_order_a,
+                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -768,9 +761,6 @@ class GemmHCUMMAC(GemmBase):
         _ = mbar_phase_expr
         if not target_is_hcu(target):
             raise ValueError("GemmHCUMMAC lowering requires an HCU target")
-
-        if self.is_blockscaled:
-            return self._lower_blockscaled(layout_map, target, thread_bounds, thread_var)
 
         thread_nums = int(thread_bounds.extent)
         meta = _resolve_hcu_mls_meta(self.gemm_node, self.A, self.B, thread_nums, target)
@@ -816,9 +806,6 @@ class GemmHCUMMAC(GemmBase):
             f"block_K ({block_K}) must be divisible by micro_size_k ({micro_size_k}) * k_pack ({k_pack})"
         )
         assert is_full_region(C_region), "Fragment output C must be a full region"
-        a_ptr_base = _fragment_pipeline_ptr_base(A_region, emitter.local_elems_a(full_k=True)) if is_fragment(self.A) else 0
-        b_ptr_base = _fragment_pipeline_ptr_base(B_region, emitter.local_elems_b(full_k=True)) if is_fragment(self.B) else 0
-
         use_gemm_mls = (a_from_mls and not is_fragment(self.A)) or (b_from_mls and not is_fragment(self.B))
         use_b_linear_ds_read = b_from_async_copy_linear and not is_fragment(self.B)
         if use_gemm_mls:
@@ -861,7 +848,7 @@ class GemmHCUMMAC(GemmBase):
                 raise NotImplementedError("gemm_mls_s (A mls, B r or s) not implemented")
 
             if is_fragment(self.A):
-                assert _is_full_fragment_region(A_region), "Fragment input A must be a full region"
+                assert is_full_region(A_region), "Fragment input A must be a full region"
 
                 @T.prim_func
                 def _gemm_r_mls() -> None:
@@ -870,7 +857,7 @@ class GemmHCUMMAC(GemmBase):
                         T.clear(C_buf)
                     emitter.ldmatrix_mls_b(B_local, B_region)
                     for ki in T.serial(0, inner_k):
-                        emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, a_ptr_base=a_ptr_base)
+                        emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c)
 
                 return _Simplify(_gemm_r_mls, inline_let=True)
 
@@ -893,7 +880,7 @@ class GemmHCUMMAC(GemmBase):
 
         elif use_b_linear_ds_read:
             if is_fragment(self.A):
-                assert _is_full_fragment_region(A_region), "Fragment input A must be a full region"
+                assert is_full_region(A_region), "Fragment input A must be a full region"
 
                 @T.prim_func
                 def _gemm_r_b_linear() -> None:
@@ -902,7 +889,7 @@ class GemmHCUMMAC(GemmBase):
                         T.clear(C_buf)
                     emitter.ldmatrix_b_linear(B_local, B_region)
                     for ki in T.serial(0, inner_k):
-                        emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, a_ptr_base=a_ptr_base)
+                        emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c)
 
                 return _Simplify(_gemm_r_b_linear, inline_let=True)
 
@@ -939,7 +926,7 @@ class GemmHCUMMAC(GemmBase):
             return _Simplify(_gemm_ss, inline_let=True)
 
         elif _is_shared_like(self.A) and is_fragment(self.B):
-            assert _is_full_fragment_region(B_region), "Fragment input B must be a full region"
+            assert is_full_region(B_region), "Fragment input B must be a full region"
 
             @T.prim_func
             def _gemm_sr() -> None:
@@ -948,12 +935,12 @@ class GemmHCUMMAC(GemmBase):
                     T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_a(A_local, A_region, ki)
-                    emitter.mmac(A_local, B_buf, C_buf, ki, trans_c=mmac_trans_c, b_ptr_base=b_ptr_base)
+                    emitter.mmac(A_local, B_buf, C_buf, ki, trans_c=mmac_trans_c)
 
             return _Simplify(_gemm_sr, inline_let=True)
 
         elif is_fragment(self.A) and _is_shared_like(self.B):
-            assert _is_full_fragment_region(A_region), "Fragment input A must be a full region"
+            assert is_full_region(A_region), "Fragment input A must be a full region"
 
             @T.prim_func
             def _gemm_rs() -> None:
@@ -962,13 +949,13 @@ class GemmHCUMMAC(GemmBase):
                     T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_b(B_local, B_region, ki)
-                    emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, a_ptr_base=a_ptr_base)
+                    emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c)
 
             return _Simplify(_gemm_rs, inline_let=True)
 
         elif is_fragment(self.A) and is_fragment(self.B):
-            assert _is_full_fragment_region(A_region), "Fragment input A must be a full region"
-            assert _is_full_fragment_region(B_region), "Fragment input B must be a full region"
+            assert is_full_region(A_region), "Fragment input A must be a full region"
+            assert is_full_region(B_region), "Fragment input B must be a full region"
 
             @T.prim_func
             def _gemm_rr() -> None:
@@ -981,8 +968,6 @@ class GemmHCUMMAC(GemmBase):
                         C_buf,
                         ki,
                         trans_c=mmac_trans_c,
-                        a_ptr_base=a_ptr_base,
-                        b_ptr_base=b_ptr_base,
                     )
 
             return _Simplify(_gemm_rr, inline_let=True)
@@ -1000,3 +985,22 @@ class GemmHCUMMAC(GemmBase):
 
     def is_gemm_rr(self) -> bool:
         return is_fragment(self.A) and is_fragment(self.B)
+
+
+class GemmHCUMMACBlockScaled(GemmBlockScaledMixin, GemmHCUMMAC):
+    """HCU lowering for the official ``GemmBlockScaledNode`` contract."""
+
+    def lower(
+        self,
+        layout_map: dict,
+        target: Target,
+        thread_bounds: Range,
+        thread_var: tirx.Var,
+        mbar_phase_expr: tirx.PrimExpr | None = None,
+    ):
+        _ = mbar_phase_expr
+        if not target_is_hcu(target):
+            raise ValueError("GemmHCUMMACBlockScaled lowering requires an HCU target")
+        if not arith.Analyzer().can_prove_equal(self.sf_k_start, 0):
+            raise ValueError("HCU gemm_blockscaled currently supports only k_start=0")
+        return self._lower_blockscaled(layout_map, target, thread_bounds, thread_var)

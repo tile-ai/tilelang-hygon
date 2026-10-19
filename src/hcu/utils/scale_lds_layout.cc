@@ -60,6 +60,8 @@ struct AutoLayoutConfig {
   int gran_k{0};
   int mn_warps{0};
   int total_warps{0};
+  int mmac_k{64};
+  ScaleBufferRowOrder row_order{ScaleBufferRowOrder::kKInner};
   std::vector<int> physical_shape;
 };
 
@@ -84,48 +86,77 @@ int FlattenPhysical(const AutoLayoutConfig &cfg, std::vector<int> coord,
   return offset;
 }
 
+void DecodeAtomOrdinal(int ordinal, int mn_atoms, int k_atoms,
+                       ScaleBufferRowOrder order, int *mn_atom, int *k_atom) {
+  if (order == ScaleBufferRowOrder::kMNInner) {
+    *k_atom = ordinal / mn_atoms;
+    *mn_atom = ordinal % mn_atoms;
+  } else {
+    *mn_atom = ordinal / k_atoms;
+    *k_atom = ordinal % k_atoms;
+  }
+}
+
 void AppendGroupWords(const AutoLayoutConfig &cfg, int fill_batch, int mn_row0,
-                      int xor_shift, std::set<int> *word_ids) {
+                      int rows_mn_per_seg, int xor_shift,
+                      std::set<int> *word_ids) {
   if (fill_batch < 0)
     return;
   const int rows_per_fill = 1 << cfg.op_ctrl;
-  const int k_atoms = cfg.tile_k / rows_per_fill;
   for (int tx16 = 0; tx16 < 16; ++tx16) {
     std::vector<int> coord;
     if (cfg.format == ScaleLdsFormat::kIdentity) {
-      const int mn_local = fill_batch / cfg.tile_k;
-      const int k_rel = fill_batch % cfg.tile_k;
+      const int k_dup = cfg.mmac_k == 64 && cfg.gran_k >= 64 ? 2 : 1;
+      const int phys_k = cfg.tile_k * k_dup;
+      const int atom_k = cfg.mmac_k == 64 ? 2 : 1;
+      const int k_atoms = phys_k / atom_k;
+      const int atom_ordinal = fill_batch / atom_k;
+      const int inner = fill_batch % atom_k;
+      int mn_local = 0, k_atom = 0;
+      DecodeAtomOrdinal(atom_ordinal, rows_mn_per_seg, k_atoms, cfg.row_order,
+                        &mn_local, &k_atom);
+      const int k_rel = (k_atom * atom_k + inner) / k_dup;
       const int mn =
           cfg.origin_mn + ScaleMnIndex(mn_row0 + mn_local, tx16, cfg.gran_mn);
       coord = {cfg.origin_k + k_rel, mn};
     } else if (cfg.format == ScaleLdsFormat::kK2Interleave) {
-      const int mn_local = fill_batch / k_atoms;
-      const int k_atom = fill_batch % k_atoms;
+      const int k_atoms = cfg.tile_k / 2;
+      int mn_local = 0, k_atom = 0;
+      DecodeAtomOrdinal(fill_batch, rows_mn_per_seg, k_atoms, cfg.row_order,
+                        &mn_local, &k_atom);
       const int mn =
           cfg.origin_mn + ScaleMnIndex(mn_row0 + mn_local, tx16, cfg.gran_mn);
       coord = {cfg.origin_k / 2 + k_atom, mn, 0};
     } else if (cfg.format == ScaleLdsFormat::kK4Interleave) {
-      const int mn_local = fill_batch / k_atoms;
-      const int k_group = fill_batch % k_atoms;
+      const int k_atoms = cfg.tile_k / 4;
+      int mn_local = 0, k_group = 0;
+      DecodeAtomOrdinal(fill_batch, rows_mn_per_seg, k_atoms, cfg.row_order,
+                        &mn_local, &k_group);
       const int mn =
           cfg.origin_mn + ScaleMnIndex(mn_row0 + mn_local, tx16, cfg.gran_mn);
       coord = {cfg.origin_k / 4 + k_group, mn, 0};
     } else if (cfg.format == ScaleLdsFormat::kK2MN2Interleave) {
       const int mixed_k_atoms = cfg.tile_k / 2;
-      const int mn_pair = fill_batch / mixed_k_atoms;
-      const int k_atom = fill_batch % mixed_k_atoms;
+      const int mn_atoms = rows_mn_per_seg / 2;
+      int mn_pair = 0, k_atom = 0;
+      DecodeAtomOrdinal(fill_batch, mn_atoms, mixed_k_atoms, cfg.row_order,
+                        &mn_pair, &k_atom);
       const int pair = cfg.origin_mn / 2 +
                        ScaleMnIndex(mn_row0 / 2 + mn_pair, tx16, cfg.gran_mn);
       coord = {cfg.origin_k / 2 + k_atom, pair / 16, pair % 16, 0, 0};
     } else if (cfg.format == ScaleLdsFormat::kMN2Interleave) {
-      const int mn_pair = fill_batch / cfg.tile_k;
-      const int k_rel = fill_batch % cfg.tile_k;
+      const int mn_atoms = rows_mn_per_seg / 2;
+      int mn_pair = 0, k_rel = 0;
+      DecodeAtomOrdinal(fill_batch, mn_atoms, cfg.tile_k, cfg.row_order,
+                        &mn_pair, &k_rel);
       const int pair = cfg.origin_mn / 2 +
                        ScaleMnIndex(mn_row0 / 2 + mn_pair, tx16, cfg.gran_mn);
       coord = {cfg.origin_k + k_rel, pair, 0};
     } else {
-      const int mn_quad = fill_batch / cfg.tile_k;
-      const int k_rel = fill_batch % cfg.tile_k;
+      const int mn_atoms = rows_mn_per_seg / 4;
+      int mn_quad = 0, k_rel = 0;
+      DecodeAtomOrdinal(fill_batch, mn_atoms, cfg.tile_k, cfg.row_order,
+                        &mn_quad, &k_rel);
       const int quad = cfg.origin_mn / 4 +
                        ScaleMnIndex(mn_row0 / 4 + mn_quad, tx16, cfg.gran_mn);
       coord = {cfg.origin_k + k_rel, quad, 0};
@@ -179,7 +210,8 @@ ConflictScore ScoreLayout(const AutoLayoutConfig &cfg, int xor_shift) {
         for (int group = group_begin; group < group_end; ++group) {
           const int fill_batch = group_base + group;
           if (fill_batch < batches_per_seg)
-            AppendGroupWords(cfg, fill_batch, mn_row0, xor_shift, &words);
+            AppendGroupWords(cfg, fill_batch, mn_row0, rows_mn_per_seg,
+                             xor_shift, &words);
         }
         if (!words.empty())
           AccumulateBatch(words, &score);
@@ -210,8 +242,8 @@ Layout MakeXorLayout(const Buffer &buffer, ScaleLdsFormat format,
   return Layout(vars, output);
 }
 
-Optional<Layout> SelectAutoLayout(const CopyScaleNode *op, int block_size,
-                                  Target target) {
+Optional<AutoLayoutConfig> BuildConfig(const CopyScaleNode *op, int block_size,
+                                       Target target) {
   if (!op->has_scale_view_ || op->scale_k_major_ != 0 ||
       op->src->dtype.bits() * op->src->dtype.lanes() != 8)
     return std::nullopt;
@@ -231,6 +263,7 @@ Optional<Layout> SelectAutoLayout(const CopyScaleNode *op, int block_size,
   cfg.origin_mn = get_int(op->origin_mn_);
   cfg.gran_mn = op->granularity_mn_;
   cfg.gran_k = op->granularity_k_;
+  cfg.mmac_k = op->gemm_elem_bits_ == 8 ? 32 : 64;
   if (cfg.parent_k <= 0 || cfg.parent_mn <= 0 || cfg.tile_k <= 0 ||
       cfg.tile_mn <= 0 || cfg.origin_k < 0 || cfg.origin_mn < 0 ||
       cfg.gran_mn <= 0 || cfg.gran_k != 32 || !IsPowerOfTwo(cfg.parent_mn))
@@ -287,6 +320,25 @@ Optional<Layout> SelectAutoLayout(const CopyScaleNode *op, int block_size,
   if (rows_mn <= 0 || rows_mn % cfg.mn_warps != 0 ||
       (rows_mn / cfg.mn_warps) * cfg.tile_k % rows_per_fill != 0)
     return std::nullopt;
+  const int atom_mn =
+      cfg.format == ScaleLdsFormat::kMN4Interleave
+          ? 4
+          : (cfg.format == ScaleLdsFormat::kMN2Interleave ||
+                     cfg.format == ScaleLdsFormat::kK2MN2Interleave
+                 ? 2
+                 : 1);
+  const int rows_mn_per_seg = rows_mn / cfg.mn_warps;
+  if (rows_mn_per_seg % atom_mn != 0)
+    return std::nullopt;
+  return cfg;
+}
+
+Optional<Layout> SelectAutoLayout(const CopyScaleNode *op, int block_size,
+                                  Target target) {
+  Optional<AutoLayoutConfig> maybe_cfg = BuildConfig(op, block_size, target);
+  if (!maybe_cfg.has_value())
+    return std::nullopt;
+  AutoLayoutConfig cfg = maybe_cfg.value();
 
   const ConflictScore linear_score = ScoreLayout(cfg, 0);
   ConflictScore best_score = linear_score;
@@ -313,6 +365,28 @@ Optional<Layout> SelectAutoLayout(const CopyScaleNode *op, int block_size,
   return MakeXorLayout(op->src, cfg.format, best_shift);
 }
 
+ScaleBufferRowOrder SelectRowOrder(const CopyScaleNode *op, int block_size,
+                                   Target target) {
+  Optional<AutoLayoutConfig> maybe_cfg = BuildConfig(op, block_size, target);
+  if (!maybe_cfg.has_value())
+    return ScaleBufferRowOrder::kKInner;
+  AutoLayoutConfig cfg = maybe_cfg.value();
+  cfg.row_order = ScaleBufferRowOrder::kKInner;
+  const ConflictScore k_score = ScoreLayout(cfg, 0);
+  cfg.row_order = ScaleBufferRowOrder::kMNInner;
+  const ConflictScore mn_score = ScoreLayout(cfg, 0);
+  if (mn_score < k_score) {
+    DLOG(INFO) << "ScaleBufferRowOrder buffer=" << op->src->name
+               << " selected MNInner score " << k_score.max_multiplicity << "/"
+               << k_score.serialized_dwords << "/" << k_score.conflicting_banks
+               << " -> " << mn_score.max_multiplicity << "/"
+               << mn_score.serialized_dwords << "/"
+               << mn_score.conflicting_banks;
+    return ScaleBufferRowOrder::kMNInner;
+  }
+  return ScaleBufferRowOrder::kKInner;
+}
+
 } // namespace
 
 namespace hcu {
@@ -323,6 +397,11 @@ Optional<Layout> SelectAutoScaleLdsLayout(const CopyScaleNode *op,
   if (block_size == nullptr)
     return std::nullopt;
   return SelectAutoLayout(op, static_cast<int>(*block_size), args.target);
+}
+
+ScaleBufferRowOrder SelectScaleBufferRowOrder(const CopyScaleNode *op,
+                                              int block_size, Target target) {
+  return SelectRowOrder(op, block_size, target);
 }
 
 } // namespace hcu

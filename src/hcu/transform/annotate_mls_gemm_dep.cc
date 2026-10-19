@@ -4,6 +4,7 @@
  * consumer GEMM facts collected via PropagationTirCollector.
  */
 
+#include "hcu/op/builtin.h"
 #include "hcu/op/ds_read_format.h"
 #include "hcu/op/mls.h"
 #include "hcu/target_utils.h"
@@ -15,9 +16,9 @@
 #include "hcu/utils/propagation_tir_collector.h"
 #include "hcu/utils/propagation_util.h"
 #include "layout/layout.h"
-#include "op/builtin.h"
 #include "op/copy.h"
 #include "op/gemm.h"
+#include "op/gemm_blockscaled.h"
 #include "op/operator.h"
 #include "op/utils.h"
 #include "transform/common/pipeline_utils.h"
@@ -77,7 +78,8 @@ private:
       if (call->op.as<OpNode>()) {
         Op tir_op = Downcast<Op>(call->op);
         if (tir_op == MatrixLoad::Get() || tir_op == DsReadFormat::Get() ||
-            tir_op == Gemm::Get() || tir_op == Copy::Get()) {
+            tir_op == Gemm::Get() || tir_op == GemmBlockScaled::Get() ||
+            tir_op == Copy::Get()) {
           if (tir_op == Copy::Get()) {
             auto copy =
                 Downcast<Copy>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
@@ -573,7 +575,25 @@ private:
   }
 
   bool IsExplicitAsyncCopy(const CallNode *call) const {
-    return HasExplicitAsyncCopySemantics(GetRef<Call>(call));
+    if (call == nullptr) {
+      return false;
+    }
+    // T.async_copy carries its own op identity; the annotation keys are the
+    // historical spellings some kernels still pass through T.copy.
+    static const Op &async_copy = Op::Get("tl.tileop.async_copy");
+    if (call->op.same_as(async_copy)) {
+      return true;
+    }
+    for (const char *key : {"is_async_copy", "force_cp_async"}) {
+      if (auto val = call->annotations.Get(key)) {
+        if (const auto *imm = val->as<IntImmNode>()) {
+          if (imm->value != 0) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
   }
 
   Stmt VisitStmt_(const SBlockNode *op) final {
@@ -1113,6 +1133,18 @@ private:
         auto annotations = call->annotations;
         annotations.Set(attr::kMlsTrans,
                         IntImm(DataType::Int(32), trans ? 1 : 0));
+        if (mode_ == Mode::kCollectCandidates) {
+          // An explicitly selected MatrixLoad is an HCU async producer by
+          // construction.  Tell the backend-neutral pipeline planner that
+          // this copy has passed the HCU promotion gate so it can retain the
+          // original producer grouping and wait placement.
+          annotations.Set(attr::kHcuCopyAsyncPromotable,
+                          IntImm(DataType::Int(32), 1));
+        } else {
+          // This marker is only an input to PipelinePlanning.  Do not leak it
+          // into the materialized TileOp/codegen annotations.
+          annotations.erase(attr::kHcuCopyAsyncPromotable);
+        }
         return Evaluate(
             Call(call->dtype, call->op, call->args, annotations, call->span));
       }
@@ -1185,7 +1217,7 @@ private:
       return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
 
-    if (tir_op.same_as(Gemm::Get())) {
+    if (tir_op.same_as(Gemm::Get()) || tir_op.same_as(GemmBlockScaled::Get())) {
       auto gemm = Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
       auto annotations =
           AnnotateGemmHcuMlsFlags(call->annotations, gemm.get(), collector_);

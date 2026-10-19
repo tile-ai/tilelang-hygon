@@ -8,15 +8,14 @@
 
 #include "copy_scale.h"
 
+#include "hcu/op/builtin.h"
 #include "hcu/op/gemm_partition.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/layout_functor.h"
 #include "hcu/utils/scale_gemm_dep.h"
 #include "hcu/utils/scale_lds_layout.h"
 #include "layout/layout.h"
-#include "op/builtin.h"
 #include "op/gemm.h"
-#include "op/region.h"
 #include "op/utils.h"
 
 #include <algorithm>
@@ -118,15 +117,10 @@ void ValidateScaleStageBroadcastLayout(const Layout &layout,
 CopyScale::CopyScale(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   ICHECK(args.size() >= 3)
       << "copy_scale expects at least 3 args: src_region, dst_region, op_ctrl";
-  auto src_call = args[0].as<CallNode>();
-  auto dst_call = args[1].as<CallNode>();
-  ICHECK(src_call) << "copy_scale args[0] must be region call (src)";
-  ICHECK(dst_call) << "copy_scale args[1] must be region call (dst)";
-
-  auto src_region = RegionOp(src_call->args);
-  auto dst_region = RegionOp(dst_call->args);
-  auto src_ranges = src_region->GetRanges();
-  auto dst_ranges = dst_region->GetRanges();
+  BufferRegion src_region = NormalizeToBufferRegion(args[0]);
+  BufferRegion dst_region = NormalizeToBufferRegion(args[1]);
+  auto src_ranges = src_region->region;
+  auto dst_ranges = dst_region->region;
 
   ICHECK(src_ranges.size() >= 2) << "copy_scale src region must be at least 2D "
                                     "(optional leading stage dims)";
@@ -134,8 +128,8 @@ CopyScale::CopyScale(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
       << "copy_scale dst (scale_buffer) region must be exactly 2D, got rank="
       << dst_ranges.size();
 
-  Buffer src_buf = src_region->GetBuffer();
-  Buffer dst_buf = dst_region->GetBuffer();
+  Buffer src_buf = src_region->buffer;
+  Buffer dst_buf = dst_region->buffer;
   ICHECK(src_buf.scope() == "shared" || src_buf.scope() == "shared.dyn")
       << "copy_scale src must be shared memory, got scope=" << src_buf.scope();
   ICHECK(dst_buf.scope() == "shared.scale")
@@ -175,6 +169,9 @@ CopyScale::CopyScale(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
       GetIntAnnOrDefault(annotations, attr::kScaleGranularityK, 1);
   node->scale_k_major_ = GetIntAnnOrDefault(annotations, attr::kScaleKMajor, 0);
   node->role_ = GetIntAnnOrDefault(annotations, attr::kScaleRole, 0);
+  node->row_order_ = GetIntAnnOrDefault(annotations, attr::kScaleRowOrder, 0);
+  node->lds_from_async_copy_ =
+      GetIntAnnOrDefault(annotations, attr::kScaleLdsFromAsync, 0);
   node->gemm_m_ = GetIntAnnOrDefault(annotations, attr::kScaleGemmM, 0);
   node->gemm_n_ = GetIntAnnOrDefault(annotations, attr::kScaleGemmN, 0);
   node->gemm_k_ = GetIntAnnOrDefault(annotations, attr::kScaleGemmK, 0);
@@ -222,6 +219,14 @@ LayoutMap CopyScaleNode::InferLayout(const LayoutInferArgs &T,
   // Explicit T.annotate_layout entries seed layout_map before strict inference
   // and always take precedence over automatic selection.
   if (T.layout_map.count(src)) {
+    if (lds_from_async_copy_) {
+      Layout linear = MakeLinearLayout(src->shape);
+      ICHECK(StructuralEqual()(T.layout_map[src], linear))
+          << "copy_scale source LDS `" << src->name
+          << "` is written by async_copy and therefore requires a linear "
+             "layout; an explicit non-linear T.annotate_layout is not "
+             "supported";
+    }
     if (has_scale_view_) {
       const auto format = static_cast<ScaleLdsFormat>(scale_format_);
       const size_t format_rank = ScaleFormatPhysicalRank(format);
@@ -231,7 +236,9 @@ LayoutMap CopyScaleNode::InferLayout(const LayoutInferArgs &T,
     }
     return result;
   }
-  Optional<Layout> automatic = hcu::SelectAutoScaleLdsLayout(this, T);
+  Optional<Layout> automatic = lds_from_async_copy_
+                                   ? Optional<Layout>()
+                                   : hcu::SelectAutoScaleLdsLayout(this, T);
   result.Set(src, automatic.defined() ? automatic.value()
                                       : MakeLinearLayout(src->shape));
   return result;
@@ -316,7 +323,7 @@ Stmt CopyScaleNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       << "copy_scale: TotalWarps=" << seg.total_warps
       << " must be divisible by MnWarps=" << mn_warps;
 
-  PrimExpr warp_id = FloorDiv(T.thread_var - T.thread_bounds->min, warp_size);
+  PrimExpr warp_id = FloorDiv(T.thread_index - T.thread_bounds->min, warp_size);
 
   // The remapped buffer may already be flattened by LowerTileOp.  Addressing
   // metadata always comes from the logical buffer / ScaleView descriptor.
@@ -482,7 +489,7 @@ Stmt CopyScaleNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
      << ", " << scale_shape_k << ", " << granularity_mn_ << ", "
      << granularity_k_ << ", " << scale_k_major_ << ", " << mn_warps << ", "
      << seg.total_warps << ", " << generated_layout.name << ", " << kMmacK
-     << ">";
+     << ", " << row_order_ << ">";
 
   Array<PrimExpr> call_args;
   call_args.push_back(StringImm(ss.str()));
