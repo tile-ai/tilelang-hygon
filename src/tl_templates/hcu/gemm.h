@@ -73,7 +73,7 @@ template <> struct MmacTraits<float> {
     *c = __builtin_hcu_mmac_16x16x8_f32_lit_lts(*((float32x2 *)a),
                                                 *((float32x2 *)b), *c, 1, 0);
 #elif defined(__gfx946__)
-    *c = __builtin_hcu_mmac_16x16x4_f32_lit_lts(*a, *b, *c, 1, 0);
+    *c = __builtin_hcu_mmac_16x16x4_f32(*a, *b, *c, 0);
 #elif defined(__gfx92a__)
     *c = __builtin_hcu_mmac_16x16x4_f32(*a, *b, *c);
 #else

@@ -1056,7 +1056,7 @@ def _assert_mls_b32_tf32_source(source: str) -> None:
     reason="b32 MLS matrix_load + ds_read_format is only supported on gfx92a/gfx946",
 )
 def test_gemm_mls_b32_tf32(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
-    """Float32 matrix_load_16x16_b32 -> TF32 ds_read_format -> TF32 GEMM coverage."""
+    """Float32 matrix_load/ds_read_format -> TF32 GEMM coverage."""
     run_gemm_mls(
         M=M,
         N=N,
@@ -1071,6 +1071,83 @@ def test_gemm_mls_b32_tf32(M, N, K, trans_A, trans_B, block_M, block_N, block_K,
         block_K=block_K,
         num_threads=num_threads,
         verify_source=_assert_mls_b32_tf32_source,
+        use_tf32=True,
+        atol=1e-1,
+        rtol=1e-1,
+    )
+
+
+def _assert_mls_b32_native_fp32_kpack2_source(source: str) -> None:
+    assert "ds_read_format_tensor_a" in source
+    assert "ds_read_format_tensor_b" in source
+    assert "__builtin_hcu_mmac_16x16x4_f32" in source
+
+
+@pytest.mark.skipif(
+    not target_supports_mls_b32(),
+    reason="b32 MLS matrix_load + ds_read_format is only supported on gfx92a/gfx946",
+)
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads",
+    [
+        pytest.param(16, 16, 16, False, True, 16, 16, 16, 64, id="at_bn_single_atom"),
+        pytest.param(32, 32, 16, False, True, 32, 32, 16, 128, id="at_bn_multi_warp"),
+        pytest.param(64, 32, 64, False, True, 64, 32, 64, 256, id="at_bn_multi_k"),
+        pytest.param(32, 32, 16, True, False, 32, 32, 16, 64, id="an_bt_single_atom"),
+    ],
+)
+def test_gemm_mls_b32_native_fp32_kpack2(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
+    """One b32 K8 ds-read atom feeds two native FP32 K4 MMACs."""
+    run_gemm_mls_ds_read_format(
+        M=M,
+        N=N,
+        K=K,
+        trans_A=trans_A,
+        trans_B=trans_B,
+        in_dtype="float32",
+        out_dtype="float32",
+        dtypeAccum="float32",
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+        num_threads=num_threads,
+        k_pack=2,
+        verify_source=_assert_mls_b32_native_fp32_kpack2_source,
+        use_tf32=False,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+@pytest.mark.skipif(
+    not target_supports_mls_b32(),
+    reason="b32 MLS matrix_load + ds_read_format is only supported on gfx92a/gfx946",
+)
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads",
+    [
+        pytest.param(16, 16, 16, False, True, 16, 16, 16, 64, id="at_bn_single_atom"),
+        pytest.param(32, 32, 16, False, True, 32, 32, 16, 128, id="at_bn_multi_warp"),
+        pytest.param(64, 32, 64, False, True, 64, 32, 64, 256, id="at_bn_multi_k"),
+        pytest.param(32, 32, 16, True, False, 32, 32, 16, 64, id="an_bt_single_atom"),
+    ],
+)
+def test_gemm_mls_ds_read_format_b32_tf32(M, N, K, trans_A, trans_B, block_M, block_N, block_K, num_threads):
+    """Explicit b32 F32 ds-read feeds a TF32 GEMM."""
+    run_gemm_mls_ds_read_format(
+        M=M,
+        N=N,
+        K=K,
+        trans_A=trans_A,
+        trans_B=trans_B,
+        in_dtype="float32",
+        out_dtype="float32",
+        dtypeAccum="float32",
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+        num_threads=num_threads,
+        k_pack=1,
         use_tf32=True,
         atol=1e-1,
         rtol=1e-1,

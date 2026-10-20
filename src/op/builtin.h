@@ -53,6 +53,7 @@ static constexpr const char *kLaunchThreads = "tl.launch_threads";
 // the common allocator depend on the backend that produced them.
 static constexpr const char *kSharedMemoryAllocationSizeBytesMap =
     "tl.shared_memory_allocation_size_bytes_map";
+
 } // namespace attr
 
 inline ffi::Optional<PrimExpr> GetAnnotatedMbarPhaseExpr(

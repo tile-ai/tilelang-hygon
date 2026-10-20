@@ -180,8 +180,6 @@ def copy_scale(src, dst, *, op_ctrl: int = 0):
         expected = {"identity": 0, "k2": 1, "k4": 2, "k2mn2": 2, "mn2": 1, "mn4": 2}[scale_src.format.name]
         if op_ctrl != expected:
             raise ValueError(f"copy_scale format {scale_src.format.name} requires op_ctrl={expected}, got {op_ctrl}")
-    elif op_ctrl != 0:
-        raise ValueError("copy_scale op_ctrl>0 requires an explicit ScaleView")
     if op_ctrl not in (0, 1, 2):
         raise ValueError(f"copy_scale op_ctrl must be 0/1/2, got {op_ctrl}")
     src_buffer, dst_buffer = _buffer(src), _buffer(dst)

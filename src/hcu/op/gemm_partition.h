@@ -37,8 +37,12 @@ HcuMmacModeInfo ResolveHcuMmacMode(DataType a_dtype, DataType b_dtype,
                                    bool a_is_fragment, bool b_is_fragment,
                                    bool is_blockscaled, int block_k,
                                    ScaleLdsFormat scale_format_a,
-                                   ScaleLdsFormat scale_format_b,
-                                   Target target);
+                                   ScaleLdsFormat scale_format_b, Target target,
+                                   bool use_tf32 = false);
+
+/// Resolve the MMAC representation from the complete GEMM contract, including
+/// fragment expansion, block-scaled formats, target architecture and TF32.
+HcuMmacModeInfo ResolveHcuMmacModeForGemm(const GemmNode *gemm, Target target);
 
 /// Resolve MN floors used by warp search / fragment / n_seg.
 /// ``extra_min_*`` are additional floors (0 = none), e.g. ScaleFormat atoms.
@@ -49,13 +53,11 @@ HcuMnPerWarp ResolveHcuMnPerWarp(int element_bits, bool A_from_mls,
 
 /// Warp partition. Writes ``policy.m/n/k_warp`` and returns effective MN floors
 /// (same values ResolveHcuMnPerWarp would produce for the same args).
-HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
-                                     int N, int K, int k_pack, int element_bits,
-                                     int block_size, Target target,
-                                     bool A_from_mls, bool B_from_mls,
-                                     bool A_mls_trans, bool B_mls_trans,
-                                     int extra_min_m_per_warp = 0,
-                                     int extra_min_n_per_warp = 0);
+HcuMnPerWarp ComputeWarpPartitionHCU(
+    const GemmWarpPolicyNode &policy, int M, int N, int K, int k_pack,
+    int element_bits, int block_size, Target target, bool A_from_mls,
+    bool B_from_mls, bool A_mls_trans, bool B_mls_trans,
+    int extra_min_m_per_warp = 0, int extra_min_n_per_warp = 0, int mmac_k = 0);
 
 /// Minimum MN extent required to keep one ScaleFormat atom inside a segment.
 int ScaleFormatMinMnPerWarp(ScaleLdsFormat scale_format);

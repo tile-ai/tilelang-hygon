@@ -62,8 +62,17 @@ struct AutoLayoutConfig {
   int total_warps{0};
   int mmac_k{64};
   ScaleBufferRowOrder row_order{ScaleBufferRowOrder::kKInner};
+  size_t leading_stage_dims{0};
   std::vector<int> physical_shape;
 };
+
+size_t ScaleFormatPhysicalRank(ScaleLdsFormat format) {
+  if (format == ScaleLdsFormat::kIdentity)
+    return 2;
+  if (format == ScaleLdsFormat::kK2MN2Interleave)
+    return 5;
+  return 3;
+}
 
 int ScaleMnIndex(int mn_row, int tx16, int gran_mn) {
   if (gran_mn >= 16)
@@ -222,7 +231,7 @@ ConflictScore ScoreLayout(const AutoLayoutConfig &cfg, int xor_shift) {
 }
 
 Layout MakeXorLayout(const Buffer &buffer, ScaleLdsFormat format,
-                     int xor_shift) {
+                     size_t leading_stage_dims, int xor_shift) {
   Array<IterVar> vars;
   Array<PrimExpr> output;
   for (size_t i = 0; i < buffer->shape.size(); ++i) {
@@ -233,8 +242,8 @@ Layout MakeXorLayout(const Buffer &buffer, ScaleLdsFormat format,
     output.push_back(vars.back()->var);
   }
   if (xor_shift != 0 && format != ScaleLdsFormat::kK2MN2Interleave) {
-    const int outer_dim = 0;
-    const int mn_dim = 1;
+    const size_t outer_dim = leading_stage_dims;
+    const size_t mn_dim = leading_stage_dims + 1;
     const PrimExpr phase =
         FloorMod(vars[outer_dim]->var * xor_shift, buffer->shape[mn_dim]);
     output.Set(mn_dim, vars[mn_dim]->var ^ phase);
@@ -270,12 +279,17 @@ Optional<AutoLayoutConfig> BuildConfig(const CopyScaleNode *op, int block_size,
     return std::nullopt;
   if (cfg.gran_mn < 16 && 16 % cfg.gran_mn != 0)
     return std::nullopt;
+  const size_t format_rank = ScaleFormatPhysicalRank(cfg.format);
+  if (op->src->shape.size() < format_rank)
+    return std::nullopt;
+  cfg.leading_stage_dims = op->src->shape.size() - format_rank;
   for (const PrimExpr &shape : op->src->shape) {
     const int value = get_int(shape);
     if (value <= 0)
       return std::nullopt;
-    cfg.physical_shape.push_back(value);
   }
+  for (size_t i = cfg.leading_stage_dims; i < op->src->shape.size(); ++i)
+    cfg.physical_shape.push_back(get_int(op->src->shape[i]));
   if ((cfg.format == ScaleLdsFormat::kIdentity &&
        cfg.physical_shape.size() != 2) ||
       ((cfg.format == ScaleLdsFormat::kK2Interleave ||
@@ -362,7 +376,29 @@ Optional<Layout> SelectAutoLayout(const CopyScaleNode *op, int block_size,
              << best_score.max_multiplicity << "/"
              << best_score.serialized_dwords << "/"
              << best_score.conflicting_banks;
-  return MakeXorLayout(op->src, cfg.format, best_shift);
+  return MakeXorLayout(op->src, cfg.format, cfg.leading_stage_dims, best_shift);
+}
+
+ScaleBufferRowOrder SelectRowOrder(const CopyScaleNode *op, int block_size,
+                                   Target target) {
+  Optional<AutoLayoutConfig> maybe_cfg = BuildConfig(op, block_size, target);
+  if (!maybe_cfg.has_value())
+    return ScaleBufferRowOrder::kKInner;
+  AutoLayoutConfig cfg = maybe_cfg.value();
+  cfg.row_order = ScaleBufferRowOrder::kKInner;
+  const ConflictScore k_score = ScoreLayout(cfg, 0);
+  cfg.row_order = ScaleBufferRowOrder::kMNInner;
+  const ConflictScore mn_score = ScoreLayout(cfg, 0);
+  if (mn_score < k_score) {
+    DLOG(INFO) << "ScaleBufferRowOrder buffer=" << op->src->name
+               << " selected MNInner score " << k_score.max_multiplicity << "/"
+               << k_score.serialized_dwords << "/" << k_score.conflicting_banks
+               << " -> " << mn_score.max_multiplicity << "/"
+               << mn_score.serialized_dwords << "/"
+               << mn_score.conflicting_banks;
+    return ScaleBufferRowOrder::kMNInner;
+  }
+  return ScaleBufferRowOrder::kKInner;
 }
 
 ScaleBufferRowOrder SelectRowOrder(const CopyScaleNode *op, int block_size,
