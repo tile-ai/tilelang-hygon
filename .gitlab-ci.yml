@@ -30,6 +30,7 @@ default:
 
 test:
   stage: test
+  timeout: 3h
   rules: *test_rules
   variables:
     GIT_SUBMODULE_STRATEGY: recursive
