@@ -175,6 +175,18 @@ private:
   }
 };
 
+bool StmtContainsAsyncCommit(const Stmt &stmt) {
+  bool found = false;
+  PostOrderVisit(stmt, [&found](const ObjectRef &node) {
+    if (const auto *call = node.as<CallNode>()) {
+      if (call->op.same_as(builtin::ptx_commit_group())) {
+        found = true;
+      }
+    }
+  });
+  return found;
+}
+
 } // namespace
 
 GemmKLoopFeatures AnalyzeGemmKLoopBody(const Stmt &body) {
@@ -220,6 +232,10 @@ const ForNode *FindOwnedWaitPlanKLoop(const Stmt &stmt) {
   // has no wait plan this pass can author: decline ownership and let the
   // in-place lowering of the commit/wait attrs stand.
   if (StmtContainsMlsAsyncLoad(k_loop->body)) {
+    return nullptr;
+  }
+  if (!StmtContainsAsyncCopy(k_loop->body) &&
+      !StmtContainsAsyncCommit(k_loop->body)) {
     return nullptr;
   }
   if (LoopHasAppliedRegisterPipeline(k_loop)) {
