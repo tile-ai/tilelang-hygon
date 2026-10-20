@@ -11,6 +11,7 @@ from typing import Any
 from collections.abc import Callable
 import sys
 import threading
+import re
 
 import torch
 from tilelang import tvm
@@ -128,8 +129,86 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         self.kernel_global_source = self.device_kernel_source
         self.executable = None
         self._executable_lock = threading.Lock()
+        self._ipc_metadata_initializer = None
+        self._ipc_allocator = None
+        self._ipc_initialized_generation = None
+        self._ipc_remote_source_indices = self._get_ipc_remote_source_indices()
 
         self._post_init()
+
+    def initialize_ipc_metadata(self, allocator, stream=None) -> bool:
+        """Initialize IPC metadata for this adapter's device module.
+
+        ``stream`` is accepted for the JITKernel backend-neutral API.  The
+        helper currently launches through TVM's ROCm current stream; the stream
+        bridge is installed by the HCU launch wrapper in a later unit.
+        """
+        if self.target.kind.name != "hcu" or str(self.target.attrs.get("dist_backend", "")) != "ipc":
+            return False
+        if self._ipc_allocator is allocator and self._ipc_initialized_generation == allocator.generation:
+            return False
+        if self.rt_mod is None and self.executable is None:
+            raise RuntimeError("IPC metadata initialization requires a runtime module")
+        if self._ipc_metadata_initializer is None:
+            from tilelang.distributed.backends.ipc import IpcMetadataInitializer, tvm_hcu_stream
+
+            self._ipc_metadata_initializer = IpcMetadataInitializer()
+        else:
+            from tilelang.distributed.backends.ipc import tvm_hcu_stream
+        stream = self.get_current_stream_functor()() if stream is None else stream
+        # Metadata is module-local. Bind the helper to the exact module used
+        # for launch. A disk-cache adapter already owns a runnable Module in
+        # self.executable; a fresh adapter must first create its per-device
+        # runtime.Executable.
+        if self.rt_mod is None:
+            execution_module = self.executable
+        else:
+            executable = self._executables_by_device.get(allocator.device)
+            if executable is None:
+                with self._executable_lock:
+                    executable = self._executables_by_device.get(allocator.device)
+                    if executable is None:
+                        executable = self._make_executable()
+                        self._executables_by_device[allocator.device] = executable
+            execution_module = executable.jit()
+        for module in [execution_module, *execution_module.imports]:
+            try:
+                helper = module.get_function("__tilelang_init_ipc_metadata", query_imports=False)
+            except AttributeError:
+                continue
+            if helper is not None:
+                with tvm_hcu_stream(allocator.device, stream):
+                    launched = self._ipc_metadata_initializer.initialize(module, allocator)
+                self._ipc_allocator = allocator
+                self._ipc_initialized_generation = allocator.generation
+                return launched
+        raise RuntimeError("compiled IPC kernel does not contain the metadata helper")
+
+    def validate_ipc_launch(self) -> None:
+        """Reject IPC launches whose allocator mapping generation is stale."""
+        if self.target.kind.name != "hcu" or str(self.target.attrs.get("dist_backend", "")) != "ipc":
+            return
+        if self._ipc_allocator is None or self._ipc_initialized_generation is None:
+            raise RuntimeError("IPC kernel must be initialized before launch")
+        if self._ipc_allocator.generation != self._ipc_initialized_generation:
+            raise RuntimeError("IPC allocator generation changed; call kernel.initialize() before launch")
+
+    def _get_ipc_remote_source_indices(self) -> set[int]:
+        source = self.device_kernel_source or ""
+        names = set(re.findall(r"^// tilelang_ipc_remote_source: (.+)$", source, flags=re.MULTILINE))
+        if not names:
+            return set()
+        return {i for i, param in enumerate(self.prim_func.params) if getattr(param, "name_hint", getattr(param, "name", "")) in names}
+
+    def validate_ipc_remote_sources(self, tensor_list) -> None:
+        if not self._ipc_remote_source_indices:
+            return
+        for index in self._ipc_remote_source_indices:
+            tensor = tensor_list[index]
+            if not isinstance(tensor, torch.Tensor):
+                raise RuntimeError("IPC remote source must be a PyTorch tensor")
+            if not self._ipc_allocator.contains(tensor.data_ptr(), tensor.numel() * tensor.element_size()):
+                raise RuntimeError("IPC remote source tensor is outside the allocator arena")
 
     def _make_executable(self) -> tvm.runtime.Executable:
         if self.rt_mod is None:
@@ -336,6 +415,8 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             if out_device is not None:
                 self._prepare_torch_device(out_device)
             executable = self._get_executable()
+            self.validate_ipc_launch()
+            self.validate_ipc_remote_sources(tensor_list)
             executable(*tensor_list)
 
             # Return outputs in the requested form
@@ -425,6 +506,10 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         adapter._ffi_callee_allocated_output_abi = adapter._uses_ffi_callee_allocated_output_abi()
         adapter.dynamic_symbolic_map = None if adapter._ffi_callee_allocated_output_abi else adapter._process_dynamic_symbolic()
         adapter._executable_lock = threading.Lock()
+        adapter._ipc_metadata_initializer = None
+        adapter._ipc_allocator = None
+        adapter._ipc_initialized_generation = None
+        adapter._ipc_remote_source_indices = adapter._get_ipc_remote_source_indices()
         adapter._post_init()
         return adapter
 

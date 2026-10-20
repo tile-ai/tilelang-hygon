@@ -1,0 +1,72 @@
+/*!
+ * \file hcu/distributed/ipc/ipc_backend.cc
+ * \brief IPC capability declaration for the HCU distributed dispatcher.
+ */
+#include "hcu/distributed/backend.h"
+
+namespace tvm {
+namespace tl {
+namespace hcu {
+namespace {
+
+class IpcDistributedBackend final : public HcuDistributedBackend {
+public:
+  ffi::String name() const final { return "ipc"; }
+
+  bool Supports(DistributedCapability capability) const final {
+    switch (capability) {
+    case DistributedCapability::kRankAndWorldSize:
+    case DistributedCapability::kBlockRemoteGet:
+      return true;
+    }
+    return false;
+  }
+
+  std::string EmitRankExpr() const final { return "tl::ipc_get_rank()"; }
+
+  std::string EmitNumRanksExpr() const final {
+    return "tl::ipc_get_num_ranks()";
+  }
+  std::string EmitBlockGetExpr(const std::string &src, const std::string &dst,
+                               const std::string &size,
+                               const std::string &src_pe) const final {
+    return "tl::ipc_get_block(" + src + ", " + dst + ", " + size + ", " +
+           src_pe + ")";
+  }
+
+  std::string ModulePreamble() const final {
+    return R"(
+extern "C" __device__ volatile uint64_t __tilelang_ipc_metadata[1024] = {};
+
+extern "C" __global__ void __tilelang_init_ipc_metadata(
+    const uint64_t* source, int64_t count) {
+  if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
+      threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+    if (source == nullptr || count < 3 || count > 1024) {
+      return;
+    }
+    const uint64_t rank = source[0];
+    const uint64_t world_size = source[1];
+    if (world_size == 0 || world_size > 1022 ||
+        count != static_cast<int64_t>(world_size + 2) || rank >= world_size) {
+      return;
+    }
+    for (int64_t i = 0; i < count; ++i) {
+      __tilelang_ipc_metadata[i] = source[i];
+    }
+  }
+}
+)";
+  }
+};
+
+} // namespace
+
+const HcuDistributedBackend &GetIpcDistributedBackend() {
+  static const IpcDistributedBackend backend;
+  return backend;
+}
+
+} // namespace hcu
+} // namespace tl
+} // namespace tvm
