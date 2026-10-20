@@ -102,7 +102,8 @@ untried; do not re-open any of these without new evidence.
 | **Block-count inflation / occupancy** | More blocks at constant bytes is worse, and **320 blocks is the best point** on both curves; the ~8× blocks that reach the ~0.98× o M=1 bound cannot be supplied, and 320 is exactly 5/CU against an 8-slot LDS residency limit. | [2026-10-17f](#2026-10-17f), [2026-10-19](#2026-10-19-lds) |
 | **Independent accumulator chains** | Splitting the single 16×16 chain is **1.539/1.524/1.644/1.641×** slower (o M=1/16, down M=1/16); a second accumulator over the same tile is neutral (**1.012/1.008/1.014/1.013×**). | [2026-10-17i](#2026-10-17i), [2026-10-18b](#2026-10-18b) |
 | **Hand-written double buffering** | Correct (rel 0.00000) but **1.26-1.70× slower**; the pipelined form is genuinely slower at this tile. | [2026-10-17h](#2026-10-17h) |
-| **Tile widening** | Monotonically catastrophic in the early sweep (`bn64/128/256`), and `bn32` alone is **7-12% worse** at every (shape, M). | [2026-10-17f](#2026-10-17f), [2026-10-18d](#2026-10-18d) |
+| **Tile widening** | Monotonically catastrophic in the early sweep (`bn64/128/256`), and `bn32` alone is **7-12% worse** at every (shape, M). At M=64 the whole neighbourhood loses to the shipped `bn64/bk128/ns2/t256`: depth (`ns3`/`ns4`) and width (`bn96`/`128`/`192`) are 1.13-1.87×, and the exactly-64-block `bn80` is 1.177×. | [2026-10-17f](#2026-10-17f), [2026-10-18d](#2026-10-18d), [2026-10-20d](#2026-10-20d) |
+| **Wave quantization (M=64)** | 80 blocks on 64 CUs is real but not the cost: the perfectly balanced 64-block point is *slower* (bn80 1.177×; N=4096 the slowest of 64/80/96/128), and the N-ladder is confounded by total bytes. No grid-shape knob exists to test co-residency cleanly. | [2026-10-20d](#2026-10-20d) |
 | **`k_pack=2`, `b_ds_read_alt=0`, `respect_layout_map`** | Hard-rejected by the MLS path / unsupported (only Alt1 exists) / exact no-ops respectively. | [2026-10-17h](#2026-10-17h) |
 
 ## Contents
@@ -144,6 +145,7 @@ subsections are indented.
 - [2026-10-20 — the fat tile is real](#2026-10-20)
   - [2026-10-20b — warp count, not A traffic](#2026-10-20b)
   - [2026-10-20c — producer A de-replication CLOSED](#2026-10-20c)
+  - [2026-10-20d — M=64 tile neighbourhood CLOSED](#2026-10-20d)
 
 <a id="setup"></a>
 ## The setup
@@ -2817,3 +2819,64 @@ about the wrong resource.
 Header change reverted; the t192 landing of 2026-10-20b stands. Standing
 re-measured after the revert (paired, 7 rounds, idle card): o 1.069/1.027/1.024
 and down 1.110/1.042/**0.928** at M = 1/16/32, all exact.
+
+<a id="2026-10-20d"></a>
+### 2026-10-20d — M=64: the tile neighbourhood is closed; neither wave quantization nor co-residency explains it
+
+**1. The M=64 neighbourhood is a measured optimum.** At `bm64`, paired
+same-process, every arm `rel = 0` (hipblas 136.64 µs on down and 52.32 µs on o
+in the same process):
+
+| config | down M=64 /hip | o M=64 /hip |
+|---|---|---|
+| **ship `64x64x128 ns2 t256`** | **1.178** | **1.083** |
+| `bn128 ns2 t256` | 1.280 | 1.128 |
+| `bn96 ns2 t256` | 1.219 | 1.183 |
+| `bn96 ns3 t256` | 1.304 | 1.235 |
+| `bn64 bk256 ns2 t256` | 1.311 | 1.294 |
+| `bn96 ns2 t384` | 1.371 | 1.303 |
+| `bn128 ns2 t512` | 1.527 | 1.443 |
+| `bn96 bk256 ns1 t256` | 1.481 | 1.459 |
+| `bn64 ns4 t256` | 1.650 | 1.547 |
+| `bn192 ns2 t384` | 1.823 | 1.700 |
+| `bn64 ns3 t256` | 1.867 | 1.716 |
+
+Depth (`ns3`/`ns4`) and width (`bn96`/`128`/`192`) both lose, and `ns3` is worse
+than `ns4` at the same tile. So the M=64 gap is not LDS volume, consistent with
+[2026-10-16c](#m64-paired).
+
+**2. Wave quantization — tested, not supported.** At bn64 the block is 32768 B of
+LDS, so 2 blocks fit per CU, and `N/bn` = 80 blocks land on 64 CUs: 16 CUs run
+two blocks, 48 run one. The natural hypothesis is a 62.5%-efficient ragged wave.
+Neither test supports it:
+
+- *Direct*: `bn80` gives exactly 64 blocks (5120/80), one per CU — **1.177x
+  slower** on down (190.08 vs 161.44 µs). Confounded: bn80 admits only 5 warps
+  (t320), which changes A's replication factor, so it is not single-variable.
+- *Indirect*: at the ship tile, vary only N so the block count is 64/80/96/128.
+  Throughput is **780 / 821 / 920 / 1060 GB/s** — monotone in block count, with
+  the perfectly balanced 64-block point the *slowest*. That refutes "ragged
+  waves are the cost", but it carries the confound the 2026-10-17f retraction
+  named: N moves block count and total bytes together, and a fixed-overhead
+  amortisation alone explains the rise (a two-point fit gives a 71-96 µs
+  intercept, which is not physical as a launch floor — so the linear model is
+  wrong too; all that can be read is the monotonicity).
+
+**Verdict.** Wave quantization is not the M=64 gap, and without a grid-shape knob
+there is no clean experiment separating co-residency from fixed overhead. Do not
+re-open on this evidence.
+
+**3. Where M=64 actually sits.** `N·K / t` against the measured 1725 GB/s read
+ceiling (B is >99% of the DRAM read stream at these M):
+
+| | M=1 | M=16 | M=32 (est) | M=64 |
+|---|---|---|---|---|
+| o | 69.1% | 67.2% | ≈60.7% | **42.9%** (740 GB/s) |
+| down | 87.3% | 85.8% | ≈75.9% | **47.2%** (814 GB/s) |
+
+M=64 moves the same B bytes as M=16 but takes 1.57x (o) and 1.82x (down) the
+time; the extra work is A (re-read once per block — 80x at bn64) plus 4x the
+mmac volume, and it is not hidden behind the B stream. At 47% of the read
+ceiling and ~24% of fp8 peak (104 TFLOPS on down), M=64 is neither
+bandwidth- nor compute-bound: it is the same exposure/overlap deficit recorded
+at M≤16, no longer covered by B.
