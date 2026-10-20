@@ -260,8 +260,6 @@ HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
     m_warp = best_m;
     n_warp = best_n * recompute;
   } else if (policy.IsFullColK()) {
-    ICHECK(!use_mls)
-        << "gemm_mls does not support warp partitioning on K (FullColK policy)";
     n_warp = num_warps;
     k_warp = 1;
     if (N % (n_warp * kNPerWarp) != 0) {

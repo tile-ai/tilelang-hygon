@@ -21,7 +21,15 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from perf.gemm.fp8_channelwise_mls import fp8_mls_channelwise  # noqa: E402
+from perf.gemm.fp8_channelwise_mls import (  # noqa: E402
+    DecodeCfg,
+    _validate_cfg,
+    decode_cfg,
+    fp8_mls_channelwise,
+)
+
+# The four qwen3-32B decode shapes, as (N, K).
+_DECODE_SHAPES = [(51200, 5120), (10240, 5120), (5120, 8192), (5120, 25600)]
 
 
 pytestmark = [
@@ -85,6 +93,297 @@ def test_hcu_gemm_fp8_mls_channelwise_small():
     ref = _ref_program(A, B, scale_a, scale_b)
     rel = (C - ref).abs().max().item() / ref.abs().max().item()
     assert rel < 0.01, f"small fp8 MLS channelwise GEMM rel error {rel:.6f} >= 0.01"
+
+
+def test_decode_cfg_is_shape_aware():
+    """The chooser used to take only M, which is why o/down lost at every M.
+
+    These assertions pin the measured N-rule and, more importantly, pin the
+    invariants -- every one of which has at some point been a silent wrong answer
+    rather than an error.
+    """
+    # N >= 10240 keeps bn32 (gate_up/qkv); N == 5120 now takes the FAT tile.
+    # Measured 2026-10-20: bn16 at N=5120 means 320 blocks each re-reading the
+    # whole A tile (320 redundant reads of A's L2 traffic), whereas hipblas's
+    # M=16 kernel covers 96 N-columns per workgroup and re-reads A only 54
+    # times.  bn96/bk256/ns2 is the widest tile whose two stages fit one CU
+    # (2*(16+96)*256 = 57344 <= 65536), and it is worth 3-8% at M=1/16/32:
+    #   wide/ship  down 0.923/0.932/0.952   o 0.952/0.950/0.969
+    wide = decode_cfg(1, 51200, 5120)
+    assert (wide.block_N, wide.threads) == (32, 256)
+    assert (decode_cfg(1, 10240, 5120).block_N, decode_cfg(1, 10240, 5120).threads) == (32, 256)
+    narrow = decode_cfg(1, 5120, 25600)
+    assert (narrow.block_N, narrow.threads, narrow.num_stages) == (96, 192, 2)
+    assert decode_cfg(1, 5120, 8192).block_N == 96
+
+    # The fat tile's thread count is pinned by the N-atom split, so unlike the
+    # old bn16 tile it does NOT scale with block_M -- bm32 keeps t192.  Three
+    # wavefronts (not six) because the MLS A producer replicates A in every
+    # warp: at fixed bn96/bk256/ns2, paired, t384 1.000 -> t192 0.952-0.962 ->
+    # t128 0.971-0.983 -> t64 1.23-1.29.  Legal warp counts at bn96 are
+    # {1,2,3,6} (96/n must stay a multiple of 16), and 3 is the measured optimum.
+    for M in (1, 16, 32):
+        for K in (8192, 25600):
+            assert decode_cfg(M, 5120, K).threads == 192, (M, K)
+
+    # Every returned config must be legal for its own shape.
+    for N, K in _DECODE_SHAPES:
+        for M in (1, 2, 4, 8, 16, 32):
+            _validate_cfg(decode_cfg(M, N, K), M, N, K)
+
+    # M=64 is out of scope and a measured structural optimum; split-K stays off.
+    for N, K in _DECODE_SHAPES:
+        assert decode_cfg(64, N, K).split_k == 1
+
+
+def test_validate_cfg_rejects_the_k8192_bk320_trap():
+    """bk=320 divides K=5120 and K=25600 but NOT K=8192. A non-dividing block_K
+    makes the pipelined T.copy read past the end of B and return silently wrong
+    results (bk=192 on K=5120 gave rel=1.61 with no error)."""
+    with pytest.raises(AssertionError, match="silent OOB copy"):
+        _validate_cfg(DecodeCfg(16, 16, 320, 1, 64, 1), 1, 5120, 8192)
+    # ...and the same config is fine where it does divide.
+    _validate_cfg(DecodeCfg(16, 16, 320, 1, 64, 1), 1, 5120, 25600)
+
+
+@pytest.mark.parametrize("N,K", _DECODE_SHAPES)
+def test_every_chosen_decode_config_is_correct(N, K):
+    """Run whatever ``decode_cfg`` actually returns, on every decode shape.
+
+    This is the coverage that was missing: M=64 is the only config that uses
+    ``num_stages > 1`` (bk128 ns2), and it was adopted on the strength of a
+    hand-run measurement with no test pinning it. It is also the config most at
+    risk -- until the 2026-10-17h fix, ``num_stages > 1`` was *silently wrong*
+    (rel=2.4, or non-finite) for most other (block_M, block_N, block_K, threads)
+    combinations, so a future edit to the M=64 row that "looks harmless" would
+    have produced garbage rather than an error. See the doc's 2026-10-17f and
+    2026-10-17h sections.
+    """
+    M = 64
+    cfg = decode_cfg(M, N, K)
+    assert cfg.num_stages > 1, f"this test is only meaningful for the ns>1 config, got {cfg}"
+    A, B, scale_a, scale_b = _make_inputs(M, N, K)
+    kernel = fp8_mls_channelwise(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
+                                 cfg.num_stages, cfg.threads, setprio=cfg.setprio)
+    C = kernel(A, B, scale_a, scale_b)
+    ref = _ref_program(A, B, scale_a, scale_b)
+    assert torch.isfinite(C).all(), f"decode_cfg(64, {N}, {K}) produced non-finite output"
+    rel = (C - ref).abs().max().item() / ref.abs().max().item()
+    assert rel < 1e-3, f"decode_cfg(64, {N}, {K}) = {cfg} rel error {rel:.6f}"
+
+
+def test_decode_cfg_keeps_split_k_closed():
+    """Split-K was built, measured, and closed (see the doc's 2026-10-17f
+    section): every candidate was 10-21% slower than the non-split baseline on
+    both o and down, and the ns=1 path was additionally numerically wrong. The
+    chooser must never select it, and the builder no longer exists.
+
+    This is a regression guard on the closure, not on the mechanism -- re-opening
+    needs new evidence, not a config change."""
+    import perf.gemm.fp8_channelwise_mls as m
+
+    assert not hasattr(m, "fp8_mls_channelwise_splitk")
+    for N, K in _DECODE_SHAPES:
+        for M in (1, 16, 32, 64, 128):
+            assert decode_cfg(M, N, K).split_k == 1
+
+
+def test_warp_k_fullcolk_mls_is_correct_and_reduced():
+    """FullColK (warp_k) on the MLS path: K is split across warps and the
+    per-K-warp partials are summed back.
+
+    This capability did not exist until 2026-10-19 -- the MLS ds_read templates
+    ``static_assert(WarpK == 1)`` and both the Python macro generator and
+    ``gemm.cc`` rejected the policy outright, so ``T.GemmWarpPolicy.FullColK``
+    was unreachable on the fp8 decode path even though ``warp_k`` was already
+    plumbed through ``inner_k_per_warp`` / ``_k_base`` / ``mmac``.
+
+    The reduction is a contract, not an optimization: ``make_gemm_fragment_hcu``
+    replicates the C fragment across the K warps and the copy-out guards to
+    replica 0, so without ``T.reduce_sum_warp`` the kernel returns K-warp 0's
+    partial with no error. The source assertions below pin both the K-split
+    (A reads WarpM=1/WarpN=1/WarpK=4; Square reads 1/4/1) and the presence of
+    the cross-warp sum, which is exactly the pair of facts that would silently
+    regress.
+
+    Measured verdict (2026-10-19, paired same-process, 9 rounds, min-of-rounds):
+    warp_k is *not* a lever on o/down -- WK4 (bn16/bk256/t256/FullColK) vs the
+    shipped bn16/bk256/t64/Square config is within +-3% with mixed sign across
+    M in {1,16,32}, and it is a substitute for ``setprio`` rather than a
+    complement (each recovers ~6-11% over the sp0 baseline, and they do not
+    stack). So the capability is kept and tested, but ``decode_cfg`` must not
+    select it. Do not re-open without new evidence.
+    """
+    import inspect
+
+    import tilelang.language as T
+
+    import perf.gemm.fp8_channelwise_mls as m
+
+    M, N, K = 16, 5120, 8192
+    fck = T.GemmWarpPolicy.FullColK
+    A, B, scale_a, scale_b = _make_inputs(M, N, K)
+    ref = _ref_program(A, B, scale_a, scale_b)
+
+    kern_wk = fp8_mls_channelwise(M, N, K, 16, 16, 256, 1, 256, policy=fck)
+    kern_sq = fp8_mls_channelwise(M, N, K, 16, 16, 256, 1, 256)
+    for tag, kern in (("FullColK", kern_wk), ("Square", kern_sq)):
+        C = kern(A, B, scale_a, scale_b)
+        assert torch.isfinite(C).all(), f"{tag} produced non-finite output"
+        rel = (C - ref).abs().max().item() / ref.abs().max().item()
+        assert rel < 1e-3, f"{tag} warp_k MLS rel error {rel:.6f}"
+
+    wk_src, sq_src = kern_wk.get_kernel_source(), kern_sq.get_kernel_source()
+    # A's ds_read takes (WarpM, WarpN, WarpK); B's takes (WarpM, WarpN, WarpK).
+    assert "ds_read_format_tensor_a<tl::sequence<16, 256>, tl::sequence<16, 256>, " \
+           "tl::sequence<16, 64>, 1, 1, 4, " in wk_src, "A is not K-split across 4 warps"
+    assert "ds_read_format_tensor_a<tl::sequence<16, 256>, tl::sequence<16, 256>, " \
+           "tl::sequence<16, 64>, 1, 4, 1, " in sq_src, "Square no longer N-splits A"
+    assert "AllReduce<tl::SumOp, 256, 64, 0>" in wk_src, \
+        "the cross-K-warp reduction is missing -- output would be K-warp 0's partial"
+    assert "AllReduce" not in sq_src, "Square must not pay for a reduction it does not need"
+
+    # Closure guard: the capability exists but the chooser must stay on Square.
+    assert inspect.signature(m.fp8_mls_channelwise).parameters["policy"].default is None
+    assert "policy" not in DecodeCfg.__dataclass_fields__
+    for N_, K_ in _DECODE_SHAPES:
+        for M_ in (1, 2, 4, 8, 16, 32, 64, 128):
+            _validate_cfg(decode_cfg(M_, N_, K_), M_, N_, K_)
+
+
+def test_mls_packed_stride_is_shared_by_producer_and_consumer():
+    """Pin the packed MLS LDS stride that the producer, the allocator and the
+    ds_read consumer must all agree on.
+
+    The 2026-10-17h defect: for a packed dst tile the C++ producer wrote stage s
+    at ``s * packed`` while the Python consumer read it at ``s * logical``, so
+    every ``num_stages > 1`` kernel whose tile took the packed branch read stage
+    >= 1 from the wrong LDS address (rel ~1e4 at bm16/bn16/bk256/ns2/t64). The
+    fix routes both through ``MlsPackedTileBytes`` / ``tl.MlsPackedTileElems``;
+    this test is the tripwire if that ever forks again.
+
+    The tile sizes are what ``ComputeMlsWarpPartition`` selects for each
+    (block_mn, block_k, threads) -- fp8-trans uses (16, 128) at 64 threads and
+    (16, 64) at 256, which is exactly why the bug tracked the thread count.
+    """
+    from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import mls_packed_tile_elems
+
+    # fp8 trans, (16, 128), 64 threads.  A single 16x128 tile is 2048 B, which
+    # does not fill a 4K slot, so block_K=128 keeps the conservative slot layout:
+    # 4096 + 1*1024 = 5120 against a 2048-B logical tile.
+    assert mls_packed_tile_elems(16, 128, 16, 128, True, "float8_e4m3fn") == 5120
+    # From block_K=256 the tiles pack densely (2026-10-20).  A 16x256 tile is
+    # exactly 4096 B -- the granule map gran = 64*(c>>2) + 4n + ((c&3+(n>>1))&3)
+    # spans 0..4095 -- so dense storage *is* the contiguous size and the packed
+    # stride collapses to 0.  Before this the 4K-slot accounting charged 6144 B
+    # for that tile, and the 50% dead padding cost a resident block per CU on the
+    # decode shapes (which is why bn96/bk256 only fits two stages).
+    assert mls_packed_tile_elems(16, 256, 16, 128, True, "float8_e4m3fn") == 0
+    assert mls_packed_tile_elems(16, 512, 16, 128, True, "float8_e4m3fn") == 0
+    # 3 tiles = 6144 B is not a whole number of 4K slots, so the conservative
+    # slot layout stays: 4096 + 3*1024 = 7168 against a 6144-B logical tile.
+    assert mls_packed_tile_elems(16, 384, 16, 128, True, "float8_e4m3fn") == 7168
+    # Same block, wider warp count -> the MLS tile is (16, 64), which takes no
+    # packed branch at all. This is the config that was always correct.
+    assert mls_packed_tile_elems(16, 256, 16, 64, True, "float8_e4m3fn") == 0
+    # bf16 trans (16, 64) is the other packed branch, but at block_mn=64/block_k=128
+    # its packed size lands exactly on the logical size (16 KB), so it reports 0.
+    assert mls_packed_tile_elems(64, 128, 16, 64, True, "bfloat16") == 0
+    # Non-packed regions must report 0 so the consumer falls back to the buffer's
+    # own stride rather than inventing one.
+    assert mls_packed_tile_elems(32, 256, 16, 128, True, "float8_e4m3fn") == 0
+
+
+# (block_M, block_N, block_K, num_stages, threads, K, note) -- the configs the
+# 2026-10-17h fix was verified against. The first two were 40/40 wrong before it;
+# the rest were already correct and must stay correct (a fix that moves a working
+# stride would be a regression, not a fix). K is per-row because K % (ns*block_K)
+# must be 0, and 5120 is 2^10*5 -- so ns=3 needs a different K.
+_NS_RACE = "ns>1 at bm16/bn16/t64 emits a wrong packed stage base (nondeterministic aliasing)"
+_PACKED_STRIDE_CONFIGS = [
+    (16, 16, 256, 2, 64, 5120, "was 40/40 WRONG"),
+    (16, 16, 256, 2, 128, 5120, "was 40/40 WRONG"),
+    (16, 16, 256, 2, 256, 5120, "packed branch never taken (tile_k=64)"),
+    (16, 16, 128, 4, 64, 5120, "ns=4, tile_issue_k=1"),
+    (16, 16, 64, 8, 64, 5120, "ns=8"),
+    (16, 16, 512, 2, 128, 5120, "packed size == logical (tile_issue_k=4)"),
+    (64, 64, 128, 2, 256, 5120, "shipped M=64 config"),
+    # --- KNOWN BROKEN (2026-10-18). The 2026-10-17h packed-stride fix did NOT
+    # close ns>1 at bm16/bn16/t64: these four are still wrong, and they are
+    # wrong NON-DETERMINISTICALLY -- five runs on identical inputs give five
+    # different rel values (measured 2026-10-18):
+    #     bk128/ns2  3504 / 2898 / 2090 / 1980 / 1119   (K=25600)
+    #     bk128/ns3 12123 / 11923 / 9552 / 10799 / 9271 (K=25600)
+    #     bk256/ns3  8899 / 8709 / 8581 / 10180 / 6289  (K=25600)
+    #     bk256/ns4  6597 / 5616 / 7074 / 7700 / 6511   (K=25600)
+    # The cause is visible in the emitted source: the per-stage LDS base should be
+    # stage * packed_size (5120 at bk128, 6144 at bk256). bk256/ns2 emits
+    # (k&1)*6144 -- exact -- while bk128/ns2 emits (k&1)*1024 and the ns=4 forms
+    # emit an affine-simplifier artifact, (((k&3)*24)&63)>>4, which over k=0..3
+    # is 0,1,3,0: not even a permutation of the stages. Aliased stages corrupt
+    # each other intermittently because the producer is async and the consumer
+    # ds_reads independently -- hence the run-to-run variation. The irregular
+    # bk/ns pattern is not a layout rule: bk256/ns2, bk128/ns4 and every
+    # contiguous case (bk64, bk512) are exact and reproducible, which is why the
+    # earlier "was 40/40 WRONG, now fixed" reading looked complete -- the old list
+    # simply never covered these four. It is NOT K-dependent (bk128/ns2 is
+    # already wrong at K=5120 / 40 k-steps, so a short K is not a safe escape).
+    # No production exposure: fp8_mls_channelwise asserts ns>1 only for
+    # bm64/bn64, and all four decode shapes at M=16 and M=64 were re-verified
+    # exact 5x each on 2026-10-18. Marked xfail so the region stays visible and
+    # flips to xpass the moment the race is fixed -- do not delete these rows.
+    pytest.param(16, 16, 128, 2, 64, 25600, "ns>1 race (known broken)", marks=pytest.mark.xfail(reason=_NS_RACE, strict=False)),
+    pytest.param(16, 16, 128, 3, 64, 25600, "ns>1 race (known broken)", marks=pytest.mark.xfail(reason=_NS_RACE, strict=False)),
+    pytest.param(16, 16, 256, 3, 64, 25600, "ns>1 race (known broken)", marks=pytest.mark.xfail(reason=_NS_RACE, strict=False)),
+    pytest.param(16, 16, 256, 4, 64, 25600, "ns>1 race (known broken)", marks=pytest.mark.xfail(reason=_NS_RACE, strict=False)),
+]
+
+
+@pytest.mark.parametrize("block_M,block_N,block_K,num_stages,threads,K,note", _PACKED_STRIDE_CONFIGS)
+def test_num_stages_gt_1_mls_is_correct(block_M, block_N, block_K, num_stages, threads, K, note):
+    """End-to-end guard for the packed-stride fix: ns>1 MLS must be correct.
+
+    Goes through all three consumers at once -- the C++ ``MatrixLoad`` producer,
+    ``MergeSharedMemoryAllocations``, and the Python ds_read base pointer -- so
+    it fails if any of them drifts. Written inline rather than through
+    ``fp8_mls_channelwise`` because that builder deliberately restricts ns>1 to
+    bm64/bn64 (untuned elsewhere), which would make this untestable.
+    """
+    import tilelang
+    import tilelang.language as T
+
+    M, N = 16, 5120
+    assert M <= block_M and K % (num_stages * block_K) == 0
+
+    @T.prim_func
+    def gemm(
+            A: T.Tensor((M, K), "float8_e4m3fn"),
+            B: T.Tensor((N, K), "float8_e4m3fn"),
+            scale_a: T.Tensor((M,), "float32"),
+            scale_b: T.Tensor((N,), "float32"),
+            C: T.Tensor((M, N), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            A_s = T.alloc_shared((block_M, block_K), "float8_e4m3fn")
+            B_s = T.alloc_shared((block_N, block_K), "float8_e4m3fn")
+            C_l = T.alloc_fragment((block_M, block_N), "float32")
+            T.clear(C_l)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                T.copy(A[by * block_M, k * block_K], A_s, prefer_instruction="matrix_load")
+                T.copy(B[bx * block_N, k * block_K], B_s, prefer_instruction="matrix_load")
+                T.gemm(A_s, B_s, C_l, False, True, k_pack=1)
+            for i, j in T.Parallel(block_M, block_N):
+                C_l[i, j] = C_l[i, j] * scale_a[by * block_M + i] * scale_b[bx * block_N + j]
+            T.copy(C_l, C[by * block_M, bx * block_N])
+
+    kernel = tilelang.compile(gemm, out_idx=[4])
+    A, B, scale_a, scale_b = _make_inputs(M, N, K)
+    C = kernel(A, B, scale_a, scale_b)
+    ref = _ref_program(A, B, scale_a, scale_b)
+    assert torch.isfinite(C).all(), f"bm{block_M}/bn{block_N}/bk{block_K}/ns{num_stages}/t{threads} non-finite"
+    rel = (C - ref).abs().max().item() / ref.abs().max().item()
+    assert rel < 1e-3, (f"bm{block_M}/bn{block_N}/bk{block_K}/ns{num_stages}/t{threads} "
+                        f"({note}) rel error {rel:.6f} -- packed MLS stride diverged")
 
 
 if __name__ == "__main__":

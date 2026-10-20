@@ -92,6 +92,7 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
     a_from_async_copy_linear = _int_annotation(annotations, "tl.hcu_a_from_async_copy_linear")
     a_at_bn_auto_lds_strategy = _has_annotation(annotations, "tl.hcu_gemm_at_bn_lds_strategy")
     b_from_async_copy_linear = _int_annotation(annotations, "tl.hcu_b_from_async_copy_linear")
+    b_vgpr_direct = _int_annotation(annotations, "tl.hcu_b_vgpr_direct")
     trans_c = _int_annotation(annotations, "trans_c")
     mmac_lit = _int_annotation(annotations, "tl.hcu_mmac_lit", int(target_has_mmac_lit_lts(target)))
     b_ds_read_alt = _int_annotation(annotations, "tl.hcu_b_ds_read_alt", 1)
@@ -121,6 +122,7 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
         a_from_async_copy_linear=a_from_async_copy_linear,
         a_at_bn_auto_lds_strategy=a_at_bn_auto_lds_strategy,
         b_from_async_copy_linear=b_from_async_copy_linear,
+        b_vgpr_direct=b_vgpr_direct,
         trans_c=trans_c,
         mmac_lit=mmac_lit,
         b_ds_read_alt=b_ds_read_alt,
@@ -369,6 +371,12 @@ class GemmHCUMMAC(GemmBase):
                 mmac_k_dim=mmac_k_b,
                 interleave=int(meta.b_ds_read_alt),
             )
+        elif meta.b_vgpr_direct:
+            # B-direct-to-VGPR: B is a GLOBAL operand read straight into the mmac's
+            # B fragment by the b_vgpr_direct_load kernel; it is not LDS-staged and
+            # not consumed through the ds_read path, so it needs no swizzle/fragment
+            # layout. The block N/K region extents are recovered at lowering.
+            pass
         else:
             raise ValueError(f"Unsupported B scope for HCU gemm: {self.B.scope()}")
         return out
@@ -789,8 +797,37 @@ class GemmHCUMMAC(GemmBase):
         if use_gemm_mls:
             if k_pack != 1:
                 raise ValueError("gemm_mls does not support kPack > 1")
+        # B-direct-to-VGPR (hipblas shape): B bypasses LDS, loaded straight from
+        # global into the mmac's B fragment. A keeps the MLS/LDS path. Requires
+        # trans_B (B is (N, K_total) N-major), warp_k == 1, and fp8 B.
+        b_vgpr_direct = int(meta.b_vgpr_direct)
+        if b_vgpr_direct:
+            if not a_from_mls:
+                raise ValueError("HCU B-direct requires A from MLS")
+            if not self.trans_B:
+                raise ValueError("HCU B-direct requires transposed B (N, K_total)")
             if warp_k != 1:
-                raise ValueError("gemm_mls does not support warp on K")
+                raise ValueError("HCU B-direct requires warp_k == 1")
+            b_dtype_name = str(self.B.dtype).lower()
+            if "float8_e4m3" not in b_dtype_name and "float8_e5m2" not in b_dtype_name:
+                raise ValueError("HCU B-direct requires fp8 B")
+
+            @T.prim_func
+            def _gemm_mls_b_direct() -> None:
+                A_local = T.alloc_local(emitter.local_elems_a(full_k=True), a_mls_local_dtype)
+                B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_mls_local_dtype)
+                if clear_accum:
+                    T.clear(C_buf)
+                emitter.ldmatrix_mls_a(A_local, A_region)
+                emitter.ldmatrix_b_vgpr_direct(B_local, B_region)
+                if mmac_setprio:
+                    T.evaluate(tirx.call_extern("handle", "tl::promote_prio"))
+                for ki in T.serial(0, inner_k):
+                    emitter.mmac(A_local, B_local, C_buf, ki, trans_c=mmac_trans_c)
+                if mmac_setprio:
+                    T.evaluate(tirx.call_extern("handle", "tl::restore_prio"))
+
+            return _Simplify(_gemm_mls_b_direct, inline_let=True)
         if use_b_linear_ds_read:
             if b_from_mls:
                 raise ValueError("HCU gemm: B cannot be both MLS-fed and async-copy-linear")

@@ -3,17 +3,24 @@
 """Benchmark fp8 channelwise GEMM on qwen3-32B decode shapes (M <= 128).
 
 Bandwidth-utilization sweep over the qwen3-32B per-token GEMM shapes
-(gate_up 51200x5120, down 5120x25600, qkv 10240x5120, o 5120x8192) with the
-winning M<=16 decode config (block 16x32x256, num_stages=1, 256 threads)
-extended to M=32..128 via block_M=pow2 tiles. Reports effective bandwidth
-vs the 1800 GB/s peak.
+(gate_up 51200x5120, down 5120x25600, qkv 10240x5120, o 5120x8192). The tile
+config now comes from the shape-aware `decode_cfg(M, N, K)` in
+`perf/gemm/fp8_channelwise_mls.py` — it used to take only M, which is why
+o/down (both N=5120) lost at every M. Reports effective bandwidth vs the
+1800 GB/s nominal peak.
+
+NOTE this prints our absolute times only, one kernel per M. It is not a
+head-to-head: the hipblas ratio has to be measured paired in the same process,
+and with only two graphs resident — a process holding many candidate graphs
+inflates `torch._scaled_mm` by ~17%. See `docs/optimization/fp8_decode_m_le_128.md`.
 
 NOTE on timing (2026-10-13): this stack's `do_bench_cudagraph` returns
 **milliseconds** and divides n_repeat out of a single unrolled-graph replay,
 which inflates utilization (it produced the old inflated figures, since
 removed). Use `graph_replay_time` below (explicit per-call CUDA-graph capture
-+ replay with event timing) — the box's measured pure-read ceiling is ~1646
-GB/s (91.5% of 1800), so any reported % above ~91 is not physical.
++ replay with event timing) — the box's measured pure-read ceiling is ~2016
+GB/s, so any reported % above that is a timing artifact. (The older ~1646
+GB/s / 91.5% figure came from an undersized 512 MB probe and is deprecated.)
 
 Run: HIP_VISIBLE_DEVICES=2 python perf/gemm/fp8_channelwise_decode_bench.py
 """
@@ -25,7 +32,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import torch
-from perf.gemm.fp8_channelwise_mls import fp8_mls_channelwise
+from perf.gemm.fp8_channelwise_mls import DecodeCfg, decode_cfg, fp8_mls_channelwise
 
 PEAK = 1800.0  # GB/s, HCU gfx938 HBM
 
@@ -64,22 +71,6 @@ def graph_replay_time(fn, reps=3, iters=50):
     return meds[0], meds[len(meds) // 2]
 
 
-def _decode_cfg(M):
-    """Per-M winning config (bm, bn, bk, ns, threads, setprio) for gate_up decode.
-    Measured same-process head-to-head vs hipblas (2026-10-15, GPU 4, graph-replay,
-    all rel=0). M=16/32 keep the narrow bn32 t256 tile; M=64/128 need a wider
-    bn64/bn128 tile spanning the full M (a single block, NOT M-splitting) — with
-    s_setprio (sp1) for M=64. The 8192² compute path uses its own 256² tile and
-    leaves setprio OFF, so these only affect the decode shape."""
-    if M <= 16:
-        return (16, 32, 256, 1, 256, 1)
-    if M <= 32:
-        return (32, 32, 256, 1, 256, 1)
-    if M <= 64:
-        return (64, 64, 256, 1, 256, 1)
-    return (128, 128, 128, 1, 512, 0)
-
-
 def bench(name, N, K, M, bm=None, bn=None, bk=None, ns=None, t=None, sp=None):
     torch.manual_seed(0)
     A = (torch.randn(M, K, device="cuda") * 0.3).to(torch.float8_e4m3fn)
@@ -88,16 +79,20 @@ def bench(name, N, K, M, bm=None, bn=None, bk=None, ns=None, t=None, sp=None):
     sb = (torch.rand(N, device="cuda") + 0.5)
     ref = (A.float() @ B.float().T) * sa[:, None] * sb[None, :]
 
-    if bm is None:
-        bm, bn, bk, ns, t, sp = _decode_cfg(M)
-    kern = fp8_mls_channelwise(M, N, K, bm, bn, bk, ns, t, setprio=sp)
+    cfg = decode_cfg(M, N, K)
+    if bm is not None:  # explicit override wins over the chooser
+        cfg = DecodeCfg(bm, bn, bk, ns, t, sp, cfg.split_k)
+    assert cfg.split_k == 1, f"{name} M={M}: split_k={cfg.split_k} needs the split-K builder"
+    kern = fp8_mls_channelwise(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
+                               cfg.num_stages, cfg.threads, setprio=cfg.setprio)
     C = kern(A, B, sa, sb)
     rel = (C - ref).abs().max().item() / ref.abs().max().item()
     assert rel < 1e-3, f"{name} M={M} rel={rel:.4f}"
 
     tmin, tmed = graph_replay_time(lambda: kern(A, B, sa, sb))
     eff = N * K / tmin * 1e-3  # GB/s
-    print(f"{name:8s} M={M:>3} (bm={bm:>3},bn={bn:>3},bk={bk:>3},t={t},sp={sp}): "
+    print(f"{name:8s} M={M:>3} (bm={cfg.block_M:>3},bn={cfg.block_N:>3},bk={cfg.block_K:>3},"
+          f"ns={cfg.num_stages},t={cfg.threads},sp={cfg.setprio}): "
           f"{tmin:7.1f}/{tmed:7.1f}us  {eff:6.0f} GB/s  {eff / PEAK * 100:5.1f}%  rel={rel:.5f}", flush=True)
     return tmin, eff
 

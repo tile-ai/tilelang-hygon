@@ -86,44 +86,30 @@ static int64_t DTypeStorageBits(DataType dtype) {
   return static_cast<int64_t>(dtype.bits()) * dtype.lanes();
 }
 
-Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
-                                              int mls_tile_mn, int mls_tile_k,
-                                              bool trans, Target target,
-                                              int lds_physical_bits) {
-  const auto hcu_arch = TargetIsHCU(target) ? GetHcuArchString(target) : "";
-  if (!TargetIsHCU(target) ||
-      (hcu_arch != "gfx946" && hcu_arch != "gfx938" && hcu_arch != "gfx92a") ||
-      dst->shape.size() < 2) {
-    return std::nullopt;
-  }
-
-  const size_t nd = dst->shape.size();
-  const int64_t *dim0 = as_const_int(dst->shape[nd - 2]);
-  const int64_t *dim1 = as_const_int(dst->shape[nd - 1]);
-  if (dim0 == nullptr || dim1 == nullptr) {
-    return std::nullopt;
-  }
-
-  int64_t leading_count = 1;
-  for (size_t i = 0; i + 2 < nd; ++i) {
-    const int64_t *dim = as_const_int(dst->shape[i]);
-    if (dim == nullptr) {
-      return std::nullopt;
-    }
-    leading_count *= *dim;
-  }
-
-  const int64_t block_mn = trans ? *dim0 : *dim1;
-  const int64_t block_k = trans ? *dim1 : *dim0;
+/// Packed LDS byte count for ONE MLS dst tile, or -1 when the tile is laid out
+/// contiguously (i.e. the packed size equals the logical size).
+///
+/// This is the single source of truth for the packed MLS LDS layout.  Three
+/// places must agree on it: the shared-memory allocation
+/// (`TryGetMlsDstActualSizeBytes` -> `kMlsActualSizeBytesMap`), the producer's
+/// per-stage stride (C++ `MatrixLoad`, via
+/// `TryGetMlsPackedLeadingElemOffset`), and the consumer's per-stage stride
+/// (Python `retrieve_mls_lds_base_ptr`, via the `tl.MlsPackedTileElems` FFI).
+/// They disagreed until 2026-10-17h: the consumer used the logical stride, so
+/// every `num_stages > 1` tile whose dst took a packed branch read stage >= 1
+/// from the wrong address.
+int64_t MlsPackedTileBytes(int64_t block_mn, int64_t block_k, int mls_tile_mn,
+                           int mls_tile_k, bool trans, int64_t dtype_bits,
+                           int64_t dtype_lanes, int lds_physical_bits) {
   if (block_mn <= 0 || block_k <= 0 || mls_tile_mn <= 0 || mls_tile_k <= 0 ||
       block_mn % mls_tile_mn != 0 || block_k % mls_tile_k != 0) {
-    return std::nullopt;
+    return -1;
   }
 
   const int64_t tile_issue_mn = block_mn / mls_tile_mn;
   const int64_t tile_issue_k = block_k / mls_tile_k;
   const int64_t logical_elements = block_mn * block_k;
-  const int64_t bits_per_elem = DTypeStorageBits(dst->dtype);
+  const int64_t bits_per_elem = dtype_bits * dtype_lanes;
   const int64_t physical_bits_per_elem =
       lds_physical_bits > 0 ? lds_physical_bits : bits_per_elem;
   int64_t packed_bytes = -1;
@@ -154,14 +140,14 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
            (kSlotStrideBytes + kSlotsPerGroup * payload_bytes);
   };
 
-  if (dst->dtype.bits() == 4 && physical_bits_per_elem == 8) {
+  if (dtype_bits == 4 && physical_bits_per_elem == 8) {
     packed_bytes = elements_to_bytes(logical_elements);
-  } else if (dst->dtype.bits() == 16 && trans && mls_tile_mn == 16 &&
+  } else if (dtype_bits == 16 && trans && mls_tile_mn == 16 &&
              mls_tile_k == 64) {
     packed_bytes = packed_bytes_for_4k_slots(
         tile_issue_mn * tile_issue_k,
         elements_to_bytes(mls_tile_mn * (mls_tile_k / 2)));
-  } else if (dst->dtype.bits() == 16 && !trans && mls_tile_mn == 64 &&
+  } else if (dtype_bits == 16 && !trans && mls_tile_mn == 64 &&
              mls_tile_k == 16) {
     const int64_t payload_bytes =
         elements_to_bytes((mls_tile_mn / 2) * mls_tile_k);
@@ -169,7 +155,7 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
                        ? packed_bytes_for_padded_k_slot_groups(payload_bytes)
                        : packed_bytes_for_4k_slots(tile_issue_mn * tile_issue_k,
                                                    payload_bytes);
-  } else if (dst->dtype.bits() == 8 && !trans && mls_tile_mn == 128 &&
+  } else if (dtype_bits == 8 && !trans && mls_tile_mn == 128 &&
              mls_tile_k == 16) {
     const int64_t payload_bytes =
         elements_to_bytes((mls_tile_mn / 2) * mls_tile_k);
@@ -177,12 +163,26 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
                        ? packed_bytes_for_padded_k_slot_groups(payload_bytes)
                        : packed_bytes_for_4k_slots(tile_issue_mn * tile_issue_k,
                                                    payload_bytes);
-  } else if (dst->dtype.bits() == 8 && trans && mls_tile_mn == 16 &&
+  } else if (dtype_bits == 8 && trans && mls_tile_mn == 16 &&
              mls_tile_k == 128) {
-    packed_bytes = packed_bytes_for_4k_slots(
-        tile_issue_mn * tile_issue_k,
-        elements_to_bytes(mls_tile_mn * (mls_tile_k / 2)));
-  } else if (dst->dtype.bits() == 4 && !trans && mls_tile_mn == 256 &&
+    // A 16x256 fp8 tile occupies exactly 4096 B of dense storage: the granule
+    // map is gran = 64*(c>>2) + 4*n + ((c&3 + (n>>1)) & 3), which spans
+    // 0..4095 for c in [0,256).  Verified bit-exact by three independent
+    // hand-written kernels that place A at 0 and B at 4096.  The 4K-slot
+    // accounting charges 4096 (slot) + 2*1024 (payload) = 6144 for that tile,
+    // i.e. 50% dead padding that silently costs a resident block per CU on the
+    // decode shapes.  Pack densely whenever every tile is a whole number of
+    // 4K slots, so the descriptor's slot base stays aligned; otherwise keep the
+    // conservative slot layout.
+    const int64_t dense_bytes =
+        tile_issue_mn * tile_issue_k * elements_to_bytes(mls_tile_mn * mls_tile_k);
+    packed_bytes =
+        dense_bytes % 4096 == 0
+            ? dense_bytes
+            : packed_bytes_for_4k_slots(
+                  tile_issue_mn * tile_issue_k,
+                  elements_to_bytes(mls_tile_mn * (mls_tile_k / 2)));
+  } else if (dtype_bits == 4 && !trans && mls_tile_mn == 256 &&
              mls_tile_k == 16) {
     const int64_t payload_bytes =
         elements_to_bytes((mls_tile_mn / 2) * mls_tile_k);
@@ -190,25 +190,68 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
                        ? packed_bytes_for_padded_k_slot_groups(payload_bytes)
                        : packed_bytes_for_4k_slots(tile_issue_mn * tile_issue_k,
                                                    payload_bytes);
-  } else if (dst->dtype.bits() == 4 && trans && mls_tile_mn == 16 &&
+  } else if (dtype_bits == 4 && trans && mls_tile_mn == 16 &&
              mls_tile_k == 256) {
     packed_bytes = packed_bytes_for_4k_slots(
         tile_issue_mn * tile_issue_k,
         elements_to_bytes(mls_tile_mn * (mls_tile_k / 2)));
-  } else if (dst->dtype.bits() == 4 && physical_bits_per_elem == 4) {
+  } else if (dtype_bits == 4 && physical_bits_per_elem == 4) {
     packed_bytes = elements_to_bytes(logical_elements);
   }
 
   if (packed_bytes <= 0) {
-    return std::nullopt;
+    return -1;
   }
 
   // MergeSharedMemoryAllocations uses dtype.bytes(), which rounds packed b4
   // storage up to one byte per logical element. Override both expansions for
   // 4K slot holes and contractions for genuinely packed 4-bit LDS storage.
+  // Mirrors DataType::bytes() * DataType::lanes() (per-scalar rounding), NOT
+  // ceil(bits*lanes/8): for b4 the two differ, and the original behaviour is
+  // what MergeSharedMemoryAllocations assumes.
+  const int64_t dtype_bytes = (dtype_bits + 7) / 8;
   const int64_t default_bytes =
-      logical_elements * dst->dtype.bytes() * dst->dtype.lanes();
+      logical_elements * dtype_bytes * dtype_lanes;
   if (packed_bytes == default_bytes) {
+    return -1;
+  }
+  return packed_bytes;
+}
+
+Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
+                                              int mls_tile_mn, int mls_tile_k,
+                                              bool trans, Target target,
+                                              int lds_physical_bits) {
+  const auto hcu_arch = TargetIsHCU(target) ? GetHcuArchString(target) : "";
+  if (!TargetIsHCU(target) ||
+      (hcu_arch != "gfx946" && hcu_arch != "gfx938" && hcu_arch != "gfx92a") ||
+      dst->shape.size() < 2) {
+    return std::nullopt;
+  }
+
+  const size_t nd = dst->shape.size();
+  const int64_t *dim0 = as_const_int(dst->shape[nd - 2]);
+  const int64_t *dim1 = as_const_int(dst->shape[nd - 1]);
+  if (dim0 == nullptr || dim1 == nullptr) {
+    return std::nullopt;
+  }
+
+  int64_t leading_count = 1;
+  for (size_t i = 0; i + 2 < nd; ++i) {
+    const int64_t *dim = as_const_int(dst->shape[i]);
+    if (dim == nullptr) {
+      return std::nullopt;
+    }
+    leading_count *= *dim;
+  }
+
+  const int64_t block_mn = trans ? *dim0 : *dim1;
+  const int64_t block_k = trans ? *dim1 : *dim0;
+  const int64_t packed_bytes =
+      MlsPackedTileBytes(block_mn, block_k, mls_tile_mn, mls_tile_k, trans,
+                         dst->dtype.bits(), dst->dtype.lanes(),
+                         lds_physical_bits);
+  if (packed_bytes <= 0) {
     return std::nullopt;
   }
   return Integer(leading_count * packed_bytes);
@@ -1130,6 +1173,26 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                                 mls_tile_k, requested_lds_bits);
         return Array<Integer>{Integer(warp_mn), Integer(warp_k),
                               Integer(mls_tile_mn), Integer(mls_tile_k)};
+      });
+  // Per-stage element stride of a packed MLS dst tile; 0 when the tile is
+  // contiguous (caller should use the buffer's logical stride).  The Python
+  // ds_read consumer needs this to agree with the C++ producer -- see
+  // MlsPackedTileBytes.
+  refl::GlobalDef().def(
+      "tl.MlsPackedTileElems",
+      [](int block_mn, int block_k, int tile_mn, int tile_k, bool trans,
+         int dtype_bits, int dtype_lanes, int lds_physical_bits) {
+        const int64_t packed = MlsPackedTileBytes(
+            block_mn, block_k, tile_mn, tile_k, trans, dtype_bits, dtype_lanes,
+            lds_physical_bits);
+        if (packed <= 0) {
+          return Integer(0);
+        }
+        const int64_t bits_per_elem =
+            static_cast<int64_t>(dtype_bits) * dtype_lanes;
+        ICHECK_EQ((packed * 8) % bits_per_elem, 0)
+            << "packed MLS tile size is not a whole number of elements";
+        return Integer(packed * 8 / bits_per_elem);
       });
 }
 

@@ -102,7 +102,11 @@ def _gemm_impl(
     A_offset = retrieve_offset(A_region)
     B_offset = retrieve_offset(B_region)
     assert A_offset[-2] == 0, "The offset of the first dimension of A must be 0"
-    assert B_offset[-2] == 0, "The offset of the first dimension of B must be 0"
+    # HCU B-VGPR-direct path passes a global (N, K_total) B block with a nonzero N
+    # offset (bx*block_N); the offset is recovered at lowering via retrieve_ptr.
+    _b_vgpr_direct = bool(annotations is not None and annotations.get("tl.hcu_b_vgpr_direct", 0))
+    if not _b_vgpr_direct:
+        assert B_offset[-2] == 0, "The offset of the first dimension of B must be 0"
     offset_a = A_offset[-1]
     offset_b = B_offset[-1]
 

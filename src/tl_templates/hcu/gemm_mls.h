@@ -79,8 +79,9 @@ public:
     B_type B_local[B_local_size];
 
     tl::mls::ds_read_format_tensor_a<tl::sequence<M, K>, tl::sequence<M, K>,
-                                     MlsTileA, num_warp_m, 1, A_type, AltA,
-                                     TransA, HcuArch>(A_lds, A_local);
+                                     MlsTileA, num_warp_m, num_warp_n, 1,
+                                     A_type, AltA, TransA, HcuArch>(A_lds,
+                                                                    A_local);
 
     tl::mls::ds_read_format_tensor_b<
         tl::sequence<N, K>, tl::sequence<N, K>, MlsTileB,

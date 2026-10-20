@@ -1,7 +1,734 @@
 # HCU fp8 Channelwise Decode GEMM — Handoff
 
-Status: **2026-10-16c** (M=64 is LDS-port-bound; gap to hipblas is 5.8% paired) /
+Status: **2026-10-17i** (three parts. (1) The ns>1 fix invalidated the bn16 ns=2 timings, so they were re-measured correctly for the first time: they are **29-45% SLOWER** than the shipped `ns=1`, matching the always-correct t256 control — the old "fast" reading measured garbage; independent accumulators (2 fragments, in-tree) are 1.52-1.64x slower; both closed. (2) A second, PRE-EXISTING packed-layout defect at bn16/bk128/ns2/t64 (packed branch at tile_issue_k==1 emits a 1088 B stage stride for a 2048 B tile, so the stages overlap) — unreachable from `decode_cfg`, documented, not fixed. (3) **The o/down diagnosis is CORRECTED.** The 2026-10-17h "the mmac side is the whole deficit" framing is wrong: with a clean compute-only arm (4 cycling L2-resident tiles — the old arm re-read one address and was slower than streaming), the compute side is *cheaper* than the load side on all four cases (0.944/0.868/0.888/0.826 vs 0.990/0.945/1.045/0.996 of hipblas), so bn16 is LOAD-bound and **neither side is the deficit**. The deficit is the 16-20% of wall time when neither pipe is busy (+7.5/+6.4/+18.2/+16.0 µs). Inflating the grid with distinct-row duplicates (zero L2 reuse) cuts per-block time 38.9 -> 30.9 µs, proving the ceiling is ~0.98x hipblas at o M=1 — but it needs ~8x the blocks, and 320 blocks over 64 CUs is exactly 5/CU against an 8-slot LDS residency limit, with `N/bn` and `bn=16` at the hardware floor. Wavefront occupancy is ruled out by measurement (t=64/128/256 at identical bytes: 1.000/1.011/1.015 on o M=1) — `wk`-split warps add instructions, not independent tiles. Standing: o M=1 1.080, **o M=16 1.000 (tie)**, down M=1 1.202, down M=16 1.180. **o and down cannot be won in-tree.**) / 2026-10-17h (o/down DECOMPOSED and CLOSED: the load path already beats hipblas on all four cases — load-only 0.957/0.917/0.977/0.948 vs hipblas for o M=1 / o M=16 / down M=1 / down M=16 — so the entire 1.13-1.20x deficit is the per-k-step ds_read/mmac/epilogue side, and it scales with K, not with grid size. The ns=2 wrongness at bn16 is ROOT-CAUSED **and FIXED**: the MLS producer and the allocator wrote stage 1 at the packed stride 6144 while the ds_read consumer read it at the logical 4096 — a real lowering defect, correct at t=256 where the packed branch is not taken. All three now share `MlsPackedTileBytes` / `tl.MlsPackedTileElems`; `bm16/bn16/bk256/ns2` at t=64 and t=128 went from 40/40 wrong (rel 1.6e4) to rel 0, with two new tests pinning it. This does not re-open o/down (the shipped tiles are ns=1). Double buffering, a hand-written 2-buffer pipeline, grid inflation, warp policy, `k_pack=2`, `b_ds_read_alt=0` and both `respect_layout_map` annotations are all measured closed. **No in-tree config can make o/down win.**) / 2026-10-17g (qkv M=32 lever adopted: `bn32/bk128/t128` beats the chosen `bn32/bk256/t256` by 9-10% at N=10240, taking qkv M=32 from 1.14x to 1.03x; two measurement errors corrected — every earlier M<=32 ratio used a `setprio=0` baseline that is NOT what `decode_cfg` returns, and hipblas is the noisy term at o/down; the last o/down lever, `ns=2` at bn16, is closed and reproduces the ns>1 silent-wrong landmine at 40/40. Standing: gate_up 6/6 wins, qkv 5/6, o 1/6, down 0/6) / 2026-10-17f (the o/down plan run to completion: the shape-aware chooser lands as a real win, plus a 1.6-1.7x win at M=32 from a thread-count fix; split-K is CLOSED by measurement — 10-21% slower, and the block-starvation diagnosis that motivated it was a confound; separately, `num_stages>1` is found to be SILENTLY WRONG outside bm64/bn64. 13/32 cells now win) / 2026-10-17e (async-wait lever attacked and RESOLVED: the "fine-grained vmcnt(4)" hypothesis is refuted by the native SASS — hipblas's k-loop is wait-all too; the real knob is pipeline depth, and `bk128 ns2` is adopted for M=64, 243.5us = 59.8%, +1.2%) / 2026-10-17d (BOTH B-fetch levers CLOSED by measurement: B-direct is 2.1x slower than baseline even at WarpM=1, and a 16-consec-k fragment cannot close it — 93.9 us/pass available vs a 267.6 us gap; the MLS-producer swap makes the GEMM 15-16% slower) / 2026-10-17c (B-direct re-opened on the native-kernel evidence: no M in the B index, waves split N; retry shape = WarpM=1 + 16-consec-k) / 2026-10-17b (idle-card M=64 gap 10.2%; MLS producer is a lever too) / 2026-10-17 / 2026-10-16c /
 2026-10-16b / 2026-10-16 / 2026-10-15 / 2026-10-13. Branch `feat/hcu-smls-b-vgpr`.
+
+## 2026-10-17i — the fix invalidated one measurement; re-timed, last two mechanisms close
+
+**1. `ns=2` at bn16, re-timed correctly for the first time.** The 2026-10-17g sweep
+called `bk256 ns2 t64/t128` the two fastest ns=2 candidates — but those are exactly
+the two the packed-stride defect broke, so "fast" measured garbage. Corrected and
+re-timed (paired, one process, 6 resident graphs, 7 rounds, min-of-rounds, GPU 2):
+they are **29-45% SLOWER** than the shipped `ns=1`, matching the always-correct
+`t256` control (1.29-1.42). Ratios vs `bn16/bk256/ns1/t64`: o M=1 1.383, o M=16
+1.386, down M=1 1.406, down M=16 1.401 (t64); t128 1.399/1.528/1.451/1.447; t256
+1.292/1.419/1.336/1.425; `bk512 ns2 t64` 1.053/1.171/**0.989**/**1.000**.
+**ns=2 at bn16 is closed** — and this retires the hope that the fix re-opened
+o/down, since the only reason to retest ns>1 was that the fast-looking candidates
+had been invalid.
+
+**2. Independent accumulator chains — closed (1.52-1.64x slower).** At bn16/t64
+there is one 16x16 accumulator, so all 256 k-loop mmacs are one serial chain from
+one wavefront — the last untested mechanism for the measured `full - AB` deficit.
+`/tmp/split_acc.py` splits it in-tree (two `(16,128)` MLS buffers per operand, two
+fragments, summed in the epilogue): o M=1 1.539, o M=16 1.524, down M=1 1.644,
+down M=16 1.641 vs the baseline. The extra MLS stream and doubled LDS outweigh any
+chain overlap.
+
+**3. A second, pre-existing packed-layout defect — found, unreachable, not fixed.**
+`bn16/bk128/ns2/t64` is wrong (rel 0.55) at every K, and was wrong before the fix
+too (rel 3e4 on the logical stride), so the fix reduces it without removing it.
+The emitted packed stage stride is `idx*1024 + idx*64` = 1088 B while the tile is
+2048 B, so the two stages overlap in LDS; `bk128/ns4/t64` (stride 2048) and
+`bk128/ns2/t128` (tile `(16,64)`, not packed) are both correct. Break is specific
+to the packed branch at `tile_issue_k == 1`. Not chased: unreachable from
+`decode_cfg` (`_validate_cfg` restricts `ns>1` to bm64/bn64, and bk128 at bn16 is
+1.596x slower at ns=1 anyway). Recorded so it is not mistaken for a regression.
+
+**4. The three-arm decomposition was redone and it CORRECTS the 2026-10-17h
+diagnosis.** That section treats the ds_read/mmac side as an *additive* cost to be
+shrunk. It is not. With a clean compute-only arm (identical kernel, every iteration
+reading one of 4 cycling L2-resident B tiles — the earlier arm re-read a single
+address, which is slower than streaming and made compute-only exceed the full
+kernel), the two sides overlap almost completely. `/tmp/floor4.py`, bn16/bk256/ns1/t64:
+
+| arm | o M=1 | o M=16 | down M=1 | down M=16 |
+|---|---|---|---|---|
+| hipblas | 31.5 | 35.0 | 78.6 | 85.3 |
+| load-only | 31.2 (0.990) | 33.1 (0.945) | 82.1 (1.045) | 85.0 (0.996) |
+| compute-only | 29.8 (0.944) | 30.4 (0.868) | 69.8 (0.888) | 70.4 (0.826) |
+| **full** | 38.7 (1.228) | 39.5 (1.128) | 100.3 (1.277) | 101.0 (1.184) |
+| floor = max | 31.2 | 33.1 | 82.1 | 85.0 |
+| exposed = full − floor | **+7.5** | **+6.4** | **+18.2** | **+16.0** |
+
+**(a) bn16 is LOAD-bound, not compute-bound** — the compute side is cheaper than
+the load side in all four cases, so the single accumulator chain is not the
+constraint (consistent with independent chains being 1.5-1.6x *worse*).
+**(b) Neither side is the deficit.** For o M=16 and down M=16 both arms beat
+hipblas individually; for o M=1 the load arm is 0.990. The whole deficit is the
+16-20% of wall time when neither pipe is busy.
+
+**5. What caps the overlap is resident blocks per CU, and it is the grid, not the
+LDS.** Inflating the grid with *distinct* B rows (`/tmp/grid_mult2.py`; the first
+version duplicated `bx % 320` and the duplicates shared an L2 window, so it
+measured partly L2 — distinct rows removes that and the effect survives), identical
+per-block work and bytes, o M=1:
+
+| | 320 blocks | 640 | 1280 | 2560 |
+|---|---|---|---|---|
+| load-only µs/block | 31.4 | 30.1 | 24.6 | 23.0 |
+| load-only GB/s | 1337 | 1394 | 1702 | 1827 |
+| full µs/block | 38.9 | 34.4 | 32.2 | 30.9 |
+
+The memory side is at 66% of the 2016 GB/s ceiling at 320 blocks and 91% with
+backfill; the full kernel converges onto its own compute floor (30.9 vs
+compute-only 29.8), i.e. **~0.98x hipblas at o M=1 is reachable** — at ~8x the
+blocks. 320 blocks over 64 CUs is *exactly* 5/CU against an LDS residency limit of
+8 (8 KB/block; `bk128/ns8` fails to launch at ~40 KB of packed stages, confirming
+the 65536 B budget), so 3 slots sit empty for the whole kernel, and `N/bn = 320`
+with `bn=16` at the hardware floor cannot fill them.
+
+**6. Wavefront occupancy is NOT the missing lever — measured.** `/tmp/warps.py`,
+bn16/bk256/ns1, t=64/128/256 (`ComputeMlsWarpPartition` picks `(16,128)` at t=64
+and `(16,64)` at t>=128, so extra warps split K at *identical* bytes and LDS):
+ratios vs t=64 are 1.000/1.011/1.015 (o M=1), 1.000/1.008/1.232 (o M=16),
+1.000/0.971/1.096 (down M=1), 1.000/1.013/1.162 (down M=16). `wk`-split warps work
+on *one* tile, so they add instructions, not independent memory streams. §5 adds
+independent *tiles*. The lever is block count, and it is fixed at 320.
+
+**7. Every remaining knob that could add resident blocks is closed.**
+split-K adds blocks but shortens the run (32 -> 8 k-steps at sk=4), and the clean
+constant-bytes experiment (2026-10-17f) found 1280/25 *worse* than 320/100 — the
+ramp cost of a short run exceeds the residency gain; §5 holds the run constant,
+split-K does not, so §5 does not license it. Deeper staging (`/tmp/ns_full.py`) is
+monotonically worse and tracks LDS: bk256 ns1 1.000 / ns2 1.343 / ns4 1.812;
+bk512 ns1 1.217 / ns2 0.984 — the only free ns=2 is bk512, free because
+`tile_issue_k == 4` makes the packed size coincide with the logical one so the
+packed branch is never taken. Smaller bk is worse (1.108x / 2.0x). Wider bn halves
+the block count (160 = 2.5 waves) and is 1.08-1.14x worse. Plus independent chains,
+more warps, tile widening, warp policy, `k_pack`, ds_read alt, layout-map.
+
+**Standing after this:** o M=1 1.080, o M=16 **1.000**, down M=1 1.202, down M=16
+1.180 (paired, same process, idle card). o M=16 is a tie, not a loss. Every
+mechanism that could hide the ds_read/mmac deficit is now measured negative — and
+the deficit is no longer the mmac side: it is the 16-20% of wall time where
+neither pipe is busy, capped by 5 resident blocks/CU against an 8-slot limit that
+the fixed grid cannot fill. **o and down cannot be won in-tree.** (Load-only arm
+precision: 2026-10-17h had 0.957/0.917/0.977/0.948, this run 0.990/0.945/1.045/0.996
+— shared card; treat it as "0.95-1.05 of hipblas", which is why down M=1 flips
+sign between runs. It does not change any conclusion.)
+
+## 2026-10-17h — o/down: the load path already WINS; the mmac side is the whole deficit, and it is closed
+
+This answers the question the previous sections assumed: **which side of the
+kernel is losing?** Full writeup in `docs/optimization/fp8_decode_m_le_128.md`
+("2026-10-17h"). Summary:
+
+**1. The load path already beats hipblas on all four o/down cases.**
+`/tmp/odown_decomp.py`: four arms per (shape, M) with the *same* tiles and
+access pattern, one process, round-robin interleaved, 7 rounds.
+
+| case | hip | AB (load only) | full | AB/hip | full/hip | mmac side adds |
+|---|---|---|---|---|---|---|
+| o M=1    | 37.3 | **35.7** | 43.5  | **0.957** | 1.167 | +7.8 us |
+| o M=16   | 34.9 | **32.0** | 39.4  | **0.917** | 1.128 | +7.4 us |
+| down M=1 | 82.7 | **80.8** | 99.5  | **0.977** | 1.203 | +18.7 us |
+| down M=16| 88.8 | **84.2** | 100.3 | **0.948** | 1.130 | +16.2 us |
+
+The deficit doubles from o (K=8192) to down (K=25600), i.e. it is proportional
+to the k-loop, not a fixed intercept. **Any story that o/down are "block-starved"
+is dead** — you cannot fix a cost that scales with the work by adding blocks.
+
+**2. `ns=2` at bn16 root-caused — it is a real lowering bug.** Dumped source:
+the MLS producer writes stage 1 at `A_s[((k+1)&1)*6144]` (the *packed* LDS
+stride, `TryGetMlsDstActualSizeBytes`, `src/hcu/op/mls.cc:89`) while the ds_read
+consumer reads `A_s[(k&1)*4096]` (the *logical* stride, from
+`TryGetMlsPackedLeadingElemOffset`'s fallback — `src/hcu/op/ds_read_format.cc:639`
+only applies the packed offset when region rank > 2). At t=256 the packed branch
+is not taken, both sides use 4096, and ns=2 is correct. That is the whole
+explanation for "correctness flips with the thread count". Worth fixing on its
+own merits — it is why `num_stages>1` is asserted off outside bm64/bn64.
+
+**3. Double buffering closed even where correct.** Where ns=2 is right it does
+overlap at bk512 (ns2/ns1 = 0.782-0.927) but at bk256 it *hurts* (1.13-1.17),
+and the best absolute ns2 config (bn16/bk512/t128 = 40.6/42.7/98.2/106.9) is no
+better than the shipped ns1/bn16/bk256/t64 (38.4/39.7/99.4/100.3) bar a 1.2% win
+on down M=1. A hand-written two-buffer pipeline (`/tmp/manual_pipe2.py`, explicit
+`T.ptx_wait_group`) is correct but 1.26-1.70x slower.
+
+**4. Grid inflation confirms it.** Fixed K, varying blocks: load-only 1298 → 1417
+→ 1644 → 1743 GB/s (320 → 2560 blocks) while the full kernel goes 1181 → 1200 →
+1288 → 1323. The load path loves occupancy; the full kernel does not care.
+
+**5. The last instruction-level knobs, all closed** (`/tmp/ann_sweep.py`):
+`tl.hcu_a/b_respect_layout_map=1` are exact no-ops; `policy=FullRow`/`FullCol` at
+t=128 are identical to each other and 1.2% worse than t=64 (the partition does
+not change at bn16); `k_pack=2` is hard-rejected by the MLS path
+(`MatrixLoad dst Gemm consumer must have kPack=1`); `tl.hcu_b_ds_read_alt=0` is
+`unsupported B interleave=0` (only Alt1 exists for b8-trans, and it is default);
+`bm32/bn16` at M<=16 is 1.8-2.6x worse, as the 16-row atom floor predicts.
+
+**Bound.** Best case, transferring the bk512 overlap fraction to the shipped
+tile: o M=1 ~34.1 (1.046, losing), o M=16 ~36.8 (1.051), down M=1 ~77.7 (0.991),
+down M=16 ~84.4 (0.998) — parity on down at best, inside hipblas's own ~20%
+spread. The structural difference is hipblas's N-tile-1 GEMV at M=1 (no LDS
+round-trip) and ~40 warps/CU at M=16, vs a 16x16 MMA atom pinned MLS partition.
+**Do not re-open the o/down config search without a new mechanism.**
+
+**6. The `ns>1` landmine is root-caused and FIXED.** (Added after the above; the
+2026-10-17f section could only say "silently wrong outside bm64/bn64, mechanism
+unknown".) An MLS dst tile whose layout is *packed* takes more LDS bytes than its
+logical element count — `(16, 128)` fp8-trans is `4096 + tile_issue_k*1024`, i.e.
+**6144** at `bk=256`. The C++ producer (`MatrixLoad`) and the shared-memory
+allocation both advanced the stage pointer by 6144; the Python ds_read consumer
+(`retrieve_mls_lds_base_ptr`) advanced it by the logical `prod(shape[-2:])` =
+4096. Dumped source at `bm16/bn16/bk256/ns2/t64` showed exactly that split. It
+tracked the thread count only because `ComputeMlsWarpPartition` picks the MLS tile
+from `(block_mn, block_k, threads)` — `t=64` → `(16, 128)` packed, `t=256` →
+`(16, 64)` contiguous — and `bk=512` coincides with the logical size by
+arithmetic accident.
+
+Fix: the packed byte count is now `MlsPackedTileBytes` in `src/hcu/op/mls.cc`,
+exported as the `tl.MlsPackedTileElems` FFI and consumed by the new
+`mls_packed_tile_elems` in `hcu_mmac_emitter_utils.py`, so all three consumers
+share one source of truth. `bm16/bn16/bk256/ns2` at `t=64` and `t=128` went from
+40/40 wrong (rel ≈ 1.6e4) to `rel = 0.00000`; everything previously correct is
+unchanged (o/down/gate_up, M=1 and M=16, ns up to 8, bk 64-512, bf16 probe).
+`92 passed, 58 skipped`. New tests:
+`test_num_stages_gt_1_mls_is_correct` (fails with rel ≈ 1.6e4 if the consumer's
+stride is forced back to 0) and
+`test_mls_packed_stride_is_shared_by_producer_and_consumer`.
+
+**This does not re-open o/down** — the shipped tiles are ns=1 and the deficit is
+the ds_read/mmac side, which ns does not touch. The `num_stages <= 1 or
+(bm, bn) == (64, 64)` asserts in `perf/gemm/fp8_channelwise_mls.py` were reworded
+from "incorrect" to "untuned", which is now the true reason.
+
+## 2026-10-17g — qkv M=32 lever adopted (1.14x → 1.03x); o/down levers exhausted
+
+Full standing, chooser vs hipblas, paired 10 rounds: gate_up **6/6 wins**
+(0.757-0.917), qkv **5/6** (0.757-0.868, M=32 now parity 1.031), o 1/6, down 0/6.
+
+### Two measurement errors found and corrected
+
+1. **Every earlier M<=32 and o/down ratio in this doc used a wrong baseline.**
+   `decode_cfg` sets `setprio=1` for M<=32, but the sweep harnesses compared
+   against hand-built configs with `setprio=0`. `o` M=32 is 51.8us at sp0 vs
+   46.7us at sp1 — a 10% error. Re-measured against `decode_cfg(M,N,K)` itself,
+   o M=1 is **1.204-1.235**, not the 1.048 the older table claims. Always compare
+   against the chooser's actual output.
+2. **hipblas is the noisy term at o/down** (31.4-36.8us at o M=1 across runs while
+   our kernel moved 38.6→38.9). Quote the ratio as a range.
+
+### The find: qkv (N=10240) at M=17..32 wants bk128/t128
+
+`bn32/bk128/ns1/t128/sp1` beats the chosen `bn32/bk256/ns1/t256/sp1` by **9-10%**
+(52.3 vs 57.8us, paired, 16 rounds, both sp1) → qkv M=32 goes 1.14x → **1.03x**
+(best round 0.945). 11 independent paired measurements across 8 processes, all
+0.84-0.91; survives an L2 flush before every replay (0.852 warm → 0.862 cold)
+while hipblas is bit-identical under the same flush; holds at N=10240 for
+K=5120/10240/20480.
+
+It is **not** a general rule and the mechanism is unknown: at M=32/K=5120 with
+bn32 it *loses* 17-38% at N = 11264, 15360, 20480, 25600, 51200. Not byte count
+(K-independent), not L2 capacity (L2 = 8 MB vs a 52 MB B), not block count
+(N=15360 has more blocks and loses). Encoded as the single measured point in
+`decode_cfg` (`bm == 32 and N <= 10240 and K % 128 == 0`), not as a range.
+
+### o/down: the last lever (ns=2 at bn16) is closed, and it is a correctness result
+
+Every shipped config is ns=1 (no k-step overlap); o/down have the fewest blocks
+(320), so ns=2 was the one structural lever left. `/tmp/ns2_odown.py`, 40 random
+trials per config, o and down at M=16:
+
+- `bn16 bk256 ns2 t128` and `... t64`: **40/40 WRONG** (rel ~1e4) — the ns>1
+  landmine reproduced cleanly on both shapes.
+- `bn16 bk128 ns2 t128`: correct but **3.5x / 4.2x slower**.
+- `bn16 bk512 ns2 t128`, `bn16 bk256 ns2 t256`: correct but 1.04-1.42x slower.
+
+The fast configs are silently wrong; the correct ones are slower. Lever closed,
+and it independently re-confirms that at bk256 correctness flips with the thread
+count (t256 ok, t128/t64 wrong).
+
+### o/down standing: structural, not an untried config
+
+Our time is flat across M (o 38.9→46.7us, down 100.0→122.4us) → purely B-bound.
+Achieved BW: gate_up 1632 GB/s (81%), down 1311 (65%), qkv 1227 (61%), o 1079
+(53%); hipblas hits 1665 on down M=1. Every in-tree lever is measured and closed:
+bn16 is the hardware floor, bk swept, threads identical, setprio already on,
+split-K 10-21% slower, GEMV structure not expressible, ns=2 closed above. The
+residual 1.08-1.28x is hipblas's N-tile-1 GEMV (no LDS round-trip, 5120 tiny
+blocks) vs a 16x16-atom MLS GEMM. **Do not re-open without a new mechanism.**
+
+## 2026-10-17f — o/down: the shape-aware chooser wins, split-K closes, and ns>1 is a landmine
+
+Goal was to beat hipblas on `o` and `down` (qkv/gate_up already win; M=64 out of
+scope). Three results, two of them negative, one of them a correctness finding
+that outranks the performance question.
+
+### 1. Step A landed: the chooser was shape-blind, and fixing it is a real win
+
+`_decode_cfg` took only `M`, so the gate_up-tuned tile was applied to all four
+decode shapes. The deficit is a property of the *shape*: **N ≥ 10240 → bn32/t256;
+N = 5120 → bn16/t64**. Same-process paired, idle card:
+
+| shape | M | before | after | hipblas | ratio after |
+|---|---|---|---|---|---|
+| o | 1 | 42.9 us | **38.6** | 32.5 | 1.188 |
+| o | 16 | — | **39.2** | 34.7 | 1.129 |
+| down | 1 | 117.4 | **99.4** | 78.1 | 1.273 |
+| down | 16 | — | **100.3** | 84.5 | 1.187 |
+
+Still losing, but o M=1 is -10% and down M=1 is -15%. gate_up (0.93) and qkv
+(0.86) are unchanged and still win. The chooser now lives in
+`perf/gemm/fp8_channelwise_mls.py` as `decode_cfg`/`_validate_cfg` (single source
+of truth, importable by the test) and validates every invariant *with the shape
+in the message* before returning.
+
+### 2. The block-starvation diagnosis was a CONFOUND, and split-K is closed
+
+The doc's justification for split-K was a sweep at fixed K varying N (160 blocks
+→ 832 GB/s, 1600 → 1598) — which moves **block count and total bytes together**.
+It cannot tell "more blocks" from "more bytes". Split-K holds bytes constant and
+only multiplies blocks, so the honest test is a constant-`N·K` curve
+(`/tmp/b0_grid_scale.py`, existing kernel unmodified):
+
+| N | K | blocks | k-steps | GB/s (o curve) | GB/s (down curve) |
+|---|---|---|---|---|---|
+| 5120 | 8192 / 25600 | 320 | 32 / 100 | **1053** | **1302** |
+| 10240 | 4096 / 12800 | 640 | 16 / 50 | 986 | 1282 |
+| 20480 | 2048 / 6400 | 1280 | 8 / 25 | 1036 | 1247 |
+| 40960 | 1024 / 3200 | 2560 | 4 / — | 923 | — |
+
+**More blocks at constant bytes is worse, not better**, and 320 blocks is the
+*best* point on both curves. The original sweep was measuring "more total bytes
+amortizes the per-block fixed cost", not block starvation.
+
+Split-K was built anyway (`fp8_mls_channelwise_splitk`) and measured directly,
+paired, 7 rounds, all four o/down cells. It loses monotonically:
+
+| shape | M | base | split_k=2 | split_k=4 | hipblas |
+|---|---|---|---|---|---|
+| o | 1 | 38.9 (1.234x) | 49.1 (1.558x) | 54.6 (1.731x) | 31.5 |
+| o | 16 | 39.5 (1.113x) | 51.4 (1.446x) | 59.8 (1.685x) | 35.5 |
+| down | 1 | 100.0 (1.273x) | 110.9 (1.411x) | 117.3 (1.493x) | 78.6 |
+| down | 16 | 100.6 (1.178x) | 113.0 (1.322x) | 122.1 (1.429x) | 85.4 |
+
+10-21% *slower* than the already-losing baseline, growing with `split_k`. B0
+predicted exactly this (the transformation costs ~5% before the memset and the
+atomic epilogue are added). **Pre-registered rule R3 fires: split-K is closed for
+o/down.** The builder, its runner, and its tests were removed; `DecodeCfg.split_k`
+survives as an assertable closure marker.
+
+Two things learned on the way, both still true:
+- **`out_idx` outputs are `torch.empty`** (`tilelang/jit/adapter/tvm_ffi.py:280`),
+  so there is no host hook to zero them. A split-K kernel accumulates onto C, so
+  C must be a caller-owned input, zeroed on the same stream inside the timed
+  closure (the zero is captured into the graph, so replay N does not stack on
+  N-1). `T.clear(C)` in-kernel races across `bz` — no grid barrier exists on HCU.
+- The ns=1 split-K path was additionally numerically wrong (`rel=nan`); see below.
+
+### 3. The M=1 GEMV structure is infeasible, by hardware
+
+The user asked for a separate GEMV-structure kernel at M=1 (what hipblas does:
+`Cijk_..._MT8x1x8192_MFWGS512_WGM1_ONLYN1`). It is not expressible in the MLS
+path: the MMA output micro-tile is hardware-fixed at 16×16
+(`src/tl_templates/hcu/gemm.h:150-151`, fp8 atom
+`__builtin_hcu_mmac_f32_16x16x32_fp8_fp8` at `:118`) and the MLS B atom floor is
+`tile_mn = 16` (`src/hcu/op/mls.cc:408-412`, surfaced as `kMinNPerWarp =
+TransB ? 16 : 32` at `src/tl_templates/hcu/gemm_mls.h:36`). Padding B_s to 16
+rows, `gemm_s_mls`, and transposing to `Cᵀ = B·Aᵀ` all still hit 16 — and padding
+adds *no* blocks, which was the entire point. The reachable GEMV-equivalent was
+maximal split-K at bn=16; measured, rejected (above).
+
+### 4. NEW: `num_stages > 1` is silently wrong outside bm64/bn64
+
+Found while sweeping: the `ns=2` candidates in the o/down sweep did not merely
+lose, they returned **non-finite or `rel` 0.75–580** values. Reproduced on all
+four shapes, all M, and bisected (`/tmp/ns2_repro.py`, `/tmp/ns_threshold.py`,
+`/tmp/ns_threads.py`):
+
+| config | LDS | result |
+|---|---|---|
+| bm16 bn16 bk128 ns2 t64 | 8192 | NON-FINITE |
+| bm16 bn32 bk128 ns2 t64 | 12288 | rel=2.47 |
+| bm16 bn64 bk128 ns2 t64 | 20480 | rel=0.98 |
+| bm16 bn128 bk128 ns2 t64 | 36864 | rel=0.90 |
+| bm16 bn16 bk512 ns2 t64 | 32768 | **ok** |
+| bm16 bn16 bk128 ns2 t128 | 8192 | **ok** |
+| bm16 bn32 bk256 ns2 t128 | 24576 | rel=0.80 |
+| bm16 bn32 bk256 ns2 t256 | 24576 | **ok** |
+| bm64 bn64 bk128 ns2 t256 | 32768 | **ok** |
+| everything ns=1, any tile | — | **ok** |
+
+It is **not** an LDS-size threshold (32768 ok vs 36864 wrong), **not** a k-step
+count, and **not** deterministic in `bk`. It tracks the thread count at small
+tiles. The mechanism is not understood; it is a lowering/pipeliner defect in a
+region no shipped config uses.
+
+**The adopted M=64 config is nevertheless sound**, and that was checked directly
+rather than assumed, because if the mechanism were a race then "correct" would
+only mean "has not lost yet": 300 trials × 4 shapes × setprio {on, off} = 2400
+runs of `decode_cfg(64)` = bk128 ns2 t256, **worst rel = 0.00, zero non-finite**
+(`/tmp/ns2_stability.py`). M=128 (ns=1) likewise.
+
+**Guards added:** both `fp8_mls_channelwise` and `_validate_cfg` now assert
+`num_stages <= 1 or (block_M, block_N) == (64, 64)`, and
+`test_every_chosen_decode_config_is_correct` runs the chooser's M=64 output on all
+four shapes — coverage that was missing, and the only place `ns>1` is exercised.
+
+### 5. What is left on o/down — nothing in the cheap knob space
+
+Full o/down sweep at M=1/M=16 (`/tmp/final_sweep.py`, paired vs hipblas in one
+process, best-first). o M=1:
+
+| config | µs | vs hipblas |
+|---|---|---|
+| **bn16 bk256 ns1 t64 sp1 (chosen)** | **38.6** | **1.048** |
+| bn16 bk256 ns1 t128 sp1 | 38.7 | 1.052 |
+| bn32 bk256 ns1 t128 sp1 | 41.0 | 1.113 |
+| bn16 bk256 ns1 t64 **sp0** | 41.3 | 1.122 |
+| bn16 bk512 ns1 t64 sp1 | 45.1 | 1.226 |
+| bn16 bk128 ns1 t64 sp1 | 58.7 | 1.596 |
+
+`setprio=1` is worth 6.5% and is required. `threads` 64→128 changes nothing (the
+16×16 atom means one warp of work either way). `bk` 128 or 512 are both much
+worse. **The chooser's answer is the optimum of the in-tree search space.**
+
+### Caveat on the ratio, and why it is quoted as a range
+
+`torch._scaled_mm` on o M=1 read 31.5, 36.8 and 32.5 µs across three runs while
+our own kernel moved only 38.9 → 38.6. hipblas is the noisy term, and a crowded
+process (18 resident CUDA graphs) inflates it. A dedicated 12-round alternating
+A/B with only two graphs in the process gives a **stable** ratio: spread ≤5%,
+o M=1 = 1.188 [1.182, 1.197], down M=1 = 1.273 [1.270, 1.273]
+(`/tmp/ratio_stability.py`). Those are the numbers to quote. Do not read a ratio
+off a sweep process that holds many candidate graphs.
+
+### 6. A second real win: the M=32 thread count
+
+Running the full matrix surfaced a 2.0x cliff at the band edges — a shape getting
+*faster* as M grows, then falling off (down: M=16 100.8 -> M=32 209.9 -> M=64
+148.0). A 2.0x step is "twice the work, same parallelism": at bn16 a bm32 tile is
+two 16x16 M-atoms, and the M-only table gave it ONE warp (t=64), making the block
+MMA-issue-bound instead of B-stream-bound. Shrinking bm does not fix it (bm16 at
+M=32 doubles B traffic — the grid is N/16 x M/16, so each B tile is read twice,
+measured worse). The untested axis was threads:
+
+| shape | M=32 t=64 | t=128 | t=256 |
+|---|---|---|---|
+| o | 75.2us (1.911x) | 72.3 (1.837x) | **46.9 (1.191x)** |
+| down | 209.9us (1.944x) | 203.0 (1.880x) | **122.4 (1.133x)** |
+
+Adopted: `threads = 64 if bm <= 16 else 256` on the N=5120 branch. **1.60x/1.71x.**
+bm32/bn32/t256 on gate_up/qkv was already right and is unchanged.
+
+### The final matrix, and what is still open
+
+`ratio` = ours/hipblas, <1 is a win. M=1..32 stable to <=5%; M=64/128 move up to
+~35% between runs (fewer blocks, sensitive to the shared box) — indicative only.
+
+| shape | M=1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|---|---|---|
+| gate_up | **0.93** | **0.78** | **0.87** | **0.88** | **0.91** | **0.86** | 1.08 | **1.00** |
+| qkv | **0.85** | **0.82** | **0.83** | **0.84** | **0.85** | 1.13 | 1.05 | 1.15 |
+| o | 1.19 | 1.14 | 1.11 | 1.11 | 1.13 | 1.19 | **0.89** | 1.83 |
+| down | 1.27 | 1.23 | 1.08 | 1.18 | 1.18 | 1.11 | 1.09 | 2.23 |
+
+**13 of 32 cells win** — gate_up M in {1..32, 128}, qkv M in {1..16}, o M=64.
+Still open, honestly: o/down M<=32 (1.08-1.27x, B-stream-bound at ~1300-1500 GB/s
+vs hipblas 1543-1670, closed on every lever tried), M=128 (1.83x/2.23x, only 40
+blocks at bn128 and bn cannot shrink without shrinking the grid further), and qkv
+M>=32 (1.05-1.15x, already at its measured neighbourhood optimum).
+
+**Net for o/down: closed on all four levers** — shape-aware config (adopted), the
+M=32 thread fix (adopted, +1.6-1.7x), split-K (measured, closed), tile widening
+(catastrophic), pipeline depth (the ns>1 region is broken anyway, and ns=1 is the
+safe optimum). The residual at M<=32 is not reachable by adding blocks within the
+MLS/MMA structure. Do not re-open split-K without new evidence.
+
+## 2026-10-17e — the async-wait lever: hypothesis refuted, a small real win found instead
+
+The in-scope plan was to attack wait granularity (hipblas's "fine-grained
+`vmcnt(4)`" vs our `cp_async_wait`). Two results.
+
+**1. The hypothesis was wrong, and the doc had it from the patched file.**
+Disassembling the **native** M=64 kernel
+(`/opt/dtk/lib/hipblaslt/library_bw_nmz/FusedMatmulKernel_gfx938.co.bak_0916_1000`)
+shows the k-loop uses **only wait-all** sync: 8× `s_waitcnt lgkmcnt(0)` and 4×
+`s_waitcnt vmcnt(0)` per k-tile. **No partial `vmcnt(N>0)` in the loop at all** —
+the `vmcnt(23)` ladder and the `vmcnt(14)…(1)` cascade live in the
+prefetch/scale/epilogue region. The in-loop `vmcnt(4)` in `down_readable.s` is
+the hand-edit of the native `vmcnt(0)`. On the LDS axis we are already *finer*
+than hipblas (rolling `lgkmcnt(7)→(0)` interleaved into the 32 MMAs vs its single
+coarse `lgkmcnt(0)` per 24). The doc's "fine-grained vmcnt(4) waits" sentence was
+an artifact of reading the delivered `.s`.
+
+**2. The real knob is `num_stages` (= cross-k-step overlap), and it is worth 1.2%.**
+`cp_async_wait<N>` comes from the generic `InjectSoftwarePipeline`; `N` is relaxed
+by `PipelinedRetainGroups = num_stages - 1`. `ns=1` ⇒ `wait<0>` (full drain);
+`ns=2` ⇒ `wait<1>`. Sweep at M=64 gate_up, same-process, interleaved, idle GPU 2
+(within-config spread ≤0.5 µs, no round-to-round overlap):
+
+| config | µs | vs base |
+|---|---|---|
+| bk256 ns1 t256 (old baseline) | 246.6 | 1.000 |
+| bk256 ns2 t256 | 250.7 | 1.017 |
+| bk128 ns1 t256 | 269.3 | 1.092 |
+| **bk128 ns2 t256 (ADOPTED)** | **243.5** | **0.988** |
+| bk128 ns3 t256 | 336.0 | 1.363 |
+| bk64 ns1 / ns2 | 313.6 / 329.0 | 1.27 / 1.33 |
+| bk128 ns2 t512 | 263.2 | 1.067 |
+| bk128 ns2 bn128 | 250.6 | 1.016 |
+| hipblas | 226.9 | 0.920 |
+
+**The wait count is not the lever** — at fixed bk=256, `wait<0>`→`wait<1>` is
+1.6% *slower*. The win is an interaction with `bk`: at bk=128 the ns=1→ns=2 swing
+is **−25.8 µs**, at bk=256 it is **+4.1 µs**. Double-buffering lets the next
+tile's loads run under the current tile's compute — the same mechanism hipblas
+gets from its VGPR queue, in LDS. It needs the smaller tile (bk128 ns1 alone is
+23 µs worse than bk256 ns1 — it syncs twice as often with no overlap), and
+`bk128 ns2` sits at 32 KB LDS so 2 CTAs stay resident. Depth >2 is much worse.
+
+**Adopted:** `_decode_cfg(64)` = `(64, 64, 128, 2, 256, 1)`. rel=0.00000 on all
+four decode shapes; 8192³ untouched (433.9 TFLOPS). Gap to hipblas 1.087 → 1.073.
+
+**Also fixed:** the builder only asserted `block_K % 64 == 0`, which does not imply
+`K % block_K == 0`. `bk=192` on K=5120 compiles, runs, and is **silently wrong**
+(rel=1.61 — 5120 % 192 = 128, so the tile copy runs past the end of B). Now
+asserted. `bk=320 ns1` is correct at rel=0, so this is divisibility, not an
+atom-width rule.
+
+**Honest size:** 1.2%, not the 5.8% the in-scope framing hoped for. The overlap
+story survives but the specific named lever does not exist. The residual 7.3% is
+hipblas hiding B's latency in a deep VGPR queue while we must round-trip through
+double-buffered LDS — a structural consequence of the mmac fragment layout, and
+the same wall B-direct hit from the other side.
+
+## 2026-10-17d — both B-fetch levers closed; the native-kernel structure is right, but the win is not there
+
+Two subagents ran the two open levers to completion. **Both are negative**, and
+B-direct's is provably negative, not just measured-negative.
+
+**B-direct: fully wired, correct, and 2.1× too slow.** The dispatch is end-to-end
+now and produces rel=0.00000. Full M=64 gate_up, same-process, idle card,
+CUDA-graph replay (`/tmp/bdirect_probe.py`):
+
+| config | µs | vs baseline |
+|---|---|---|
+| baseline — Square, B-via-LDS | **246.2** | 1.00x |
+| FullCol, B-via-LDS (WarpM=1) | 273.9 | 1.11x |
+| B-direct — Square (WarpM=4, 8-consec-k) | 904.2 | **3.67x** |
+| B-direct — FullCol (WarpM=1, 8-consec-k) | 513.8 | **2.09x** |
+
+So `WarpM=1` does remove the m-warp redundancy (904 → 514) — the 2026-10-17c
+partition reading was not wrong — but it lands **2.1× above baseline**. The
+loader-only probe (which measured only the `buffer_load`s) overstated the win; the
+real kernel adds the mmac chain, A-MLS, the per-lane B fragment shuffle, and the
+half-sector pattern across the actual 4-warp M-split, and the gain does not
+survive them.
+
+**The 16-consec-k fragment cannot rescue it — two independent proofs.**
+
+1. *It cannot feed the mmac without a cross-lane repack.* The fp8 mmac B operand
+   is hardware-fixed at `int32x2` = 8 B/lane (`src/tl_templates/hcu/gemm.h:109`,
+   `__builtin_hcu_mmac_f32_16x16x32_fp8_fp8`); **no fp8 `16x16x64` exists** (the
+   only `16x16x64` builtins are fp4 `scale_buffer.hpp:545` and ROCm i8). So
+   16-consec-k is a *load* shape only. The two loaders in
+   `tilelang_ds_read_format.hpp` have provably different per-lane ownership:
+   `b_vgpr_direct_load` (8-consec-k) → lane owns 16 n-rows × 4 k-offsets, chunks
+   32 apart, and its comment says it targets the **byte-identical**
+   `ds_read_format_tensor_b` layout; `b_vgpr_direct_load16` → lane owns 32 n-rows
+   × 64 *contiguous* k, and its own comment says that is **DIFFERENT** from the
+   mmac fragment. Converting one to the other needs an 8-byte `lane^16` exchange
+   per 16 B chunk.
+2. *The arithmetic bound settles it without building the repack.* The 8→16-consec
+   swap can only recover the sector penalty = loader-only `d8b_1w − d16b_1w` =
+   217.8 − 123.9 = **93.9 µs/pass**. The B-direct FullCol gap to baseline is
+   513.8 − 246.2 = **267.6 µs**. 93.9 < 267.6 ⇒ best case ~419.9 µs, still
+   **173.7 µs above baseline**. Independent of the overlap model.
+
+**MLS producer: closed negative.** The 128×16 atom is ~20% slower than 64×32 in
+isolation (1600 vs 1892 GB/s), but that gap is already hidden by the pipeliner —
+swapping to the faster atom makes the full GEMM **15–16% slower** (287.2 vs
+246.2 µs, both rel=0.000000). The kernel is **overlap-quality-bound, not
+producer-throughput-bound**. No source change.
+
+**Net:** the native-kernel reading from 2026-10-17c (B→VGPR global-direct, no M in
+the B index, waves split N) is still *structurally* correct and worth keeping as
+the description of what hipblas does — but it does **not** transfer into a win in
+the current tilelang structure. The remaining gap to hipblas at M=64 is overlap
+quality (see the M=64 section of the doc), not B-fetch throughput. Do not re-open
+either lever without new evidence. *(2026-10-17e: the overlap lever was then
+attacked — see above — worth 1.2%, and the "5.8%" quoted here is the contended
+figure; idle-card it was 10.2%, now 7.3%.)*
+
+**Code state:** the B-direct dispatch (`gemm_hcu_mmac.py` `_gemm_mls_b_direct` +
+`tl.hcu_b_vgpr_direct` gate + the `pass` branch in `infer_layout`) and the three
+loaders are complete and correct but non-winning — keep on this branch as
+closed-experiment infrastructure, **do not merge**. The `"+v"` → `"=&v"` fix at
+`tilelang_ds_read_format.hpp:557` is a real correctness fix.
+
+## 2026-10-17c — B-direct re-opened: the 4x was the partition, not the fetch
+
+> **SUPERSEDED by 2026-10-17d (above).** The native-kernel reading below is
+> structurally correct and worth keeping, but its *actionable* conclusion ("the
+> retry shape is WarpM=1 + 16-consec-k, so B-direct is the larger lever") is
+> falsified by measurement: WarpM=1 B-direct is still 2.1× slower than baseline,
+> and the 16-consec-k fragment is both mmac-incompatible without a cross-lane
+> repack and arithmetically insufficient. Read this section as a *description of
+> what hipblas does*, not as a plan.
+
+Re-read the **native, unpatched** hipblaslt kernels (the `deliverable_*.s` files
+are *patched* — Layout A / slc / vmcnt4 hand-edits — and the deliverable README
+itself warns "operand 角色不能跨 M 复制"). Two native witnesses now, both showing
+the same structure:
+
+- **M=64 down** — extracted from the pristine pre-patch library
+  (`/opt/dtk/lib/hipblaslt/library_bw_nmz/FusedMatmulKernel_gfx938.co.bak_0916_1000`
+  via `llvm-objdump -d --mcpu=gfx938`): `MT96x64x256_TT6_2_WG16_32_1_MFWGS512_WGM8`.
+- **MT256x128x128** — the readable Tensile `.s` in `/workspace/misc/`.
+
+Both confirm: **weight B is loaded `buffer_load_dwordx4 … idxen offen` straight
+into the MMA operand block (M=64: `v[96:127]`; MT256: `vgprValuB_X0_I0`), no
+`lds` modifier — B never touches LDS. A is staged through LDS.** The B index is
+built from `lane%16` alone (M=64: `v_mul_lo_u32 v184, s78, v6`, `v6=Serial&15`;
+MT256: `v6=(lane%16)+wave*32`, `v9=(lane/16)*16`) — **no M coordinate** — so the
+4 waves split **N**, each B byte is fetched **once** (cross-check: M=64 down
+baseline 131.8 µs / 131.1 MB = 995 GB/s, impossible under 2×/4× replication), and
+B's reuse across the whole M extent happens **in-register** (one 8-byte B operand
+→ 8 mmacs in MT256, 18 in M=64).
+
+**This reverses the 2026-10-17b conclusion.** Our measured 3.62× is a **warp-
+partition artifact**, not a property of B-direct: our M=64 kernel is `WarpM=4`,
+so 4 independent waves each issue their own identical B loads. hipblas has no such
+term because its B index has no M coordinate. B-direct is the **larger** lever
+(123.9 vs 164.0 µs/pass = 40 µs, vs the MLS producer's 33 µs). The retry shape is
+**`bm64 bn64` with WarpM=1, WarpN=4, t128** (each warp = all 64 M × 16 N; B fetched
+once; A redundant across n-warps but 327 KB / L2-resident and stays on LDS).
+Winning still needs the **16-consec-k fragment** too (8-consec-k at 1× redundancy
+still loses: 217.8 vs 164.0 µs/pass). Both are in-repo generator changes
+(`ComputeMlsWarpPartition` `src/hcu/op/mls.cc:506`, `AnalyzeResourceAxis`
+`src/hcu/transform/hoist_mls_resource.cc:1615`, + the mmac B-operand/A-index
+wiring), **not** hand-written C++, and **not** blocked by the excluded weight
+reorder (Layout A). The WIP `b_vgpr_direct_*` loaders on this branch are the
+foundation for the retry, not dead weight.
+
+Also corrected in the doc: the M=1 "SLC" bullet (0 native loads carry `slc`; the
+9 in the delivered M=64 file were added by the patch) and the "91.5% read
+ceiling" (the real ceiling is ~2016 GB/s, not 1646 — the 512 MB probe was too
+short; our standing vs the ceiling is *worse* than the 78% framing implies, and
+headroom is *larger*).
+
+## 2026-10-17b — B-direct-VGPR is a dead end; root cause is 4x m-warp redundancy, not the scheduler
+
+Confirmed today (reproduced from first principles in `/tmp/bdirect_bench.cu` +
+`stride_test.cu` + `asm16ec.cu`):
+
+1. **The opaque-asm "one big block" fix is real but not enough.** Multi-load
+   inline asm VMFaults without `=&v` (early-clobber) because LLVM aliases an
+   output VGPR pair over a later input (the next load's address). 2 loads work,
+   3+ fault. With `=&v`, 16 loads issue correctly (SASS-verified: distinct output
+   regs, one `s_waitcnt vmcnt(0)`). Raw BW matches `hipMemcpyD2D` at ~1319 GB/s
+   for contiguous patterns and ~1318 GB/s for strided patterns — the hardware
+   handles strided buffer_load fine, and the aillvm re-drain was specific to
+   the tracked `hcu_buffer_load_impl` path (which we never need to use again).
+2. **Why the full GEMM is still 71x slower than control:** the 4 m-warps per
+   n-warp each issue their own 16 buffer_loads of identical B data → **4x
+   global traffic** plus VGPR pressure (101 vs 82 VGPR) plus register-move
+   overhead. LDS staging exists precisely to coalesce 4 global reads into 1.
+   The 8-consec-k fragment then adds a further ~2x of sector inefficiency vs
+   hipblas's 16-consec-k. Combined, B-direct cannot beat the MLS path — it can
+   only lose by a lot.
+3. **To get hipblas-class B-direct you need two things we don't have:**
+   (a) a 16-consec-k B fragment (requires full MMAC operand rewrite, not just
+   a loader swap), and (b) WarpM ≈ 1 so the m-warp redundancy cost goes away
+   (requires a wider tile / more n-warps). Both are out of scope for "optimize
+   within existing tilelang".
+
+**Action: do not merge the B-direct WIP.** The 6 files of diff
+(`tilelang_ds_read_format.hpp` + 3 emitter/gemm_op Python files + docs +
+handoff) are the record of the attempt; the header additions are the
+infrastructure for a future fragment-rewrite effort only. Don't turn the
+annotation on.
+
+### The real lever: the MLS producer (33 us/pass headroom)
+
+From [[hcu-b-direct-vgpr-closed]]: `matrix_load_128x16_b8` global→LDS runs at
+1599 GB/s (79% of achievable) vs 2002 GB/s (99%) for a plain copy of the same
+tile. 33 us/pass of headroom, vs a 23 us total gap to hipblas. The MLS
+partition heuristic (`ComputeMlsWarpPartition` in `src/hcu/op/mls.cc` +
+`hoist_mls_resource.cc`) is the only in-scope lever left. Requires a C++
+rebuild.
+
+### The 5.8% was a contention artifact
+
+`hy-smi` shows co-tenant load varies hugely between sessions. Measured on three
+load levels:
+
+| machine state | hipblas | ours | ratio |
+|---|---|---|---|
+| idle (2026-10-17, all HCU 0%) | **224.2us (64.9%)** | **247.0us (58.9%)** | **1.102, stable ±0.2% / 8 rounds** |
+| mild (GPU4, 10-16c) | 257.0us | 272.0us | 1.058 |
+| heavy (GPU2, co-tenant 50-100%) | 276-293us | 284us | ~1.00 ("parity" — false) |
+
+Contention disproportionately hurts hipblas's deep in-flight queue, so the gap
+SHRINKS as the machine gets dirtier. **Never conclude "gap closed" on a loaded
+card. Check `hy-smi` (HCU% column must be ~0) before trusting absolute times or
+even ratios.** Quiet-machine reference now: 224.2 / 247.0 (supersedes the
+231.7 / 247.0 pair; hipblas's 213-226us range in the older docs was also
+idle-machine).
+
+### Where the 23us goes (idle-card, paired load-only decomposition)
+
+- B-only load: 166.6us = 1574 GB/s = 87% of the 1800 GB/s ceiling — **the load
+  path is not the bottleneck**.
+- A+B load: 195.0us. A's cost ≈ 28us, of which ~13us is A loaded once and ~15us
+  is A re-loaded per k-iteration (800 blocks × 20 iters re-reading the 327 KB
+  L2-resident matrix; LDS-size/occupancy hypotheses refuted by a dummy-alloc
+  control at −0.2us).
+- Full kernel: 247.0us → compute (ds_read+mmac) exposes ~52us.
+- hipblas total: 224.2us. Gap 22.8us.
+
+### hipblas M=64 k-loop structure (SASS from the delivered `down_readable.s`)
+
+See the table in `docs/optimization/fp8_decode_m_le_128.md` (section "hipblas
+M=64 k-loop vs ours"). The three load-bearing differences: (1) the weight is
+loaded **direct global→VGPR** with slc (16B dwordx4), never through LDS; (2)
+a **vmcnt ladder (vmcnt(23)→0) drains once per 2-chunk window** → ~20+ loads
+in flight; (3) only the small activation operand uses LDS, so the B side is
+barrier-free. Our 10-15 `b_vgpr_direct` attempt matched (1) with 8B loads but
+the aillvm backend re-drained the queue before each 4-mmac group (rolling
+vmcnt(3)) → 4× regression.
+
+### Outcome (2026-10-16): B-direct is closed by measurement, and the lever moved
+
+The annotation-gated B-direct path was built and measured. It is **4.0x slower**
+(975.4us vs 243.4us LDS control) even after two real bugs were fixed (VMFault
+from missing early-clobber `"=&v"` on multi-load inline asm; a scratch spill from
+a dynamic slice index). Isolated loader kernels show why, and it is arithmetic
+rather than a backend failure: our block is t256 = 2 n-groups x **4 m-warps**
+(`nbase = (warp_id / 4) * 32`), so every B byte is fetched 4x. Predicating the
+loads to one m-warp per n-warp (1x reads) removes **3.62x** of the cost on the
+identical pattern. LDS staging is not overhead — it is the mechanism that turns
+four global fetches into one. Our 8-consec-k fragment then adds an independent
+**2x** vs hipblas's 16-consec-k (half-sectors vs full sectors). See
+`docs/optimization/fp8_decode_m_le_128.md`, "B-direct-to-VGPR: what it costs".
+
+B-direct does win in exactly one configuration — 16-consec-k fragment (`dwordx4`)
+**and** WarpM=1, measured at 123.9us/pass vs 164.0us/pass for the MLS producer —
+but that needs a fragment rewrite plus a different warp arrangement (t128 4
+n-warps, or BN=128 with 8), and A must stay on MLS/LDS since it goes redundant
+across n-warps under WarpM=1.
+
+### Where the 23us actually is
+
+Not the fetch pattern, and not the barrier. The B tile fetch pattern (64 rows x
+256 B, rows 5120 B apart) reaches 1881-2016 GB/s with a plain copy — and the
+"1646 GB/s read ceiling" in earlier notes is wrong; a grid-stride read measures
+**2016 GB/s**. The loss is inside the producer: `matrix_load_128x16_b8`
+global->LDS delivers **164.0us/pass (1599 GB/s, 79.3%)** where a plain
+`buffer_load_dwordx4` copy of the same tile delivers **131.0us/pass (2002 GB/s,
+99.3%)**. Not the per-k-step barrier (plain + same barrier = 2013 GB/s), not
+pipeline depth (2-deep double-buffered MLS is *worse*, 1456 GB/s).
+
+**33us/pass of headroom against a 23us total gap.** The MLS partition/axis is
+shape-dependent (`ComputeMlsWarpPartition`, `src/hcu/op/mls.cc:506`): bm64 bn64
+bk256 gives `sequence<64,256>, sequence<16,128>, 2, 2, ... mn`, bk512 gives
+`1, 4, ... k`, bn128 gives `2, 2, ... k`. That is the next lever, and it is a
+C++ change. The WIP B-direct lowering code (header +181, emitter +44, macro
+generator +118, `gemm_op.py` +6/-2) is now dead weight — revert or keep as
+reference, but it does not go in.
 
 ## 2026-10-16c — M=64 IS LDS-PORT-BOUND, AND THE GAP IS 5.8%. Read this first.
 
@@ -397,29 +1124,171 @@ emulation. The *right* one needs 16-byte VGPR loads (N=16) + slc + non-blocking.
 
 ## Next steps (recommended order)
 
-Levers 1, 2, 4 and 5 are closed (see the levers section). What is left is
-structural, not a config search:
+**The search space is exhausted as of 2026-10-19.** Every axis has now been
+measured and closed, and the last one — `warp_k` / `FullColK` on the MLS path —
+was implemented (it had three separate hard guards) and turned out to be
+neutral-to-negative. See the doc's 2026-10-19 section.
 
-1. **A wide-bn MLS partition that keeps the fast shape.** This is the highest-value
-   compiler-side fix. `ComputeMlsWarpPartition` (`src/hcu/op/mls.cc:506`) and
-   `AnalyzeResourceAxis` (`src/hcu/transform/hoist_mls_resource.cc:1615`) pick
-   (warp_mn, warp_k) and the mn-vs-k resource axis from the tile shape. For
-   `B(64,256)` at 4 warps they land on the optimal (2,2)/`axis::mn`; for
-   `B(128,256)` the axis flips to `k`, and for `bk=128` the partition becomes
-   (4,1). Both raise LDS read amplification from 2× to 3–4×, which costs more than
-   the A-write traffic that wide bn saves. Forcing (2,2)/`axis::mn` for
-   `B(128,256)` would cut A's LDS writes in half — worth ~15us if the read side
-   holds. Measure with `__builtin_hcu_matrix_load_*` unchanged; this is a pure
-   heuristic change.
-2. **A global→VGPR matrix load.** There is no such builtin today (all
-   `__builtin_hcu_matrix_load_*` are global→LDS). If the ISA has one, it removes
-   A's LDS round-trip outright and V1 (217.0us) becomes the real kernel.
-3. Only after 1 or 2: lock configs into `perf/gemm/fp8_channelwise_decode_bench.py`
-   `_decode_cfg` and commit with a writeup. `_decode_cfg` already returns
-   `(64,64,256,1,256,1)` for M<=64 — the measured optimum — so no change is
-   pending there.
+Closed, each with a measured bound:
 
-Do **not** re-run the wide-bn or nt-shared-A sweeps; they are settled negative.
+| lever | verdict |
+|---|---|
+| wide-bn MLS partition (was "lever 1") | closed 2026-10-18: N-split is 2-3x worse; A's LDS read scales with warp count |
+| B-direct-VGPR via `buffer_load` (was "lever 2") | closed: 2.5-3.2x slower at every M; 16-consec-k is mmac-incompatible |
+| **`__builtin_hcu_matrix_load_b8` (global->VGPR matrix load)** | **the builtin DOES exist** (correcting the 2026-10-17d note); measured 2026-10-19 and still **closed** — its fixed per-lane micro-layout is not the mmac operand layout. See the doc's 2026-10-19 section. |
+| rolling LDS window | closed: an 8-warp occupancy technique, 3x slower at our 1-warp structure |
+| split-K | closed twice: not expressible (MLS K-offset silently wrong for any nonzero base) and 10-21% slower |
+| `ns>1` | closed: ~1% at best where it is exact; wrong in four configs |
+| register operands, plain shared, bn widening, thread count | all measured negative |
+| **`warp_k` / `FullColK`** | **built 2026-10-19, correct, 0.97-1.03 vs shipped with mixed sign; a *substitute* for `setprio`, not a complement** |
+
+Also newly established: the MLS producer's per-access offset is a **signed 10-bit
+element immediate** (`tilelang_mls_base.hpp:328`), so `block_K <= 512` at the
+bn16 fp8 tile. hipblas's 2048-element K chunk uses 32-bit `buffer_load_dwordx4`
+addressing and is structurally unreachable from the MLS path — that is a cap,
+not a tuning choice.
+
+What is left is **not** a config search:
+
+1. Lock the already-shipped configs and commit with the writeup (nothing is
+   pending in `decode_cfg`; the o/down rows are `bn16/bk256/ns1/t64` at M<=16 and
+   `bn32/bk256/ns1/t256` at M=32, both with `setprio=1`).
+2. Anything further needs a new *mechanism* — a producer that is not MLS, or an
+   ISA path that avoids the LDS round trip — not another sweep.
+
+Do **not** re-run the wide-bn, nt-shared-A, split-K, `ns>1`, rolling-window or
+B-direct sweeps; they are settled negative.
+
+## 2026-10-19 — the o/down gap, located and closed (supersedes "not a config search")
+
+The gap to hipblas **has** been found and it is arithmetically closed, not an
+unfound knob. Full writeup: `docs/optimization/fp8_decode_m_le_128.md`,
+section "2026-10-19 — o/down: the gap is an LDS-capacity invariant".
+
+Three facts to carry forward:
+
+1. **Occupancy cliff.** Same kernel, only the dynamic smem size changed:
+   12288 B → 5 blk/CU → **93.7 µs**; 14336 B → 4 blk/CU → **168.9 µs**. 5→4
+   blocks/CU costs 80%. The shipped config is exactly 320 blocks = 64 CU × 5 =
+   one wave, on a knife edge. Any LDS increase is catastrophic.
+2. **The invariant.** `total = const × w × (L + C·ns)`, where `w` = MLS packed /
+   logical (bk128 → 2.5, bk256 → 1.5, bk512 → 1.0), `L ≈ 0.79 µs` = one DRAM
+   round trip per warp-iteration, `C ≈ 0.15 µs` = the exposed
+   `ds_read_matrix_trans_format ×8 → mmac ×8` chain. **bk and ns cancel** — more
+   stages ⟺ fewer blocks/CU ⟺ more waves. This is *why* `ns>1` and split-K are
+   neutral, and it predicts bk64/bk128/bk256 within 10%.
+3. **SASS root cause.** The four `matrix_load_128x16_b8` producers are emitted
+   *after* the mmac and immediately before the branch, and the next iteration
+   opens with `s_waitcnt vmcnt(0)`. The full load latency is exposed every
+   iteration. Decomposition: dropping mmac saves 9.4%, dropping the ds_reads 9.3%,
+   dropping **both** 9.8% — one serialized chain. The pure load path alone is at
+   ~1.02× hipblas, so the load machinery is already at the ceiling.
+
+**Only landed-quality change available: rotate the MLS producer above the
+`promote_prio`/mmac block** (~3%, reproduced 3×; the compiler inserts the needed
+`s_waitcnt lgkmcnt(0)`, so it is not racy). It needs an emitter/pass change — the
+producer placement comes from the MLS lowering, not a config flag. Note this
+only overlaps the mmac portion; the ds_read portion cannot be hoisted above the
+load issue without a second buffer, and a second buffer is exactly what the LDS
+capacity wall forbids.
+
+## 2026-10-20 — fat-tile decode config landed; the kernel cache serves stale code
+
+**Landed (working tree, uncommitted).**
+
+1. `src/hcu/op/mls.cc` — the fp8-trans `(16,128)` packed branch now packs densely
+   when the dst tile is a whole number of 4K slots. A 16x256 tile is exactly
+   4096 B, so `MlsPackedTileBytes` returns -1 (contiguous) and the allocator
+   stops reserving 6144 B for it. bk=128 keeps the conservative 5120-B slot
+   layout; bk=384 is 3 slots and also keeps it.
+2. `perf/gemm/fp8_channelwise_mls.py` — `decode_cfg` returns
+   `bn96/bk256/ns2/t384` for `N == 5120 and K % 256 == 0`; both `ns>1` guards
+   allow exactly that one wide config. qkv/gate_up keep bn32.
+
+**Cold-cache re-validation** (cache cleared, card 0 idle, one process, paired,
+5 rounds, medians; `old` = the pre-landing bn16 chooser):
+
+| shape/M | old | ship | hipblas | ship/old | ship/hip |
+|---|---|---|---|---|---|
+| o 1 | 38.88 | 36.80 | 32.96 | 0.947 | 1.117 |
+| o 16 | 39.84 | 37.44 | 35.20 | 0.940 | 1.064 |
+| o 32 | 47.84 | 45.12 | 39.68 | 0.943 | 1.137 |
+| down 1 | 100.00 | 92.80 | 78.40 | 0.928 | 1.184 |
+| down 16 | 100.80 | 93.28 | 84.80 | 0.925 | 1.100 |
+| down 32 | 125.44 | 116.48 | 109.76 | 0.929 | 1.061 |
+
+All rel 0.0 (down M=32 5.9e-08). So the wide tile is a stable 5-7% win over the
+old chooser; o/down are still 6-18% behind hipblas.
+
+**The kernel disk cache is blind to codegen changes — this cost the afternoon.**
+`~/.tilelang/cache/<version>/linux-x86_64/kernels/<hash>/` stores
+`device_kernel.cu` + `executable.so` keyed on TIR/options only. After the
+2026-10-19 emitter changes (`ds_read_format.cc` gained the WarpN template arg,
+`hcu_mmac_*` Python emitters changed), old entries kept being served:
+`test_warp_k_fullcolk_mls_is_correct_and_reduced` saw
+`ds_read_format_tensor_a<..., 1, 1, tl::fp8_t, ...>` — a call the current
+header cannot even compile — while `TILELANG_DISABLE_CACHE=1` emitted the
+expected `..., 1, 4, 1, tl::fp8_t, ...`. Clearing
+`~/.tilelang/cache/0.1.12_cuda_git0a92729d/linux-x86_64/kernels/*` fixed it.
+**Rule: after touching any emitter/lowering/header, clear that directory before
+trusting a test or a timing.** Purely numeric changes (LDS sizes) change the TIR
+hash and invalidate themselves; format-string and header changes do not.
+
+**Test status after the cache clear: 18 passed, 3 xfailed, 1 xpassed.** The
+xpass is `bm16/bn16/bk256/ns4/t64`, now exact *because* dense packing makes the
+stage stride equal the logical stride (bk128 is still broken: 5120-B packed
+stride against a 2048-B tile). `test_mls_packed_stride_is_shared_by_producer_and_consumer`
+was updated accordingly: `mls_packed_tile_elems(16, 256, 16, 128, True, fp8)` is
+now 0 (dense == contiguous), and a bk=384 case pins the 7168-B slot fallback.
+
+### 2026-10-20b — 3 wavefronts, not 6: the A producer replicates per warp
+
+The wide tile's intended mechanism (cut A's re-read 320x -> 54x) never happened.
+SASS shows the A `matrix_load` address has **no warp-id term** (B's does: warp id
+mod 6, offset warp*2048), so every warp loads the same A. A's re-read is
+blocks x warps = N/16 warp-loads **independent of the tile** — 54x6 is the same
+as the old 320x1. That is why the fat tile bought 5-7% and not 1.7x.
+
+Warp count at fixed bn96/bk256/ns2 (legal counts {1,2,3,6}; paired, 5 rounds,
+idle card 0):
+
+| warps | t384 | **t192** | t128 | t64 |
+|---|---|---|---|---|
+| vs t384 | 1.000 | **0.952-0.962** | 0.971-0.983 | 1.23-1.29 |
+
+U-shaped: fewer warps means less A traffic but also less latency hiding.
+Landed `decode_cfg` N==5120 -> t192 (was t384). Against hipblas, M=1/16/32:
+o 1.069/1.020/**1.000**, down 1.110/1.053/**0.935** — o ties and down wins at
+M=32. All rel 0.0 (down M=32 5.9e-08). Tests: 18 passed, 3 xfailed, 1 xpassed.
+
+Next: de-replicate the producer in `src/hcu/op/mls.cc` (one warp loads A, or
+partition its copy across warps) to keep 6 warps without paying 6x; A is ~1/3 of
+per-step per-block bytes, so the bound is ~28% of per-step traffic.
+
+### 2026-10-20c — that lever was built and is CLOSED
+
+Implemented as an issue gate in `tilelang_mls_base::{async_mls_load_asm_impl_ct,
+_impl_rt}` (canonical owner per axis: `cluster_idx[ii] < EffectiveWarpCluster[ii]`,
+covering full *and* partial replication). Bit-exact, and slower everywhere
+(paired, idle card, base = the t192 landing above):
+
+| shape / M | t384 | t192 |
+|---|---|---|
+| o M=16 / M=1 | 1.145 / 1.044 | 1.265 / 1.286 |
+| down M=16 / M=1 | 1.190 / 1.071 | 1.347 / 1.358 |
+
+Root cause (SASS): `cp_async_wait<1>` sizes its `vmcnt` constant from the
+*unconditional* async loads; putting A behind `if (owner)` drops it out of the
+count, so the wait becomes one group too strict (t192 `vmcnt(8)->(4)`, t384
+`(4)->(2)`) and the prefetch level the whole kernel depends on disappears.
+22% less traffic never pays for that.
+
+Two corrections: t384's A handle is `WarpMN=3, WarpK=2` (K already split) so A
+is only 3x replicated there, not 6x — the fully-replicated rule emitted
+byte-identical SASS at t384; and A's duplicates are L2-served, so they were
+never on the step-time critical path. Header change reverted (SASS verified
+identical to the pre-change build). Standing after revert: o 1.069/1.027/1.024,
+down 1.110/1.042/**0.928** at M=1/16/32, all exact.
 
 ## Repo hygiene
 

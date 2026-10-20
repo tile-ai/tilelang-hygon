@@ -66,8 +66,56 @@ def mls_full_and_read_mn_k(
     return lds_mn, lds_k, read_mn, read_k, origin_mn, origin_k
 
 
-def retrieve_mls_lds_base_ptr(src: tirx.Buffer | tirx.BufferLoad | tirx.BufferRegion, access_type: str = "r"):
-    """Pointer to full LDS base (+ leading-dim offset only). Last-2 slice mins are NOT applied."""
+def mls_packed_tile_elems(
+    block_mn: int,
+    block_k: int,
+    tile_mn: int,
+    tile_k: int,
+    mls_trans: bool,
+    dtype,
+    lds_bits: int | None = None,
+) -> int:
+    """Per-stage element stride of a packed MLS dst tile; 0 when contiguous.
+
+    Delegates to the C++ ``MlsPackedTileBytes`` so the ds_read consumer, the
+    MLS producer and the shared-memory allocation cannot drift apart again --
+    they did, and every ``num_stages > 1`` tile whose dst took a packed branch
+    (fp8 trans tile (16,128), i.e. block_K >= 256 at bn16) silently read stage
+    >= 1 from the wrong LDS address.
+    """
+    dt = DataType(dtype)
+    return int(
+        _ffi_api.MlsPackedTileElems(
+            int(block_mn),
+            int(block_k),
+            int(tile_mn),
+            int(tile_k),
+            bool(mls_trans),
+            int(dt.bits),
+            int(dt.lanes),
+            # Matches the C++ producer/allocator, which both pass
+            # ``dst->dtype.bits()`` as lds_physical_bits.
+            int(lds_bits) if lds_bits is not None else int(dt.bits),
+        )
+    )
+
+
+def retrieve_mls_lds_base_ptr(
+    src: tirx.Buffer | tirx.BufferLoad | tirx.BufferRegion,
+    access_type: str = "r",
+    *,
+    tile_mn: int | None = None,
+    tile_k: int | None = None,
+    mls_trans: bool | None = None,
+    lds_bits: int | None = None,
+):
+    """Pointer to full LDS base (+ leading-dim offset only). Last-2 slice mins are NOT applied.
+
+    The leading dims are the pipeline stage (and any outer tile dims).  Their
+    stride is the *packed* MLS tile size when the dst layout is packed, not the
+    logical ``prod(shape[-2:])`` -- pass ``tile_mn``/``tile_k``/``mls_trans``
+    so the stride matches what the producer and the allocator use.
+    """
     from tilelang.language.utils import get_buffer_region_from_load
     from tilelang.utils.language import retrieve_ptr
     from tvm.ir import Range
@@ -84,14 +132,32 @@ def retrieve_mls_lds_base_ptr(src: tirx.Buffer | tirx.BufferLoad | tirx.BufferRe
     else:
         raise TypeError(f"Unsupported mls src type: {type(src)}")
 
-    ranges = []
     n = len(region.region)
+    buf = region.buffer
+    if n > 2 and tile_mn is not None and tile_k is not None and mls_trans is not None:
+        block_mn, block_k = mls_block_mn_k_from_shape(buf.shape, bool(mls_trans))
+        packed_elems = mls_packed_tile_elems(
+            block_mn, block_k, int(tile_mn), int(tile_k), bool(mls_trans), buf.dtype, lds_bits
+        )
+        if packed_elems > 0:
+            # Flat leading index, scaled by the packed per-stage stride.
+            idx = None
+            stride = 1
+            for i in range(n - 3, -1, -1):
+                term = region.region[i].min * stride
+                idx = term if idx is None else idx + term
+                stride = stride * int(buf.shape[i])
+            if idx is None:
+                idx = 0
+            return buf.access_ptr(access_type, offset=idx * packed_elems)
+
+    ranges = []
     for i, r in enumerate(region.region):
         if i + 2 >= n:
             ranges.append(Range.from_min_extent(tirx.IntImm(r.min.dtype, 0), r.extent))
         else:
             ranges.append(r)
-    return retrieve_ptr(tirx.BufferRegion(region.buffer, ranges), access_type)
+    return retrieve_ptr(tirx.BufferRegion(buf, ranges), access_type)
 
 
 def check_mls_slice_aligned_to_tile(
@@ -168,6 +234,7 @@ def build_ds_read_format_tensor_a_template(
     tile_mn: int,
     tile_k: int,
     warp_m: int,
+    warp_n: int,
     warp_k: int,
     mls_trans: bool,
     dtype_str: str,
@@ -188,7 +255,7 @@ def build_ds_read_format_tensor_a_template(
     return (
         f"tl::mls::ds_read_format_tensor_a<tl::sequence<{lds_block_mn}, {lds_block_k}>, "
         f"tl::sequence<{ds_read_mn}, {ds_read_k}>, tl::sequence<{tile_mn}, {tile_k}>, "
-        f"{warp_m}, {warp_k}, {dtype_str}, 1, {trans}, tl::hcu_target_enum::{arch}{target_type}>"
+        f"{warp_m}, {warp_n}, {warp_k}, {dtype_str}, 1, {trans}, tl::hcu_target_enum::{arch}{target_type}>"
     )
 
 
@@ -244,6 +311,50 @@ def build_ds_read_format_tensor_b_linear_template(
     dtype_str: str,
 ) -> str:
     return f"tl::mls::ds_read_format_tensor_b_linear<tl::sequence<{block_n}, {block_k}>, {total_warp}, {warp_n}, {dtype_str}>"
+
+
+def build_b_vgpr_direct_load_template(
+    *,
+    block_n: int,
+    block_k: int,
+    total_warp: int,
+    warp_n: int,
+    warp_k: int,
+    min_n_per_warp: int,
+    warp_cols: int,
+) -> str:
+    """B-operand global->VGPR direct load (hipblas shape): same B_local layout as
+    ds_read_format_tensor_b, but reads straight from global (8B dwordx2 per lane),
+    no LDS round-trip. See tl::mls::b_vgpr_direct_load. ``warp_cols`` is the mmac
+    warp_cols (n-panels of 16 rows per n-warp); the run order must match the
+    mmac's ``B_local[(ki*WarpCols+j)*8]``."""
+    return (
+        f"tl::mls::b_vgpr_direct_load<{total_warp}, {warp_n}, {warp_k}, "
+        f"{block_n}, {block_k}, {int(min_n_per_warp)}, {int(warp_cols)}>"
+    )
+
+
+def build_b_vgpr_direct_load_stage_template(
+    *,
+    block_n: int,
+    total_warp: int,
+    warp_n: int,
+    warp_k: int,
+    min_n_per_warp: int,
+    warp_cols: int,
+) -> str:
+    """One 32-wide K-slice of the B-operand global->VGPR direct load, for the
+    software-pipelined path (hipblas LoopBeginL_1 shape): each stage issues one
+    ki-slice (ReadK=32) into a ping-pong VGPR buffer while the mmac chain for
+    the previous slice creates the s_waitcnt (vmcnt) window. The per-slice dest
+    layout matches one ki-slice of the mmac's B fragment
+    (``warp_cols * local_size_b`` elems, consumed with stride 0). ``k_offset``
+    is in elements along K (ki * 32 for fp8). See
+    tl::mls::b_vgpr_direct_load_stage."""
+    return (
+        f"tl::mls::b_vgpr_direct_load_stage<{total_warp}, {warp_n}, {warp_k}, "
+        f"{block_n}, 32, {int(min_n_per_warp)}, {int(warp_cols)}>"
+    )
 
 
 def block_col_warps_no_recompute(block_n: int, block_col_warps: int, min_n_per_warp: int) -> int:

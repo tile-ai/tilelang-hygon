@@ -522,6 +522,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
   int tile_mn = 0;
   int tile_k = 0;
   int w_mn = 0;
+  int w_n = 0;
   int w_k = 0;
   // Mls tile / LdsDesc must follow the *full* LDS write shape.
   DsReadMlsPhysicalInfo info =
@@ -575,6 +576,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     int warp_n = policy->n_warp;
     int warp_k_part = policy->k_warp;
     w_mn = meta->feeds_slot == 0 ? warp_m : warp_n;
+    w_n = warp_n;
     w_k = warp_k_part;
   } else {
     const int alt = alt_;
@@ -599,8 +601,8 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
       ss << "tl::mls::ds_read_format_tensor_a<tl::sequence<" << lds_mn << ", "
          << lds_k << ">, tl::sequence<" << read_mn << ", " << read_k
          << ">, tl::sequence<" << tile_mn << ", " << tile_k << ">, " << w_mn
-         << ", " << w_k << ", " << dtype_str << ", " << alt_ << ", "
-         << (ds_trans ? "true" : "false")
+         << ", " << w_n << ", " << w_k << ", " << dtype_str << ", " << alt_
+         << ", " << (ds_trans ? "true" : "false")
          << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
          << target_dtype_str << ", " << lds_physical_bits << ", " << reg_bits
          << ">";

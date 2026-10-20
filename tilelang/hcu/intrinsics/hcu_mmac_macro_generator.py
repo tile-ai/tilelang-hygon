@@ -5,6 +5,8 @@ import tilelang.language as T
 from tilelang import tvm as tvm
 from tilelang.hcu.intrinsics.hcu_mmac_emitter_utils import (
     block_col_warps_no_recompute,
+    build_b_vgpr_direct_load_stage_template,
+    build_b_vgpr_direct_load_template,
     build_ds_read_format_tensor_a_template,
     build_ds_read_format_tensor_b_linear_template,
     build_ds_read_format_tensor_b_template,
@@ -735,8 +737,6 @@ class HCUMatrixCoreIntrinEmitter:
 
     def ldmatrix_mls_a(self, A_local_buf, A_mls_src: Buffer | BufferLoad | BufferRegion):
         """MLS LDS -> 1D ``local`` in gemm ``body_rr`` layout (C ``ds_read_format_tensor_a``)."""
-        if self.block_k_warps != 1:
-            raise ValueError("ldmatrix_mls_a requires block_k_warps == 1 (MLS ds_read path)")
         mls_trans = not self.a_transposed
         lds_block_mn, lds_block_k, ds_read_mn, ds_read_k, origin_mn, origin_k = mls_full_and_read_mn_k(A_mls_src, mls_trans)
         # Mls tile / LdsDesc follow the full write shape.
@@ -767,6 +767,7 @@ class HCUMatrixCoreIntrinEmitter:
             tile_mn=tile_mn,
             tile_k=tile_k,
             warp_m=self.block_row_warps,
+            warp_n=self.block_col_warps,
             warp_k=self.block_k_warps,
             mls_trans=mls_trans,
             dtype_str=hcu_mls_ds_read_dtype_str(self.a_dtype),
@@ -777,7 +778,9 @@ class HCUMatrixCoreIntrinEmitter:
             lds_bits=lds_bits if self.fp4_mmac_mode == "f8f6f4" else None,
             reg_bits=reg_bits if self.fp4_mmac_mode == "f8f6f4" else None,
         )
-        src_ptr = retrieve_mls_lds_base_ptr(A_mls_src, "r")
+        src_ptr = retrieve_mls_lds_base_ptr(
+            A_mls_src, "r", tile_mn=tile_mn, tile_k=tile_k, mls_trans=mls_trans
+        )
         dst_ptr = retrieve_ptr(A_local_buf, "rw")
         warp_id_offset = self.scoped_warp_id_offset()
         self._a_full_k = True
@@ -800,8 +803,6 @@ class HCUMatrixCoreIntrinEmitter:
 
     def ldmatrix_mls_b(self, B_local_buf, B_mls_src: Buffer | BufferLoad | BufferRegion):
         """MLS LDS -> 1D ``local`` in gemm ``body_rr`` layout (C ``ds_read_format_tensor_b``)."""
-        if self.block_k_warps != 1:
-            raise ValueError("ldmatrix_mls_b requires block_k_warps == 1 (MLS ds_read path)")
         mls_trans = self.b_transposed
         lds_block_mn, lds_block_k, ds_read_mn, ds_read_k, origin_mn, origin_k = mls_full_and_read_mn_k(B_mls_src, mls_trans)
         reg_bits = 8 if self.fp4_mmac_mode == "f8f6f4" else elem_bits(B_local_buf.dtype)
@@ -844,7 +845,9 @@ class HCUMatrixCoreIntrinEmitter:
             reg_bits=reg_bits if self.fp4_mmac_mode == "f8f6f4" else None,
             min_n_per_warp=self.min_n_per_warp,
         )
-        src_ptr = retrieve_mls_lds_base_ptr(B_mls_src, "r")
+        src_ptr = retrieve_mls_lds_base_ptr(
+            B_mls_src, "r", tile_mn=tile_mn, tile_k=tile_k, mls_trans=mls_trans
+        )
         dst_ptr = retrieve_ptr(B_local_buf, "rw")
         warp_id_offset = self.scoped_warp_id_offset()
         self._b_full_k = True
@@ -864,6 +867,122 @@ class HCUMatrixCoreIntrinEmitter:
             )
 
         return _warp_ldmatrix_mls_b(B_local_buf, B_mls_src)
+
+    def ldmatrix_b_vgpr_direct(self, B_local_buf, B_src: Buffer | BufferLoad | BufferRegion):
+        """hipblas-style B load straight from global -> the same 1D ``local`` layout
+        as ``ldmatrix_mls_b`` (``ds_read_format_tensor_b``), but via 8B
+        ``buffer_load_dwordx2`` per lane with NO LDS round-trip (no LDS write, no B
+        ``__syncthreads``). ``B_src`` is a GLOBAL (N, K_total) block slice; the row
+        stride is ``B_src.buffer.shape[-1]`` (K_total), not the block k-extent."""
+        if self.block_k_warps != 1:
+            raise ValueError("ldmatrix_b_vgpr_direct requires block_k_warps == 1")
+        B_region = self._legalize_to_buffer_region(B_src)
+        # B is (N, K_total) N-major (trans_B); the region is [n0:n0+block_N, k0:k0+block_K].
+        ext_n = B_region.region[-2].extent
+        ext_k = B_region.region[-1].extent
+        if not isinstance(ext_k, tirx.IntImm) or not isinstance(ext_n, tirx.IntImm):
+            raise ValueError("ldmatrix_b_vgpr_direct requires static B[N, K] region extents")
+        block_n = int(ext_n.value)
+        block_k = int(ext_k.value)
+        if block_k % 32 != 0 or block_n % 16 != 0:
+            raise ValueError("ldmatrix_b_vgpr_direct requires K multiple of 32 and N multiple of 16")
+        total_warp = self.threads // self.WARP_SIZE
+        template = build_b_vgpr_direct_load_template(
+            block_n=block_n,
+            block_k=block_k,
+            total_warp=total_warp,
+            warp_n=self.block_col_warps,
+            warp_k=self.block_k_warps,
+            min_n_per_warp=self.min_n_per_warp,
+            warp_cols=self.warp_cols,
+        )
+        # Global base pointer (region minima offset) + full-K row stride.
+        from tilelang.utils.language import retrieve_ptr
+        global_base = retrieve_ptr(B_region, "r")
+        k_stride = B_region.buffer.shape[-1]  # full K_total (hipblas s44)
+        dst_ptr = retrieve_ptr(B_local_buf, "rw")
+        warp_id_offset = self.scoped_warp_id_offset()
+        self._b_full_k = True
+
+        @T.macro
+        def _warp_ldmatrix_b_vgpr_direct(B_local_buf, B_src):
+            T.evaluate(
+                tirx.call_extern(
+                    "handle",
+                    template,
+                    global_base,
+                    dst_ptr,
+                    k_stride,
+                    warp_id_offset,
+                )
+            )
+
+        return _warp_ldmatrix_b_vgpr_direct(B_local_buf, B_src)
+
+    def ldmatrix_b_vgpr_direct_pipeline(
+        self,
+        B_local_buf,
+        B_src: Buffer | BufferLoad | BufferRegion,
+        ki: PrimExpr | int = 0,
+    ):
+        """One 32-wide K-slice ``ki`` of the hipblas-shaped B global->VGPR direct
+        load into ``B_local_buf[ki*slice .. +slice)``. Calling convention / dest
+        layout / full-K row stride are byte-identical to
+        ``ldmatrix_b_vgpr_direct``; only the K-window changes. The caller issues
+        all slices up-front (target VGPRs are disjoint per slice, so the compiler
+        batches the dwordx2s — many in flight at once, hipblas's 4-wide
+        lookahead), then the single ki mmac chain + one loop-bottom
+        ``tl::buffer_load_fence`` (vmcnt(0)) drains the batch — the 8-mmac chain
+        is the ONE latency window (per-slice fences were a 5x regression)."""
+        if self.block_k_warps != 1:
+            raise ValueError("ldmatrix_b_vgpr_direct_pipeline requires block_k_warps == 1")
+        B_region = self._legalize_to_buffer_region(B_src)
+        ext_n = B_region.region[-2].extent
+        ext_k = B_region.region[-1].extent
+        if not isinstance(ext_k, tirx.IntImm) or not isinstance(ext_n, tirx.IntImm):
+            raise ValueError("ldmatrix_b_vgpr_direct_pipeline requires static B[N, K] region extents")
+        block_n = int(ext_n.value)
+        block_k = int(ext_k.value)
+        if block_k % 32 != 0 or block_n % 16 != 0:
+            raise ValueError("ldmatrix_b_vgpr_direct_pipeline requires K multiple of 32 and N multiple of 16")
+        total_warp = self.threads // self.WARP_SIZE
+        template = build_b_vgpr_direct_load_stage_template(
+            block_n=block_n,
+            total_warp=total_warp,
+            warp_n=self.block_col_warps,
+            warp_k=self.block_k_warps,
+            min_n_per_warp=self.min_n_per_warp,
+            warp_cols=self.warp_cols,
+        )
+        from tilelang.utils.language import retrieve_ptr
+        global_base = retrieve_ptr(B_region, "r")
+        k_stride = B_region.buffer.shape[-1]  # full K_total (hipblas s44)
+        dst_ptr = retrieve_ptr(B_local_buf, "rw")
+        warp_id_offset = self.scoped_warp_id_offset()
+        self._b_full_k = True
+        # Slice ki is staged into B_local[ki*slice .. +slice) (slice =
+        # warp_cols*local_size_b elems) — disjoint from mmac ki's read at
+        # ki*slice, so the single full-k buffer pipelines without aliasing.
+        # k_offset_elem shifts the global read address along K (32 elems/slice).
+        k_offset_elem = (ki * 32) if self.k_pack == 1 else (ki * 32 * self.k_pack)
+        dst_offset_elems = ki * self.warp_cols * self.local_size_b * self.k_pack
+
+        @T.macro
+        def _warp_ldmatrix_b_vgpr_direct_pipeline(B_local_buf, B_src):
+            T.evaluate(
+                tirx.call_extern(
+                    "handle",
+                    template,
+                    global_base,
+                    dst_ptr,
+                    k_stride,
+                    k_offset_elem,
+                    dst_offset_elems,
+                    warp_id_offset,
+                )
+            )
+
+        return _warp_ldmatrix_b_vgpr_direct_pipeline(B_local_buf, B_src)
 
     def ldmatrix_b_linear(self, B_local_buf, B_src: Buffer | BufferLoad | BufferRegion):
         """Load linear LDS B[K, N] directly into the full-K MMAC B fragment."""
