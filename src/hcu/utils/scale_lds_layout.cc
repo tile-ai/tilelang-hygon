@@ -401,28 +401,6 @@ ScaleBufferRowOrder SelectRowOrder(const CopyScaleNode *op, int block_size,
   return ScaleBufferRowOrder::kKInner;
 }
 
-ScaleBufferRowOrder SelectRowOrder(const CopyScaleNode *op, int block_size,
-                                   Target target) {
-  Optional<AutoLayoutConfig> maybe_cfg = BuildConfig(op, block_size, target);
-  if (!maybe_cfg.has_value())
-    return ScaleBufferRowOrder::kKInner;
-  AutoLayoutConfig cfg = maybe_cfg.value();
-  cfg.row_order = ScaleBufferRowOrder::kKInner;
-  const ConflictScore k_score = ScoreLayout(cfg, 0);
-  cfg.row_order = ScaleBufferRowOrder::kMNInner;
-  const ConflictScore mn_score = ScoreLayout(cfg, 0);
-  if (mn_score < k_score) {
-    DLOG(INFO) << "ScaleBufferRowOrder buffer=" << op->src->name
-               << " selected MNInner score " << k_score.max_multiplicity << "/"
-               << k_score.serialized_dwords << "/" << k_score.conflicting_banks
-               << " -> " << mn_score.max_multiplicity << "/"
-               << mn_score.serialized_dwords << "/"
-               << mn_score.conflicting_banks;
-    return ScaleBufferRowOrder::kMNInner;
-  }
-  return ScaleBufferRowOrder::kKInner;
-}
-
 } // namespace
 
 namespace hcu {
