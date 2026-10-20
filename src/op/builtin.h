@@ -9,8 +9,8 @@
 #include "operator.h"
 
 #include <tvm/ir/cast.h>
-#include <tvm/tirx/op.h>
 #include <tvm/runtime/logging.h>
+#include <tvm/tirx/op.h>
 
 namespace tvm {
 namespace tl {

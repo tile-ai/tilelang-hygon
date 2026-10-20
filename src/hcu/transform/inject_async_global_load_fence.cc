@@ -3,14 +3,14 @@
  * \brief Lower async wait scopes and insert G2S barriers.
  */
 
-#include "transform/common/attr.h"
-#include "hcu/transform/gemm_k_loop_utils.h"
-#include "transform/common/pipeline_utils.h"
 #include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
+#include "hcu/transform/gemm_k_loop_utils.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "rocm/op/builtin.h"
+#include "transform/common/attr.h"
+#include "transform/common/pipeline_utils.h"
 
 #include <tvm/runtime/logging.h>
 #include <tvm/s_tir/stmt.h>
@@ -793,9 +793,8 @@ SharedPipelineWaitPlan MakeWaitPlan(const Stmt &root) {
         << "the register-pipeline phase unroll must be positive, got "
         << *phases;
     ICHECK_EQ(cpt % *phases, 0)
-        << "the K loop body commits " << cpt
-        << " group(s) but folds " << *phases
-        << " pipeline iterations into it";
+        << "the K loop body commits " << cpt << " group(s) but folds "
+        << *phases << " pipeline iterations into it";
     cpt /= static_cast<int>(*phases);
   }
   plan.commits_per_tile = cpt;

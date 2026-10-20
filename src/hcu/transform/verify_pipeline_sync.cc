@@ -168,8 +168,7 @@ ScopeSummary Summarize(const Stmt &stmt) {
  * Scheduler barriers do not order memory, so they do not count.
  */
 void VerifyWaitBarrierPairs(const std::vector<Event> &events,
-                            const std::string &where,
-                            bool register_pipeline) {
+                            const std::string &where, bool register_pipeline) {
   for (size_t i = 0; i < events.size(); ++i) {
     if (events[i].kind != EventKind::kWait) {
       continue;
@@ -215,8 +214,9 @@ private:
     std::vector<Event> events;
     if (owned) {
       ICHECK(owned_scope_depth_ == 0)
-          << func_name_ << ": nested tl.sync_owned_scope loops are not "
-                           "supported; the fence planner owns one K loop";
+          << func_name_
+          << ": nested tl.sync_owned_scope loops are not "
+             "supported; the fence planner owns one K loop";
       summary = Summarize(op->body);
       EventCollector collector;
       collector(op->body);
@@ -253,8 +253,7 @@ private:
         << attr::kAsyncSharedWrite
         << "; every copy in an owned scope must let ThreadSync see the "
            "asynchronous write it compensates for";
-    VerifyWaitBarrierPairs(events, where,
-                           LoopHasAppliedRegisterPipeline(op));
+    VerifyWaitBarrierPairs(events, where, LoopHasAppliedRegisterPipeline(op));
   }
 
   void VisitExpr_(const CallNode *op) final {

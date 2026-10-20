@@ -16,8 +16,6 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
-#include "span_utils.h"
-#include "transform/common/pipeline_utils.h"
 #include "hcu/target_utils.h"
 #include "hcu/transform/gemm_k_loop_utils.h"
 #include "op/builtin.h"
@@ -25,6 +23,8 @@
 #include "op/gemm.h"
 #include "op/operator.h"
 #include "op/utils.h"
+#include "span_utils.h"
+#include "transform/common/pipeline_utils.h"
 
 #include <tvm/tirx/buffer.h>
 
@@ -215,7 +215,8 @@ Stmt ReplaceInnermostSeq(const Stmt &stmt, Array<Stmt> components) {
   return inner;
 }
 
-PrimExpr MakeTileRegionExpr(const BufferRegion &buffer_region, int access_mask) {
+PrimExpr MakeTileRegionExpr(const BufferRegion &buffer_region,
+                            int access_mask) {
   Array<PrimExpr> mins;
   Array<PrimExpr> args;
   mins.reserve(buffer_region->region.size());
@@ -442,9 +443,8 @@ public:
           op, "the loop extent is not a compile-time constant, so the "
               "register rotation cannot be resolved into static slots");
     }
-    const int64_t rotation_period =
-        std::max<int64_t>(num_register_stages,
-                          compute_stage - register_stage + 1);
+    const int64_t rotation_period = std::max<int64_t>(
+        num_register_stages, compute_stage - register_stage + 1);
     if (*extent - compute_stage < rotation_period) {
       return DeclineRegisterPipeline(
           op, "the loop runs " + std::to_string(*extent) +

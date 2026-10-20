@@ -198,8 +198,7 @@ private:
       return StmtMutator::VisitStmt_(op);
     }
     Stmt body = StmtMutator::VisitStmt(op->body);
-    std::unordered_map<std::string, int64_t> versions =
-        ReadVersionedLocals(op);
+    std::unordered_map<std::string, int64_t> versions = ReadVersionedLocals(op);
     if (versions.empty()) {
       // Nothing rotates, so nothing has to become a constant slot.
       if (body.same_as(op->body)) {
@@ -391,8 +390,8 @@ private:
     ICHECK(value.has_value())
         << "register-pipeline stage index of " << buffer->name
         << " did not fold to a constant after unrolling: " << index;
-    ICHECK_GE(*value, 0) << "register-pipeline stage index of "
-                         << buffer->name << " is negative: " << *value;
+    ICHECK_GE(*value, 0) << "register-pipeline stage index of " << buffer->name
+                         << " is negative: " << *value;
     return *value;
   }
 
@@ -410,9 +409,8 @@ private:
       return StmtExprMutator::VisitExpr_(op);
     }
     ICHECK_GE(op->indices.size(), 2U);
-    const Buffer slot =
-        SlotBuffer(slots.value(), SlotIndex(op->indices[0], op->buffer),
-                   op->buffer);
+    const Buffer slot = SlotBuffer(
+        slots.value(), SlotIndex(op->indices[0], op->buffer), op->buffer);
     Array<PrimExpr> indices;
     indices.reserve(op->indices.size() - 1);
     for (size_t i = 1; i < op->indices.size(); ++i) {
@@ -427,9 +425,8 @@ private:
       return StmtExprMutator::VisitStmt_(op);
     }
     ICHECK_GE(op->indices.size(), 2U);
-    const Buffer slot =
-        SlotBuffer(slots.value(), SlotIndex(op->indices[0], op->buffer),
-                   op->buffer);
+    const Buffer slot = SlotBuffer(
+        slots.value(), SlotIndex(op->indices[0], op->buffer), op->buffer);
     Array<PrimExpr> indices;
     indices.reserve(op->indices.size() - 1);
     for (size_t i = 1; i < op->indices.size(); ++i) {
@@ -457,8 +454,8 @@ private:
     ICHECK_GE(region->region.size(), 2U);
     int64_t first = 0;
     int64_t count = static_cast<int64_t>(slots.value().size());
-    if (auto folded_min = GetConstIntValue(
-            analyzer_.Simplify(region->region[0]->min));
+    if (auto folded_min =
+            GetConstIntValue(analyzer_.Simplify(region->region[0]->min));
         folded_min.has_value()) {
       if (auto folded_extent =
               GetConstIntValue(analyzer_.Simplify(region->region[0]->extent));
@@ -477,9 +474,8 @@ private:
     Array<BufferRegion> split;
     split.reserve(count);
     for (int64_t i = 0; i < count; ++i) {
-      split.push_back(
-          BufferRegion(SlotBuffer(slots.value(), first + i, region->buffer),
-                       ranges));
+      split.push_back(BufferRegion(
+          SlotBuffer(slots.value(), first + i, region->buffer), ranges));
     }
     return split;
   }
@@ -541,8 +537,7 @@ private:
           changed = true;
         } else {
           result.push_back(BufferRegion(
-              region->buffer,
-              region->region.Map([&](const Range &r) {
+              region->buffer, region->region.Map([&](const Range &r) {
                 return Range::FromMinExtent(VisitExpr(r->min),
                                             VisitExpr(r->extent));
               })));
@@ -623,7 +618,7 @@ class RegisterPipelineLoopCollector : public StmtVisitor {
 public:
   std::vector<const ForNode *> loops;
 
- private:
+private:
   void VisitStmt_(const ForNode *op) final {
     if (LoopHasAppliedRegisterPipeline(op)) {
       loops.push_back(op);
@@ -649,8 +644,8 @@ tirx::transform::Pass MaterializeRegisterPipelineStages() {
     std::unordered_map<std::string, int64_t> versions;
     bool transformed = false;
     auto *n = f.CopyOnWrite();
-    n->body = KLoopStageUnroller(GetUnrollFactor(ctx), &versions, &transformed)(
-        std::move(n->body));
+    n->body = KLoopStageUnroller(GetUnrollFactor(ctx), &versions,
+                                 &transformed)(std::move(n->body));
     if (!transformed || versions.empty()) {
       return f;
     }
@@ -667,8 +662,7 @@ tirx::transform::Pass MaterializeRegisterPipelineStages() {
       ICHECK(found != finder.found.end())
           << "the injector versioned " << entry.first
           << " but no allocation of it is left in the kernel";
-      slots.emplace(entry.first,
-                    MakeSlotBuffers(found->second, entry.second));
+      slots.emplace(entry.first, MakeSlotBuffers(found->second, entry.second));
     }
     n->body = RegisterSlotSplitter(std::move(slots))(std::move(n->body));
     return f;

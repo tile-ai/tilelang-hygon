@@ -3587,10 +3587,10 @@ private:
         << "ValueError: The body of the software pipeline has no schedulable "
            "statements after removing replayable scalar Bind statements";
 
-    auto pipeline_stages = Downcast<Array<Integer>>(
-        op->annotations.at(flavor_.stage_key));
-    auto pipeline_orders = Downcast<Array<Integer>>(
-        op->annotations.at(flavor_.order_key));
+    auto pipeline_stages =
+        Downcast<Array<Integer>>(op->annotations.at(flavor_.stage_key));
+    auto pipeline_orders =
+        Downcast<Array<Integer>>(op->annotations.at(flavor_.order_key));
     ICHECK_EQ(pipeline_stages.size(), pipeline_orders.size())
         << "PrimFunc " << global_symbol_
         << " has software_pipeline_stage annotation " << pipeline_stages
@@ -3637,7 +3637,8 @@ private:
                                         ? original_order.size()
                                         : scheduled_order.size();
 
-    // The flavor's async stage set: stages whose producers issue asynchronously.
+    // The flavor's async stage set: stages whose producers issue
+    // asynchronously.
     std::unordered_set<int> pipeline_async_stages;
     if (flavor_.async_stage_key != nullptr) {
       if (auto async_annot = op->annotations.Get(flavor_.async_stage_key)) {
@@ -3745,8 +3746,8 @@ private:
     if (flavor_.local_min_versions_key != nullptr) {
       if (auto requested =
               ReadLoopAnnotationAsInt(op, flavor_.local_min_versions_key)) {
-        local_min_versions_ = std::max(
-            local_min_versions_, static_cast<int>(requested.value()));
+        local_min_versions_ =
+            std::max(local_min_versions_, static_cast<int>(requested.value()));
       }
     }
 
