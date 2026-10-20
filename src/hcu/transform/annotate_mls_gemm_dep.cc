@@ -1002,6 +1002,61 @@ private:
     }
     Op tir_op = Downcast<Op>(call->op);
 
+    if (tir_op == MatrixStore::Get()) {
+      auto store = Downcast<MatrixStore>(ParseOperator(GetRef<Call>(call)));
+      Buffer source = store->src;
+      int before = collector_->GetCallStmtOrder(call);
+      std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual> visited;
+      while (IsFragmentBuffer(source) && visited.insert(source).second) {
+        auto records = collector_->GetProducerRecords(source);
+        const ProducerRecord *last = nullptr;
+        for (const auto &record : records) {
+          if (record.stmt_order < before &&
+              (!last || record.stmt_order > last->stmt_order))
+            last = &record;
+        }
+        if (!last || !last->call)
+          break;
+        auto producer = last->call;
+        if (producer->op.same_as(Gemm::Get())) {
+          auto gemm = Downcast<Gemm>(ParseOperator(GetRef<Call>(producer)));
+          auto meta =
+              BuildMlsGemmDepMeta({gemm, gemm->b_}, collector_, target_);
+          auto annotations = call->annotations;
+          annotations.Set(attr::kMlsGemmDep, meta);
+          annotations.Set(
+              "tl.store_gemm_element_bits",
+              Integer(hcu::ResolveHcuMmacModeForGemm(gemm.get(), target_)
+                          .element_bits));
+          return Evaluate(
+              Call(call->dtype, call->op, call->args, annotations, call->span));
+        }
+        if (!producer->op.same_as(Copy::Get()))
+          break;
+        auto copy = Downcast<Copy>(ParseOperator(GetRef<Call>(producer)));
+        // Only whole-fragment identity copies preserve GEMM warp ownership.
+        if (!IsFragmentBuffer(copy->src) ||
+            !StructuralEqual()(copy->src->shape, copy->dst->shape))
+          break;
+        bool full_copy = copy->src_range.size() == copy->src->shape.size() &&
+                         copy->dst_range.size() == copy->dst->shape.size();
+        for (size_t axis = 0; full_copy && axis < copy->src_range.size();
+             ++axis) {
+          full_copy = is_zero(copy->src_range[axis]->min) &&
+                      is_zero(copy->dst_range[axis]->min) &&
+                      analyzer_->CanProveEqual(copy->src_range[axis]->extent,
+                                               copy->src->shape[axis]) &&
+                      analyzer_->CanProveEqual(copy->dst_range[axis]->extent,
+                                               copy->dst->shape[axis]);
+        }
+        if (!full_copy)
+          break;
+        source = copy->src;
+        before = last->stmt_order;
+      }
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
+    }
+
     if (tir_op == MatrixLoad::Get()) {
       auto mls =
           Downcast<MatrixLoad>(ParseOperator(tvm::ffi::GetRef<Call>(call)));

@@ -2,7 +2,14 @@
 HCU gfx946 WASP GEMM POC: warp-specialized producer/consumer handoff via ABarrier.
 
 Kernels (gfx946 + WDRA only): MLS 4p4c4c one-shot and persistent variants,
-with an optional packed-F16 MatrixStore output path.
+with an optional native-B16 MatrixStore output path.
+
+The CLI uses dynamic M/N/K by default; --static-shape provides a baseline.
+Use --variant mls_4p4c4c_persistent --matrix-store for native B16 output.
+The demo interface independently infers the largest power-of-two divisor
+of the actual M/N/K and passes those constraints to the JIT kernel.
+No additional alignment cache or shape bucketing is used.
+Direct kernel-factory callers must honor any supplied alignment preconditions.
 """
 
 import argparse
@@ -49,6 +56,17 @@ def require_gfx946():
         raise RuntimeError(f"gemm_wasp requires HCU target {GFX946_ARCH!r}, got {arch!r}.")
 
 
+def _validate_alignment(alignment, axis):
+    if not isinstance(alignment, int) or alignment <= 0 or alignment & (alignment - 1):
+        raise ValueError(f"{axis} alignment must be a positive power of two, got {alignment}")
+
+
+def _max_power_of_two_alignment(size):
+    if size <= 0:
+        raise ValueError(f"dimension must be positive, got {size}")
+    return size & -size
+
+
 @tl.jit(
     out_idx=[-1],
     pass_configs=WASP_PASS_CONFIGS,
@@ -62,8 +80,13 @@ def gemm_wasp_mls_4p4c4c(
     block_K: int = 64,
     dtype: str = "float16",
     accum_dtype: str = "float",
+    max_m_align: int = 1,
+    max_n_align: int = 1,
+    max_k_align: int = 1,
 ):
-    """4p4c4c with MLS: producer matrix_load, consumer ds_read_format (WDRA 3-branch)."""
+    """4p4c4c MLS; each dimension must satisfy its power-of-two alignment."""
+    for alignment, axis in ((max_m_align, "M"), (max_n_align, "N"), (max_k_align, "K")):
+        _validate_alignment(alignment, axis)
     num_producer_waves = 4
     num_consumer_waves_per_group = 4
     num_consumer_groups = 2
@@ -71,7 +94,9 @@ def gemm_wasp_mls_4p4c4c(
     threads = (num_producer_waves + num_consumer_waves) * WARP_SIZE
     producer_tx = num_producer_waves * WARP_SIZE
     consumer0_tx = (num_producer_waves + num_consumer_waves_per_group) * WARP_SIZE
-    k_tiles = T.ceildiv(K, block_K)
+    m_blocks = M // block_M if max_m_align % block_M == 0 else T.ceildiv(M, block_M)
+    n_blocks = N // block_N if max_n_align % block_N == 0 else T.ceildiv(N, block_N)
+    k_tiles = K // block_K if max_k_align % block_K == 0 else T.ceildiv(K, block_K)
     full_k_pairs = k_tiles // 2
     half_N = block_N // 2
     mls_annotations = {"no_implicit_async_commit_wait": T.int32(1)}
@@ -82,7 +107,16 @@ def gemm_wasp_mls_4p4c4c(
         B: T.Tensor((N, K), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+        if max_m_align > 1:
+            T.assume(M > 0)
+            T.assume(M % max_m_align == 0)
+        if max_n_align > 1:
+            T.assume(N > 0)
+            T.assume(N % max_n_align == 0)
+        if max_k_align > 1:
+            T.assume(K > 0)
+            T.assume(K % max_k_align == 0)
+        with T.Kernel(n_blocks, m_blocks, threads=threads) as (bx, by):
             tx = T.get_thread_binding()
 
             A_shared_ping = T.alloc_shared((block_M, block_K), dtype)
@@ -133,16 +167,16 @@ def gemm_wasp_mls_4p4c4c(
                     T.sched_barrier(0)
                     T.abarrier_try_wait(FREE_PONG, phase)
                     T.abarrier_seq(READY_PONG)
+                    # An even ceildiv(K, block_K) can still leave a partial pong.
+                    # Keep automatic K filtering here; only ping is guaranteed full.
                     T.matrix_load(
                         A[by * block_M, k_pong * block_K],
                         A_shared_pong,
-                        boundary=(None, False),
                         annotations=mls_annotations,
                     )
                     T.matrix_load(
                         B[bx * block_N, k_pong * block_K],
                         B_shared_pong,
-                        boundary=(None, False),
                         annotations=mls_annotations,
                     )
                     T.abarrier_arrive(READY_PONG)
@@ -295,12 +329,20 @@ def gemm_wasp_mls_4p4c4c_persistent(
     dtype: str = "float16",
     accum_dtype: str = "float",
     use_matrix_store: bool = False,
+    max_m_align: int = 1,
+    max_n_align: int = 1,
+    max_k_align: int = 1,
 ):
-    """Persistent 4p4c4c MLS kernel with role-local output-block loops."""
+    """Persistent MLS kernel with optional native B16 MatrixStore output.
+
+    max_m/n/k_align independently specifies each power-of-two divisor.
+    A value of 1 adds no alignment assumption for that dimension.
+    These are caller preconditions, not runtime bounds checks.
+    """
+    for alignment, axis in ((max_m_align, "M"), (max_n_align, "N"), (max_k_align, "K")):
+        _validate_alignment(alignment, axis)
     if use_matrix_store and dtype != "float16":
-        raise ValueError("packed MatrixStore output currently requires dtype=float16")
-    if use_matrix_store and (M % block_M != 0 or N % block_N != 0 or K % block_K != 0):
-        raise ValueError("packed MatrixStore output currently requires full M/N/K tiles")
+        raise ValueError("MatrixStore output currently requires dtype=float16")
 
     k_pair_boundary = (None, False)
     num_producer_waves = 4
@@ -309,13 +351,13 @@ def gemm_wasp_mls_4p4c4c_persistent(
     threads = (num_producer_waves + num_consumer_waves) * WARP_SIZE
     producer_tx = num_producer_waves * WARP_SIZE
     consumer0_tx = (num_producer_waves + num_consumer_waves_per_group) * WARP_SIZE
-    m_blocks = T.ceildiv(M, block_M)
-    n_blocks = T.ceildiv(N, block_N)
+    m_blocks = M // block_M if max_m_align % block_M == 0 else T.ceildiv(M, block_M)
+    n_blocks = N // block_N if max_n_align % block_N == 0 else T.ceildiv(N, block_N)
     total_blocks = m_blocks * n_blocks
     # Do not launch idle blocks.  T.Serial(ceildiv) is compiled with the max
     # trip count, so extra blocks would still issue MLS at OOB tile_id.
     grid_size = T.min(num_persistent_blocks, total_blocks)
-    k_tiles = T.ceildiv(K, block_K)
+    k_tiles = K // block_K if max_k_align % block_K == 0 else T.ceildiv(K, block_K)
     full_k_pairs = k_tiles // 2
     ping_uses_per_block = full_k_pairs + k_tiles % 2
     pong_uses_per_block = full_k_pairs
@@ -330,11 +372,17 @@ def gemm_wasp_mls_4p4c4c_persistent(
         B: T.Tensor((N, K), dtype),
         C: T.Tensor((M, N), dtype),
     ):
+        if max_m_align > 1:
+            T.assume(M > 0)
+            T.assume(M % max_m_align == 0)
+        if max_n_align > 1:
+            T.assume(N > 0)
+            T.assume(N % max_n_align == 0)
+        if max_k_align > 1:
+            T.assume(K > 0)
+            T.assume(K % max_k_align == 0)
         with T.Kernel(grid_size, threads=threads) as block_id:
             tx = T.get_thread_binding()
-
-            if use_matrix_store:
-                C_packed = T.view(C, (M, N // 2), dtype="uint32")
 
             A_shared_ping = T.alloc_shared((block_M, block_K), dtype)
             A_shared_pong = T.alloc_shared((block_M, block_K), dtype)
@@ -398,16 +446,17 @@ def gemm_wasp_mls_4p4c4c_persistent(
                         T.sched_barrier(0)
                         T.abarrier_try_wait(FREE_PONG, pong_phase)
                         T.abarrier_seq(READY_PONG)
+                        # Keep default boundary inference for pong: the last
+                        # tile may be partial even when ceildiv(K, block_K)
+                        # is even. Only ping is guaranteed full in a pair.
                         T.matrix_load(
                             A[by * block_M, k_pong * block_K],
                             A_shared_pong,
-                            boundary=k_pair_boundary,
                             annotations=mls_annotations,
                         )
                         T.matrix_load(
                             B[bx * block_N, k_pong * block_K],
                             B_shared_pong,
-                            boundary=k_pair_boundary,
                             annotations=mls_annotations,
                         )
                         T.abarrier_arrive(READY_PONG)
@@ -493,7 +542,7 @@ def gemm_wasp_mls_4p4c4c_persistent(
                         T.copy(C_local, C_store_local)
                         T.matrix_store(
                             C_store_local,
-                            C_packed[by * block_M, bx * (block_N // 2)],
+                            C[by * block_M, bx * block_N],
                         )
                     else:
                         T.copy(C_local, C[by * block_M, bx * block_N])
@@ -562,7 +611,7 @@ def gemm_wasp_mls_4p4c4c_persistent(
                         T.copy(C_local1, C_store_local1)
                         T.matrix_store(
                             C_store_local1,
-                            C_packed[by * block_M, bx * (block_N // 2) + half_N // 2],
+                            C[by * block_M, bx * block_N + half_N],
                         )
                     else:
                         T.copy(C_local1, C[by * block_M, bx * block_N + half_N])
@@ -587,16 +636,43 @@ def run_check(
     k: int = BLOCK_K,
     device: int = 0,
     dtype: str = "float16",
+    dynamic: bool = True,
+    matrix_store: bool = False,
+    dump_source: bool = False,
 ):
     require_gfx946()
     torch.cuda.set_device(device)
     kernel_fn = KERNELS[variant]
-    kernel = kernel_fn(m, n, k, dtype=dtype)
-    a = torch.randn(m, k, device=f"cuda:{device}", dtype=getattr(torch, dtype))
-    b = torch.randn(n, k, device=f"cuda:{device}", dtype=getattr(torch, dtype))
+    if min(m, n, k) <= 0:
+        raise ValueError("M/N/K must be positive")
+    max_m_align = _max_power_of_two_alignment(m)
+    max_n_align = _max_power_of_two_alignment(n)
+    max_k_align = _max_power_of_two_alignment(k)
+    if matrix_store and variant != "mls_4p4c4c_persistent":
+        raise ValueError("--matrix-store requires the persistent variant")
+    shape = (T.dynamic("M"), T.dynamic("N"), T.dynamic("K")) if dynamic else (m, n, k)
+    options = {
+        "dtype": dtype,
+        "max_m_align": max_m_align,
+        "max_n_align": max_n_align,
+        "max_k_align": max_k_align,
+    }
+    if variant == "mls_4p4c4c_persistent":
+        options["use_matrix_store"] = matrix_store
+    kernel = kernel_fn(*shape, **options)
+    if dump_source:
+        print(kernel.get_kernel_source())
+        return
+    generator = torch.Generator().manual_seed(321)
+    a = torch.randn(m, k, generator=generator, dtype=getattr(torch, dtype))
+    b = torch.randn(n, k, generator=generator, dtype=getattr(torch, dtype))
+    expected = cpu_ref_program(a, b)
+    a, b = a.to(device=f"cuda:{device}"), b.to(device=f"cuda:{device}")
     c = kernel(a, b)
-    torch.testing.assert_close(c.cpu(), cpu_ref_program(a, b), rtol=1e-2, atol=1e-2)
-    print(f"OK: gemm_wasp_{variant} M={m} N={n} K={k} on device {device}")
+    torch.testing.assert_close(c.cpu(), expected, rtol=1e-2, atol=1e-2)
+    print(
+        f"OK: gemm_wasp_{variant} M={m} N={n} K={k} dynamic={dynamic} matrix_store={matrix_store} alignment={(max_m_align, max_n_align, max_k_align)} on device {device}"
+    )
 
 
 def main():
@@ -617,19 +693,17 @@ def main():
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--dtype", type=str, default="float16")
     parser.add_argument("--dump-source", action="store_true")
+    parser.add_argument("--static-shape", action="store_true", help="use static dimensions instead of the default dynamic M/N/K")
+    parser.add_argument("--matrix-store", action="store_true", help="use native B16 MatrixStore (persistent variant only)")
     args = parser.parse_args()
+    if args.matrix_store and args.variant != "mls_4p4c4c_persistent":
+        parser.error("--matrix-store requires --variant mls_4p4c4c_persistent")
 
     require_gfx946()
     torch.cuda.set_device(args.device)
 
     variants = ["mls_4p4c4c", "mls_4p4c4c_persistent"] if args.variant == "all" else [args.variant]
     for variant in variants:
-        kernel_fn = KERNELS[variant]
-        kernel = kernel_fn(args.m, args.n, args.k, dtype=args.dtype)
-        if args.dump_source:
-            print(f"===== gemm_wasp_{variant} =====")
-            print(kernel.get_kernel_source())
-            continue
         run_check(
             variant,
             args.m,
@@ -637,6 +711,9 @@ def main():
             args.k,
             device=args.device,
             dtype=args.dtype,
+            dynamic=not args.static_shape,
+            matrix_store=args.matrix_store,
+            dump_source=args.dump_source,
         )
 
 

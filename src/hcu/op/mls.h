@@ -95,6 +95,7 @@ public:
 
 class MatrixStoreNode : public TileOperatorNode {
 public:
+  Map<String, ObjectRef> annotations;
   Buffer src, dst;
   Array<Range> src_ranges;
   Array<Range> dst_ranges;
@@ -108,6 +109,7 @@ public:
   static void RegisterReflection() {
     namespace refl = reflection;
     refl::ObjectDef<MatrixStoreNode>()
+        .def_ro("annotations", &MatrixStoreNode::annotations)
         .def_ro("src", &MatrixStoreNode::src)
         .def_ro("dst", &MatrixStoreNode::dst)
         .def_ro("src_ranges", &MatrixStoreNode::src_ranges)
