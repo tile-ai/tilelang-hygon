@@ -1,11 +1,151 @@
 # fp8 Channelwise GEMM on HCU — decode regime (M ≤ 128)
 
+**What this document is.** The measured record of the HCU (gfx938) fp8
+channelwise decode GEMM: `o` (N=5120, K=8192), `down` (N=5120, K=25600),
+`qkv` (N=10240) and `gate_up` (N=51200) at M ≤ 128, measured against hipblasLt
+`torch._scaled_mm` (bf16 out, RowWise). It holds the paired ratios, the SASS
+evidence, and the verdict for every lever that was tried. Sections are dated and
+append-only; where a later section corrects an earlier one, it says so.
+
 Follow-up to `fp8_channelwise_gemm.md` (the 200 → 300 → 432 TFLOPS three-stage
 story). This note covers the **decode regime** (qwen3-32B per-token GEMMs:
 M=1–128, K=5120, N=51200 gate_up), where the kernel is *bandwidth-bound*, not
 compute-bound, and the goal is to beat hipblaslt's fp8 rowwise kernel on
 effective bandwidth.
 
+**Current shipped config** (`decode_cfg`, `perf/gemm/fp8_channelwise_mls.py`):
+N=5120 (`o`/`down`) at M ≤ 32 → `bn96 / bk256 / ns2 / t192` with `setprio=1`;
+`qkv` (N=10240) and `gate_up` (N=51200) keep `bn32` (the `qkv` M=32 point is
+`bn32 / bk128 / t128`). M=64 and M=128 are unchanged (their earlier returns).
+See [2026-10-20](#2026-10-20), [2026-10-20b](#2026-10-20b) and
+[2026-10-20c](#2026-10-20c) below.
+
+**Current standing** (paired same-process, idle card, `rel=0`; ratio =
+ours/hipblas, **< 1 is a win**):
+
+| shape | M=1 | M=16 | M=32 |
+|---|---|---|---|
+| o | 1.069 | 1.027 | 1.024 |
+| down | 1.110 | 1.042 | **0.928** |
+
+<a id="what-won"></a>
+## What actually won
+
+Most of this document records closures. This is the short list of changes that
+were **adopted**, with the measurement that justifies each, and the resulting
+movement in the standing. Ratios are ours/hipblas (paired same-process, idle
+card, `rel = 0`); lower is better.
+
+| # | lever | measured effect | where |
+|---|---|---|---|
+| 1 | **Shape-aware chooser.** `decode_cfg` took only `M` and was tuned on gate_up, so o/down ran a tile chosen for a different shape. | o M=1 42.9 → 38.6 µs (1.188), o M=16 39.2 (1.129); down M=1 117.4 → 99.4 (1.273), down M=16 100.3 (1.187) | `decode_cfg` ([2026-10-17f](#2026-10-17f)) |
+| 2 | **qkv M=32 window** `bn32/bk128/t128`. | 52.3 vs 57.8 µs (+9-10%); qkv M=32 1.14 → 1.03 | `decode_cfg` ([2026-10-17g](#2026-10-17g)) |
+| 3 | **Dense MLS packing.** A 16×256 fp8-trans dst tile is exactly 4096 B, but the 4K-slot accounting charged 4096 (slot) + 2×1024 (payload) = 6144 B — 50% dead padding. `MlsPackedTileBytes` now returns −1 (default allocation) whenever the dense size is a whole number of slots. | 6144 → 4096 B per block-stage | `src/hcu/op/mls.cc` ([2026-10-20](#2026-10-20)) |
+| 4 | **Fat tile** `bn96/bk256/ns2` for N=5120 — the widest tile that still fits two stages in one CU (`2·(16+96)·256 = 57344 ≤ 65536`). | 0.947/0.940/0.943 on o and 0.928/0.925/0.929 on down at M=1/16/32, vs the `bn16/t64` incumbent | `decode_cfg` ([2026-10-20](#2026-10-20)) |
+| 5 | **Warp count 6 → 3** (t384 → t192) at bn96. A's k-loop loads carry no warp-id term, so A is re-read once per warp (N/16 warp-loads, an invariant of the tiling); three warps is the measured optimum of the U. | 0.952–0.962 vs t384 | `decode_cfg` ([2026-10-20b](#2026-10-20b)) |
+
+Net movement (ratio ours/hipblas; `—` = not measured at that stage):
+
+| shape | M | shape-aware (10-17f) | fat tile (10-20) | + t192 (10-20b) | final (10-20c) |
+|---|---|---|---|---|---|
+| o | 1 | 1.188 | 1.117 | 1.069 | **1.069** |
+| o | 16 | 1.129 | 1.064 | 1.020 | **1.027** |
+| o | 32 | — | 1.137 | 1.000 | **1.024** |
+| down | 1 | 1.273 | 1.184 | 1.110 | **1.110** |
+| down | 16 | 1.187 | 1.100 | 1.053 | **1.042** |
+| down | 32 | — | 1.061 | 0.935 | **0.928** |
+
+The last column is a fresh re-measurement after the 2026-10-20c de-replication
+attempt was reverted, so 10-20b → final is run-to-run noise (~1%), not a change.
+Reading the `down` row: 27% behind at M=1, now **7.2% ahead** at M=32; `o` M=1
+went from 18.8% behind to 6.9%.
+
+### The four mechanisms worth remembering
+
+1. **A is replicated per warp, not partitioned.** The SASS A-load address has no
+   warp-id term, so A's total re-read is `blocks × warps = N/16` regardless of
+   the tile — widening bn never cuts it, and the warp count at fixed bn is the
+   real lever. ([2026-10-20b](#2026-10-20b))
+2. **Prefetch depth is the currency; LDS is where we pay for it.** hipblas pays
+   depth in VGPRs (free), we must pay in LDS, and both come out of the same
+   budget — which is why every ns / split-K / bk sweep is neutral against
+   `total = const × w × (L + C·ns)`. ([2026-10-19](#2026-10-19-lds))
+3. **Making a per-warp load conditional silently shrinks the cp.async group
+   count**, because `cp_async_wait<k>` is sized from the *unconditional* loads on
+   the path. That is why producer A de-replication lost a prefetch level and
+   1.04–1.36× despite saving 22% of per-step bytes. ([2026-10-20c](#2026-10-20c))
+4. **The real DRAM read ceiling is 1725 GB/s, not 2016.** The earlier 2016 figure
+   was a timing artifact; against 1725 the MLS B-stream is already at 97.5%, so
+   the residual gap is exposed latency, not bandwidth. ([2026-10-18b](#2026-10-18b))
+
+<a id="closed-levers"></a>
+## Closed levers — index
+
+One row per lever that has been measured and closed, with the decisive reason and
+the dated section that decides it. "Closed" means measured negative, not merely
+untried; do not re-open any of these without new evidence.
+
+| lever | decisive reason | section |
+|---|---|---|
+| **split-K** | The motivating block-starvation diagnosis was a confound; measured **10-21% slower**, and the MLS K-slice offset is silently wrong for any nonzero base, so it is not expressible at all. | [2026-10-17f](#2026-10-17f), [2026-10-18d](#2026-10-18d) |
+| **`num_stages > 1`** | At bn16, re-timed correctly, **29-45% slower**; where it is exact (`bk512/ns2`) it is worth ~1%, and the small-tile packed stage stride is a second, independent defect. | [2026-10-17i](#2026-10-17i), [2026-10-18d](#2026-10-18d) |
+| **B-VGPR-direct / rolling-window producer** | B-direct is **2.1× slower even at `WarpM=1`**; the 16-consec-k rescue is mmac-incompatible and arithmetically insufficient (93.9 µs available vs a 267.6 µs gap). The per-lane rolling window is a multi-warp technique, measured closed on the producer axis. | [B-direct](#b-direct) |
+| **MMA density / hipblas warp mapping** | `v_mmac` costs **0.5%** — the MMA itself is free. Copying hipblas's 54-block, 8-warp, N-tile-96 structure through MLS is worse at every cell (adding warps to a wide tile loses blocks/CU), and the largest remaining term is the transposing LDS read, **9.3%**. | [2026-10-19 (b)](#2026-10-19-hipblas-launch) |
+| **MLS producer atom / partition swap** | The 128×16 atom is ~20% slower standalone than 64×32 (1600 vs 1892 GB/s), but swapping to the faster atom makes the full GEMM **15-16% slower** (287.2 vs 246.2 µs): the kernel is overlap-quality-bound, not producer-throughput-bound. | [MLS producer](#mls-producer) |
+| **N-split / widening bn** | N-split is **2-3× worse** and A's LDS read scales with the warp count. At t=64, wider bn is 1.077/1.123 (bn32) and 1.191/1.340 (bn64) at o M=16 / down M=16: the loss is blocks, not A's duplicated LDS read. | [N-split](#n-split), [2026-10-18c](#2026-10-18c) |
+| **Layout A (out of scope)** | The 71.6% "70% target" is reached only via Layout A (blocked weight reorder), which is excluded; hipblas's own no-reorder baseline is **213.0 µs = 68.4%**. | [Layout A](#layout-a) |
+| **Producer A de-replication** | Bit-exact but slower everywhere (**1.044-1.358×**). `cp_async_wait<1>` sizes its vmcnt constant from the unconditional async loads, so putting A behind `if (owner)` drops a prefetch level; A's duplicates are L2-served and were never on the critical path. | [2026-10-20c](#2026-10-20c) |
+| **M=1 GEMV structure** | Not expressible: the MMA output micro-tile is hardware-fixed at 16×16 and the MLS B atom floor is `tile_mn=16`; the reachable split-K equivalent was measured and rejected. | [M=1 GEMV](#gemv-m1) |
+| **`warp_k` / `FullColK`** | Built and correct, but **0.97-1.03** vs shipped with mixed sign; it is a *substitute* for `setprio`, not a complement, and `decode_cfg` does not select it. | [2026-10-19](#2026-10-19-warpk) |
+| **`__builtin_hcu_matrix_load_b8` (global→VGPR)** | The builtin exists, but its fixed per-lane layout is 4 consec-k × 4 n, not the mmac's 8 consec-k at one mn; bridging needs a full cross-lane permutation. | [2026-10-19](#2026-10-19-matrixload) |
+| **A-direct-to-VGPR / `r_mls`** | A must round-trip through LDS: `r_mls` is **1.935×/2.592×** slower (o/down M=16), and the MMA fragment wants 8 consecutive K at one row, a 5120-byte lane stride. | [2026-10-18c](#2026-10-18c) |
+| **Block-count inflation / occupancy** | More blocks at constant bytes is worse, and **320 blocks is the best point** on both curves; the ~8× blocks that reach the ~0.98× o M=1 bound cannot be supplied, and 320 is exactly 5/CU against an 8-slot LDS residency limit. | [2026-10-17f](#2026-10-17f), [2026-10-19](#2026-10-19-lds) |
+| **Independent accumulator chains** | Splitting the single 16×16 chain is **1.539/1.524/1.644/1.641×** slower (o M=1/16, down M=1/16); a second accumulator over the same tile is neutral (**1.012/1.008/1.014/1.013×**). | [2026-10-17i](#2026-10-17i), [2026-10-18b](#2026-10-18b) |
+| **Hand-written double buffering** | Correct (rel 0.00000) but **1.26-1.70× slower**; the pipelined form is genuinely slower at this tile. | [2026-10-17h](#2026-10-17h) |
+| **Tile widening** | Monotonically catastrophic in the early sweep (`bn64/128/256`), and `bn32` alone is **7-12% worse** at every (shape, M). | [2026-10-17f](#2026-10-17f), [2026-10-18d](#2026-10-18d) |
+| **`k_pack=2`, `b_ds_read_alt=0`, `respect_layout_map`** | Hard-rejected by the MLS path / unsupported (only Alt1 exists) / exact no-ops respectively. | [2026-10-17h](#2026-10-17h) |
+
+## Contents
+
+Dated sections and the sections that support them, in file order; nested dated
+subsections are indented.
+
+- [What actually won](#what-won)
+- [Closed levers — index](#closed-levers)
+- [The setup](#setup)
+- [What hipblas does at M=1](#hipblas-m1)
+- [M ≤ 16: bn32 / bk256 / ns0 / t256](#m-le-16)
+  - [The achievable ceiling](#m-le-16-ceiling)
+  - [GEMM really streams B](#m-le-16-streams)
+  - [Verified M=1..16 head-to-head](#m-le-16-h2h)
+- [M=1..128 vs hipblas — all four decode shapes (2026-10-17e)](#2026-10-17e)
+- [Correctness](#correctness)
+- [Why M ≤ 16 is flat at ~78% and M=32 drops to ~59%](#why-flat)
+- [M ≥ 32 ≤ 128: the streaming kernel breaks down](#m-ge-32)
+  - [M=64 root cause (2026-10-16)](#m64-root-cause)
+  - [M=64 is LDS-port-bound (paired)](#m64-paired)
+  - [hipblas M=64 k-loop vs ours — SASS](#m64-sass)
+  - [Async-wait granularity (2026-10-17d)](#async-wait)
+  - [The "70% target" is Layout A](#layout-a)
+- [o/down: shape-aware config, split-K closes, `ns>1` landmine (2026-10-17f)](#2026-10-17f)
+- [Reproduce](#reproduce)
+- [B-direct-to-VGPR (2026-10-16 → closed 2026-10-17c)](#b-direct)
+- [qkv M=32 lever adopted; o/down levers exhausted (2026-10-17g)](#2026-10-17g)
+- [2026-10-17h — o/down decomposed](#2026-10-17h)
+  - [2026-10-17i — re-timed; the last two mechanisms close](#2026-10-17i)
+- [2026-10-18 — N-split closed; a second `ns>1` defect](#2026-10-18)
+- [2026-10-18b — the "2016 GB/s ceiling" is not real](#2026-10-18b)
+- [2026-10-18c — the exposure is volumetric and per-iteration](#2026-10-18c)
+- [2026-10-18d — split-K is not expressible; double buffering ~1%](#2026-10-18d)
+- [2026-10-19 — `warp_k` / `FullColK` is not a lever](#2026-10-19-warpk)
+- [2026-10-19 — `__builtin_hcu_matrix_load_b8` exists but is closed](#2026-10-19-matrixload)
+- [2026-10-19 — o/down: the LDS-capacity invariant](#2026-10-19-lds)
+  - [2026-10-19 (b) — what hipblas actually launches](#2026-10-19-hipblas-launch)
+- [2026-10-20 — the fat tile is real](#2026-10-20)
+  - [2026-10-20b — warp count, not A traffic](#2026-10-20b)
+  - [2026-10-20c — producer A de-replication CLOSED](#2026-10-20c)
+
+<a id="setup"></a>
 ## The setup
 
 - B is (N, K) fp8 = 51200 × 5120 × 1 B = **262 MB**; 1800 GB/s peak → floor
@@ -18,6 +158,7 @@ effective bandwidth.
 - Our initial MLS GEMM (block 256×256×64, ns=1, t512): M=1 198.7 µs (73.3%),
   M=2 73.4%, M=32 67.5% — M=2 and M=32 beat hipblas, the others lost.
 
+<a id="hipblas-m1"></a>
 ## What hipblas does at M=1 (from disassembly)
 
 No split-K, no dedicated GEMV. A plain per-block streaming kernel:
@@ -44,6 +185,7 @@ No split-K, no dedicated GEMV. A plain per-block streaming kernel:
 > re-verified; treat the bullet as unconfirmed until it is re-sourced from a
 > native `.s`.
 
+<a id="m-le-16"></a>
 ## M ≤ 16: bn32 / bk256 / ns0 / t256 — ~78%, beats hipblas (except M=1)
 
 > **2026-10-13 re-verification:** all utilization numbers in this section were
@@ -52,6 +194,7 @@ No split-K, no dedicated GEMV. A plain per-block streaming kernel:
 > stack / single-launch events carry host overhead — both inflate
 > utilization). Effective bandwidth = N×K / latency vs 1800 GB/s nominal.
 
+<a id="m-le-16-ceiling"></a>
 ### The achievable ceiling (measured)
 
 Pure HBM read on this box tops out well below the 1800 GB/s nominal:
@@ -87,6 +230,7 @@ definitionally wrong unless B is partially served from L2 (it is not: 262 MB
 > a ratio against a nominal. See *"The MLS producer, not the fetch pattern, is the
 > real bottleneck"* below for the probe details.
 
+<a id="m-le-16-streams"></a>
 ### GEMM really streams B
 
 Latency scales linearly with B bytes at M=1 (bn32/bk256/ns0/t256):
@@ -101,6 +245,7 @@ Latency scales linearly with B bytes at M=1 (bn32/bk256/ns0/t256):
 At the decode N=51200 the kernel moves 262 MB → **1403 GB/s ≈ 78%** — right
 where it should be, just under the 91.5% ceiling.
 
+<a id="m-le-16-h2h"></a>
 ### Verified M=1..16 head-to-head (current slc code, bm16/bn32/bk256/ns0/t256)
 
 | M | tilelang (min/med) | % | hipblas (min/med) | % | TL vs hipblas |
@@ -147,6 +292,7 @@ Key: **bn=32 + t256**. bn=64 doubles per-block bytes and halves the block count
 → worse tail/latency amortization; t512 halves per-thread coalescing width on
 a 32-wide bn tile. slc is in (already shipped); ns/prio make no further dent.
 
+<a id="2026-10-17e"></a>
 ## M=1..128 vs hipblas — all four decode shapes (paired, 2026-10-17e)
 
 > **The `ours` column below predates the shape-aware chooser (2026-10-17f).** It
@@ -247,6 +393,7 @@ constant and varying only block count reverses the sign (2026-10-17f, below):
 exactly that transformation, was then built and measured **10-21% slower** than
 this baseline. See the 2026-10-17f section.
 
+<a id="correctness"></a>
 ## Correctness — vs hipblas fp8, not fp32
 
 Because the M=1 kernel runs with bm=16 (only M=1 rows of the fragment are
@@ -267,6 +414,7 @@ same 262 MB B runs at only 8.6% — a reduce does not saturate HBM, so it says
 nothing about whether a streaming GEMM can. The GEMM's 78% sits just under the
 measured 91.5% read ceiling, which is the right place.
 
+<a id="why-flat"></a>
 ## Why M ≤ 16 is flat at ~78% and M=32 drops to ~59%
 
 - Grid is fixed (N=51200, bn=32) → M ≤ 16 only changes how many of the bm=16
@@ -277,6 +425,7 @@ measured 91.5% read ceiling, which is the right place.
   MMA pressure starts to interfere with the streaming path (best measured
   config (32,32,256,1,256): 246 µs ≈ 59%).
 
+<a id="m-ge-32"></a>
 ## M ≥ 32 ≤ 128: the streaming kernel breaks down
 
 For M ≥ 32 the bm=pow2≥M tiles inflate: bm=64 → A tile is 64×256×1B = 16 KB
@@ -287,6 +436,7 @@ LDS/MMA work), and MMA becomes the bottleneck: a 128×128×256 fp8 tile at
 compute-bound. Measured M=32 with the M≤16 winner shape: 246 µs ≈ 59%
 (hipblas ~65%), i.e. the streaming win does not transfer.
 
+<a id="m64-root-cause"></a>
 ### M=64 root cause (measured 2026-10-16): LDS-bound, not bandwidth-bound
 
 The A-reread intuition above is right in spirit but the mechanism is **LDS write
@@ -332,6 +482,7 @@ So `bm64 bn64 bk256 ns1 t256 sp1` (245.9 µs fp32 / 243.4 µs bf16) is a structu
 local optimum. This supersedes the earlier split-K / fold-M suggestions for M=64,
 which target a bandwidth wall that measurement shows is not there.
 
+<a id="m64-paired"></a>
 ### M=64 is LDS-port-bound; the gap is 5.8% (measured paired)
 
 **Measure paired, or don't measure.** HCU[4] is shared with co-tenants
@@ -436,6 +587,7 @@ once, in the epilogue.
 > full drain, the next k-tile's loads have zero overlap with the current tile's
 > compute — which is exactly the effect the `ns=2` sweep below then measures.
 
+<a id="m64-sass"></a>
 ### hipblas M=64 k-loop vs ours — SASS structural comparison
 
 The 5.8% figure above was measured under mild co-tenant contention. On a fully
@@ -599,6 +751,7 @@ that standalone gap is already hidden by the pipeliner — swapping to the faste
 is shape-dependent and controlled by `ComputeMlsWarpPartition` (`src/hcu/op/mls.cc`)
 + `hoist_mls_resource.cc`; both levers require a C++ rebuild, and neither pays.
 
+<a id="async-wait"></a>
 ### Async-wait granularity — the lever, measured (2026-10-17d)
 
 **Hypothesis (now refuted).** The residual gap is overlap quality, and the doc
@@ -697,6 +850,7 @@ really divisibility and not an atom-width rule: `bk=320 ns1` has
 `K % 320 == 0`, is *not* a multiple of 128, and is **correct** at rel=0.000000.
 `bk=320 ns2` and `bk=2560` fail only on the 64 KB LDS cap.)
 
+<a id="layout-a"></a>
 ### The "70% target" is Layout A — which is out of scope
 
 The reference deliverable
@@ -772,6 +926,7 @@ The one in-scope lever left is the MLS partition heuristic
 `ds_read_format_tensor_a/b` pins the partition and degrades to (4,2)/(8,1) with
 3–4× LDS read amplification as soon as the shape moves. That needs a C++ rebuild.
 
+<a id="2026-10-17f"></a>
 ## o/down: shape-aware config wins, split-K closes, and `ns>1` is a landmine (2026-10-17f)
 
 Target was to beat hipblas on `o` and `down` (qkv/gate_up already win; M=64 out of
@@ -797,6 +952,7 @@ space — `block_N < 16` cannot be expressed (MMA output micro-tile fixed at 16�
 `src/tl_templates/hcu/gemm.h:150`; MLS B atom floor `tile_mn=16`,
 `src/hcu/op/mls.cc:408`).
 
+<a id="split-k"></a>
 ### Split-K: the motivating diagnosis was a confound, and the lever is closed
 
 The "o/down are block-starved" claim came from a sweep at fixed K varying N, which
@@ -833,6 +989,7 @@ kernel races across `bz` (no grid barrier on HCU), and a `bz == 0` guard is the
 same race. The only correct form is C as a caller-owned input zeroed on the same
 stream inside the timed closure.
 
+<a id="gemv-m1"></a>
 ### The M=1 GEMV structure is infeasible, by hardware
 
 hipblas uses `Cijk_..._MT8x1x8192_MFWGS512_WGM1_ONLYN1` (N-tile-1 GEMV) at M=1.
@@ -968,6 +1125,7 @@ The remaining gaps, honestly:
   apply (it already uses t=256) and `bm32/bn32/t256` is the measured best of its
   neighbourhood.
 
+<a id="reproduce"></a>
 ## Reproduce
 
 ```
@@ -984,6 +1142,7 @@ single-launch event timing carries host overhead; both give inflated
 not physical. (The old "91.5% of 1800 GB/s" ceiling was wrong — see the
 correction in the M=64 section.)
 
+<a id="b-direct"></a>
 ## B-direct-to-VGPR: the cost, the root cause, and why it is closed (2026-10-16, corrected 2026-10-17, closed 2026-10-17c)
 
 Goal of this round: make the weights (B) bypass LDS, hipblas-style. All figures
@@ -1122,6 +1281,7 @@ correct but **not a winning path** — closed-experiment infrastructure, kept on
 branch, not merged. The 16-consec-k `"+v"` → `"=&v"` fix at
 `tilelang_ds_read_format.hpp:557` is a genuine correctness fix regardless.
 
+<a id="mls-producer"></a>
 ### The MLS producer lever is also CLOSED NEGATIVE (measured 2026-10-17c)
 
 The "91.5% of 1646 GB/s" framing in earlier notes is wrong. A plain grid-stride
@@ -1188,6 +1348,7 @@ quality (see the M=64 section), not B-fetch throughput.
   spills the array to scratch (ScratchSize 272 B -> 7.77x slowdown). A constant
   index gives ScratchSize 0.
 
+<a id="2026-10-17g"></a>
 ## qkv M=32 lever adopted; o/down levers exhausted (2026-10-17g)
 
 Target: make o/qkv/down beat hipblas at M<=32. Current standing, chooser vs
@@ -1286,6 +1447,7 @@ MLS GEMM, not a config that has not been tried.
 
 Do not re-open o/down config search without a new mechanism.
 
+<a id="2026-10-17h"></a>
 ## 2026-10-17h — o/down decomposed: the load path already wins, the mmac side is the whole deficit, and it is closed
 
 The previous section closed every *configuration* lever for o/down. This one
@@ -1481,6 +1643,7 @@ performance question rather than a silent-wrong-answer question. The
 `test_mls_packed_stride_is_shared_by_producer_and_consumer` pin the fix — the
 former fails with rel ≈ 1.6e4 if the consumer's stride is forced back to 0.
 
+<a id="2026-10-17i"></a>
 ### 2026-10-17i — the fix invalidated one measurement; re-timed, and the last two mechanisms close
 
 **1. The `ns>1` fix invalidated the `bn16` ns=2 timings, so they were re-measured.**
@@ -1654,8 +1817,10 @@ same-process paired, and the card is shared, so treat the load arm as
 (the exposed fraction dominates the uncertainty), but it is why down M=1 flips
 sign between runs.
 
+<a id="2026-10-18"></a>
 ## 2026-10-18 — the N-split repartition is closed hard; `ns>1` has a second, independent defect
 
+<a id="n-split"></a>
 ### `ComputeMlsWarpPartition` can N-split, and it is 2-3x worse
 
 The 2026-10-17g note closed "more warps at bn16" on the grounds that the extra
@@ -1773,6 +1938,7 @@ is closed by 2-3x, with the mechanism (A LDS read amplification ∝ warp count)
 identifying *why* — and it also explains why every "more warps" variant in this
 document failed. **o and down still cannot be won in-tree.**
 
+<a id="2026-10-18b"></a>
 ## 2026-10-18b — the "2016 GB/s ceiling" is not real; the gap is A's redundancy + exposed compute
 
 Everything above divides by a read ceiling of 2016 GB/s. That number has no
@@ -1909,6 +2075,7 @@ independent memory streams are in flight at once.
 **Closed. The exposure has no remaining lever, and the load side is at 97.5% of a
 ceiling that is 1725 GB/s rather than 2016.**
 
+<a id="2026-10-18c"></a>
 ## 2026-10-18c — the exposure is volumetric and per-iteration; two real gaps closed
 
 The previous section concluded the exposure "is the memory pipe going idle while
@@ -2070,6 +2237,7 @@ that **our load-only floor (85.1) is already equal to hipblas's entire kernel
 (85.3)**: hipblas hides 100% of its compute, we hide 72%, and we have nothing to
 hide it behind.
 
+<a id="2026-10-18d"></a>
 ## 2026-10-18d — split-K is not merely slow, it is not expressible; and double buffering is worth ~1%
 
 The 2026-10-18c section left one structural idea standing: the per-iteration LDS
@@ -2205,6 +2373,7 @@ load side is at its ceiling, A's redundancy can only be reduced by `bn`, which
 costs more in blocks than it saves, and the compute exposure is not removable by
 the only mechanism available (`ns>1`) at any residency that keeps the CUs fed.
 
+<a id="2026-10-19-warpk"></a>
 ## 2026-10-19 — `warp_k` / `FullColK` is now implemented on the MLS path, and it is **not** a lever
 
 This was the last untested structural axis: the one place where the kernel's
@@ -2312,6 +2481,7 @@ any of them needs new evidence, not a config change.
 
 ---
 
+<a id="2026-10-19-matrixload"></a>
 ## 2026-10-19 — `__builtin_hcu_matrix_load_b8` exists; its micro-layout is why it is still closed
 
 The 2026-10-17d closure of "lever 2" rested on a factual claim that is **wrong**:
@@ -2406,6 +2576,7 @@ remove, so the mbarrier primitives have nothing to buy.
 
 ---
 
+<a id="2026-10-19-lds"></a>
 ## 2026-10-19 — o/down: the gap is an LDS-capacity invariant, not a missing knob
 
 Driven by "我们和hipblas的差距没有找到吗 明明是有差距的". The gap **is** now
@@ -2499,6 +2670,7 @@ not racy. Worth ~3% consistently (down M=16 1.124→1.084, o M=16 1.11→1.08 in
 session's paired runs). It requires an emitter/pass change: the producer is
 placed by the MLS lowering, not by a config flag.
 
+<a id="2026-10-19-hipblas-launch"></a>
 ### 2026-10-19 (b) — what hipblas actually launches, decoded
 
 From the hipblaslt shape table (columns are **N, M, K**):
@@ -2559,6 +2731,7 @@ different rows 25600 B apart — ~4× read amplification, measured 2.09× slower
 double-buffering to overlap it costs LDS, which the occupancy cliff above turns
 into a net loss.
 
+<a id="2026-10-20"></a>
 ## 2026-10-20 — the fat tile is real: bn96/bk256/ns2 for N=5120
 
 Two changes, both landed in the working tree:
@@ -2584,6 +2757,7 @@ predating an emitter change are served verbatim (source *and* binary); clear
 headers. And dense packing incidentally makes `bm16/bn16/bk256/ns4/t64` exact
 (its stage stride is now the logical stride); bk128 remains wrong at 5120 vs 2048.
 
+<a id="2026-10-20b"></a>
 ### 2026-10-20b — the wide tile did not cut A after all; warp count does
 
 The 2026-10-20 landing assumed bn 16 -> 96 would cut A's re-read from 320x to
@@ -2610,6 +2784,7 @@ wash). The next structural lever is to stop replicating A in the producer
 (`src/hcu/op/mls.cc`): A is ~1/3 of per-step per-block bytes, so loading it once
 per block at 6 warps bounds the gain at ~28% of per-step traffic.
 
+<a id="2026-10-20c"></a>
 ### 2026-10-20c — producer A de-replication: built, measured, CLOSED
 
 The lever above (stop replicating A in the MLS producer) was implemented in

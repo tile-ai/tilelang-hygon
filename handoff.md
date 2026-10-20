@@ -1,7 +1,94 @@
 # HCU fp8 Channelwise Decode GEMM — Handoff
 
-Status: **2026-10-17i** (three parts. (1) The ns>1 fix invalidated the bn16 ns=2 timings, so they were re-measured correctly for the first time: they are **29-45% SLOWER** than the shipped `ns=1`, matching the always-correct t256 control — the old "fast" reading measured garbage; independent accumulators (2 fragments, in-tree) are 1.52-1.64x slower; both closed. (2) A second, PRE-EXISTING packed-layout defect at bn16/bk128/ns2/t64 (packed branch at tile_issue_k==1 emits a 1088 B stage stride for a 2048 B tile, so the stages overlap) — unreachable from `decode_cfg`, documented, not fixed. (3) **The o/down diagnosis is CORRECTED.** The 2026-10-17h "the mmac side is the whole deficit" framing is wrong: with a clean compute-only arm (4 cycling L2-resident tiles — the old arm re-read one address and was slower than streaming), the compute side is *cheaper* than the load side on all four cases (0.944/0.868/0.888/0.826 vs 0.990/0.945/1.045/0.996 of hipblas), so bn16 is LOAD-bound and **neither side is the deficit**. The deficit is the 16-20% of wall time when neither pipe is busy (+7.5/+6.4/+18.2/+16.0 µs). Inflating the grid with distinct-row duplicates (zero L2 reuse) cuts per-block time 38.9 -> 30.9 µs, proving the ceiling is ~0.98x hipblas at o M=1 — but it needs ~8x the blocks, and 320 blocks over 64 CUs is exactly 5/CU against an 8-slot LDS residency limit, with `N/bn` and `bn=16` at the hardware floor. Wavefront occupancy is ruled out by measurement (t=64/128/256 at identical bytes: 1.000/1.011/1.015 on o M=1) — `wk`-split warps add instructions, not independent tiles. Standing: o M=1 1.080, **o M=16 1.000 (tie)**, down M=1 1.202, down M=16 1.180. **o and down cannot be won in-tree.**) / 2026-10-17h (o/down DECOMPOSED and CLOSED: the load path already beats hipblas on all four cases — load-only 0.957/0.917/0.977/0.948 vs hipblas for o M=1 / o M=16 / down M=1 / down M=16 — so the entire 1.13-1.20x deficit is the per-k-step ds_read/mmac/epilogue side, and it scales with K, not with grid size. The ns=2 wrongness at bn16 is ROOT-CAUSED **and FIXED**: the MLS producer and the allocator wrote stage 1 at the packed stride 6144 while the ds_read consumer read it at the logical 4096 — a real lowering defect, correct at t=256 where the packed branch is not taken. All three now share `MlsPackedTileBytes` / `tl.MlsPackedTileElems`; `bm16/bn16/bk256/ns2` at t=64 and t=128 went from 40/40 wrong (rel 1.6e4) to rel 0, with two new tests pinning it. This does not re-open o/down (the shipped tiles are ns=1). Double buffering, a hand-written 2-buffer pipeline, grid inflation, warp policy, `k_pack=2`, `b_ds_read_alt=0` and both `respect_layout_map` annotations are all measured closed. **No in-tree config can make o/down win.**) / 2026-10-17g (qkv M=32 lever adopted: `bn32/bk128/t128` beats the chosen `bn32/bk256/t256` by 9-10% at N=10240, taking qkv M=32 from 1.14x to 1.03x; two measurement errors corrected — every earlier M<=32 ratio used a `setprio=0` baseline that is NOT what `decode_cfg` returns, and hipblas is the noisy term at o/down; the last o/down lever, `ns=2` at bn16, is closed and reproduces the ns>1 silent-wrong landmine at 40/40. Standing: gate_up 6/6 wins, qkv 5/6, o 1/6, down 0/6) / 2026-10-17f (the o/down plan run to completion: the shape-aware chooser lands as a real win, plus a 1.6-1.7x win at M=32 from a thread-count fix; split-K is CLOSED by measurement — 10-21% slower, and the block-starvation diagnosis that motivated it was a confound; separately, `num_stages>1` is found to be SILENTLY WRONG outside bm64/bn64. 13/32 cells now win) / 2026-10-17e (async-wait lever attacked and RESOLVED: the "fine-grained vmcnt(4)" hypothesis is refuted by the native SASS — hipblas's k-loop is wait-all too; the real knob is pipeline depth, and `bk128 ns2` is adopted for M=64, 243.5us = 59.8%, +1.2%) / 2026-10-17d (BOTH B-fetch levers CLOSED by measurement: B-direct is 2.1x slower than baseline even at WarpM=1, and a 16-consec-k fragment cannot close it — 93.9 us/pass available vs a 267.6 us gap; the MLS-producer swap makes the GEMM 15-16% slower) / 2026-10-17c (B-direct re-opened on the native-kernel evidence: no M in the B index, waves split N; retry shape = WarpM=1 + 16-consec-k) / 2026-10-17b (idle-card M=64 gap 10.2%; MLS producer is a lever too) / 2026-10-17 / 2026-10-16c /
-2026-10-16b / 2026-10-16 / 2026-10-15 / 2026-10-13. Branch `feat/hcu-smls-b-vgpr`.
+This is the entry point for a new session. Status comes first, then what is open,
+then the closed levers with their decisive reasons, then the detailed dated
+record. The full measured record — every table, ratio, SASS excerpt and
+correction — is in `docs/optimization/fp8_decode_m_le_128.md`; links below point
+into it. Branch: `feat/hcu-smls-b-vgpr`.
+
+## 1. What is shipped right now
+
+`decode_cfg` (`perf/gemm/fp8_channelwise_mls.py`) returns:
+
+- **N=5120 (`o`/`down`) at M ≤ 32:** `bn96 / bk256 / ns2 / t192`, `setprio=1`.
+- **`qkv` (N=10240) / `gate_up` (N=51200):** `bn32`, `setprio=1`; the `qkv` M=32
+  point is `bn32 / bk128 / t128`.
+
+Standing (paired same-process, idle card, `rel=0`; ratio = ours/hipblas, **< 1 is
+a win**):
+
+| shape | M=1 | M=16 | M=32 |
+|---|---|---|---|
+| o | 1.069 | 1.027 | 1.024 |
+| down | 1.110 | 1.042 | **0.928** |
+
+These are the post-2026-10-20b (`t192`) numbers, re-measured after the 2026-10-20c
+producer A de-replication attempt was reverted. All four decode shapes are exact.
+
+How it got here: the five adopted levers and the per-stage ratio movement are in
+the doc's [What actually won](docs/optimization/fp8_decode_m_le_128.md#what-won).
+In short — `down` M=1 went 1.273 → 1.110 and `down` M=32 1.061 → 0.928 between the
+2026-10-17f shape-aware chooser and now; `o` M=1 went 1.188 → 1.069. Everything
+else in the search space is a measured closure (§3).
+
+## 2. What is open
+
+- **Nothing in the `decode_cfg` search space.** Every partition axis (warp_m/n/k,
+  policy), tiling axis (bn, bk, threads, residency), pipelining axis (ns,
+  setprio) and producer axis (MLS, plain shared, rolling window, B-direct-VGPR)
+  has a measured closure. Anything further needs a new *mechanism* — a producer
+  that is not MLS, or an ISA path that avoids the LDS round trip.
+- **The one open measurement in o/down:** o's load-only arm runs at 1387 GB/s
+  where down's runs at 1679 GB/s (ceiling 1725 GB/s); no mechanism is established
+  for that 21% and no lever was found. (docs
+  [2026-10-18c](docs/optimization/fp8_decode_m_le_128.md#2026-10-18c))
+- **M=128:** o 1.83×, down 2.23×, qkv 1.15×. Only 40 blocks at bn128, and bn
+  cannot shrink without shrinking the grid further. Not addressed. (docs
+  [2026-10-17f final matrix](docs/optimization/fp8_decode_m_le_128.md#2026-10-17f))
+- **`qkv` M≥32:** 1.05-1.15×; `bm32/bn32/t256` is the measured best of its
+  neighbourhood. (docs [2026-10-17f](docs/optimization/fp8_decode_m_le_128.md#2026-10-17f))
+- **Not taken:** rotating the MLS producer above the `promote_prio`/mmac block is
+  worth ~3% (reproduced 3×) but needs an emitter/pass change, not a config flag.
+  (docs [2026-10-19 §6](docs/optimization/fp8_decode_m_le_128.md#2026-10-19-lds))
+- **Known correctness defects, unreachable from `decode_cfg`:** the small-tile
+  packed stage stride (`bn16/bk128/ns2/t64` emits 1088 B for a 2048 B tile) and
+  the MLS K-slice offset (any nonzero base is silently wrong). Both are
+  documented, not fixed. (docs [2026-10-18](docs/optimization/fp8_decode_m_le_128.md#2026-10-18),
+  [2026-10-18d](docs/optimization/fp8_decode_m_le_128.md#2026-10-18d))
+
+## 3. What is closed, and why
+
+The full one-row-per-lever index is in the doc's
+[closed-levers index](docs/optimization/fp8_decode_m_le_128.md#closed-levers).
+The load-bearing closures:
+
+| lever | decisive reason |
+|---|---|
+| split-K | 10-21% slower, and the MLS K-slice offset is silently wrong for any nonzero base, so it is not expressible. |
+| `num_stages > 1` | 29-45% slower at bn16; ~1% at best where exact (`bk512/ns2`). |
+| B-VGPR-direct / rolling-window producer | 2.1× slower even at `WarpM=1`; 16-consec-k is mmac-incompatible and arithmetically insufficient (93.9 vs 267.6 µs). |
+| MMA density / hipblas warp mapping | The MMA itself is 0.5% of time; adding warps to a wide tile through MLS is worse, and the loss is the transposing LDS read (9.3%). |
+| MLS producer atom / partition swap | The faster 64×32 atom makes the full GEMM 15-16% slower. |
+| N-split / widening bn | 2-3× worse; A's LDS read scales with warp count. |
+| Layout A | The 71.6% target requires the excluded weight reorder; hipblas's no-reorder baseline is 68.4%. |
+| Producer A de-replication | Bit-exact but 1.044-1.358× slower: gating A out of `cp_async_wait<1>` drops a prefetch level. |
+| M=1 GEMV structure | Not expressible: 16×16 MMA atom and `tile_mn=16` MLS floor. |
+| `warp_k` / `FullColK` | 0.97-1.03 vs shipped, mixed sign; a substitute for `setprio`, not a complement. |
+| `__builtin_hcu_matrix_load_b8` | Exists, but its per-lane layout is not the mmac operand layout; needs a cross-lane permutation. |
+| A-direct-to-VGPR / `r_mls` | 1.9-2.6× slower; A must round-trip through LDS. |
+| Block-count inflation | 320 blocks is the best point; the ~8× blocks that reach the ~0.98× o M=1 bound cannot be supplied. |
+| Independent accumulator chains | 1.52-1.64× slower; a second accumulator on one tile is neutral. |
+| Hand-written double buffering | Correct but 1.26-1.70× slower. |
+| Tile widening | Catastrophic; `bn32` alone is 7-12% worse at every (shape, M). |
+| `k_pack=2`, `b_ds_read_alt=0`, `respect_layout_map` | Hard-rejected / unsupported / exact no-ops. |
+
+## 4. Detailed history
+
+The sections below are in file order, not chronological; the newest are
+2026-10-20b/20c near the end. They are historical: wording and numbers are as
+recorded at the time, and several early readings were later corrected (the
+native-kernel operand roles, the read ceiling, the `ns>1` mechanism). Read the
+dated corrections and closures in the later sections.
 
 ## 2026-10-17i — the fix invalidated one measurement; re-timed, last two mechanisms close
 
