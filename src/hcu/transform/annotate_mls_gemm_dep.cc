@@ -79,16 +79,7 @@ private:
       if (call->op.as<OpNode>()) {
         Op tir_op = Downcast<Op>(call->op);
         if (tir_op == MatrixLoad::Get() || tir_op == DsReadFormat::Get() ||
-            tir_op == Gemm::Get() || tir_op == GemmBlockScaled::Get() ||
-            tir_op == Copy::Get()) {
-          if (tir_op == Copy::Get()) {
-            auto copy =
-                Downcast<Copy>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
-            if (!IsMatrixLoadPreferredCopy(*copy.get())) {
-              StmtExprVisitor::VisitStmt_(op);
-              return;
-            }
-          }
+            tir_op == Gemm::Get() || tir_op == GemmBlockScaled::Get()) {
           found_ = true;
           return;
         }
@@ -406,7 +397,6 @@ public:
                                       &analyzer, Mode::kCollectCandidates);
     PrimFuncNode *fn = f.CopyOnWrite();
     fn->body = mutator(f->body);
-    mutator.ValidateAutoLayoutsAttached();
     return f;
   }
 
@@ -577,26 +567,9 @@ private:
     return op.same_as(Copy::Get()) || op.same_as(async_copy);
   }
 
-  bool IsExplicitAsyncCopy(const CallNode *call) const {
-    if (call == nullptr) {
-      return false;
-    }
-    // T.async_copy carries its own op identity; the annotation keys are the
-    // historical spellings some kernels still pass through T.copy.
+  bool IsAsyncCopyOp(const Op &op) const {
     static const Op &async_copy = Op::Get("tl.tileop.async_copy");
-    if (call->op.same_as(async_copy)) {
-      return true;
-    }
-    for (const char *key : {"is_async_copy", "force_cp_async"}) {
-      if (auto val = call->annotations.Get(key)) {
-        if (const auto *imm = val->as<IntImmNode>()) {
-          if (imm->value != 0) {
-            return true;
-          }
-        }
-      }
-    }
-    return false;
+    return op.same_as(async_copy);
   }
 
   Stmt VisitStmt_(const SBlockNode *op) final {
@@ -877,51 +850,6 @@ private:
     return true;
   }
 
-  /*!
-   * \brief Whether every reader of `buffer` after this copy is one whose
-   * mls_trans ComputeSharedDstMlsTrans() can resolve.
-   *
-   * The matrix-load transpose of a shared destination is derived from its
-   * consumers, and that derivation understands exactly two reader forms: a GEMM
-   * that takes the buffer as an operand, and a ds_read_format that relays the
-   * buffer through its fragment into a GEMM.  Any other reader consumes a
-   * matrix-load destination without knowing the layout it was written in, and
-   * would be skipped silently by the derivation -- so the copy is rejected here
-   * instead of being lowered with a transpose only some of its consumers agree
-   * with.
-   */
-  bool HasResolvableMlsReadersAfterCall(const Buffer &buffer,
-                                        const CallNode *after_site_call) const {
-    if (collector_ == nullptr) {
-      return false;
-    }
-    const int after_order = after_site_call == nullptr
-                                ? -1
-                                : collector_->GetCallStmtOrder(after_site_call);
-    bool has_reader = false;
-    for (const ReaderCallRecord &reader : collector_->GetReaderCalls(buffer)) {
-      if (reader.call == nullptr || reader.stmt_order <= after_order) {
-        continue;
-      }
-      has_reader = true;
-      if (IsGemmTileOpCall(reader.call)) {
-        continue;
-      }
-      Optional<TileOperator> reader_op =
-          ParseOperator(tvm::ffi::GetRef<Call>(reader.call));
-      if (reader_op.defined() &&
-          reader_op->GetTypeKey() == std::string("tl.DsReadFormat")) {
-        const DsReadFormat &ds = Downcast<DsReadFormat>(reader_op);
-        if (PropagateToFindGemmConsumerOpWithInputAfterCall(ds->dst, collector_,
-                                                            reader.call)) {
-          continue;
-        }
-      }
-      return false;
-    }
-    return has_reader;
-  }
-
   bool CollectExclusiveGemmConsumersAfterCall(
       const Buffer &buffer, int after_order, BufferSet *visited_buffers,
       std::unordered_set<const CallNode *, CallNodePtrHash, CallNodePtrEqual>
@@ -1109,8 +1037,8 @@ private:
       auto copy = Downcast<Copy>(ParseOperator(ffi::GetRef<Call>(call)));
       if (mode_ == Mode::kMaterialize &&
           call->annotations.count(kPendingGemmLdsCopyStrategy)) {
-        const bool selected = IsExplicitAsyncCopy(call) ||
-                              selected_calls_.count(GetRef<Call>(call));
+        const bool selected =
+            IsAsyncCopyOp(tir_op) || selected_calls_.count(GetRef<Call>(call));
         auto annotations = call->annotations;
         if (selected) {
           annotations =
@@ -1125,12 +1053,6 @@ private:
             Call(call->dtype, call->op, call->args, annotations, call->span));
       }
       if (IsMatrixLoadPreferredCopy(*copy.get())) {
-        ICHECK(HasResolvableMlsReadersAfterCall(copy->dst, call))
-            << "Explicit prefer_instruction=\"matrix_load\" requires every "
-               "downstream reader of buffer "
-            << copy->dst->name
-            << " after this copy to be a tl.tileop.gemm, or a "
-               "tl.tileop.ds_read_format that feeds one.";
         bool trans = true;
         LookupSharedMlsTrans(copy->dst, &trans);
         auto annotations = call->annotations;
@@ -1185,7 +1107,7 @@ private:
         return Evaluate(Call(call->dtype, DsReadFormat::Get(), call->args,
                              annotations, call->span));
       }
-      if (mode_ == Mode::kCollectCandidates && IsExplicitAsyncCopy(call) &&
+      if (mode_ == Mode::kCollectCandidates && IsAsyncCopyOp(tir_op) &&
           consumer) {
         std::vector<GemmWithInput> consumers =
             PropagateToFindAllGemmConsumersAfterCall(copy->dst, collector_,
@@ -1198,7 +1120,7 @@ private:
                                active_annotations, call->span));
         }
       }
-      if (mode_ == Mode::kCollectCandidates && !IsExplicitAsyncCopy(call) &&
+      if (mode_ == Mode::kCollectCandidates && !IsAsyncCopyOp(tir_op) &&
           consumer && IsGlobalLikeBuffer(copy->src) &&
           IsSharedBuffer(copy->dst)) {
         if (auto consumers =
@@ -1213,7 +1135,7 @@ private:
           }
         }
       }
-      if (IsExplicitAsyncCopy(call) && IsSharedBuffer(copy->dst) &&
+      if (IsAsyncCopyOp(tir_op) && IsSharedBuffer(copy->dst) &&
           !HasAnnotatedLayout(copy->dst)) {
         async_copy_linear_outputs_.insert(copy->dst->data);
       }

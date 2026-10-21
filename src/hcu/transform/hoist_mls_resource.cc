@@ -119,7 +119,9 @@ std::string MlsBaseTemplateFromLoadTile(
       << "mls_load_tile expects at least 8 template args";
   std::ostringstream os;
   os << "tl::mls::tilelang_mls_base<";
-  const size_t base_arg_count = MlsLoadTileHasDstBits(args) ? 9 : 8;
+  size_t base_arg_count = 8;
+  if (MlsLoadTileHasDstBits(args))
+    base_arg_count = 9;
   for (size_t i = 0; i < base_arg_count; ++i) {
     if (i != 0)
       os << ", ";

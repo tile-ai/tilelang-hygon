@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -19,11 +18,7 @@ if TYPE_CHECKING:
 
 BackendCallback = Callable[..., object]
 TargetPredicate = Callable[[Target], bool]
-#: Host facts that change the artifact a backend compiles; see cache_key_extra.
-CacheKeyExtra = Callable[[], Mapping[str, str]]
 _T = TypeVar("_T")
-
-logger = logging.getLogger(__name__)
 
 
 def _freeze_components(components: Mapping[str, tuple[_T, ...]]) -> Mapping[str, tuple[_T, ...]]:
@@ -43,11 +38,6 @@ class BackendModule:
     host_codegens: Mapping[str, HostCodegen] = field(default_factory=dict)
     host_codegen_hooks: Mapping[str, tuple[HostCodegenHook, ...]] = field(default_factory=dict)
     callbacks: Mapping[str, BackendCallback] = field(default_factory=dict)
-    #: Host facts this backend derives from the machine rather than the target —
-    #: toolchain probes, device library paths. They change the flags a compile
-    #: runs with, so they are part of the kernel cache key: two hosts that probe
-    #: differently must not share a cached artifact. Called lazily, once per key.
-    cache_key_extra: CacheKeyExtra | None = None
 
     def __post_init__(self) -> None:
         target_kinds = tuple(self.target_kinds)
@@ -92,8 +82,6 @@ class BackendModule:
         callbacks = MappingProxyType(dict(self.callbacks))
         if any(not name for name in callbacks):
             raise ValueError(f"BackendModule {self.name!r} callback names must not be empty")
-        if self.cache_key_extra is not None and not callable(self.cache_key_extra):
-            raise ValueError(f"BackendModule {self.name!r} cache_key_extra must be callable")
 
         object.__setattr__(self, "target_kinds", target_kinds)
         object.__setattr__(self, "pipelines", pipelines)
@@ -298,28 +286,6 @@ def list_backends() -> dict[str, BackendModule]:
     """Return a copy of the registered backend modules."""
 
     return dict(_BACKENDS)
-
-
-def backend_cache_key_extra() -> dict[str, str]:
-    """Return the host facts every registered backend declares for the cache key.
-
-    Namespaced with the backend name. A probe that raises contributes its
-    failure instead of nothing, so a broken probe cannot silently reuse the
-    entry of a host that probes successfully.
-    """
-
-    extra: dict[str, str] = {}
-    for name, backend in _BACKENDS.items():
-        if backend.cache_key_extra is None:
-            continue
-        try:
-            facts = backend.cache_key_extra()
-        except Exception as err:  # noqa: BLE001 - report any probe failure as a distinct key
-            logger.warning(f"Backend {name!r} environment probe failed: {err!r}")
-            extra[f"{name}.probe_error"] = type(err).__name__
-            continue
-        extra.update((f"{name}.{key}", str(value)) for key, value in facts.items())
-    return extra
 
 
 def _list_backend_modules_for_target_kind(target_kind: str) -> tuple[BackendModule, ...]:

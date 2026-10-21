@@ -175,10 +175,6 @@ HcuMnPerWarp ComputeWarpPartitionHCU(const GemmWarpPolicyNode &policy, int M,
                                      int extra_min_m_per_warp,
                                      int extra_min_n_per_warp, int mmac_k) {
   const bool use_mls = A_from_mls || B_from_mls;
-  if (use_mls) {
-    ICHECK(k_pack == 1) << "gemm_mls does not support kPack > 1";
-  }
-
   const int warp_size = TargetHcuGetWarpSize(target);
   ICHECK_GE(block_size, warp_size)
       << "HCU T.gemm needs at least one full wave, but this block has only "

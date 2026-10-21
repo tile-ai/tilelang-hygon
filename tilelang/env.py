@@ -386,12 +386,6 @@ class Environment:
         "TILELANG_CLEANUP_TEMP_FILES", "1"
     )  # cleanup temporary compiler files/dirs after compilation (set to 0 to keep for debugging)
     TILELANG_HIP_SAVE_TEMP_FILES = EnvVar("TILELANG_HIP_SAVE_TEMP_FILES", "0")  # save temporary files for HIP compilation
-    # Overrides for the two HCU toolchain facts that are probed from the host
-    # installation instead of from the target: the device library the compiler
-    # reads and the code-object version it emits.  Empty means "probe the
-    # installation"; a device lib path of "none"/"off"/"0" suppresses the flag.
-    TILELANG_HCU_DEVICE_LIB_PATH = EnvVar("TILELANG_HCU_DEVICE_LIB_PATH", "")
-    TILELANG_HCU_CODE_OBJECT_VERSION = EnvVar("TILELANG_HCU_CODE_OBJECT_VERSION", "")
     TILELANG_JIT_DIAGNOSTICS = EnvVar("TILELANG_JIT_DIAGNOSTICS", "0")  # enable JIT phase diagnostics
     TILELANG_COMPILE_TIMEOUT_SECONDS = EnvVar("TILELANG_COMPILE_TIMEOUT_SECONDS", "")  # optional NVCC subprocess timeout in seconds
 

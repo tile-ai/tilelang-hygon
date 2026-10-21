@@ -22,7 +22,7 @@ from collections.abc import Callable
 from tvm.target import Target
 from tvm.tirx import PrimFunc
 from tvm.runtime import Executable
-from tilelang.backend.module import BackendContext, backend_cache_key_extra, create_backend_context
+from tilelang.backend.module import BackendContext, create_backend_context
 from tilelang.engine.param import KernelParam, dump_kernel_params, load_kernel_params
 from tilelang.utils.language import get_prim_func_name
 from tilelang import env
@@ -205,11 +205,6 @@ class KernelCache:
     @staticmethod
     def _get_base_key() -> dict:
         base = {"version": __version__, "platform": platform.machine()}
-        backend_extra = backend_cache_key_extra()
-        if backend_extra:
-            # Host facts the backends probe (toolchain, device library): the
-            # same target compiles to different artifacts across machines.
-            base["backend"] = backend_extra
         if env.should_use_kernel_cache_lib_stamp():
             lib_stamp = KernelCache._get_tilelang_lib_stamp()
             if lib_stamp:

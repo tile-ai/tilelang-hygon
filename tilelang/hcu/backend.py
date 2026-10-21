@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from tilelang.backend.host_codegen import STANDARD_HOST_CODEGENS
 from tilelang.backend.module import BackendModule, register_backend
-from tilelang.contrib.hcu import hcu_cache_key_extra, tilelang_callback_hcu_compile
+from tilelang.contrib.hcu import tilelang_callback_hcu_compile
 
 from . import codegen, execution_backend, pipeline
 
@@ -18,6 +18,5 @@ BACKEND = register_backend(
         execution_backends=execution_backend.EXECUTION_BACKENDS,
         host_codegens=STANDARD_HOST_CODEGENS,
         callbacks={"tilelang_callback_hcu_compile": tilelang_callback_hcu_compile},
-        cache_key_extra=hcu_cache_key_extra,
     )
 )
