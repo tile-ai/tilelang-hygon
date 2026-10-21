@@ -4,7 +4,7 @@
 """Correctness test for the fp8 channelwise GEMM on the MLS (matrix-LDS-read)
 producer path.
 
-Kernel: ``perf/gemm/fp8_channelwise_mls.py``. Semantics:
+Kernel: ``tilelang/hcu/op/gemm/gemm_fp8_channelwise.py``. Semantics:
 ``C[m, n] = scale_a[m] * scale_b[n] * sum_k A[m, k] * B[n, k]`` with A (M, K)
 fp8, B (N, K) fp8 (N-major), fp32 per-token / per-channel scales. Validated
 configuration on HCU (gfx938): block 256x256x64, num_stages=1, 512 threads.
@@ -21,11 +21,11 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from perf.gemm.fp8_channelwise_mls import (  # noqa: E402
+from tilelang.hcu.op.gemm.gemm_fp8_channelwise import (  # noqa: E402
     DecodeCfg,
     _validate_cfg,
     decode_cfg,
-    fp8_mls_channelwise,
+    fp8_channelwise_gemm,
 )
 
 # The four qwen3-32B decode shapes, as (N, K).
@@ -61,12 +61,12 @@ def _make_inputs(M, N, K, seed=0):
     return A, B, scale_a, scale_b
 
 
-def test_hcu_gemm_fp8_mls_channelwise_validated_config():
+def test_hcu_gemm_fp8_channelwise_validated_config():
     M, N, K = 8192, 8192, 8192
     block_M, block_N, block_K, num_stages, threads = 256, 256, 64, 1, 512
     A, B, scale_a, scale_b = _make_inputs(M, N, K)
 
-    kernel = fp8_mls_channelwise(
+    kernel = fp8_channelwise_gemm(
         M, N, K, block_M, block_N, block_K, num_stages=num_stages, threads=threads
     )
 
@@ -84,11 +84,11 @@ def test_hcu_gemm_fp8_mls_channelwise_validated_config():
     kernel.get_profiler().assert_allclose(_ref_program, atol=1e-2, rtol=1e-2)
 
 
-def test_hcu_gemm_fp8_mls_channelwise_small():
+def test_hcu_gemm_fp8_channelwise_small():
     # Smaller shape, ns=0 (explicit wait path), to exercise the non-pipelined branch.
     M, N, K = 1024, 1024, 1024
     A, B, scale_a, scale_b = _make_inputs(M, N, K)
-    kernel = fp8_mls_channelwise(M, N, K, 128, 128, 64, num_stages=0, threads=256)
+    kernel = fp8_channelwise_gemm(M, N, K, 128, 128, 64, num_stages=0, threads=256)
     C = kernel(A, B, scale_a, scale_b)
     ref = _ref_program(A, B, scale_a, scale_b)
     rel = (C - ref).abs().max().item() / ref.abs().max().item()
@@ -154,6 +154,44 @@ def test_decode_cfg_is_shape_aware():
     # and loses (1.287x vs 1.135x hipblas, paired).
     assert decode_cfg(96, 5120, 25600).block_N == 96
 
+    # M in (64,128] on the wide-N shapes (2026-10-21): block count decides the
+    # pipeline depth, MMA padding decides block_M.  gate_up (N=51200) has 400
+    # blocks at bn128 and takes ns2+unroll at every M>64 (0.934/0.960/0.966 vs
+    # hipblas at M=80/96/128); qkv (N=10240) has only 80 blocks at bn128 (1.25
+    # waves), so ns2 loses there (1.261/1.277) and instead it shrinks to
+    # bm96/bn96 while M <= 96 fits in one tile row: 1.202 -> 1.070 at M=80 and
+    # 1.246 -> 1.048 at M=96 (bn is NOT the lever there -- bm128/bn96 is 1.248).
+    for M in (65, 80, 96):
+        q = decode_cfg(M, 10240, 5120)
+        assert (q.block_M, q.block_N, q.block_K, q.num_stages, q.threads) == \
+            (96, 96, 128, 2, 384), (M, q)
+    # gate_up M in (64,96] takes bm96/bn128: bm128 spent 25-37% of its MMA rows on
+    # padding, and bm96 removes it at zero byte cost (A_issued has no bm in it).
+    # Paired 2x each: M=80 293.1/293.3 (bm128/t512) vs 285.4/285.6 (bm96/t512);
+    # M=96 296.0/296.5 vs 286.7/287.4 (bm96/t256).  The thread optimum flips at
+    # the band ends, so the split is at 80.  bn96 loses here (303.2, 1.016).
+    # M > 96 cannot use bm96 (two 96-row block rows = 50% padding).
+    for M, threads in ((65, 512), (80, 512), (96, 256)):
+        g = decode_cfg(M, 51200, 5120)
+        assert (g.block_M, g.block_N, g.block_K, g.num_stages, g.threads) == \
+            (96, 128, 128, 2, threads), (M, g)
+    # qkv M in (112,128] keeps the bn128/ns1 tile, M=128 takes the o/down one.
+    # Both tiles launch the same 80/107 blocks for any M<=128, so the only
+    # difference is MMA padding: at M=112 it is 12.5% (MMA per byte low, bn96's
+    # +17% A bytes are not repaid: 86.56/86.72 vs 87.84us), at M=128 it is zero
+    # (87.52/87.84 vs 88.64/88.96us for bn96).  Paired, 7 rounds, idle card.
+    q = decode_cfg(112, 10240, 5120)
+    assert (q.block_M, q.block_N, q.block_K, q.num_stages, q.threads, q.setprio) == \
+        (128, 128, 128, 1, 512, 0), q
+    q = decode_cfg(128, 10240, 5120)
+    assert (q.block_M, q.block_N, q.block_K, q.num_stages, q.threads, q.setprio) == \
+        (128, 96, 128, 2, 512, 1), q
+    for M in (112, 128):
+        g = decode_cfg(M, 51200, 5120)
+        assert (g.block_M, g.block_N, g.block_K, g.num_stages, g.threads) == \
+            (128, 128, 128, 2, 512), (M, g)
+        _validate_cfg(decode_cfg(M, 10240, 5120), M, 10240, 5120)
+
 
 def test_validate_cfg_rejects_the_k8192_bk320_trap():
     """bk=320 divides K=5120 and K=25600 but NOT K=8192. A non-dividing block_K
@@ -182,7 +220,7 @@ def test_every_chosen_decode_config_is_correct(N, K):
     cfg = decode_cfg(M, N, K)
     assert cfg.num_stages > 1, f"this test is only meaningful for the ns>1 config, got {cfg}"
     A, B, scale_a, scale_b = _make_inputs(M, N, K)
-    kernel = fp8_mls_channelwise(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
+    kernel = fp8_channelwise_gemm(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
                                  cfg.num_stages, cfg.threads, setprio=cfg.setprio)
     C = kernel(A, B, scale_a, scale_b)
     ref = _ref_program(A, B, scale_a, scale_b)
@@ -205,13 +243,65 @@ def test_m128_wide_tile_is_exact(K):
     assert (cfg.block_M, cfg.block_N, cfg.block_K, cfg.num_stages,
             cfg.threads) == (128, 96, 128, 2, 512), cfg
     A, B, scale_a, scale_b = _make_inputs(M, N, K)
-    kernel = fp8_mls_channelwise(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
+    kernel = fp8_channelwise_gemm(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
                                  cfg.num_stages, cfg.threads, setprio=cfg.setprio)
     C = kernel(A, B, scale_a, scale_b)
     ref = _ref_program(A, B, scale_a, scale_b)
     assert torch.isfinite(C).all(), f"decode_cfg(128, {N}, {K}) produced non-finite output"
     rel = (C - ref).abs().max().item() / ref.abs().max().item()
     assert rel < 1e-3, f"decode_cfg(128, {N}, {K}) = {cfg} rel error {rel:.6f}"
+
+
+@pytest.mark.parametrize("N,K", _DECODE_SHAPES)
+@pytest.mark.parametrize("M", (1, 16, 32))
+def test_small_m_decode_configs_are_exact(M, N, K):
+    """The M <= 32 rows of ``decode_cfg`` -- what every decode step actually runs.
+
+    Two unrelated families live here: ``bn96/bk256/ns2/t192`` for N=5120 and
+    ``bn32`` + ns1 for the wide-N shapes (qkv M=32 is ``bn32/bk128/t128``).
+    Until now only their *config* was asserted, never their output, and the ns2
+    family is exactly the one the packed-stage-stride defect lives in -- so the
+    N=5120 rows are the cells that most need a numeric pin.
+    """
+    cfg = decode_cfg(M, N, K)
+    A, B, scale_a, scale_b = _make_inputs(M, N, K)
+    kernel = fp8_channelwise_gemm(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
+                                 cfg.num_stages, cfg.threads, setprio=cfg.setprio)
+    C = kernel(A, B, scale_a, scale_b)
+    ref = _ref_program(A, B, scale_a, scale_b)
+    assert torch.isfinite(C).all(), f"decode_cfg({M}, {N}, {K}) produced non-finite output"
+    rel = (C - ref).abs().max().item() / ref.abs().max().item()
+    assert rel < 1e-3, f"decode_cfg({M}, {N}, {K}) = {cfg} rel error {rel:.6f}"
+
+
+@pytest.mark.parametrize("N,K", ((10240, 5120), (51200, 5120)))
+@pytest.mark.parametrize("M", (80, 96, 128))
+def test_wide_n_mid_band_is_exact(M, N, K):
+    """The M in (64,128] wide-N rule (2026-10-21/21d) on both shapes it serves.
+
+    Six arms, and each one is a tile that was previously unshipped: qkv M=96
+    takes bm96/bn96/ns2/U8, qkv M=128 takes bm128/bn96/ns2/t512/setprio (the
+    o/down M>96 tile -- 1.3% faster than bm128/bn128/ns1 because M=128 pads the
+    bm=128 tile zero, so the extra 107-vs-80 blocks pay for their +17% A bytes;
+    M=112 is the opposite, 1.4% the other way), gate_up takes
+    bm96/bn128/ns2/U8 at M=80/96 (2026-10-21d: bm96 deletes 48/128 and 32/128
+    padded MMA rows at zero byte cost) and bm128/bn128/ns2/U8 at M=128.  All of
+    them are ns>1 *or* a bm that does not
+    equal M, so this pins the predicated copies and the unrolled path where the
+    pre-2026-10-17h code was silently wrong.
+    """
+    cfg = decode_cfg(M, N, K)
+    A, B, scale_a, scale_b = _make_inputs(M, N, K)
+    kernel = fp8_channelwise_gemm(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
+                                 cfg.num_stages, cfg.threads, setprio=cfg.setprio)
+    if cfg.num_stages > 1 and (N, M) != (51200, 64):
+        assert "cp_async_wait<2>" in kernel.get_kernel_source(), (
+            f"decode_cfg({M}, {N}, {K}) = {cfg} did not take the unrolled k-loop")
+    C = kernel(A, B, scale_a, scale_b)
+    ref = _ref_program(A, B, scale_a, scale_b)
+    assert torch.isfinite(C).all(), f"decode_cfg({M}, {N}, {K}) produced non-finite output"
+    rel = (C - ref).abs().max().item() / ref.abs().max().item()
+    assert rel < 1e-3, f"decode_cfg({M}, {N}, {K}) = {cfg} rel error {rel:.6f}"
 
 
 @pytest.mark.parametrize("K", (8192, 25600))
@@ -228,7 +318,7 @@ def test_unrolled_k_loop_is_exact(M, K):
     N = 5120
     cfg = decode_cfg(M, N, K)
     A, B, scale_a, scale_b = _make_inputs(M, N, K)
-    kernel = fp8_mls_channelwise(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
+    kernel = fp8_channelwise_gemm(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
                                  cfg.num_stages, cfg.threads, setprio=cfg.setprio)
     assert "cp_async_wait<2>" in kernel.get_kernel_source(), (
         f"decode_cfg({M}, {N}, {K}) = {cfg} did not take the unrolled k-loop")
@@ -247,9 +337,9 @@ def test_decode_cfg_keeps_split_k_closed():
 
     This is a regression guard on the closure, not on the mechanism -- re-opening
     needs new evidence, not a config change."""
-    import perf.gemm.fp8_channelwise_mls as m
+    import tilelang.hcu.op.gemm.gemm_fp8_channelwise as m
 
-    assert not hasattr(m, "fp8_mls_channelwise_splitk")
+    assert not hasattr(m, "fp8_channelwise_gemm_splitk")
     for N, K in _DECODE_SHAPES:
         for M in (1, 16, 32, 64, 128):
             assert decode_cfg(M, N, K).split_k == 1
@@ -285,15 +375,15 @@ def test_warp_k_fullcolk_mls_is_correct_and_reduced():
 
     import tilelang.language as T
 
-    import perf.gemm.fp8_channelwise_mls as m
+    import tilelang.hcu.op.gemm.gemm_fp8_channelwise as m
 
     M, N, K = 16, 5120, 8192
     fck = T.GemmWarpPolicy.FullColK
     A, B, scale_a, scale_b = _make_inputs(M, N, K)
     ref = _ref_program(A, B, scale_a, scale_b)
 
-    kern_wk = fp8_mls_channelwise(M, N, K, 16, 16, 256, 1, 256, policy=fck)
-    kern_sq = fp8_mls_channelwise(M, N, K, 16, 16, 256, 1, 256)
+    kern_wk = fp8_channelwise_gemm(M, N, K, 16, 16, 256, 1, 256, policy=fck)
+    kern_sq = fp8_channelwise_gemm(M, N, K, 16, 16, 256, 1, 256)
     for tag, kern in (("FullColK", kern_wk), ("Square", kern_sq)):
         C = kern(A, B, scale_a, scale_b)
         assert torch.isfinite(C).all(), f"{tag} produced non-finite output"
@@ -311,7 +401,7 @@ def test_warp_k_fullcolk_mls_is_correct_and_reduced():
     assert "AllReduce" not in sq_src, "Square must not pay for a reduction it does not need"
 
     # Closure guard: the capability exists but the chooser must stay on Square.
-    assert inspect.signature(m.fp8_mls_channelwise).parameters["policy"].default is None
+    assert inspect.signature(m.fp8_channelwise_gemm).parameters["policy"].default is None
     assert "policy" not in DecodeCfg.__dataclass_fields__
     for N_, K_ in _DECODE_SHAPES:
         for M_ in (1, 2, 4, 8, 16, 32, 64, 128):
@@ -395,7 +485,7 @@ _PACKED_STRIDE_CONFIGS = [
     # earlier "was 40/40 WRONG, now fixed" reading looked complete -- the old list
     # simply never covered these four. It is NOT K-dependent (bk128/ns2 is
     # already wrong at K=5120 / 40 k-steps, so a short K is not a safe escape).
-    # No production exposure: fp8_mls_channelwise asserts ns>1 only for
+    # No production exposure: fp8_channelwise_gemm asserts ns>1 only for
     # bm64/bn64, and all four decode shapes at M=16 and M=64 were re-verified
     # exact 5x each on 2026-10-18. Marked xfail so the region stays visible and
     # flips to xpass the moment the race is fixed -- do not delete these rows.
@@ -413,7 +503,7 @@ def test_num_stages_gt_1_mls_is_correct(block_M, block_N, block_K, num_stages, t
     Goes through all three consumers at once -- the C++ ``MatrixLoad`` producer,
     ``MergeSharedMemoryAllocations``, and the Python ds_read base pointer -- so
     it fails if any of them drifts. Written inline rather than through
-    ``fp8_mls_channelwise`` because that builder deliberately restricts ns>1 to
+    ``fp8_channelwise_gemm`` because that builder deliberately restricts ns>1 to
     bm64/bn64 (untuned elsewhere), which would make this untestable.
     """
     import tilelang

@@ -19,7 +19,7 @@ Constraint: with ``trans_B=True`` the B MLS atom is the trans b8 tile
 (tile_k 64/128), so ``block_K`` must be a multiple of 64.
 
 Run (validate + bench):
-    HIP_VISIBLE_DEVICES=2 python perf/gemm/fp8_channelwise_mls.py
+    HIP_VISIBLE_DEVICES=2 python tilelang/hcu/op/gemm/gemm_fp8_channelwise.py
 """
 
 from dataclasses import dataclass
@@ -77,8 +77,12 @@ def _validate_cfg(cfg, M, N, K):
     # bn96/bk128/ns2 at bm>=64 is the M in (64,128] band tile, added 2026-10-20:
     # exact (rel < 1e-3) at bm 64/96/128 on o and down, and 1.35x faster than its
     # ns=1 counterpart at M=128 (that is defect (2) in decode_cfg's comment).
+    # bm96/bn128/bk128/ns2 is the gate_up M in (64,96] tile (2026-10-21): exact
+    # (rel = 0) at M = 65/72/80/88/96 with both t512 and t256 -- the stage stride
+    # depends on (bm,bn,bk) and the A copy extent on M, so both were swept.
     _wide_exact = (bn == 96 and bk == 256 and ns <= 2) or (bn == 96 and bk == 128 and bm >= 64 and ns <= 2) \
-        or (bm == 128 and bn == 128 and bk == 128 and ns <= 2)
+        or (bm == 128 and bn == 128 and bk == 128 and ns <= 2) \
+        or (bm == 96 and bn == 128 and bk == 128 and ns <= 2)
     assert ns <= 1 or (bm, bn) == (64, 64) or _wide_exact, (
         f"shape {M}x{N}x{K}: num_stages={ns} is only tuned for bm=bn=64 or the bn96 wide tile "
         f"(bm={bm}, bn={bn}, bk={bk})")
@@ -100,6 +104,11 @@ def decode_cfg(M, N, K):
                     fallback when K % 256 != 0)
                     M in (96,128] -> bm128/bn96/bk128/ns2/t512 (2026-10-21,
                     unrolled k-loop; it was bn128/t256 under T.Pipelined)
+      M in (64,128], other N (gate_up, qkv) -- decided by BLOCK COUNT first and
+                    MMA padding second (2026-10-21):
+                      ceil(N/128) >= 256 -> bm128/bn128/bk128/ns2/t512
+                      else M <= 96       -> bm96/bn96/bk128/ns2/t384
+                      else               -> bm128/bn128/bk128/ns1/t512
 
     block_N < 16 is impossible: the MMA output micro-tile is hardware-fixed at
     16x16 (``src/tl_templates/hcu/gemm.h:150``) and the MLS B atom floor is
@@ -174,6 +183,88 @@ def decode_cfg(M, N, K):
         # (88.5us), bm112 (90.6us) and U6/U16 (68.3/71.4us).
         return _validate_cfg(DecodeCfg(128, 96, 128, 2, 512, 1), M, N, K)
     else:
+        # M in (64, 128] on the wide-N shapes that are neither o/down (handled
+        # above) nor small-M: gate_up (N=51200, 400 blocks) and qkv (N=10240, 80
+        # blocks).  Same tile either way; the difference is the pipeline depth.
+        #
+        # ns2 + the unrolled k-loop pay ONLY when there are enough blocks to
+        # keep feeding the CUs (2026-10-21, paired same-process, graph replay,
+        # 7 rounds, idle card, setprio=0 on both arms so ns is the only variable):
+        #   gate_up M=128  311.8 -> 300.5us  (1.002x -> 0.966x hipblas)
+        #   gate_up M= 96  305.4 -> 296.0us  (1.020x -> 0.989x)
+        #   qkv     M=128   85.1 ->  90.9us  (1.114x -> 1.136x)   <- loses
+        #   qkv     M= 96   87.4 ->  90.1us  (1.238x -> 1.277x)   <- loses
+        # qkv at bn128 is 80 blocks on 64 CUs (1.25 waves): almost every CU runs
+        # exactly one block, so a second pipeline stage has nothing to overlap
+        # with and only costs LDS/registers.  gate_up's 400 blocks (6.25 waves)
+        # always have a successor.  256 blocks = 4 waves is the measured split;
+        # no point between 80 and 400 exists for these shapes.
+        # NOT a wider-bn lever: bn160 is an illegal MLS tile ("No valid MLS tile
+        # config for trans: block_mn=160") and bn256 forces bk64 or ns1, measured
+        # 1.59x / 1.48x slower.
+        #
+        # qkv (80 blocks) instead buys its blocks by shrinking bm to 96, which
+        # also removes MMA padding -- and that half of the effect is the larger
+        # one (2026-10-21, paired, 7 rounds, setprio=0, hipblas calibrated to
+        # within 1.35x of its quiet-card time before each run):
+        #   M= 80  bm128/bn128/ns1 84.8 -> bm96/bn96/ns2/U8 75.5  (1.202 -> 1.070)
+        #   M= 96  bm128/bn128/ns1 87.5 -> bm96/bn96/ns2/U8 73.6  (1.246 -> 1.048)
+        # At M=96 bm128 rows are 25% padding; bn128 also gives only 80 blocks
+        # (1.25 waves) against bn96's 107.  U8 beats U6 by 1.1% here and is
+        # identical on o/down (58.56/58.56, 155.8/155.5), so the table uses 8.
+        # Closed at this band: bn128/ns2 (1.261 at M=80), bm128/bn96 (1.248 at
+        # M=96 -- bn is not the lever, bm is), setprio=1 (-2.2%).
+        #
+        # M in (96, 128] cannot use bm96 (two 96-row tiles = 192 rows for <=128,
+        # 50% padding) and every wave-packing variant loses: bm64/bn128 1.467,
+        # bm64/bn96 1.705, bn80/128 blocks 1.214, bn96 1.172, bn128/ns1 1.178.
+        # qkv at this M is the one cell this path does not win; 80 blocks on 64
+        # CUs (1.25 waves) is not fixable by any legal tile (bn160 is illegal).
+        # Closed here 2026-10-21 (all paired, bit-exact, worse than the shipped
+        # tile): bm96/bn96 ns1 76.48us/1.084 and bk256/ns1 108.00us/1.531 at
+        # M=96; t256 at bm96/bn96 83.04/1.177; bk320 does not launch; at M=128
+        # bn256/bk128/ns1 111.84/1.472 and ns2+U8 on bn128 91.20/1.200.
+        if -(-N // 128) >= 256:
+            # gate_up M in (64,96] moves to bm96 (2026-10-21, paired same-process,
+            # graph replay, 7 rounds, idle card, min-of-rounds, U8 on every arm):
+            # bm128 burns 32-48 of its 128 MMA rows as padding, and bm96 removes
+            # that at ZERO byte cost -- A_issued = ceil(N/bn)*M*K has no bm in it.
+            #   M=80  bm128/t512 293.1/293.3us   bm96/t256 288.0/288.2   bm96/t512 285.4/285.6
+            #   M=96  bm128/t512 296.0/296.5us   bm96/t256 286.7/287.4   bm96/t512 297.6/298.4
+            # ratio vs hipblas 0.955 -> 0.934 (M=80) and 0.990 -> 0.960 (M=96).
+            # The thread optimum flips between the two ends (0.9% / 3.6%, each
+            # reproduced twice), so the split is at 80: both ends take their
+            # measured best and the unmeasured 81..95 interior takes the M=96 arm.
+            # bn96 -- the qkv tile -- LOSES here (303.2/303.5, 1.016): 400+ blocks
+            # are already enough, so halving bn only adds A bytes.  M > 96 cannot
+            # use bm96 (two 96-row block rows = 50% padding).
+            # The 20% of the gap that padding removal does NOT buy, and why bm96
+            # is the end of this lever: gate_up M=64 stays on bm64/bn64 (1.059-1.070);
+            # 11 arms measured there (bn 96/128, bm 96, t 128/512, bk 64/256, ns1,
+            # setprio=0, U16) all lose -- see the 2026-10-21d section.
+            if M <= 80:
+                return _validate_cfg(DecodeCfg(96, 128, 128, 2, 512, 0), M, N, K)
+            if M <= 96:
+                return _validate_cfg(DecodeCfg(96, 128, 128, 2, 256, 0), M, N, K)
+            return _validate_cfg(DecodeCfg(128, 128, 128, 2, 512, 0), M, N, K)
+        if M <= 96:
+            return _validate_cfg(DecodeCfg(96, 96, 128, 2, 384, 0), M, N, K)
+        # M in (112,128] takes the o/down M>96 tile instead: bn96's 107 blocks
+        # beat bn128's 80 (1.25 waves, 62.5% fill) once the block carries a full
+        # bm=128 of MMA rows.  The switch is at 112, not 96, because both tiles
+        # launch the SAME 80/107 blocks at any M<=128 -- only the padding moves:
+        # at M=112, 12.5% of the tile's MMA rows are wasted, so MMA per byte is
+        # low and the +17% A bytes of bn96 are not repaid (2026-10-21, paired,
+        # 7 rounds, idle card, min-of-rounds, ratio = ours/hipblas):
+        #   M=112  bn128/ns1 86.56/86.72  bn96/ns2 87.84   -> bn128 by 1.4%
+        #   M=128  bn128/ns1 88.64/88.96  bn96/ns2 87.52/87.84 -> bn96 by 1.3%
+        # (M=128 has zero padding, so the extra blocks do pay).  Both arms
+        # bit-exact (rel=0).  qkv M=128 1.178 -> 1.153 as a result -- still the
+        # one losing cell: winning it needs issued bytes < hipblas's 78.9MB,
+        # i.e. bn >= 190, which is not an MLS tile, and split-K (the only other
+        # block-count lever) is closed on correctness.
+        if M > 112:
+            return _validate_cfg(DecodeCfg(128, 96, 128, 2, 512, 1), M, N, K)
         return _validate_cfg(DecodeCfg(128, 128, 128, 1, 512, 0), M, N, K)
 
     if N >= 10240:
@@ -194,7 +285,7 @@ def decode_cfg(M, N, K):
         # anyway). So it is a property of this one grid shape, written as the one
         # measured point rather than extrapolated. K % 128 keeps the fallback's
         # silent-OOB guard intact for shapes this was never measured on. See the
-        # 2026-10-17g section of docs/optimization/fp8_decode_m_le_128.md.
+        # 2026-10-17g section of docs/optimization/fp8_decode_gemm.md.
         if bm == 32 and N <= 10240 and K % 128 == 0:
             return _validate_cfg(DecodeCfg(32, 32, 128, 1, 128, 1), M, N, K)
     else:
@@ -246,8 +337,11 @@ _UNROLL_TILES = {
     (16, 96, 256, 2, 192): 8,      # o/down, M <= 16
     (32, 96, 256, 2, 192): 8,      # o/down, M in (16, 32]
     (64, 64, 128, 2, 256): 8,      # o/down, M in (32, 64]
-    (96, 96, 128, 2, 384): 6,      # o/down, M in (64, 96]
-    (128, 96, 128, 2, 512): 8,     # o/down, M in (96, 128]
+    (96, 96, 128, 2, 384): 8,      # o/down + qkv, M in (64, 96]
+    (128, 96, 128, 2, 512): 8,     # o/down M in (96,128]; qkv at M in (112,128]
+    (128, 128, 128, 2, 512): 8,    # gate_up, M in (96, 128]
+    (96, 128, 128, 2, 512): 8,     # gate_up, M in (64, 80]
+    (96, 128, 128, 2, 256): 8,     # gate_up, M in (80, 96]
     # Measured and NOT taken (2026-10-21, paired): at M=128 bn128/40 blocks
     # 71.0/214.7us, bn64/80 blocks 104.0us, bn80 -- illegal MLS tile, t1024
     # 88.5us, bm112 90.6us (2 blocks/row group instead of a clean warp split);
@@ -265,7 +359,7 @@ def _cp_async_wait(n):
     T.evaluate(T.call_extern("handle", "tl::cp_async_wait<%d>" % n))
 
 
-def fp8_mls_channelwise(
+def fp8_channelwise_gemm(
     M,
     N,
     K,
@@ -376,9 +470,14 @@ def fp8_mls_channelwise(
     # exact (rel == 0.0) on all four decode shapes at M in {1,16,32}, because
     # 16x96x256 packs to 4096 B/tile after the dense-packing fix, so the stage
     # stride is the packed size.  bm16/bn16/ns2 remains NaN and stays blocked.
+    # bm96/bn128/bk128/ns2 is the gate_up M in (64,96] tile (2026-10-21).  Checked
+    # against the fp32 reference at M = 65/72/80/88/96 with t512 and t256 (10
+    # kernels, every one rel = 0): the stage stride depends on (bm,bn,bk) and the
+    # A copy extent on M, so both were swept before this tile was admitted.
     _wide_exact = (block_N == 96 and block_K == 256 and num_stages <= 2) or (
         block_N == 96 and block_K == 128 and block_M >= 64 and num_stages <= 2) or (
-        block_M == 128 and block_N == 128 and block_K == 128 and num_stages <= 2)
+        block_M == 128 and block_N == 128 and block_K == 128 and num_stages <= 2) or (
+        block_M == 96 and block_N == 128 and block_K == 128 and num_stages <= 2)
     assert num_stages <= 1 or (block_M, block_N) == (64, 64) or _wide_exact or _ns_escape, (
         f"num_stages={num_stages} is only tuned for block_M=block_N=64 on HCU "
         f"(got block_M={block_M}, block_N={block_N}); multi-stage small tiles are correct "
@@ -514,13 +613,13 @@ def _validate_and_bench(size=8192):
     sa = torch.rand(size, device="cuda") + 0.5
     sb = torch.rand(size, device="cuda") + 0.5
 
-    kern = fp8_mls_channelwise(size, size, size)  # 256x256x64 ns1 t512
+    kern = fp8_channelwise_gemm(size, size, size)  # 256x256x64 ns1 t512
     C = kern(A, B, sa, sb)
     ref = _ref(A, B, sa, sb)
     rel = (C - ref).abs().max().item() / ref.abs().max().item()
     lat = do_bench_cudagraph(lambda: kern(A, B, sa, sb))
     tf = 2.0 * size * size * size / lat * 1e-9
-    print(f"fp8_mls_channelwise {size}^3 (256x256x64 ns1 t512): "
+    print(f"fp8_channelwise_gemm {size}^3 (256x256x64 ns1 t512): "
           f"{tf:.1f} TFLOPS, rel={rel:.6f}, {lat * 1e3:.1f} us")
     assert rel < 1e-3, f"rel error {rel} too large"
     return tf, rel

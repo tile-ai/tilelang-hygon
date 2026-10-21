@@ -5,14 +5,14 @@
 Bandwidth-utilization sweep over the qwen3-32B per-token GEMM shapes
 (gate_up 51200x5120, down 5120x25600, qkv 10240x5120, o 5120x8192). The tile
 config now comes from the shape-aware `decode_cfg(M, N, K)` in
-`perf/gemm/fp8_channelwise_mls.py` — it used to take only M, which is why
+`tilelang/hcu/op/gemm/gemm_fp8_channelwise.py` — it used to take only M, which is why
 o/down (both N=5120) lost at every M. Reports effective bandwidth vs the
 1800 GB/s nominal peak.
 
 NOTE this prints our absolute times only, one kernel per M. It is not a
 head-to-head: the hipblas ratio has to be measured paired in the same process,
 and with only two graphs resident — a process holding many candidate graphs
-inflates `torch._scaled_mm` by ~17%. See `docs/optimization/fp8_decode_m_le_128.md`.
+inflates `torch._scaled_mm` by ~17%. See `docs/optimization/fp8_decode_gemm.md`.
 
 NOTE on timing (2026-10-13): this stack's `do_bench_cudagraph` returns
 **milliseconds** and divides n_repeat out of a single unrolled-graph replay,
@@ -32,7 +32,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import torch
-from perf.gemm.fp8_channelwise_mls import DecodeCfg, decode_cfg, fp8_mls_channelwise
+from tilelang.hcu.op.gemm.gemm_fp8_channelwise import DecodeCfg, decode_cfg, fp8_channelwise_gemm
 
 PEAK = 1800.0  # GB/s, HCU gfx938 HBM
 
@@ -83,7 +83,7 @@ def bench(name, N, K, M, bm=None, bn=None, bk=None, ns=None, t=None, sp=None):
     if bm is not None:  # explicit override wins over the chooser
         cfg = DecodeCfg(bm, bn, bk, ns, t, sp, cfg.split_k)
     assert cfg.split_k == 1, f"{name} M={M}: split_k={cfg.split_k} needs the split-K builder"
-    kern = fp8_mls_channelwise(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
+    kern = fp8_channelwise_gemm(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
                                cfg.num_stages, cfg.threads, setprio=cfg.setprio)
     C = kern(A, B, sa, sb)
     rel = (C - ref).abs().max().item() / ref.abs().max().item()
