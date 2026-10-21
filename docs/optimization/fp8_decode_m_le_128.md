@@ -16,9 +16,13 @@ effective bandwidth.
 **Current shipped config** (`decode_cfg`, `perf/gemm/fp8_channelwise_mls.py`):
 N=5120 (`o`/`down`) at M ≤ 32 → `bn96 / bk256 / ns2 / t192` with `setprio=1`;
 `qkv` (N=10240) and `gate_up` (N=51200) keep `bn32` (the `qkv` M=32 point is
-`bn32 / bk128 / t128`). M=64 and M=128 are unchanged (their earlier returns).
-See [2026-10-20](#2026-10-20), [2026-10-20b](#2026-10-20b) and
-[2026-10-20c](#2026-10-20c) below.
+`bn32 / bk128 / t128`). M=64 → `bm64 / bn64 / bk128 / ns2 / t256`;
+M in (64,128] → `bn96 / bk128 / ns2` with `bm96 / t384` up to M=96 and
+`bm128 / t512` above it (see [2026-10-20e](#2026-10-20e) — this is new: M=96 had
+no entry and M≤128 was losing 1.8-2.3×).
+See [2026-10-20](#2026-10-20), [2026-10-20b](#2026-10-20b),
+[2026-10-20c](#2026-10-20c), [2026-10-20d](#2026-10-20d) and
+[2026-10-20e](#2026-10-20e) below.
 
 **Current standing** (paired same-process, idle card, `rel=0`; ratio =
 ours/hipblas, **< 1 is a win**):
@@ -43,6 +47,8 @@ card, `rel = 0`); lower is better.
 | 3 | **Dense MLS packing.** A 16×256 fp8-trans dst tile is exactly 4096 B, but the 4K-slot accounting charged 4096 (slot) + 2×1024 (payload) = 6144 B — 50% dead padding. `MlsPackedTileBytes` now returns −1 (default allocation) whenever the dense size is a whole number of slots. | 6144 → 4096 B per block-stage | `src/hcu/op/mls.cc` ([2026-10-20](#2026-10-20)) |
 | 4 | **Fat tile** `bn96/bk256/ns2` for N=5120 — the widest tile that still fits two stages in one CU (`2·(16+96)·256 = 57344 ≤ 65536`). | 0.947/0.940/0.943 on o and 0.928/0.925/0.929 on down at M=1/16/32, vs the `bn16/t64` incumbent | `decode_cfg` ([2026-10-20](#2026-10-20)) |
 | 5 | **Warp count 6 → 3** (t384 → t192) at bn96. A's k-loop loads carry no warp-id term, so A is re-read once per warp (N/16 warp-loads, an invariant of the tiling); three warps is the measured optimum of the U. | 0.952–0.962 vs t384 | `decode_cfg` ([2026-10-20b](#2026-10-20b)) |
+| 6 | **Unrolled k-loop** (`k_unroll`, U6/U8). `T.Pipelined` addresses the shared stage symbolically, and `(k+d) % 3` lowers to `v_mul_lo_u16`/`v_sub_u16`/**`v_readfirstlane_b32`** on the `matrix_load` address path — 13% of the kernel. Unrolling makes every stage index a constant and lets the next step's address hoist above the MMA. | down/o M=96 **195.8 → 155.2** / **71.4 → 58.7 µs** (0.79/0.82× of the pipelined loop); M=64 **160.3 → 127.0** / **57.0 → 49.6** (0.925×/0.951× hipblas, was 1.164/1.099); worth 2-3% down to M=1 | `fp8_mls_channelwise(k_unroll=…)` ([2026-10-21](#2026-10-21-d10x)) |
+| 7 | **M>96 tile back to bn96**, now with t512 and U8. 54 blocks of 64 CUs hide the per-step `cp_async` wait better than 40, enough to pay 17% more bytes. | down M=128 **214.7 → 182.2 µs**, o M=128 **71.0 → 67.8** (0.849/0.955×; 1.02× hipblas, was 1.20) | `decode_cfg` ([2026-10-21](#2026-10-21-d10x)) |
 
 Net movement (ratio ours/hipblas; `—` = not measured at that stage):
 
@@ -59,6 +65,16 @@ The last column is a fresh re-measurement after the 2026-10-20c de-replication
 attempt was reverted, so 10-20b → final is run-to-run noise (~1%), not a change.
 Reading the `down` row: 27% behind at M=1, now **7.2% ahead** at M=32; `o` M=1
 went from 18.8% behind to 6.9%.
+
+The band the chooser had never won, M in (64,128] (2026-10-21, per-M, paired):
+
+| shape | M=65 | M=80 | M=96 | M=112 | M=128 |
+|---|---|---|---|---|---|
+| o | **0.941** | **0.939** | **0.937** | 0.995 | 1.047 |
+| down | **0.882** | **0.891** | **0.887** | 1.056 | 1.002 |
+
+Before this round the same cells were 1.12-1.23× (pipelined loop) and
+1.25-1.29× (2026-10-20e).
 
 ### The four mechanisms worth remembering
 
@@ -77,6 +93,12 @@ went from 18.8% behind to 6.9%.
 4. **The real DRAM read ceiling is 1725 GB/s, not 2016.** The earlier 2016 figure
    was a timing artifact; against 1725 the MLS B-stream is already at 97.5%, so
    the residual gap is exposed latency, not bandwidth. ([2026-10-18b](#2026-10-18b))
+5. **Every loop construct that is not a constant is paid on the load-address
+   path.** A `(k+d) % 3` shared-stage index costs 13% of the kernel
+   (`v_readfirstlane_b32` serialises the wavefront), and the fix is unrolling the
+   loop, not raising the stage count. Corollary: the `cp_async` counter is a FIFO,
+   so "cover B two steps ahead" is inexpressible — the wait that would do it also
+   forces A(k+2). ([2026-10-21](#2026-10-21-d10x))
 
 <a id="closed-levers"></a>
 ## Closed levers — index
@@ -101,7 +123,8 @@ untried; do not re-open any of these without new evidence.
 | **A-direct-to-VGPR / `r_mls`** | A must round-trip through LDS: `r_mls` is **1.935×/2.592×** slower (o/down M=16), and the MMA fragment wants 8 consecutive K at one row, a 5120-byte lane stride. | [2026-10-18c](#2026-10-18c) |
 | **Block-count inflation / occupancy** | More blocks at constant bytes is worse, and **320 blocks is the best point** on both curves; the ~8× blocks that reach the ~0.98× o M=1 bound cannot be supplied, and 320 is exactly 5/CU against an 8-slot LDS residency limit. | [2026-10-17f](#2026-10-17f), [2026-10-19](#2026-10-19-lds) |
 | **Independent accumulator chains** | Splitting the single 16×16 chain is **1.539/1.524/1.644/1.641×** slower (o M=1/16, down M=1/16); a second accumulator over the same tile is neutral (**1.012/1.008/1.014/1.013×**). | [2026-10-17i](#2026-10-17i), [2026-10-18b](#2026-10-18b) |
-| **Hand-written double buffering** | Correct (rel 0.00000) but **1.26-1.70× slower**; the pipelined form is genuinely slower at this tile. | [2026-10-17h](#2026-10-17h) |
+| **Hand-written double buffering** | Correct (rel 0.00000) but **1.26-1.70× slower** with a symbolic stage index; the shipped `T.Pipelined` loop already emits the same two barriers. **The lever was the modulo, not the scaffolding**: unrolled so the index is constant, the same hand-written body is **0.79-0.82×** of the pipelined loop. | [2026-10-17h](#2026-10-17h), [2026-10-21](#2026-10-21-d10x) |
+| **Deeper cover (B two steps ahead, `ns>2`, split depth)** | **174.56 vs 155.20 µs** re-measured with the modulo removed, so the earlier result was not an artefact of stage-index arithmetic; `A3B2` 156.00, and an `A2B3` arm addressed `%2` (footprint isolated) 155.68. The `cp_async` counter is FIFO: a wait that covers B(k+1) also forces A(k+2), so B can never lead by more than one step. Footprint alone is free up to 65536 B. | [2026-10-21](#2026-10-21-d10x), [2026-10-20g](#2026-10-20g) |
 | **Tile widening** | Monotonically catastrophic in the early sweep (`bn64/128/256`), and `bn32` alone is **7-12% worse** at every (shape, M). At M=64 the whole neighbourhood loses to the shipped `bn64/bk128/ns2/t256`: depth (`ns3`/`ns4`) and width (`bn96`/`128`/`192`) are 1.13-1.87×, and the exactly-64-block `bn80` is 1.177×. | [2026-10-17f](#2026-10-17f), [2026-10-18d](#2026-10-18d), [2026-10-20d](#2026-10-20d) |
 | **Wave quantization (M=64)** | 80 blocks on 64 CUs is real but not the cost: the perfectly balanced 64-block point is *slower* (bn80 1.177×; N=4096 the slowest of 64/80/96/128), and the N-ladder is confounded by total bytes. No grid-shape knob exists to test co-residency cleanly. | [2026-10-20d](#2026-10-20d) |
 | **`k_pack=2`, `b_ds_read_alt=0`, `respect_layout_map`** | Hard-rejected by the MLS path / unsupported (only Alt1 exists) / exact no-ops respectively. | [2026-10-17h](#2026-10-17h) |
@@ -146,6 +169,12 @@ subsections are indented.
   - [2026-10-20b — warp count, not A traffic](#2026-10-20b)
   - [2026-10-20c — producer A de-replication CLOSED](#2026-10-20c)
   - [2026-10-20d — M=64 tile neighbourhood CLOSED](#2026-10-20d)
+  - [2026-10-20e — M in (64,128]: the band's tile](#2026-10-20e)
+  - [2026-10-20f — the (64,128] band decomposed: stream vs chain](#2026-10-20f)
+  - [2026-10-20g — the residual is a per-step fixed cost](#2026-10-20g)
+  - [2026-10-20i — the M>96 tile moves to bn128](#2026-10-20i)
+  - [2026-10-20j — o's "21% slower producer" is amortisation](#2026-10-20j)
+- [2026-10-21 — the unrolled k-loop; the M>96 tile reverses to bn96](#2026-10-21-d10x)
 
 <a id="setup"></a>
 ## The setup
@@ -1121,8 +1150,11 @@ The remaining gaps, honestly:
 - **o/down M≤32 (1.08-1.27×):** B-stream-bound at ~1300-1500 GB/s vs hipblas's
   1543-1670. Closed on every lever tried (above). Not a block-count, tile,
   pipelining or epilogue problem.
-- **M=128 (1.83× o / 2.23× down, 1.15× qkv):** only 40 blocks at bn128 on N=5120,
-  and `bn` cannot shrink without shrinking the grid further. Not addressed.
+- **M=128 (1.83× o / 2.23× down, 1.15× qkv):** only 40 blocks at bn128 on N=5120.
+  ~~and `bn` cannot shrink without shrinking the grid further. Not addressed.~~
+  **Superseded 2026-10-20e — see the section of that name: bn96 shrinks `bn` and
+  *raises* the block count to 54, which is the whole fix (now 1.26× o / 1.30×
+  down, and M=96 got its own bm96 tile at 1.14× / 1.12×).**
 - **qkv M≥32 (1.05-1.15×):** 320 blocks at bn32; the M=32 thread fix does not
   apply (it already uses t=256) and `bm32/bn32/t256` is the measured best of its
   neighbourhood.
@@ -2880,3 +2912,727 @@ mmac volume, and it is not hidden behind the B stream. At 47% of the read
 ceiling and ~24% of fp8 peak (104 TFLOPS on down), M=64 is neither
 bandwidth- nor compute-bound: it is the same exposure/overlap deficit recorded
 at M≤16, no longer covered by B.
+
+<a id="2026-10-20e"></a>
+## 2026-10-20e — M in (64,128]: three defects, one tile change, 1.7x (and the prefetch note this band falsifies)
+
+Landed in `decode_cfg` (`perf/gemm/fp8_channelwise_mls.py`). Before this, M=96
+had **no entry at all** — it silently inherited the M=128 return — and M up to
+128 was served by one tile (`bm128/bn128/bk128/ns1/t512`, 40 blocks).
+
+### What hipblas does here (native `.s`, `/workspace/misc`)
+
+`MT96x128x256_TT6_4_WG16_32_1_MFWGS768` serves **both M=96 and M=128**. Its
+MacroTile0 (the 5120 axis = our N) is **96**, so its grid is
+`ceildiv(5120,96) = 54` blocks, and MacroTile1 = 128 covers M=96 with 32 padded
+rows. That single fact is the whole diagnosis: 96 is a legal N macro-tile, and
+it is what gives hipblas 54 blocks out of 64 CUs.
+
+### The three defects in our old tile
+
+1. **`bn128` → 40 blocks on 64 CUs: 24 CUs idle.** Bytes model
+   `total = N·K (weights) + blocks·bm·K (activations)`: at M=128/down, bn128
+   moves 262 MB, bn96 moves 308 MB (+17%) for +35% occupancy — and bn96 wins.
+   Occupancy is worth more than the bytes here.
+2. **`ns=1` is serialized.** Emitted CUDA at bn96/bk128/ns1 is
+   `[load k][commit][cp_async_wait<0>][__syncthreads][ds_read+mmac]` — wait-all
+   with nothing in flight. At ns=2 it is
+   `[issue A/B(k+1)][commit][cp_async_wait<1>][__syncthreads][ds_read+24 mmac]`,
+   i.e. loads issued *before* the compute with one group outstanding. Measured
+   cost of the difference at M=128/down (both sp=0): bn96/ns1 **1.85×** vs
+   bn96/ns2 **1.37×**.
+3. **M=96 paid 32/128 padded MMA rows.** `bm96` is a legal MLS tile (6 atoms,
+   `kMlsTileConfigsB8Trans`), and at the same 54 blocks it is 1.71× faster than
+   bm128 on M=96. Padded-M boundary measured: M=65 → bm96 1.115, M=80 → bm96
+   1.129, M=112 → bm128 1.337 — the switch is at 96.
+
+### Landed
+
+```python
+N == 5120 and K % 128 == 0:            # o, down
+    M <= 96 -> bm96 /bn96/bk128/ns2/t384/sp1
+    else    -> bm128/bn96/bk128/ns2/t512/sp1
+```
+LDS is 57344 B and 61440 B respectively, so one block per CU either way (the
+2026-10-19 capacity invariant is not touched). Non-5120 shapes are unchanged —
+qkv/gate_up already win and keep `bm128/bn128/bk128/ns1/t512` for M>64.
+
+Measured 2026-10-20, paired, same process, CUDA-graph replay, 7 rounds, idle
+card, min-of-rounds, ratio = ours/hipblas:
+
+| | old tile | landed | hipblas µs |
+|---|---|---|---|
+| down M=128 | 2.287 (405.1 µs) | **1.297** (229.9 µs) | 177.0 |
+| down M=96 | 1.991 | **1.121** | 175.0 |
+| o M=128 | 1.825 | **1.262** | 64.8 |
+| o M=96 | 1.865 | **1.137** | 63.1 |
+
+`setprio=1` is +3.5% at M=128 (1.342 → 1.297) and +2.5% at M=96 (1.150 →
+1.121) — it matters here, unlike at bn16. All arms `rel < 1e-3` vs the fp32
+reference at M = 65/80/96/112/128 on both shapes; the in-tree bench
+(`perf/gemm/fp8_channelwise_decode_bench.py`, M list extended to 65/80/96/112)
+prints `rel=0.00000` for every cell.
+
+### This band falsifies the "prefetch distance is ZERO" claim — scope it to M≤32
+
+The 2026-10-18 note ("our ISA puts `s_waitcnt vmcnt(0)` first and the 4
+matrix_load last") is true for the bn16/ns1 and bn96/bk256/ns2 M≤32 path that
+produced it, **but not for this tile**. Here ns=2 emits `cp_async_wait<1>` with
+the k+1 loads already issued ahead of the compute (dumped source:
+`update_k_base → __syncthreads → A(k+1) → B(k+1) → commit → wait<1> →
+__syncthreads → ds_read → promote_prio → 24 mmac`). One full body of prefetch
+cover. So the depth lever is *already spent* at ns=2 in this band: ns=1 is the
+serialized one, and it is 1.35× worse. Do not re-open "add prefetch depth" here.
+
+### M=64 is unchanged and still a local optimum
+
+`bm64/bn64/bk128/ns2/t256/sp1` = 1.181 (down) / 1.096 (o), re-measured inside
+the M-band process and consistent with the [2026-10-20d](#2026-10-20d) record
+(1.178 / 1.083); the neighbourhood table, the `bn80` expressibility result and
+the wave-quantization falsification all live there and are not restated here.
+
+### The honest residual
+
+Total moved bytes (weights + 54 blocks of re-read activations) and achieved rate:
+
+| | bytes | ours | hipblas | ours GB/s | hipblas GB/s |
+|---|---|---|---|---|---|
+| down M=128 | 308 MB | 229.9 µs | 177.0 µs | 1342 | 1741 |
+| down M=96 | 264 MB* | 196.2 µs | 175.0 µs | 1345 | 1760 |
+| o M=128 | 98.6 MB | 81.8 µs | 64.8 µs | 1205 | 1522 |
+
+\* bm96: `131.07 + 54·96·25600`. hipblas's M=96 arm moves the M=128 byte count
+(MT1=128 covers it), so its rate is the same 1741-1760.
+
+So the geometry is now right and the remaining loss is a **per-CU streaming-rate
+deficit**: 1342 vs 1741 GB/s at the same 54 blocks, i.e. 24.9 vs 32.2 GB/s per
+resident block on a 64-CU part with 54 of them busy. Its one visible structural difference is that hipblas runs at 768 threads =
+**8 consumer + 4 dedicated producer waves** (`(MT1/16 + 4)·64`), so the loads
+issue continuously from their own instruction streams, while our 8 warps each
+serialize load-issue and MMA in one stream — the same exposure/overlap deficit
+recorded at M≤16, now at a different operating point. Every config lever
+measured *in this band* is closed: t768, bk64/ns4, bk256/ns1, bn128/ns2, bn64,
+bn96/ns1 all lose to the landed arms.
+
+<a id="2026-10-20f"></a>
+## 2026-10-20f — the (64,128] band decomposed: the stream already beats hipblas, the loss is unoverlapped compute
+
+All numbers below are paired same-process on an idle card (HCU 0%), CUDA-graph
+replay, 7 rounds, min-of-rounds, `down M=128` unless stated. The harness carries
+~10.3 µs of event-pair overhead in *every* arm including hipblas, so only ratios
+and differences are read, never absolutes across processes.
+
+### The decomposition (the point of this round)
+
+Three arms on the identically-shaped tile `bm128/bn96/bk128/ns2/t512/sp1`:
+
+| arm | what it isolates | µs | /hipblas | /base |
+|---|---|---|---|---|
+| base (loads + MMA in the pipelined loop) | everything | 229.8 | 1.299 | 1.000 |
+| **stream** — `T.gemm` moved after the loop (anti-DCE), copies kept | the MLS copy stream alone | **167.2** | **0.945** | 0.728 |
+| **chain** — both copies hoisted out of the loop | the consume chain alone (LDS read + mmac + barriers) | **109.8** | **0.620** | 0.478 |
+
+Both are value-wrong by construction (ungated), but they are exact mechanisms:
+`chain` moves ~no DRAM and `stream` does no MMA. Reading:
+
+- **The pure copy stream is already faster than hipblas's entire kernel**
+  (167.2 vs 177.0 µs). The B-stream/tile/geometry side is *not* the problem.
+- The chain runs at **305 TFLOPS = 84% of the 54-CU-usable fp8 MMA peak**
+  (33.55 GFLOP / 109.8 µs; 432 TFLOPS × 54/64 = 364). Compute is irreducible.
+- Additive would be 277.0 µs; measured 229.8 ⇒ only **~43% of the chain is
+  hidden** behind the stream (62.6 µs exposed). With perfect overlap this tile
+  lands at ≤167 µs, i.e. a 0.945× **win**. The entire residual is that the
+  consumer's transposing LDS read + mmac does not overlap the producer's MLS
+  issue — precisely the "one instruction stream" defect named in 2026-10-20e.
+
+Chain cost model from the bk128/bk64 pair: `chain ≈ steps·(f + c·bk)` with
+`f ≈ 0.057 µs` per step and `c ≈ 0.00384 µs` per k-unit (bk128 → 0.549 µs/step,
+200 steps → 109.8 µs). `f` is small, so the chain is proportional to K, not to
+step count — fewer/ fatter steps cannot buy anything.
+
+### Why more overcover is unreachable (both routes measured closed)
+
+Overlap needs ≥2 steps of prefetch cover on the B stream. At `(bm+bn)=224`,
+`bk=128`, the LDS budget (65536 B) caps `ns` at **2** — one step of cover.
+
+1. **More stages at smaller bk is arithmetically punished.** The fp8-trans MLS
+   dst tile is packed densely at 2048 B per (16,128), but a (16,64) tile's
+   1024 B payload still occupies a 4096 B slot ⇒ **4× LDS waste**. So the two
+   LDS-legal deeper points lose exactly as that predicts: `bk64/ns3` **1.509×**,
+   `bk64/ns4` **1.427×** (base 1.000).
+2. **Split depth (B deep, A shallow) is planner-blocked.**
+   `order=[0,1,2], stage=[2,0,2]` (A 1 buffer 16384 + B 3 × 12288 = 53248) is
+   the encoding that would fit; it fails to build at
+   `src/transform/inject_pipeline.cc:2584` — *a consumer may not read buffers
+   produced at two different async stages* ("A dependency on multiple async
+   stages is not supported"). Both copies must sit at the same stage, hence get
+   the same buffer count, hence `ns=3` everywhere ⇒ 86016 B > 65536 B. Not an
+   annotation mistake; structurally inexpressible.
+3. **Shrinking `bm` to buy stages doubles the weight stream.** `bm<M` splits M
+   and re-reads B once per M-block (`total = N·K·M/bm + …`), so it is fatal
+   regardless of how much depth it buys: `bm64/bn96/bk128/ns3/t256` **1.491×**,
+   `bm32/bn96/bk128/ns3/t256` **2.582×**, `bm16/bn96/bk128/ns4` does not even
+   build (`m_warp·n_warp·k_warp != num_warps`). At M=128 `bm=128` is forced.
+
+So the residual's two terms — a 803 GB/s stream and 57% unoverlapped compute —
+trace to one cause: **cover is paid in LDS, and the budget is spent**. hipblas
+pays it in VGPRs (its M=16 loop is 7 rolling `buffer_load_dwordx4`), which is
+free — and that door is closed for us by the mmac layout (B-direct-VGPR measured
+2.5-3.2× slower at every M; rolling window built bit-exact and 5-8% slower
+in-kernel).
+
+### The rest of the neighbourhood is closed too (this band, paired)
+
+| arm | ratio/base | reading |
+|---|---|---|
+| **D1** — A's tile index forced to `(k&1)` (A ~L2-only) | 1.019 | A's DRAM/L2 **footprint** costs nothing; note this keeps the same request instructions and bytes, so it only falsifies "A's footprint", not "the request path" |
+| `bm128/bn96/bk128/ns2/t256` (only the barrier narrows) | 1.017 | barrier width is not a lever |
+| `bm128/bn32/bk128/ns3/t256` | 1.960 | fewer bytes/CU, more blocks: loses on A amplification + waves |
+| `bm128/bn32/bk64/ns2/t256` | 2.006 | same, plus the 4× slot waste |
+| `bm128/bn96/bk256/ns1/t512` (half the steps) | 1.281 | ns=1 serializes; step count is not the cost |
+| `bm128/bn96/bk128/ns2/t768` (12 warps) | 1.490 | more warps per block loses |
+| `bm64/bn64/bk128/ns2/t256` (160 blk, 2/CU) | 1.491 | B re-read over 2 M-blocks |
+
+Combined with 2026-10-20e, every knob in the shipped builder — `bn`, `bm`,
+`bk`, `ns`, `threads`, `setprio`, `k_pack`, `warp_k`, co-residency, grid shape,
+split-K, A's replication/footprint — is now measured closed **at this band**.
+`down M=128` sits at 1.29× hipblas and `o M=128` at 1.26×; the gap is the
+LDS-priced prefetch depth, and no config change moves it.
+
+**Do not re-open** `down`/`o` at M in (64,128] on: prefetch depth (LDS-capped at
+ns=2 with a 4× slot tax on the alternative), split-depth (planner), bm<M (B
+re-read), or "the copy stream is too slow" (it is 0.945× hipblas on its own).
+
+## 2026-10-20g — the residual is a per-step *fixed* cost, and the step count is LDS-blocked
+
+Prompted by the observation "each half wins alone, together it loses" — so this
+round attacked the *overlap*, not the bytes. Every arm is paired same-process,
+CUDA-graph replay, 7 rounds, min-of-rounds, `down M=128`, idle card, hipblas
+176.3-181.6 µs drifting between invocations (ratios only).
+
+### 1. Where the issue sits, and the MMA priority, are both null
+
+| arm (identical tile, only the pipeline `order`/`stage` map changes) | /base |
+|---|---|
+| `ovlN1` — B copy issued before A | 1.002 |
+| `ovlG_` — gemm, then A, B | 1.338 |
+| `ovlGB` — gemm, B, A | 1.485 |
+| `ovlB_` — B, gemm, A | 1.478 |
+| `sp0` / `sp2` / `sp3` (`setprio`) | 1.036 / 1.000 / 1.001 |
+
+Reordering the body so the MMA precedes the copies is *strictly worse*: with only
+one step of cover the issue order is the only thing keeping the stream alive, so
+moving the MMA in front of it serializes. `setprio > 1` is an exact no-op (sp1 is
+already the top level this ISA honours). Neither is the lever.
+
+### 2. It is not memory latency either (D2 closes it)
+
+The symmetric diagnostic to D1: force **B**'s tile index to `(k&1)`, leaving the
+same request instructions and the same bytes on the wire but serving them from a
+2-tile L2 footprint instead of DRAM.
+
+| arm | /base | reading |
+|---|---|---|
+| D1 — A@`(k&1)` | 1.018 | A's footprint: free (as in 2026-10-20f) |
+| **D2 — B@`(k&1)` (latency only)** | **1.007** | exposing B's *DRAM latency* is not the cost |
+| D12 — both | 1.006 | same |
+
+229.8 - 167.2 = 62.6 µs of exposure survives when the entire DRAM latency of the
+B stream is removed. So the exposure is **not** "the consumer is waiting on a
+miss", which is what the "more cover" hypothesis (2026-10-20f) had assumed.
+
+### 3. It is a per-step fixed cost, and one barrier is 0.219 µs of it
+
+`chain` = copies hoisted out of the loop (pure LDS-read + mmac); `chainb` /
+`chainb2` insert one / two block-wide `T.sync_threads()` per step, which is what
+the real pipeline body carries. The difference *is* the barrier cost:
+
+| arm | steps | µs | /base | Δ vs `chain` |
+|---|---|---|---|---|
+| chain, bk128 | 200 | 109.76 | 0.478 | — |
+| chainb, bk128 | 200 | 153.60 | 0.669 | +43.84 ⇒ **0.219 µs/step** |
+| chainb2, bk128 | 200 | 156.00 | 0.679 | +2.40 (2nd barrier ~free) |
+| chain, bk256 | 100 | 113.60 | 0.494 | — |
+| chainb, bk256 | 100 | 135.52 | 0.590 | +21.92 ⇒ 0.219 µs/step |
+| chain, bk64 | 400 | 121.28 | 0.528 | — |
+| chainb, bk64 | 400 | 170.72 | 0.966 | +49.44 ⇒ 0.124 µs/step |
+
+The barrier is **per step, not per byte** (21.9 µs at bk256 vs 43.8 at bk128 over
+the same total bytes). The bk64 point is lower per step but confounded by 4
+blocks/CU and shorter steps; the bk128/bk256 pair is the clean measurement.
+
+Fitting the full kernel over the two same-LDS points (base bk128 229.76/200 =
+1.1488, `bk64/ns4` 325.12/400 = 0.8128) gives
+**`cost/step = F + v·bk`, F ≈ 0.477 µs, v ≈ 0.00525 µs/k-unit.**
+The fixed term is `0.477 × 200 ≈ 95 µs` — of which one barrier is ~44 µs. That
+single number *is* the 52 µs gap to hipblas.
+
+So depth at constant bytes is worthless (`bk64/ns2` 1.466, `ns3` 1.500, `ns4`
+1.416 — all ≈ 0.81-0.86 µs/step, the depth ladder is flat) and the only knob left
+is the **step count**: halving it to 100 removes ~48 µs, i.e. the entire gap.
+
+### 4. The step count cannot be halved — measured, not argued
+
+`bk256/ns2` (100 steps, 2 buffers) and `bk128/ns3` were built and launched
+anyway, on the chance the arch allows a bigger per-workgroup carve-out:
+
+```
+bk256/ns2 114688B   BUILD-FAIL hipModuleLaunchKernel(...)
+bk128/ns3  86016B   BUILD-FAIL hipModuleLaunchKernel(...)
+```
+
+Hard wall at 65536 B/CU. And it is arithmetic, not bad luck: halving the step
+count needs `bk=256` at `ns=2`, whose budget `(128+bn)·512 ≤ 65536` requires
+**`bn ≤ 0`** — no legal `bn` exists at `bm=128`. The two tiles that *do* fit are
+both already measured and both lose: `bm128/bn32/bk128/ns3` (61440 B) is
+**1.960×** because narrowing `bn` to buy depth costs more than the depth buys,
+and `bm32/bn96/bk256/ns2` (65536 B exactly) re-reads the weight stream 4×
+(524 MB at 1725 GB/s ≈ 304 µs) — dead on the bytes side, exactly as 2026-10-20f
+measured for `bm<M`. There is no free axis: step count, depth and `bn` are one
+budget.
+
+### Verdict for this band
+
+The chain of facts is now closed end to end: (a) each half alone beats hipblas
+(stream 0.945×, chainb 0.865×); (b) together only ~37% of the possible overlap is
+realised; (c) that exposure is **not** issue placement (null), **not** MMA
+priority (null), **not** memory latency (D2 1.007); (d) it is a per-step fixed
+cost of ~0.48 µs, ~0.22 of which is the compiler-mandated post-`cp.async`
+`__syncthreads()` (`src/transform/thread_storage_sync.cc`), and the rest is
+per-step descriptor/issue overhead; (e) the only fix is fewer steps, which needs
+`bk=256` double-buffered = 114688 B against a 65536 B/CU cap.
+
+hipblas pays its depth in **VGPRs** (7 rolling `buffer_load_dwordx4`,
+`s_waitcnt vmcnt(6)`, one LDS buffer) so it can afford `k-tile 256` (100 steps).
+That is the same door this repo has already measured shut twice
+(B-direct-VGPR 2.5-3.2× slower, rolling window 5-8% slower in-kernel), and it is
+a C++/warp-specialization route that is out of scope by instruction.
+
+**Do not re-open** on: pipeline issue order, `setprio`, memory-latency
+attribution ("it is waiting on DRAM"), prefetch depth at constant bytes, or
+`bk256`+`ns2` (launch-infeasible at `bm=128`).
+
+## 2026-10-20i — the M in (96,128] tile moves to bn128: the byte minimum is reachable, and it pays
+
+Every arm here is paired same-process, CUDA-graph replay, 7 rounds, min-of-rounds,
+idle card 1. hipblas drifted between *invocations* (down M=128 172.5-178.7 µs,
+o M=112 63.2, qkv M=128 75.5), so only in-process ratios are quoted. This section
+supersedes the tile choice of 2026-10-20e for M > 96 only.
+
+### 1. The byte law, and why bn96 was leaving 15% on the table
+
+At `bm = M` (one M-block, which is what the decode path uses) B is read exactly
+once and A is re-read once per N-block:
+
+```
+A traffic = (N/bn) · M · K        B traffic = N · K
+total read = N · K · (M/bn + 1)
+```
+
+`bm` cancels out of A's term, so at fixed `M` the **only** byte lever is `bn`:
+
+| tile | blocks | A | B | total | vs bn96 |
+|---|---|---|---|---|---|
+| bm128 / bn96 | 54 | 177 MB | 131 MB | 308 MB | — |
+| **bm128 / bn128** | **40** | **131 MB** | **131 MB** | **262 MB** | **−15%** |
+
+`(128+128)·128·2 = 65536 B` — exactly the per-CU LDS cap, so `bm128/bn128/bk128/ns2`
+is the *widest legal* double-buffered `bk128` tile on this arch. It had never been
+built. The price is 40 blocks on 64 CUs instead of 54.
+
+### 2. It wins, at both endpoints and across the band
+
+`down` (N=5120, K=25600) and `o` (N=5120, K=8192), built through the shipped
+builder so the emitted kernel is the real one:
+
+| arm | down M=112 | down M=128 | o M=112 | o M=128 |
+|---|---|---|---|---|
+| old `bm128/bn96/bk128/ns2/t512` | 230.56 | 229.6-229.9 | 81.44 | 81.28-81.44 |
+| **new `bm128/bn128/bk128/ns2/t256`** | **222.56** | **223.68** | **79.36** | **79.36** |
+| ratio vs base | **0.965** | **0.973-0.974** | **0.974** | **0.974-0.976** |
+| ratio vs hipblas (new) | 1.290 | **1.252** | 1.256 | **1.256** |
+| ratio vs hipblas (old) | 1.337 | 1.285-1.288 | 1.289 | 1.267-1.289 |
+
+Both exact: `rel = 6.1e-8` (down) and `0` (o), against
+`A.float() @ B.float().T · sa · sb`.
+
+This is the first arm in the whole (64,128] campaign to **beat** the previous
+best; everything else in 2026-10-20e/f/g was a closure.
+
+### 3. It does not transfer to M ≤ 96, and that is the right threshold
+
+| arm (M=96, down) | µs | /hip |
+|---|---|---|
+| **shipped `bm96/bn96/bk128/ns2/t384`** | **196.00** | **1.109** |
+| `bm96/bn96/bk128/ns2/t256` | 196.64 | 1.113 |
+| `bm128/bn128/bk128/ns2/t256` | 221.76 | 1.255 |
+
+At M=96 the 128-row tile pads 25% of the MMA rows and the byte law still charges
+`M/bn`; `bm96/bn96` is also 54 blocks, so there is no CU cost to trade. So the
+chooser's 96/97 split is correct and stays.
+
+### 4. The decomposition at the new operating point, and a retraction
+
+`bn128/t256`, down M=128, with the `chain` / `chainb` / `chainb2` arms (copies
+hoisted, 0 / 1 / 2 barriers per step):
+
+```
+chain (pure LDS-read + mmac)      146.9
++ first barrier  (WAR, top of step) 32.0
++ second barrier (post-wait)         2.4     <-- 2026-10-20g's "44 us" is retracted
++ copy exposure                      42.5
+                                 = 223.8   (measured 223.68)
+```
+
+**Retraction of 2026-10-20g §3.** That section concluded "one barrier is ~44 µs
+… that single number *is* the gap". At the new tile the first barrier is 32.0 µs,
+but the *second* one — the one a hand-written single-barrier loop would remove —
+is worth **2.4 µs**, because it is adjacent to the first and every warp is already
+aligned. So the actionable form of that claim is false: restructuring the body to
+one barrier per step buys ~1%, not 44 µs. The 32 µs belongs to the WAR sync that
+protects buffer reuse, and it only shrinks with more buffers, which LDS forbids.
+
+The loads-only arm at this tile moves 262 MB in 134.4 µs = **1950 GB/s of request
+bandwidth** (A is L2-resident, B is the DRAM stream) — the producer is at the
+ceiling, and the remaining 42.5 µs is the fraction of it that one step of cover
+does not hide. The binding half has flipped: at bn96 bytes were binding
+(stream 166.9 > chain 109.8); at bn128 the chain (146.9) exceeds the stream
+(134.4). That is why the tile cannot be pushed further: 40 of 64 CUs is the
+compute floor at the byte minimum.
+
+### 5. Everything else at this tile is closed (measured, this round)
+
+| arm (down M=128 unless noted) | µs | /base |
+|---|---|---|
+| `bm128/bn128/bk128/ns2/t256` | 223.68 | 1.000 |
+| same + `setprio=3` | 223.36 | 0.999 (null) |
+| `t512` | 235.8 | 1.054 |
+| `t128` | 276.3 | 1.235 |
+| `t192` / `t320` / `t384` | BUILD-FAIL | `m_warp·n_warp·k_warp == num_warps` at a 128-wide tile |
+| `FullColK` (warp_k=4, `src/hcu/op/mls.cc:544`) | 242.08 | 1.083 |
+| `bk256/ns1` (100 steps) | 369.80 | 1.653 |
+| `bk64/ns3` / `bk64/ns4` | 473.3 / 463.5 | 2.12 / 2.07 |
+| `bm64/bn128/t256` (80 blocks, B read twice) | 337.60 | 1.510 |
+| `bm64/bn128/t512` | 410.40 | 1.835 |
+| `bn32/bk256/ns2` at bm128 | BUILD-FAIL | `(128+32)·256·2 = 81920 B > 65536` |
+
+`bk64` at this tile is the clearest confirmation of 2026-10-20g's per-step model
+taken to the extreme: 400 steps at *half* the bytes per step is 2.1× slower, i.e.
+per-step cost is not proportional to bytes and depth never pays.
+
+### 6. Side result: the `ns=1` fallback for wide-N is validated, not a hole
+
+M>96 at N≠5120 falls through to the never-benchmarked `bn128/bk128/ns1/t512`.
+`qkv` M=128 (N=10240):
+
+| arm | µs | /hip |
+|---|---|---|
+| **chooser `bn128/bk128/ns1/t512`** | **89.12** | **1.180** |
+| `bn128/bk128/ns2/t256` | 102.24 | 1.353 |
+| `bn128/bk128/ns2/t512` | 105.76 | 1.400 |
+| `bn64/bk128/ns2/t256` | 114.56 | 1.516 |
+
+80 blocks fit 2-per-CU at `ns=1` (32768 B), which is worth far more than the
+cross-step overlap `ns=2` would buy — the same trade that 2026-10-20f measured at
+`qkv` M=128. Left as-is.
+
+### 7. Landed
+
+- `decode_cfg` (`perf/gemm/fp8_channelwise_mls.py`): M in (96,128] at N=5120,
+  `K % 128 == 0` → `DecodeCfg(128, 128, 128, 2, 256, 1)`. M ≤ 96 keeps
+  `DecodeCfg(96, 96, 128, 2, 384, 1)`.
+- `_wide_exact` (both the validator and the builder's copy) admits
+  `bm128/bn128/bk128/ns <= 2`.
+- `testing/python/hcu/test_hcu_gemm_fp8_mls_channelwise.py`:
+  `test_m128_wide_tile_is_exact` (K=8192 and 25600, `rel < 1e-3` and finite) plus
+  the chooser pin in `test_decode_cfg_is_shape_aware`. Suite: 20 passed, 3
+  xfailed, 1 xpassed.
+
+**Do not re-open** at this band: warp count (`t512/t128` worse, everything else
+illegal), `FullColK`, `setprio`, `bk` in either direction, `bm < M`, or `bn`
+below 128 (bn96 is the old base; narrower is worse on bytes *and* blocks).
+
+### 8. The bytes-vs-blocks frontier is now sampled at five points, and bn128 is its minimum
+
+The byte law says the only knob at `bm = M` is `bn`, and it is monotone: every
+block you buy (smaller `bn`) costs A's re-read. Only two of the five legal
+multiples of 16 had ever been measured, and they tie — so the curve had never
+actually been located. Measured at `down M=128` (paired, same process, hipblas
+179.52 µs):
+
+| arm | blocks | bytes | µs | /hip | /base | GB/s |
+|---|---|---|---|---|---|---|
+| **bn128/t256 (shipped)** | 40 | 262 MB | **223.84** | **1.247** | **1.000** | 1171 |
+| bn80/t512 | 64 | 341 MB | 227.84 | 1.269 | 1.018 | 1496 |
+| bn112/t512 | 46 | 281 MB | 272.96 | 1.520 | 1.219 | 1029 |
+| bn96/t512 (old base) | 54 | 308 MB | 229.60 | 1.279 | 1.026 | 1342 |
+| bn112/t256, bn80/t256 | — | — | BUILD-FAIL | | | no valid trans MLS atom (`block_mn=112`/`80` at 4 warps) |
+
+`bn80` is the interesting one: it is **exactly 64 blocks**, one per CU, no wave
+remainder — the first point in this campaign that fills the chip at 1 blk/CU — and
+it reaches **1496 GB/s**, the highest achieved rate of any arm in this band (vs
+1171 at bn128). It still loses by 1.8%, because A's re-read costs 30% more bytes
+and the two effects are worth almost exactly the same. `bn112` loses on both
+counts (46 blocks *and* a 5-warp-equivalent warp partition).
+
+So the frontier is flat-topped at bn128 and there is no interior optimum to find:
+at 40 blocks we are byte-optimal; at 64 blocks we are bandwidth-optimal; the
+product is equal to within 2%.
+
+### 9. Why M ≥ 96 cannot reach hipblas under this producer — the occupancy pin
+
+Combining this with the earlier decomposition gives a closed argument.
+
+1. **M ≥ 96 requires `bm = M`** (a smaller `bm` re-reads the whole weight stream;
+   `bm64/bn128` at M=128 is 337.6 µs = 1.510×).
+2. **`ns = 2` is required** (`ns=1` serialises: `bk256/ns1` 369.8 µs). So the LDS
+   budget is `(bm+bn)·bk·2 ≤ 65536`, i.e. `bm+bn ≤ 256` at `bk=128`.
+3. **Two blocks per CU needs `(bm+bn)·bk·2 ≤ 32768`**, i.e. `bm+bn ≤ 128` — which
+   with `bm = M ≥ 96` leaves `bn ≤ 32`, and `bn32` at M=128 is a 160-block,
+   1.05 GB A-traffic arm (7-12% worse at every shape ever measured). **M ≥ 96 is
+   therefore pinned at one block per CU, by arithmetic.**
+4. At one block per CU the achieved rate is 1171-1496 GB/s against a 1725 GB/s
+   read ceiling, and hipblas — at the same 308 MB — achieves 1741 GB/s. The
+   difference is not bytes, not the CU count (54 vs 40 is worth ≈0, measured
+   twice), and not latency (D2) or issue order (ovl*): it is that hipblas's
+   producer runs concurrently with its MMA and ours realises 43% of the overlap.
+
+Within this producer the only escape is **three or more LDS stages**, which needs
+`(bm+bn)·bk·3 ≤ 65536` ⇒ `bm+bn ≤ 170` at `bk=128`; with `bm = 128` that is
+`bn ≤ 42`, a 122-block, 1.3 GB-traffic arm. Deep slack and the byte minimum are
+mutually exclusive at every tile — the same invariant recorded on 2026-10-19,
+now confirmed against a measured frontier rather than inferred from it.
+
+**Do not re-open** `bn ∈ {80, 112}` at M > 96, or any argument that a different
+block count fixes the overlap. The block count and the byte count are one number.
+
+## 2026-10-20j — the "o's producer is 21% slower than down's" anomaly is amortisation, and at M=1 the producer alone is the wall
+
+This closes the last open item in `handoff.md` §2. Same tile as shipped
+(`bm16/bn96/bk256/ns2/t192`), `stream` arm = MMA hoisted out of the loop so only
+the copy stream is timed, plus a `bk` ladder at constant total bytes. M=1, paired,
+7 rounds:
+
+| shape | arm | µs | /hipblas | per-step µs |
+|---|---|---|---|---|
+| o (K=8192) | full | 34.40 | 1.108 | 1.075 |
+| o | **stream bk256 (32 steps)** | **30.88** | **0.995** | 0.965 |
+| o | stream bk512 (16 steps) | 31.84 | 1.026 | 1.990 |
+| o | stream bk128 (64 steps) | 35.04 | 1.129 | 0.548 |
+| down (K=25600) | full | 87.68 | 1.118 | 0.877 |
+| down | **stream bk256 (100 steps)** | **82.08** | **1.047** | 0.821 |
+| down | stream bk512 (50 steps) | 83.52 | 1.065 | 1.670 |
+| down | stream bk128 (200 steps) | 115.68 | 1.476 | 0.578 |
+
+### 1. It is a fixed ~5-6 µs per launch, not a k-stride property
+
+Per-step time at a fixed `bk` is the same for o and down (0.821 vs 0.965 µs at
+bk256; the small difference is exactly the amortisation term). Fitting
+`t = steps·s + F` on the two shapes at bk256: `s ≈ 0.78 µs`, **`F ≈ 5-6 µs`**.
+o has 32 steps instead of 100, so the same fixed cost is 3.1× less amortised —
+that is the whole "21%". The rate gap closes when the step count is equalised:
+at bk128, o runs 0.578 µs/step and down 0.578 µs/step (identical), and the
+`N·K/t` deficit becomes purely `F`. **There is no o-specific producer defect**;
+the earlier 1387-vs-1679 GB/s contrast was a step-count contrast (note the
+`~10 µs` event-pair overhead the harness carries is inside `F` and applies to
+both arms, so the honest kernel-level ratios here are slightly worse than
+reported, not better).
+
+Corollary worth knowing: `bk512` halves the steps at identical bytes and is
+*worse* (o 31.84 vs 30.88; down 83.52 vs 82.08). The per-step fixed cost is
+smaller than the per-step bandwidth loss from a bigger tile, so `bk256` is the
+right rung at this `bm/bn` — the same conclusion as the `bk` ladders at M ≥ 96,
+from the other side.
+
+### 2. M=1 down: a perfect-overlap kernel would still lose
+
+| | bytes | ours | hipblas | ours GB/s | hipblas GB/s |
+|---|---|---|---|---|---|
+| down M=1, **stream only** | 131.5 MB | **82.08** | 78.40 | **1602** | 1677 |
+| down M=1, full | 131.5 MB | 87.68 | | 1500 | |
+| o M=1, **stream only** | 42.4 MB | **30.88** | 31.04 | **1373** | 1366 |
+| o M=1, full | 42.4 MB | 34.40 | | 1233 | |
+
+B is 131 MB of this and is irreducible (A is 0.44 MB at M=1), so 131.5 MB is the
+byte floor. hipblas converts it at **97% of the 1725 GB/s ceiling**; our producer
+does 93%. Since our *loads alone* (82.08 µs) already exceed hipblas's *whole
+kernel* (78.40), down M=1 has **no overlap headroom to recover** — the remaining
+9.3 µs splits into 4.6 µs of producer rate and 4.7 µs of exposure, and only the
+first is reachable, by finding 4% more producer bandwidth (54 of 64 CUs, and the
+block-count inflation that would fix it is measured closed).
+
+o M=1 is the opposite: the producer is *already* 0.995× hipblas and the entire
+gap is the 3.5 µs of exposure.
+
+**Do not re-open** "o's producer is slower than down's". It is the launch-fixed
+cost over a shorter K, and it is not a kernel property.
+
+<a id="2026-10-21-d10x"></a>
+## 2026-10-21 — unrolling the k-loop: the per-step cost was an *address* chain, and it reverses the M>96 tile
+
+Every arm here is paired same-process, CUDA-graph replay, 7 rounds,
+min-of-rounds, idle card 1, `rel < 1e-3` against `A.float() @ B.float().T · sa · sb`
+checked before timing. Only in-process ratios are quoted; absolutes drift ~15%
+between invocations on this box.
+
+Starting point was 2026-10-20g: the residual is a per-step *fixed* cost
+F ≈ 0.477 µs (0.219 of it a barrier), 200 steps = 95 µs, and the step count is
+pinned by the LDS wall. That framing is right about `bk` and wrong about the
+cost — the fixed per-step cost is not a barrier, it is the *stage index*.
+
+### 1. A symbolic stage index costs 13% of the kernel
+
+The shipped loop (`T.Pipelined(..., num_stages=2)`, dumped with
+`get_kernel_source`) is
+
+```
+[__syncthreads][copy A][copy B][cp_async_commit][cp_async_wait<1>][__syncthreads][gemm]
+```
+
+i.e. **two barriers per step, exactly as a hand-written double buffer**, so there
+was nothing to remove at the pass layer. Re-writing that loop by hand with
+`T.serial` and a 3-deep buffer changes one thing: the stage index becomes
+`(k+d) % 3`, and the kernel is **13% slower** (down M=96: 209.4 vs 184.3 µs).
+The reason is in the SASS: `(k+d) % 3` on a `matrix_load` destination lowers to
+`v_mul_lo_u16_e32` + `v_sub_u16_e32` + **`v_readfirstlane_b32`** sitting on the
+address path of the four `matrix_load`s, and `v_readfirstlane` serialises the
+wavefront. With 2 stages (`% 2`) the same expression is a single `v_and`, which is
+why the shipped loop is not slowed by it.
+
+Unrolling the main loop so every stage index is a compile-time constant removes
+the chain *and* lets the scheduler hoist the next step's load address above the
+current step's MMA. That is the whole lever — barriers, stage count, LDS bytes
+and the copies are unchanged.
+
+### 2. It is worth 20-24% on both bands
+
+| arm | down M=96 | o M=96 |
+|---|---|---|
+| `T.Pipelined` (pre-2026-10-21) | 195.8 | 71.4 |
+| **unrolled, U6** | **155.2** | **58.7** |
+| vs pipelined | **0.793** | **0.822** |
+
+deep-cover arms, same tile, unrolled so the modulo is out of the picture:
+
+| arm | down M=96 |
+|---|---|
+| A×2/B×2 (baseline structure) | 155.20 |
+| A×2/B×3, B two steps ahead | 174.56 |
+| A×3/B×2 | 156.00 |
+| A×2/B×3 but addressed `%2` (`pad`, footprint isolated) | 155.68 |
+
+So **deeper cover is falsified a second time**, now without the modulo confound,
+and LDS footprint is free up to the cap (61440 == 49152 measured). The mechanism
+is the FIFO `cp_async` counter: with A issued before B inside a step, the group
+newest to B(k) is B(k)'s own, so covering B(k) is free, but the wait that would
+cover B(k+1) also forces A(k+2) — `wait<2*d+1>` when A leads, and B can never be
+more than one step ahead of A. With 2 stages the wait is `wait<2>`.
+
+### 3. It changes *which* tile wins at M > 96, and the byte law was the wrong objective
+
+Unrolled, the M in (96,128] tile moves from `bm128/bn128/t256` (2026-10-20i) to
+**`bm128/bn96/bk128/ns2/t512`, U8**:
+
+| arm (M=128) | down | o |
+|---|---|---|
+| `bm128/bn128/bk128/ns2/t512`, U4 | 214.72 | 71.04 |
+| `bm128/bn128/bk128/ns2/t512`, U8 | — | 70.24 |
+| **`bm128/bn96/bk128/ns2/t512`, U8** | **182.24** | **67.84** |
+| ratio vs bn128 | **0.849** | **0.955** |
+| vs hipblas | **1.022** | **1.022** |
+
+M=112 agrees (down 183.20 vs 208.64; o 67.84 vs 70.88), and the unroll ladder at
+bn96 is U6 68.3 / **U8 67.8** / U16 71.4 (o).
+
+This contradicts the byte law of 2026-10-20i, which said bn128 (262 MB) beats
+bn96 (308 MB) by 15%. Both numbers are right; the law just optimises the wrong
+thing. What actually bounds a step is
+
+```
+per-step grid bytes = N·bk (B, fixed) + blocks·bm·bk (A)
+time/step           = max(bytes/1725 GB/s , exposed part of the cp_async wait)
+```
+
+| tile | blocks | per-step bytes | floor/step | measured/step |
+|---|---|---|---|---|
+| bn128 | 40 | 1.31 MB | 0.76 µs | 1.11 |
+| **bn96** | **54** | **1.54 MB** | **0.89 µs** | **1.02** |
+| bn64 | 80 | 1.70 MB | 0.99 µs | (104 µs total) |
+
+bn96 moves 17% more bytes and is *closer to its own floor* (87% vs 68%), because
+54 of 64 CUs are issuing instead of 40. The exposure is per-block wait latency,
+and it hides in proportion to the number of blocks. bn64 crosses to the other
+side: its A term (80·128·K, +33% over bn96) costs more than the extra 26 blocks
+buy, 104 µs. So **54 blocks is an interior optimum at bm=128**, and it is
+hipblas's own macro-tile (N/54).
+
+Also closed at this band, all paired: `t1024` 88.5 µs, `bm112/bn128/t512`
+90.6 µs (the 112-row tile does not split into warps), `bm128/bn96/t384` is an
+illegal MLS tile, `bm96` at M=112 needs two block rows (109.1 µs).
+
+For M ≤ 96 nothing changes: `bm96/bn96/t384` is 58.7-59.0 µs at o against
+`bm128/bn96/t512` 67.0-67.7 (M=65/96), so the 96/97 boundary is still right, and
+`bm96/bn96/t512` is an illegal warp partition.
+
+### 4. The standing, per M
+
+Shipped `decode_cfg`, one process per M (two graphs resident — a process holding
+many graphs inflates `torch._scaled_mm`), 7 rounds:
+
+| M | o tile | o µs | o /hip | down µs | down /hip |
+|---|---|---|---|---|---|
+| 65 | bm96/bn96/t384 | 58.40 | **0.941** | 154.72 | **0.882** |
+| 80 | bm96/bn96/t384 | 59.04 | **0.939** | 155.5 | **0.891** |
+| 96 | bm96/bn96/t384 | 59.20 | **0.937** | 155.36 | **0.887** |
+| 112 | bm128/bn96/t512 | 67.84 | 0.995 | 182.72 | 1.056 |
+| 128 | bm128/bn96/t512 | 67.84 | 1.047 | 182.40 | 1.002 |
+
+The M=80 down row is bimodal across invocations (155.5 / 170.2 for an identical
+kernel and identical bytes); the same-process ratio is what is quoted.
+
+At M ≤ 96 the cell is bandwidth-bound on B and *beats* hipblas at 0.88-0.94.
+What is left there is the ~10 µs of exposure over the 49 µs floor at o, and it is
+the same per-step wait; 54 blocks is already the optimum for it.
+
+### 5. M ≤ 64 takes the same lever, and its tile does *not* move
+
+The unrolled loop is not specific to the (64,128] band: it is worth 2-3% at M=1
+and 19-21% at M=64, so every N=5120 decode tile now runs it.
+
+| M | tile | down before | down after | down /hip | o before | o after | o /hip |
+|---|---|---|---|---|---|---|---|
+| 1 | bm16/bn96/bk256/ns2/t192 | 86.88 | **84.48** | 1.078 | 34.72 | **33.92** | 1.049 |
+| 16 | bm16/bn96/bk256/ns2/t192 | 89.60 | **88.16** | 1.038 | 36.16 | **35.04** | 1.009 |
+| 32 | bm32/bn96/bk256/ns2/t192 | 101.60 | **95.04** | 0.870 | 40.32 | **37.92** | 0.972 |
+| 64 | bm64/bn64/bk128/ns2/t256 | 160.32 | **127.04** | 0.925 | 56.96 | **49.60** | 0.951 |
+
+`U8` is the measured unroll for all of these (M=64 down: U4 128.16, **U8 127.04**;
+o: U4 50.24, **U8 49.60**, U16 50.88; M=16/32 bk256 tiles tie U6/U8).
+
+Full paired standing after the change, one process per M, 7 rounds (`rel = 0`
+everywhere, `5.9e-8` at down M=32):
+
+| M | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| o | 1.049 | **0.986** | **0.964** | **0.986** | 1.009 | **0.972** | **0.951** |
+| down | 1.078 | 1.041 | **0.910** | 1.008 | 1.038 | **0.870** | **0.925** |
+
+**The M=64 tile neighbourhood stays closed** — unlike M in (96,128], where the
+unroll handed the win to 54 blocks. Re-measured with U8 at o M=64:
+
+| arm | blocks | o µs |
+|---|---|---|
+| **bm64/bn64/bk128/ns2/t256** | 80 | **49.60** |
+| bm64/bn96/t384 | 54 | 54.56 |
+| bm64/bn128/t512 | 40 | 60.16 |
+| bm96/bn96/t384 (U6) | 54 | 58.56 |
+
+The difference is the padding: at M=64 a bm96 tile wastes 50% of its MMA rows,
+whereas at M=112-128 a bm128 tile wastes 0-12.5%. So the "more blocks beats more
+bytes" rule of §3 is not general — it needs the padded-MMA term to be small.
+The 80-block point is also already past the CU count (1.25 waves), so the wait
+it exposes is fully covered.
+
+What is left at M ≤ 64 is M=1 (1.05/1.08), and that is the launch-fixed ~5-6 µs
+of [2026-10-20j](#2026-10-20j), not a per-step cost: down M=1's *stream only*
+runs 82.1 µs against hipblas's whole kernel 78.4. `F` is untouched by the unroll.

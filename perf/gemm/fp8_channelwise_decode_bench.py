@@ -100,7 +100,7 @@ def bench(name, N, K, M, bm=None, bn=None, bk=None, ns=None, t=None, sp=None):
 def main():
     for name, (N, K) in SHAPES.items():
         print(f"\n== {name} {N}x{K} ==", flush=True)
-        for M in [1, 8, 16, 32, 64, 128]:
+        for M in [1, 8, 16, 32, 64, 65, 80, 96, 112, 128]:
             try:
                 bench(name, N, K, M)
             except Exception as ex:

@@ -74,8 +74,14 @@ def _validate_cfg(cfg, M, N, K):
     # bn96/bk256/ns2 is the one benchmarked small-tile ns>1 exception: exact
     # (rel == 0.0) on all four decode shapes at M in {1,16,32}, and 3-8% faster
     # than its ns=1 counterpart.  bm16/bn16/ns2 stays blocked (it is NaN).
-    assert ns <= 1 or (bm, bn) == (64, 64) or (bn == 96 and bk == 256 and ns <= 2), (
-        f"shape {M}x{N}x{K}: num_stages={ns} is only tuned for bm=bn=64 or bn96/bk256 (bm={bm}, bn={bn}, bk={bk})")
+    # bn96/bk128/ns2 at bm>=64 is the M in (64,128] band tile, added 2026-10-20:
+    # exact (rel < 1e-3) at bm 64/96/128 on o and down, and 1.35x faster than its
+    # ns=1 counterpart at M=128 (that is defect (2) in decode_cfg's comment).
+    _wide_exact = (bn == 96 and bk == 256 and ns <= 2) or (bn == 96 and bk == 128 and bm >= 64 and ns <= 2) \
+        or (bm == 128 and bn == 128 and bk == 128 and ns <= 2)
+    assert ns <= 1 or (bm, bn) == (64, 64) or _wide_exact, (
+        f"shape {M}x{N}x{K}: num_stages={ns} is only tuned for bm=bn=64 or the bn96 wide tile "
+        f"(bm={bm}, bn={bn}, bk={bk})")
     return cfg
 
 
@@ -92,6 +98,8 @@ def decode_cfg(M, N, K):
       N ==  5120 -> bn96/bk256/ns2/t192  (o/down; superseded bn16/t64 on
                     2026-10-20 -- see the inline note; bn16 is still the
                     fallback when K % 256 != 0)
+                    M in (96,128] -> bm128/bn96/bk128/ns2/t512 (2026-10-21,
+                    unrolled k-loop; it was bn128/t256 under T.Pipelined)
 
     block_N < 16 is impossible: the MMA output micro-tile is hardware-fixed at
     16x16 (``src/tl_templates/hcu/gemm.h:150``) and the MLS B atom floor is
@@ -118,6 +126,53 @@ def decode_cfg(M, N, K):
         # beats bk256 ns1 by 1.2% (243.5 vs 246.6us). The gain is cross-k-step overlap,
         # NOT wait granularity -- at fixed bk256, ns=2 is 1.6% SLOWER.
         return _validate_cfg(DecodeCfg(64, 64, 128, 2, 256, 1), M, N, K)
+    elif N == 5120 and K % 128 == 0:
+        # M in (64, 128] -- the band that the chooser used to serve with ONE tile
+        # (bm128/bn128/bk128/ns1/t512, 40 blocks), which measured 1.83-2.29x
+        # slower than hipblas.  Three things were wrong, all visible in hipblas's
+        # own decode SASS (MT96x128x256: its N macro-tile is *96*, i.e. its grid
+        # is ceildiv(5120,96) = 54 blocks, and one kernel serves M=96 and M=128):
+        #   1. bn128 -> 40 blocks on 64 CUs: 24 CUs idle.  bn96 -> 54 blocks
+        #      (+35% occupancy) for +17% activation bytes, and it wins even
+        #      though it moves MORE bytes.
+        #   2. ns=1 -> no cross-k-step overlap at all: bn96/ns1 1.85x vs
+        #      bn96/ns2 1.37x (M=128 down, paired, same process).
+        #   3. M=96 inherited bm128 and paid 32/128 padded MMA rows; bm96 is a
+        #      legal MLS tile (6 atoms) and is 1.71x faster at the same block
+        #      count.  The padded-M boundary is measured: M=65/80 -> bm96 wins
+        #      (1.115/1.129), M=112 -> bm128 wins (1.337), so the switch is at 96.
+        # Measured 2026-10-20, paired same-process, graph replay, 7 rounds,
+        # idle card, min-of-rounds, ratio = ours/hipblas (M=128 / M=96):
+        #   down 1.297 / 1.121   o 1.262 / 1.137
+        # vs the old single tile's 2.287 / 1.991 (down) and 1.825 / 1.865 (o).
+        # setprio=1 is +3.5% at M=128, +2.5% at M=96 (1.342 -> 1.297, 1.150 -> 1.121).
+        # Correctness: rel < 1e-3 against the fp32 reference on o and down at
+        # M = 65/80/96/112/128 (bn96/bk128/ns2 is exact at bm64/96/128).
+        # M > 96 must move to bm=128: bm96 would need two block rows
+        # (ceildiv(112,96)=2) and M=112 measures 109.1us at o vs 67.8 here.
+        if M <= 96:
+            return _validate_cfg(DecodeCfg(96, 96, 128, 2, 384, 1), M, N, K)
+        # M == 97..128 takes bm128/bn96/bk128/ns2/t512/u8.  The 2026-10-20i
+        # choice here was bn128/t256 on the byte law (A = (N/bn)*M*K + B = N*K:
+        # 308MB at bn96 vs 262MB at bn128), which is the wrong objective -- see
+        # the block-count argument below.  Closed at this tile: bk256/ns1
+        # (369.8), bk64/ns3-4 (~470), FullColK/warp_k=4 (242.1), t256 at bn128
+        # (223.8/79.7).  rel = 6.1e-8 (down) / 0 (o).
+        # bn96 -- NOT bn128 -- once the k-loop is unrolled (2026-10-21, paired
+        # same-process, 7 rounds, idle card, M in {112,128}, every round):
+        #   down 183.2/182.6 vs 208.6/214.7us   o 67.8/67.8 vs 70.9/71.0us
+        # i.e. 1.06/1.02x hipblas, against 1.21/1.20x.  This reverses the
+        # 2026-10-20i bn128 choice, and the reason is NOT the byte law: with
+        # bm=128 the per-step traffic is (N/bn)*bm*bk for A plus N*bk for B, so
+        #   bn96  -> 54 blocks, 1.54MB/step, floor 0.89us/step, measured 1.02
+        #   bn128 -> 40 blocks, 1.31MB/step, floor 0.76us/step, measured 1.11
+        # bn96 moves 17% MORE bytes and still wins, because 54 of 64 CUs are
+        # fed instead of 40: the exposed part of a step is the cp_async wait,
+        # and it hides when more blocks are issuing.  bn64 (80 blocks, 1.26MB
+        # of A alone) loses at 104us, so 54 blocks is a genuine optimum.
+        # t512/U8 measured against t384 (illegal MLS tile at bm128), t1024
+        # (88.5us), bm112 (90.6us) and U6/U16 (68.3/71.4us).
+        return _validate_cfg(DecodeCfg(128, 96, 128, 2, 512, 1), M, N, K)
     else:
         return _validate_cfg(DecodeCfg(128, 128, 128, 1, 512, 0), M, N, K)
 
@@ -184,6 +239,32 @@ def decode_cfg(M, N, K):
     return _validate_cfg(DecodeCfg(bm, bn, 256, 1, threads, sp), M, N, K)
 
 
+# (block_M, block_N, block_K, num_stages, threads) -> measured ``k_unroll``.
+# Only tiles that were measured on the N=5120 decode shapes are listed; anything
+# else keeps the T.Pipelined loop.  See the ``k_unroll`` docstring for numbers.
+_UNROLL_TILES = {
+    (16, 96, 256, 2, 192): 8,      # o/down, M <= 16
+    (32, 96, 256, 2, 192): 8,      # o/down, M in (16, 32]
+    (64, 64, 128, 2, 256): 8,      # o/down, M in (32, 64]
+    (96, 96, 128, 2, 384): 6,      # o/down, M in (64, 96]
+    (128, 96, 128, 2, 512): 8,     # o/down, M in (96, 128]
+    # Measured and NOT taken (2026-10-21, paired): at M=128 bn128/40 blocks
+    # 71.0/214.7us, bn64/80 blocks 104.0us, bn80 -- illegal MLS tile, t1024
+    # 88.5us, bm112 90.6us (2 blocks/row group instead of a clean warp split);
+    # U6 68.3/183.7, U8 67.8/182.6, U16 71.4/183.4.  At M=64 the pre-unroll
+    # neighbourhood stays closed: bn96/t384 54.6us and bn128/t512 60.2us against
+    # bn64's 49.6, bm96 58.6 (bm96 pads 50% of the MMA rows there), U4 50.2,
+    # U16 50.9.
+}
+
+
+def _cp_async_wait(n):
+    """``tl::cp_async_wait<n>`` -- wait until at most n cp_async groups are in
+    flight.  There is no Python wrapper for this on HCU; each ``T.copy`` with
+    ``prefer_instruction="matrix_load"`` commits exactly one group."""
+    T.evaluate(T.call_extern("handle", "tl::cp_async_wait<%d>" % n))
+
+
 def fp8_mls_channelwise(
     M,
     N,
@@ -196,10 +277,36 @@ def fp8_mls_channelwise(
     accum_dtype="float32",
     setprio=0,
     policy=None,
+    k_unroll="auto",
 ):
     """Channelwise fp8 GEMM using MLS (matrix-LDS-read) A/B producers.
 
     ``block_K`` must be a multiple of 64 (the trans-B fp8 MLS atom width).
+
+    ``k_unroll`` replaces ``T.Pipelined`` with an explicit k-loop that barriers
+    by hand and is unrolled ``k_unroll`` times per iteration (``"auto"`` consults
+    ``_UNROLL_TILES``).  Measured on the N=5120 decode tiles, paired same-process,
+    graph replay, 7 rounds, idle card (2026-10-21):
+
+      bm64/bn64/bk128/ns2/t256,  M=64  down 160.3 -> 127.0 us   o 57.0 -> 49.6
+      bm96/bn96/bk128/ns2/t384,  M=96  down 195.8 -> 155.2 us   o 71.4 -> 58.7
+      bm128/bn96/bk128/ns2/t512, M=128 down 214.7 -> 182.6 us   o 71.0 -> 67.8
+
+    i.e. 0.79-0.88x of the pipelined loop, and against ``torch._scaled_mm``:
+    down 0.87-1.08x, o 0.94-1.05x over all of M <= 128 (it used to be 1.03-1.23x).
+    The M>96 tile shows the unroll also changes *which* tile wins -- there bn96
+    beats bn128 by 15% once unrolled, though it moves 17% more bytes.  M=64 does
+    not move (bm96 pads 50% of its MMA rows).
+    Two effects, both from the unroll: (a) every shared-stage index becomes a
+    compile-time constant -- a symbolic ``(k+d) % 3`` costs 13% on its own,
+    because it lowers to v_mul_lo_u16/v_sub_u16/v_readfirstlane_b32 sitting on
+    the matrix_load address path; (b) the scheduler can hoist the next step's
+    load address above the MMA of the current step.  Per-step LDS bytes, stage
+    count and barrier count are unchanged, and deeper prefetch was measured to
+    *hurt* (the cp_async counter is FIFO, so covering step k's A also covers
+    B(k+1) when B leads -- the DRAM stream is never more than one step ahead of
+    the wait).  Requires ns=2 and the Square policy; a non-unrolled caller is
+    byte-identical to the previous builder.
 
     ``setprio=1`` wraps the MLS mmac loop in ``s_setprio(1)``/``s_setprio(0)``
     (``tl.hcu_mmac_setprio``), matching hipblas's MMA priority bump. At the
@@ -269,7 +376,9 @@ def fp8_mls_channelwise(
     # exact (rel == 0.0) on all four decode shapes at M in {1,16,32}, because
     # 16x96x256 packs to 4096 B/tile after the dense-packing fix, so the stage
     # stride is the packed size.  bm16/bn16/ns2 remains NaN and stays blocked.
-    _wide_exact = block_N == 96 and block_K == 256 and num_stages <= 2
+    _wide_exact = (block_N == 96 and block_K == 256 and num_stages <= 2) or (
+        block_N == 96 and block_K == 128 and block_M >= 64 and num_stages <= 2) or (
+        block_M == 128 and block_N == 128 and block_K == 128 and num_stages <= 2)
     assert num_stages <= 1 or (block_M, block_N) == (64, 64) or _wide_exact or _ns_escape, (
         f"num_stages={num_stages} is only tuned for block_M=block_N=64 on HCU "
         f"(got block_M={block_M}, block_N={block_N}); multi-stage small tiles are correct "
@@ -277,6 +386,24 @@ def fp8_mls_channelwise(
     gemm_annotations = {"tl.hcu_mmac_setprio": int(setprio)} if setprio else None
     if policy is None:
         policy = T.GemmWarpPolicy.Square
+    if k_unroll == "auto":
+        k_unroll = _UNROLL_TILES.get((block_M, block_N, block_K, num_stages, threads), 1)
+        if k_unroll > 1 and K // block_K < k_unroll + 4:
+            # short K: the measured tiles assume the decode shapes' step counts,
+            # so fall back to the pipelined loop instead of failing.
+            k_unroll = 1
+    unroll = int(k_unroll)
+    if unroll > 1:
+        assert num_stages == 2, (
+            f"k_unroll={unroll} is only implemented at num_stages=2 (got {num_stages})")
+        assert policy == T.GemmWarpPolicy.Square, (
+            f"k_unroll={unroll} is only implemented for Square (got {policy})")
+        nstep = K // block_K
+        nmain = nstep - 1            # A is prefetched one step ahead
+        L = (nmain // unroll) * unroll
+        rem = nmain - L
+        assert nstep >= unroll + 4, (
+            f"k_unroll={unroll} needs more k-steps than that (nstep={nstep})")
 
     @T.prim_func
     def gemm(
@@ -287,18 +414,77 @@ def fp8_mls_channelwise(
         C: T.Tensor((M, N), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-            A_s = T.alloc_shared((block_M, block_K), "float8_e4m3fn")
-            B_s = T.alloc_shared((block_N, block_K), "float8_e4m3fn")
             C_l = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_l)
-            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
-                T.copy(A[by * block_M, k * block_K], A_s, prefer_instruction="matrix_load")
-                T.copy(B[bx * block_N, k * block_K], B_s, prefer_instruction="matrix_load")
-                if num_stages == 0:
-                    T.ptx_wait_group(0)
-                    T.sync_warp()
-                T.gemm(A_s, B_s, C_l, False, True, k_pack=1, annotations=gemm_annotations,
-                       policy=policy)
+            if unroll > 1:
+                # Explicit double-buffered k-loop.  Structure per step:
+                #   [sync][A copy][B copy][wait(2)][sync][gemm k]
+                # Each T.copy commits its own cp_async group, so one step is two
+                # groups and wait(2) leaves exactly the current step's pair in
+                # flight.  The top sync is the WAR barrier (stage k+1 was last
+                # read at step k-1), the second is the RAW one.
+                A_s = T.alloc_shared((2, block_M, block_K), "float8_e4m3fn")
+                B_s = T.alloc_shared((2, block_N, block_K), "float8_e4m3fn")
+                T.copy(A[by * block_M:by * block_M + block_M, 0:block_K], A_s[0, :, :],
+                       prefer_instruction="matrix_load")
+                T.copy(B[bx * block_N:bx * block_N + block_N, 0:block_K], B_s[0, :, :],
+                       prefer_instruction="matrix_load")
+                for ko in T.serial(L // unroll):
+                    for u in T.unroll(unroll):
+                        T.sync_threads()
+                        T.copy(A[by * block_M:by * block_M + block_M,
+                                 (ko * unroll + u + 1) * block_K:
+                                 (ko * unroll + u + 2) * block_K],
+                               A_s[(ko * unroll + u + 1) % 2, :, :],
+                               prefer_instruction="matrix_load")
+                        T.copy(B[bx * block_N:bx * block_N + block_N,
+                                 (ko * unroll + u + 1) * block_K:
+                                 (ko * unroll + u + 2) * block_K],
+                               B_s[(ko * unroll + u + 1) % 2, :, :],
+                               prefer_instruction="matrix_load")
+                        _cp_async_wait(2)
+                        T.sync_threads()
+                        T.gemm(A_s[(ko * unroll + u) % 2, :, :],
+                               B_s[(ko * unroll + u) % 2, :, :], C_l, False, True,
+                               k_pack=1, annotations=gemm_annotations, policy=policy)
+                # leftover of the unrolled loop: same body, one step at a time
+                for k in T.serial(rem):
+                    T.sync_threads()
+                    T.copy(A[by * block_M:by * block_M + block_M,
+                             (k + L + 1) * block_K:(k + L + 2) * block_K],
+                           A_s[(k + L + 1) % 2, :, :], prefer_instruction="matrix_load")
+                    T.copy(B[bx * block_N:bx * block_N + block_N,
+                             (k + L + 1) * block_K:(k + L + 2) * block_K],
+                           B_s[(k + L + 1) % 2, :, :], prefer_instruction="matrix_load")
+                    _cp_async_wait(2)
+                    T.sync_threads()
+                    T.gemm(A_s[(k + L) % 2, :, :], B_s[(k + L) % 2, :, :], C_l, False,
+                           True, k_pack=1, annotations=gemm_annotations, policy=policy)
+                for k in T.serial(K // block_K - nmain):
+                    # drain: reload this step's own tiles (nothing reads them
+                    # before the wait), so the tail needs no prefetch bookkeeping
+                    T.copy(A[by * block_M:by * block_M + block_M,
+                             (nmain + k) * block_K:(nmain + k + 1) * block_K],
+                           A_s[(nmain + k) % 2, :, :], prefer_instruction="matrix_load")
+                    T.copy(B[bx * block_N:bx * block_N + block_N,
+                             (nmain + k) * block_K:(nmain + k + 1) * block_K],
+                           B_s[(nmain + k) % 2, :, :], prefer_instruction="matrix_load")
+                    _cp_async_wait(0)
+                    T.sync_threads()
+                    T.gemm(A_s[(nmain + k) % 2, :, :], B_s[(nmain + k) % 2, :, :], C_l,
+                           False, True, k_pack=1, annotations=gemm_annotations,
+                           policy=policy)
+            else:
+                A_s = T.alloc_shared((block_M, block_K), "float8_e4m3fn")
+                B_s = T.alloc_shared((block_N, block_K), "float8_e4m3fn")
+                for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                    T.copy(A[by * block_M, k * block_K], A_s, prefer_instruction="matrix_load")
+                    T.copy(B[bx * block_N, k * block_K], B_s, prefer_instruction="matrix_load")
+                    if num_stages == 0:
+                        T.ptx_wait_group(0)
+                        T.sync_warp()
+                    T.gemm(A_s, B_s, C_l, False, True, k_pack=1, annotations=gemm_annotations,
+                           policy=policy)
             if policy == T.GemmWarpPolicy.FullColK:
                 # Cross-K-warp reduction. The C fragment is replicated per K warp
                 # (make_gemm_fragment_hcu) and the copy-out stores replica 0 only,
@@ -308,7 +494,11 @@ def fp8_mls_channelwise(
                 C_l[i, j] = C_l[i, j] * scale_a[by * block_M + i] * scale_b[bx * block_N + j]
             T.copy(C_l, C[by * block_M, bx * block_N])
 
-    return tilelang.compile(gemm, out_idx=[4])
+    # The unrolled loop inserts its barriers explicitly, so the automatic
+    # storage-sync pass must not add more (it would duplicate the RAW barrier).
+    return tilelang.compile(
+        gemm, out_idx=[4],
+        **({"pass_configs": {"tl.disable_thread_storage_sync": True}} if unroll > 1 else {}))
 
 
 def _ref(A, B, scale_a, scale_b):

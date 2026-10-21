@@ -10,7 +10,22 @@ full measured record — every table, ratio, SASS excerpt and correction — is 
 
 `decode_cfg` (`perf/gemm/fp8_channelwise_mls.py`) returns:
 
-- **N=5120 (`o`/`down`) at M ≤ 32:** `bn96 / bk256 / ns2 / t192`, `setprio=1`.
+- **N=5120 (`o`/`down`) at M ≤ 32:** `bn96 / bk256 / ns2 / t192`, `setprio=1`,
+  unrolled k-loop U8. Standing (unroll in parentheses): o 1.05 / 0.99 / 0.96 /
+  0.99 / **1.01** at M=1/2/4/8/16, **0.97** at M=32; down 1.08 / 1.04 / **0.91**
+  / 1.01 / 1.04 / **0.87**.
+- **N=5120 at M=64:** `bm64 / bn64 / bk128 / ns2 / t256`, `setprio=1`, U8 —
+  **0.925× down / 0.951× o** (was 1.164/1.099). The neighbourhood is closed, and
+  the unroll did *not* reopen it (bn96 54.6 µs, bn128 60.2, bm96 58.6 against
+  bn64's 49.6): a bm96 tile wastes 50% of the MMA rows at M=64. Docs
+  [2026-10-20d](docs/optimization/fp8_decode_m_le_128.md#2026-10-20d).
+- **N=5120 at M in (64,128]:** M ≤ 96 → `bm96 / bn96 / bk128 / ns2 / t384`
+  (54 blocks, **0.88× down / 0.94× o**); above → **`bm128 / bn96 / bk128 / ns2
+  / t512`** (`setprio=1`, 54 blocks, 1.00-1.06×). Both run the unrolled k-loop
+  (`k_unroll` `"auto"` → U6 / U8), which is what produced those numbers: the
+  pipelined loop was 1.12-1.23× at the same tiles. Docs
+  [2026-10-20e](docs/optimization/fp8_decode_m_le_128.md#2026-10-20e),
+  [2026-10-21](docs/optimization/fp8_decode_m_le_128.md#2026-10-21-d10x).
 - **`qkv` (N=10240) / `gate_up` (N=51200):** `bn32`, `setprio=1`; the `qkv` M=32
   point is `bn32 / bk128 / t128`.
 
@@ -42,9 +57,19 @@ else in the search space is a measured closure (§3).
   where down's runs at 1679 GB/s (ceiling 1725 GB/s); no mechanism is established
   for that 21% and no lever was found. (docs
   [2026-10-18c](docs/optimization/fp8_decode_m_le_128.md#2026-10-18c))
-- **M=128:** o 1.83×, down 2.23×, qkv 1.15×. Only 40 blocks at bn128, and bn
-  cannot shrink without shrinking the grid further. Not addressed. (docs
-  [2026-10-17f final matrix](docs/optimization/fp8_decode_m_le_128.md#2026-10-17f))
+- **M in (64,128], the standing gap:** 0.88-0.94× at M ≤ 96 (we win), and
+  1.00-1.06× at M=112/128. What is left is the exposed part of the per-step
+  `cp_async_wait`: at o M=96 the floor is 49 µs and we run 59 µs, at 54 blocks of
+  64 CUs. The lever that would act on it is *more blocks*, and both directions
+  are measured closed (bn128 → 40 blocks 0.955× worse; bn64 → 80 blocks 1.53×
+  worse), as is deeper cover (A2B3 174.6 vs 155.2), more warps (t1024 88.5),
+  and removing a barrier (the shipped loop already has the same two). Docs
+  [2026-10-21](docs/optimization/fp8_decode_m_le_128.md#2026-10-21-d10x).
+- **M ≤ 64:** now 0.87-0.99× at M ≥ 2 except down M=8 (1.008) and down M=16
+  (1.038). The only real gap left is **M=1 (1.05× o / 1.08× down)**, which is the
+  launch-fixed ~5-6 µs of [2026-10-20j](docs/optimization/fp8_decode_m_le_128.md#2026-10-20j),
+  untouched by the unroll. M=64 is 0.925×/0.951× and its tile neighbourhood is
+  still closed (docs [2026-10-20d](docs/optimization/fp8_decode_m_le_128.md#2026-10-20d)).
 - **`qkv` M≥32:** 1.05-1.15×; `bm32/bn32/t256` is the measured best of its
   neighbourhood. (docs [2026-10-17f](docs/optimization/fp8_decode_m_le_128.md#2026-10-17f))
 - **Not taken:** rotating the MLS producer above the `promote_prio`/mmac block is
@@ -81,6 +106,19 @@ The load-bearing closures:
 | Hand-written double buffering | Correct but 1.26-1.70× slower. |
 | Tile widening | Catastrophic; `bn32` alone is 7-12% worse at every (shape, M). |
 | `k_pack=2`, `b_ds_read_alt=0`, `respect_layout_map` | Hard-rejected / unsupported / exact no-ops. |
+| Prefetch depth > `ns=2` at `(bm+bn)=224, bk128` | 65536 B of LDS caps it; `bk64/ns3` 1.509× and `bk64/ns4` 1.427× because a (16,64) fp8-trans tile pays a 4096 B slot for 1024 B of payload (4× waste). |
+| Split pipeline depth (B deep, A shallow) | Inexpressible: `inject_pipeline.cc:2584` rejects a consumer reading buffers produced at two different async stages, so both copies share one buffer count (`ns=3` ⇒ 86016 B). |
+| `bm < M` to buy stages | Re-reads the whole weight stream per M-block: `bm64/bn96/bk128/ns3` 1.491×, `bm32/...ns3` 2.582×, `bm16/...ns4` does not build. |
+| A's DRAM/L2 footprint (D1) | Forcing A to a 2-tile index is 1.019×: the footprint costs nothing (request instructions/bytes unchanged), so "A's traffic" is not the lever. |
+| B's DRAM latency (D2) | Forcing B's tile index to `(k&1)` (same instructions/bytes, L2-served) is 1.007×: the 62.6 µs of exposure is **not** a memory stall, so "more cover" was the wrong target. |
+| Pipeline issue order | Moving the MMA ahead of the copies is 1.34-1.49× worse; B-before-A is 1.002 (null). With one step of cover, issue order is the only thing keeping the stream alive. |
+| `setprio > 1` | sp0 1.036, sp2 1.000, sp3 1.001 — above the top level the ISA honours it is an exact no-op. |
+| `bk256/ns2` (halve the step count) | Launch-infeasible: 114688 B > 65536 B/CU (`hipModuleLaunchKernel` fails), and `(128+bn)·512 ≤ 65536` has no legal `bn`. The two fitting alternatives already lose (bn32 1.960×; bm32 4× B re-read). The residual is a per-step fixed cost (~0.48 µs), so fewer steps is the *only* lever and LDS blocks it. |
+| Second per-step barrier (single-barrier body) | Removing the post-`cp_async_wait` barrier is worth **2.4 µs** at bn128/t256, not the ~44 µs 2026-10-20g implied: the two barriers are adjacent, so the second is already aligned away. The 32.0 µs belongs to the WAR sync at the top of the step, which needs more buffers, not a body rewrite. |
+| `bn` between 96 and 128 at M>96 (the frontier) | Measured *pre-unroll* at all five legal multiples of 16: bn80 1.018× (64 blocks, 341 MB, 1496 GB/s), bn96 1.026×, bn112 1.219× (also a 5-warp-equivalent partition), bn128 1.000× — flat-topped, no interior optimum. `bn80/t256` and `bn112/t256` do not build (no valid trans MLS atom at 4 warps). **Partly falsified 2026-10-21**: unrolled, bn96/t512 beats bn128/t512 by 15% (down 182.2 vs 214.7), so the frontier has an interior optimum at 54 blocks once the modulo is out of the address path. bn80 is still not buildable at bm128. |
+| Two blocks/CU at M ≥ 96 | Arithmetic, not a measurement gap: 2 blk/CU needs `(bm+bn)·bk·2 ≤ 32768` ⇒ `bm+bn ≤ 128`; with `bm = M ≥ 96` that leaves `bn ≤ 32`, whose A traffic is 1.05 GB. So M ≥ 96 is pinned at 1 blk/CU — and with `bm = 128` the ≥3 LDS stages that would buy prefetch slack need `bn ≤ 42` (1.3 GB of A). Deep slack and the byte minimum are mutually exclusive at every tile. |
+| `bn < 128` at M>96, N=5120 | **Reversed 2026-10-21.** The byte law (`total = N·K·(M/bn + 1)`: bn96 308 MB vs bn128 262 MB) is arithmetically right and was the wrong objective: per step, the bound is `max(bytes/1725 GB/s, exposed wait)`, and 54 blocks of 64 CUs hide the wait 87% against 40 blocks' 68%. bn96/u8/t512 is 0.849× of bn128 on down and 1.022× hipblas. Only *narrower than 96* is closed (bn64 → 104 µs). |
+| Deeper cover / second-barrier removal (re-measured with the unroll) | A2B3 (B two steps ahead, unrolled so no modulo) is 174.56 vs 155.20 µs; A3B2 156.00; a `%2`-addressed A2B3 that isolates the LDS footprint 155.68. The `cp_async` counter is FIFO, so a wait that covers B(k+1) also forces A(k+2) — B can never lead by more than one step. Removing the post-wait barrier is worth 2.4 µs, and the shipped `T.Pipelined` loop already emits exactly the two barriers of a hand-written double buffer, so there is nothing to remove at the pass layer. |
 
 ## 4. History index
 
@@ -119,6 +157,9 @@ the read ceiling, the `ns>1` mechanism) — the doc says where.
 | 2026-10-20b | The wide tile never cut A's re-read (A's address has no warp-id term, so blocks × warps is invariant); warp count is the lever, U-shaped, and `t192` is 0.952-0.962× of t384. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-20b) |
 | 2026-10-20c | Producer A de-replication is bit-exact but 1.044-1.358× slower: gating A out of `cp_async_wait<1>` drops a prefetch level (t192 `vmcnt(8)→(4)`). | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-20c) |
 | 2026-10-20d | The M=64 tile neighbourhood is closed (ship 1.178× down / 1.083× o; every `bn`/depth/width arm loses) and wave quantization is refuted — the exactly-64-block `bn80` is 1.177× slower. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-20d) |
+| 2026-10-20e | M in (64,128] was losing 1.8-2.3×; `bn96` (54 blocks, hipblas's own macro-tile) + `ns2` + a `bm96` arm for M=96 takes it to 1.30× down / 1.26× o (M=96: 1.12/1.14). `ns=1` is the serialized one, so "prefetch distance is zero" is scoped to M≤32. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-20e) |
+| 2026-10-20f | Decomposed the band: stream-only 167.2 µs (0.945× hipblas) + chain-only 109.8 µs (0.620×, 84% of usable MMA peak) = 229.8 µs, so only 43% of the compute overlaps and perfect overlap would win. More cover is unreachable (LDS caps `ns` at 2, split-depth is planner-blocked, `bm<M` re-reads B). | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-20f) |
+| 2026-10-21 | **The unrolled k-loop is the per-step lever**: a symbolic stage index `(k+d)%3` costs 13% (`v_readfirstlane` on the `matrix_load` address path), and the shipped loop already had both barriers. U6 takes down M=96 195.8→155.2 µs and o 71.4→58.7 (0.79/0.82× pipelined, 0.88/0.94× hipblas); unrolled, the M>96 tile reverses to bn96/t512/u8 (down 182.2 vs 214.7), i.e. 1.00-1.06×. Deeper cover re-falsified (A2B3 174.6 vs 155.2); LDS footprint still free. Every N=5120 tile takes U8: M=64 down 160.3→127.0 (0.925×, was 1.164) and o 57.0→49.6 (0.951×); M=1 is 2-3% (the residual there is the launch-fixed cost, untouched). M=64's tile does *not* move — bm96 would pad 50% of its MMA rows. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-21-d10x) |
 
 ## Authorized optimization levers (user-approved: may edit C++/pass, M<=64 may use pass changes)
 

@@ -135,6 +135,25 @@ def test_decode_cfg_is_shape_aware():
     for N, K in _DECODE_SHAPES:
         assert decode_cfg(64, N, K).split_k == 1
 
+    # M in (96,128] at N=5120 takes the 128x128 tile (2026-10-20i): -2.6% vs the
+    # bm128/bn96/bk128/ns2/t512 it replaced (down 223.7 vs 229.9us, o 79.4 vs
+    # 81.3us, paired, every round) because with bm=M the read traffic is
+    # (N/bn)*M*K + N*K, i.e. 308MB at bn96 vs 262MB at bn128, and
+    # (128+128)*128*2 = 65536 B is exactly the per-CU LDS cap.
+    # 2026-10-21: with the unrolled k-loop the optimum moves to bn96/t512/u8 --
+    # down 182.6 vs 214.7us, o 67.8 vs 71.0us (paired, 7 rounds, every round),
+    # i.e. 1.02x hipblas against 1.20x.  bn96 moves 17% MORE bytes: 54 blocks
+    # of 64 CUs issuing beats 40 blocks, and the exposed part of a step is the
+    # cp_async wait.  bn64 (80 blocks) is 104us, so 54 really is the optimum.
+    for K in (8192, 25600):
+        m128 = decode_cfg(128, 5120, K)
+        assert (m128.block_M, m128.block_N, m128.block_K, m128.num_stages,
+                m128.threads) == (128, 96, 128, 2, 512)
+        _validate_cfg(m128, 128, 5120, K)
+    # M=96 keeps the 96x96 tile: bn128 needs a bm that is a legal MLS shape there
+    # and loses (1.287x vs 1.135x hipblas, paired).
+    assert decode_cfg(96, 5120, 25600).block_N == 96
+
 
 def test_validate_cfg_rejects_the_k8192_bk320_trap():
     """bk=320 divides K=5120 and K=25600 but NOT K=8192. A non-dividing block_K
@@ -150,9 +169,9 @@ def test_validate_cfg_rejects_the_k8192_bk320_trap():
 def test_every_chosen_decode_config_is_correct(N, K):
     """Run whatever ``decode_cfg`` actually returns, on every decode shape.
 
-    This is the coverage that was missing: M=64 is the only config that uses
-    ``num_stages > 1`` (bk128 ns2), and it was adopted on the strength of a
-    hand-run measurement with no test pinning it. It is also the config most at
+    This is the coverage that was missing: M=64 is (with the M>96 bn128 row below)
+    one of only two configs that use ``num_stages > 1`` (bk128 ns2), and it was
+    adopted on the strength of a hand-run measurement with no test pinning it. It is also the config most at
     risk -- until the 2026-10-17h fix, ``num_stages > 1`` was *silently wrong*
     (rel=2.4, or non-finite) for most other (block_M, block_N, block_K, threads)
     combinations, so a future edit to the M=64 row that "looks harmless" would
@@ -170,6 +189,54 @@ def test_every_chosen_decode_config_is_correct(N, K):
     assert torch.isfinite(C).all(), f"decode_cfg(64, {N}, {K}) produced non-finite output"
     rel = (C - ref).abs().max().item() / ref.abs().max().item()
     assert rel < 1e-3, f"decode_cfg(64, {N}, {K}) = {cfg} rel error {rel:.6f}"
+
+
+@pytest.mark.parametrize("K", (8192, 25600))
+def test_m128_wide_tile_is_exact(K):
+    """M in (96,128] at N=5120 takes bm128/bn96/bk128/ns2/t512 (2026-10-21).
+
+    It is a *newly chosen* ns>1 config at a tile where the pre-2026-10-17h code
+    was silently wrong, so it gets the same correctness pin as the M=64 row:
+    rel=6.1e-8 on down and 0 on o were measured by hand, not by the suite.  The
+    tile is also in _UNROLL_TILES, so this pins the unrolled path (k_unroll->8),
+    not just the tile choice."""
+    M, N = 128, 5120
+    cfg = decode_cfg(M, N, K)
+    assert (cfg.block_M, cfg.block_N, cfg.block_K, cfg.num_stages,
+            cfg.threads) == (128, 96, 128, 2, 512), cfg
+    A, B, scale_a, scale_b = _make_inputs(M, N, K)
+    kernel = fp8_mls_channelwise(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
+                                 cfg.num_stages, cfg.threads, setprio=cfg.setprio)
+    C = kernel(A, B, scale_a, scale_b)
+    ref = _ref_program(A, B, scale_a, scale_b)
+    assert torch.isfinite(C).all(), f"decode_cfg(128, {N}, {K}) produced non-finite output"
+    rel = (C - ref).abs().max().item() / ref.abs().max().item()
+    assert rel < 1e-3, f"decode_cfg(128, {N}, {K}) = {cfg} rel error {rel:.6f}"
+
+
+@pytest.mark.parametrize("K", (8192, 25600))
+@pytest.mark.parametrize("M", (65, 96, 112))
+def test_unrolled_k_loop_is_exact(M, K):
+    """The shipped decoder runs an explicitly unrolled, hand-barriered k-loop.
+
+    Two things it must get right that the pipelined path did not exercise:
+    ``block_M > M`` (M=65 into a 96-row tile, M=112 into a 128-row tile -- the
+    copies are slice-form, so they must predicate), and the tail/remainder when
+    ``(K/block_K - 1)`` is not a multiple of ``k_unroll`` (7 of 8 configurations
+    here leave a remainder).  rel is pinned at 1e-3 like the other decode rows.
+    """
+    N = 5120
+    cfg = decode_cfg(M, N, K)
+    A, B, scale_a, scale_b = _make_inputs(M, N, K)
+    kernel = fp8_mls_channelwise(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
+                                 cfg.num_stages, cfg.threads, setprio=cfg.setprio)
+    assert "cp_async_wait<2>" in kernel.get_kernel_source(), (
+        f"decode_cfg({M}, {N}, {K}) = {cfg} did not take the unrolled k-loop")
+    C = kernel(A, B, scale_a, scale_b)
+    ref = _ref_program(A, B, scale_a, scale_b)
+    assert torch.isfinite(C).all(), f"decode_cfg({M}, {N}, {K}) produced non-finite output"
+    rel = (C - ref).abs().max().item() / ref.abs().max().item()
+    assert rel < 1e-3, f"decode_cfg({M}, {N}, {K}) = {cfg} rel error {rel:.6f}"
 
 
 def test_decode_cfg_keeps_split_k_closed():
