@@ -2,13 +2,16 @@
 
 This is the entry point for a new session. Status comes first, then what is open,
 then the closed levers with their decisive reasons, then the history index. The
-full measured record — every table, ratio, SASS excerpt and correction — is in
-`docs/optimization/fp8_decode_m_le_128.md`; links below point into it. Branch:
-`feat/hcu-smls-b-vgpr`.
+results, the bandwidth model and the closed-lever index are in
+`docs/optimization/fp8_decode_gemm.md`; the per-experiment record — every arm
+table, per-round ratio, SASS excerpt and correction — is its companion log,
+`llm-adaptation/qwen3-32b-fp8-rowwise/docs/fp8_decode_gemm_log.md`. Links below
+resolve inside this repo (dated ones land on the results doc's history index).
+Branch: `feat/hcu-smls-b-vgpr`.
 
 ## 1. What is shipped right now
 
-`decode_cfg` (`perf/gemm/fp8_channelwise_mls.py`) returns:
+`decode_cfg` (`tilelang/hcu/op/gemm/gemm_fp8_channelwise.py`) returns:
 
 - **N=5120 (`o`/`down`) at M ≤ 32:** `bn96 / bk256 / ns2 / t192`, `setprio=1`,
   unrolled k-loop U8. Standing (unroll in parentheses): o 1.05 / 0.99 / 0.96 /
@@ -18,32 +21,59 @@ full measured record — every table, ratio, SASS excerpt and correction — is 
   **0.925× down / 0.951× o** (was 1.164/1.099). The neighbourhood is closed, and
   the unroll did *not* reopen it (bn96 54.6 µs, bn128 60.2, bm96 58.6 against
   bn64's 49.6): a bm96 tile wastes 50% of the MMA rows at M=64. Docs
-  [2026-10-20d](docs/optimization/fp8_decode_m_le_128.md#2026-10-20d).
+  [2026-10-20d](docs/optimization/fp8_decode_gemm.md#h-2026-10-20d).
 - **N=5120 at M in (64,128]:** M ≤ 96 → `bm96 / bn96 / bk128 / ns2 / t384`
   (54 blocks, **0.88× down / 0.94× o**); above → **`bm128 / bn96 / bk128 / ns2
   / t512`** (`setprio=1`, 54 blocks, 1.00-1.06×). Both run the unrolled k-loop
   (`k_unroll` `"auto"` → U6 / U8), which is what produced those numbers: the
   pipelined loop was 1.12-1.23× at the same tiles. Docs
-  [2026-10-20e](docs/optimization/fp8_decode_m_le_128.md#2026-10-20e),
-  [2026-10-21](docs/optimization/fp8_decode_m_le_128.md#2026-10-21-d10x).
-- **`qkv` (N=10240) / `gate_up` (N=51200):** `bn32`, `setprio=1`; the `qkv` M=32
-  point is `bn32 / bk128 / t128`.
+  [2026-10-20e](docs/optimization/fp8_decode_gemm.md#h-2026-10-20e),
+  [2026-10-21](docs/optimization/fp8_decode_gemm.md#h-2026-10-21-d10x).
+- **`qkv` (N=10240) / `gate_up` (N=51200) at M ≤ 64:** `bn32`, `setprio=1`; the
+  `qkv` M=32 point is `bn32 / bk128 / t128`; M=64 takes the o/down row
+  (`bm64 / bn64 / bk128 / ns2 / t256`).
+- **N=10240 / N=51200 at M in (64,128]:** block count decides the pipeline depth
+  and MMA padding decides `block_M` — `ceil(N/128) >= 256` (gate_up, 400 blocks) →
+  `bm96 / bn128 / bk128 / ns2 / t512` for M ≤ 80, `bm96 / bn128 / bk128 / ns2 /
+  t256` for M ≤ 96 (both U8; **0.962 / 0.953×** at M=80/96, was 0.955/0.990 —
+  bm96 deletes 32-48 of bm128's 128 MMA rows of padding at zero byte cost, and
+  the thread optimum flips at the band ends), then `bm128 / bn128 / bk128 / ns2 /
+  t512` above (U8, 0.966× at M=128) [2026-10-21d];
+  `qkv` (80 blocks) → `bm96 / bn96 / bk128 / ns2 / t384` while M ≤ 96
+  (**1.070 / 1.048×** at M=80/96, was 1.202/1.246), `bm128 / bn128 / bk128 /
+  ns1 / t512` for M in (96,112], and the o/down M>96 tile `bm128 / bn96 / bk128
+  / ns2 / t512` + `setprio=1` at M=128 (**1.153×**, was 1.178 — the switch is at
+  M>112 because both tiles launch the same 80/107 blocks and only the MMA padding
+  differs: M=112 pads 12.5% and prefers bn128 by 1.4%, M=128 pads nothing and
+  prefers bn96 by 1.3%). The M=128 cell is still the only loss in the band. Docs
+  [2026-10-21b](docs/optimization/fp8_decode_gemm.md#h-2026-10-21b),
+  [2026-10-21c](docs/optimization/fp8_decode_gemm.md#h-2026-10-21c).
 
-Standing (paired same-process, idle card, `rel=0`; ratio = ours/hipblas, **< 1 is
-a win**):
+Standing (paired same-process, idle card; ratio = ours/hipblas, **< 1 is a win**).
+M ≤ 32 from the post-`t192` run, M ≥ 64 from 2026-10-21/21b (hipblas calibrated to
+within 1.35× of its quiet-card time before every run — see §Environment). This
+table is the single standing; ratios quoted inside §1/§3 come from their own
+paired runs and can differ by a few percent (e.g. down M=64 is 0.925 in the
+unroll run and 0.978 here) — always re-measure paired before quoting.
 
-| shape | M=1 | M=16 | M=32 |
-|---|---|---|---|
-| o | 1.069 | 1.027 | 1.024 |
-| down | 1.110 | 1.042 | **0.928** |
+| shape | M=1 | M=16 | M=32 | M=64 | M=80 | M=96 | M=128 |
+|---|---|---|---|---|---|---|---|
+| o | 1.082 | **0.995** | **0.967** | **0.956** | **0.939** | **0.933** | 1.037 |
+| down | 1.092 | 1.028 | **0.875** | **0.978** | **0.891** | **0.889** | 1.036 |
+| gate_up | **0.915** | **0.900** | **0.872** | 1.030 | **0.962** | **0.953** | **0.966** |
+| qkv | **0.864** | **0.855** | **0.932** | 1.008 | 1.070 | 1.048 | 1.153 (was 1.178) |
 
-These are the post-2026-10-20b (`t192`) numbers, re-measured after the 2026-10-20c
-producer A de-replication attempt was reverted. All four decode shapes are exact.
+**18 of 28 cells win.** Losses: o M=1/128, down M=1/16/128, gate_up M=64,
+qkv M=64/80/96/128. The `M=128` column is the weak one (3 of 4 cells lose) and
+`qkv` is the worst row (4 of 7). `qkv` M=128 (1.153) is the worst single cell.
 
-How it got here: the five adopted levers and the per-stage ratio movement are in
-the doc's [What actually won](docs/optimization/fp8_decode_m_le_128.md#what-won).
-In short — `down` M=1 went 1.273 → 1.110 and `down` M=32 1.061 → 0.928 between the
-2026-10-17f shape-aware chooser and now; `o` M=1 went 1.188 → 1.069. Everything
+All four decode shapes are exact (`rel < 1e-3`, suite green: 30 passed, 3 xfailed,
+1 xpassed — the xpass is the known `ns>1` MLS race).
+
+How it got here: the adopted levers and the per-stage ratio movement are in
+the doc's [What actually won](docs/optimization/fp8_decode_gemm.md#what-won).
+In short — `down` M=1 went 1.273 → 1.092 and `down` M=32 1.061 → 0.875 between the
+2026-10-17f shape-aware chooser and now; `o` M=1 went 1.188 → 1.082. Everything
 else in the search space is a measured closure (§3).
 
 ## 2. What is open
@@ -56,7 +86,7 @@ else in the search space is a measured closure (§3).
 - **The one open measurement in o/down:** o's load-only arm runs at 1387 GB/s
   where down's runs at 1679 GB/s (ceiling 1725 GB/s); no mechanism is established
   for that 21% and no lever was found. (docs
-  [2026-10-18c](docs/optimization/fp8_decode_m_le_128.md#2026-10-18c))
+  [2026-10-18c](docs/optimization/fp8_decode_gemm.md#h-2026-10-18c))
 - **M in (64,128], the standing gap:** 0.88-0.94× at M ≤ 96 (we win), and
   1.00-1.06× at M=112/128. What is left is the exposed part of the per-step
   `cp_async_wait`: at o M=96 the floor is 49 µs and we run 59 µs, at 54 blocks of
@@ -64,27 +94,48 @@ else in the search space is a measured closure (§3).
   are measured closed (bn128 → 40 blocks 0.955× worse; bn64 → 80 blocks 1.53×
   worse), as is deeper cover (A2B3 174.6 vs 155.2), more warps (t1024 88.5),
   and removing a barrier (the shipped loop already has the same two). Docs
-  [2026-10-21](docs/optimization/fp8_decode_m_le_128.md#2026-10-21-d10x).
+  [2026-10-21](docs/optimization/fp8_decode_gemm.md#h-2026-10-21-d10x).
 - **M ≤ 64:** now 0.87-0.99× at M ≥ 2 except down M=8 (1.008) and down M=16
   (1.038). The only real gap left is **M=1 (1.05× o / 1.08× down)**, which is the
-  launch-fixed ~5-6 µs of [2026-10-20j](docs/optimization/fp8_decode_m_le_128.md#2026-10-20j),
+  launch-fixed ~5-6 µs of [2026-10-20j](docs/optimization/fp8_decode_gemm.md#h-2026-10-20j),
   untouched by the unroll. M=64 is 0.925×/0.951× and its tile neighbourhood is
-  still closed (docs [2026-10-20d](docs/optimization/fp8_decode_m_le_128.md#2026-10-20d)).
-- **`qkv` M≥32:** 1.05-1.15×; `bm32/bn32/t256` is the measured best of its
-  neighbourhood. (docs [2026-10-17f](docs/optimization/fp8_decode_m_le_128.md#2026-10-17f))
+  still closed (docs [2026-10-20d](docs/optimization/fp8_decode_gemm.md#h-2026-10-20d)).
+  **gate_up M=64 is now closed on its own 11 arms** (1.059-1.070, docs
+  [2026-10-21d](docs/optimization/fp8_decode_gemm.md#h-2026-10-21d)): every legal
+  neighbour loses, and the two that "should" win do not — bn128 halves A's
+  traffic but drops co-residency from 2 blocks/CU to 1 (32768 → 49152 B), and
+  t256 beats both t128 and t512.
+- **`qkv` M ≥ 96:** the worst cell left is **qkv M=128 1.153**. At bn128 N=10240
+  is 80 blocks on 64 CUs (1.25 waves) and no legal tile fixes it: bn160 is not an
+  MLS tile, bn80 (2.00 waves) is 1.03× worse, bm64 is 1.47-1.71×, and split-K
+  (the only constant-byte block-count lever) is closed on correctness. M=128
+  already took its 2% (o/down's bn96/ns2 tile); M ≤ 112 is a measured optimum
+  (10 arms at M=96, all ≥ 1.052). Winning M=128 needs issued bytes < hipblas's
+  78.9 MB ⇒ bn ≥ 190. Docs
+  [2026-10-21c](docs/optimization/fp8_decode_gemm.md#h-2026-10-21c).
+- **o/down M=128:** 1.037/1.036, i.e. the issued-byte rate (1693 GB/s) against
+  hipblas's 1755 (3.7%) — the same bytes, the same block count, so the residual is
+  per-step efficiency and is inside the ±3% machine noise. Docs
+  [2026-10-21b](docs/optimization/fp8_decode_gemm.md#h-2026-10-21b).
+- **M > 128 (vLLM's dense region):** unmeasured. A saturated vLLM decode step is
+  M = `max_num_seqs` (default 256), and the arithmetic-intensity crossover sits at
+  M ≈ 125, so M ≥ 128 is MMA-bound (at M=256 the MMA floor is ~2× the memory
+  floor on all four shapes) while both we and hipblas measured only ~43% of the
+  fp8 peak at M=128. `bm128` is the largest legal MLS tile here. A different
+  problem, not a config sweep.
 - **Not taken:** rotating the MLS producer above the `promote_prio`/mmac block is
   worth ~3% (reproduced 3×) but needs an emitter/pass change, not a config flag.
-  (docs [2026-10-19 §6](docs/optimization/fp8_decode_m_le_128.md#2026-10-19-lds))
+  (docs [2026-10-19 §6](docs/optimization/fp8_decode_gemm.md#2026-10-19-lds))
 - **Known correctness defects, unreachable from `decode_cfg`:** the small-tile
   packed stage stride (`bn16/bk128/ns2/t64` emits 1088 B for a 2048 B tile) and
   the MLS K-slice offset (any nonzero base is silently wrong). Both are
-  documented, not fixed. (docs [2026-10-18](docs/optimization/fp8_decode_m_le_128.md#2026-10-18),
-  [2026-10-18d](docs/optimization/fp8_decode_m_le_128.md#2026-10-18d))
+  documented, not fixed. (docs [2026-10-18](docs/optimization/fp8_decode_gemm.md#h-2026-10-18),
+  [2026-10-18d](docs/optimization/fp8_decode_gemm.md#h-2026-10-18d))
 
 ## 3. What is closed, and why
 
 The full one-row-per-lever index is in the doc's
-[closed-levers index](docs/optimization/fp8_decode_m_le_128.md#closed-levers).
+[closed-levers index](docs/optimization/fp8_decode_gemm.md#closed-levers).
 The load-bearing closures:
 
 | lever | decisive reason |
@@ -95,6 +146,8 @@ The load-bearing closures:
 | MMA density / hipblas warp mapping | The MMA itself is 0.5% of time; adding warps to a wide tile through MLS is worse, and the loss is the transposing LDS read (9.3%). |
 | MLS producer atom / partition swap | The faster 64×32 atom makes the full GEMM 15-16% slower. |
 | N-split / widening bn | 2-3× worse; A's LDS read scales with warp count. |
+| `bn > 128` | bn160 is **not a legal MLS tile** (`block_mn=160`); bn256 forces bk64 or ns1 = 1.48-1.59× slower. |
+| Wave packing (bm split, bn80) | Halving bm for whole waves is 1.13-4.19× worse; bn80's exact 1.00/2.00-wave grid is 1.03-1.09× worse because A's issued traffic is `N·M·K/bn`. |
 | Layout A | The 71.6% target requires the excluded weight reorder; hipblas's no-reorder baseline is 68.4%. |
 | Producer A de-replication | Bit-exact but 1.044-1.358× slower: gating A out of `cp_async_wait<1>` drops a prefetch level. |
 | M=1 GEMV structure | Not expressible: 16×16 MMA atom and `tile_mn=16` MLS floor. |
@@ -123,43 +176,48 @@ The load-bearing closures:
 ## 4. History index
 
 One row per dated record, with its decisive measurement. The full prose for each
-is in `docs/optimization/fp8_decode_m_le_128.md` at the linked anchor; this table
-is the map, not the record. Rows are historical: numbers are as recorded at the
+is in the companion log, `llm-adaptation/qwen3-32b-fp8-rowwise/docs/fp8_decode_gemm_log.md`,
+at the same anchor (`#h-` prefix dropped); the links here land on the matching
+row of the results doc's [history index](docs/optimization/fp8_decode_gemm.md#history).
+This table is the map, not the record. Rows are historical: numbers are as recorded at the
 time, and several early readings were later corrected (the native operand roles,
 the read ceiling, the `ns>1` mechanism) — the doc says where.
 
 | date | what it decided | doc |
 |---|---|---|
-| 2026-10-15 | M≤16 was already a win (~78% of nominal) and a single full-M block + `setprio` took M=64/128 from −89%/−225% to −7.2%/+0.3% (the exact numbers are handoff-only, below). | [link](docs/optimization/fp8_decode_m_le_128.md#m-le-16-h2h) |
-| undated (early) | Pre-MLS standing on effective BW: behind at M=32 (53.8% vs 66.8%) and M=64 (49.7% vs 62.2%), ahead at M=128 (47.9% vs 46.0%). | [link](docs/optimization/fp8_decode_m_le_128.md#m-ge-32) |
-| undated (early) | `bm16/bn32/bk256/ns1/t256` is the M≤16 winner; growing `block_M` to 32/64/128 is where the kernel loses. | [link](docs/optimization/fp8_decode_m_le_128.md#m-le-16) |
-| undated (early) | First generated-code reading of the M=32..128 gap (hipblas A→VGPR, B→LDS) — later refuted: the native kernel is the reverse. | [link](docs/optimization/fp8_decode_m_le_128.md#layout-a) |
-| 2026-10-16 | M=64's root cause is A's LDS write traffic, not DRAM: A staged once is 217.0 vs 246.9 µs, and pinning B saves only 8 µs for 262 MB. | [link](docs/optimization/fp8_decode_m_le_128.md#m64-root-cause) |
-| 2026-10-16b | The 71.6% "70% target" needs the excluded Layout A reorder; hipblas's no-reorder baseline is 68.4% (213.0 µs), so the in-scope gap is 34 µs, and grouping A's loads (249.3 µs) does not close it. | [link](docs/optimization/fp8_decode_m_le_128.md#layout-a) |
-| 2026-10-16c | M=64 is LDS-port-bound, not bandwidth-bound: LDS bytes/output is identical to hipblas (0.15625) and the paired gap is 5.8% contended / 7.3% idle. | [link](docs/optimization/fp8_decode_m_le_128.md#m64-paired) |
-| 2026-10-17b | B-direct-VGPR dies on two independent costs: 4× m-warp redundancy (loader-only 3.62×) and the 8-consec-k half-sector penalty (~2×); the full GEMM is 975.4 vs 243.4 µs. | [link](docs/optimization/fp8_decode_m_le_128.md#b-direct) |
-| 2026-10-17c | The native SASS reverses the operand roles (B→VGPR with no M coordinate, A→LDS), yet B-direct at `WarpM=1` is still 2.1× slower (513.8 vs 246.2 µs). | [link](docs/optimization/fp8_decode_m_le_128.md#b-direct) |
-| 2026-10-17d | Both B-fetch levers close: the 16-consec-k swap is worth at most 93.9 µs against a 267.6 µs gap, and the faster 64×32 MLS atom makes the full GEMM 15-16% slower (287.2 vs 246.2 µs). | [link](docs/optimization/fp8_decode_m_le_128.md#b-direct) |
-| 2026-10-17e | The "fine-grained `vmcnt(4)`" premise was a patched-file artifact; the real knob is `num_stages`, worth 1.2% (`bk128/ns2` 243.5 vs 246.6 µs), and `bk=192` is silently wrong (rel 1.61). | [link](docs/optimization/fp8_decode_m_le_128.md#async-wait) |
-| 2026-10-17f | A shape-aware chooser is a real win (o M=1 42.9→38.6 µs); split-K is 10-21% slower and its block-starvation premise was a confound; the M=32 thread fix is 1.60-1.71×; `ns>1` is silently wrong outside bm64/bn64. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-17f) |
-| 2026-10-17g | `qkv` M=32 wants `bn32/bk128/t128` (9-10%, 1.14× → 1.03×), the earlier ratios had used a `setprio=0` baseline, and `ns=2` at bn16 is 40/40 wrong or slower. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-17g) |
-| 2026-10-17h | The load path already beats hipblas on all four o/down cells (0.917-0.977), so the deficit is the mmac side and scales with K; the packed-stage stride bug is root-caused and fixed. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-17h) |
-| 2026-10-17i | Re-timed `ns=2` is 29-45% slower (the "fast" candidates had been measuring garbage), independent chains are 1.52-1.64× slower, and the deficit is the 16-20% where neither pipe is busy — 0.98× needs ~8× the blocks. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-17i) |
-| 2026-10-18 | N-split is closed hard (2-3× worse) and `ns>1` has a second, independent stage-index defect (bk128/ns2 rel ≈ 1119-3504, exact in the four configs the old tests happened to cover). | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-18) |
-| 2026-10-18b | The "2016 GB/s ceiling" was ~17% too high (1725 GB/s measured) and accumulator splitting is neutral (1.012-1.014×) — the exposure is not the mmac chain. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-18b) |
-| 2026-10-18c | The exposure is volumetric and per-iteration (half gemm +4.0 µs, double +13.6 µs at o M=16) and A-direct-to-VGPR is closed again (`r_mls` 1.935×/2.592× slower). | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-18c) |
-| 2026-10-18d | Split-K is not merely slow but inexpressible — the MLS K-slice offset is silently wrong for any nonzero base — and double buffering is worth ~1%. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-18d) |
-| 2026-10-19 | `warp_k`/`FullColK` is built and correct but 0.97-1.03× with mixed sign: a substitute for `setprio`, not a complement; the MLS `moffset` is a signed 10-bit immediate, so `block_K ≤ 512`. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-19-warpk) |
-| 2026-10-19 | `__builtin_hcu_matrix_load_b8` exists, but its per-lane layout is 4 consec-k × 4 n, not the mmac's 8 consec-k at one mn; bridging needs a full cross-lane permutation. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-19-matrixload) |
-| 2026-10-19 | hipblas launches 54 blocks × 256 threads (N macro-tile = N/54), so A is read 54× not 320×; reproducing that structure through MLS is still slower. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-19-hipblas-launch) |
-| 2026-10-19 | The gap is an LDS-capacity invariant, `total = const × w × (L + C·ns)`: 5→4 blocks/CU costs 80% (93.7→168.9 µs) and `bk`/`ns` cancel; the producer rotation worth ~3% needs an emitter change. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-19-lds) |
-| 2026-10-20 | Dense MLS packing (6144→4096 B) lets `bn96/bk256/ns2` land, a stable 5-7% win, and the disk kernel cache is blind to codegen changes. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-20) |
-| 2026-10-20b | The wide tile never cut A's re-read (A's address has no warp-id term, so blocks × warps is invariant); warp count is the lever, U-shaped, and `t192` is 0.952-0.962× of t384. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-20b) |
-| 2026-10-20c | Producer A de-replication is bit-exact but 1.044-1.358× slower: gating A out of `cp_async_wait<1>` drops a prefetch level (t192 `vmcnt(8)→(4)`). | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-20c) |
-| 2026-10-20d | The M=64 tile neighbourhood is closed (ship 1.178× down / 1.083× o; every `bn`/depth/width arm loses) and wave quantization is refuted — the exactly-64-block `bn80` is 1.177× slower. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-20d) |
-| 2026-10-20e | M in (64,128] was losing 1.8-2.3×; `bn96` (54 blocks, hipblas's own macro-tile) + `ns2` + a `bm96` arm for M=96 takes it to 1.30× down / 1.26× o (M=96: 1.12/1.14). `ns=1` is the serialized one, so "prefetch distance is zero" is scoped to M≤32. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-20e) |
-| 2026-10-20f | Decomposed the band: stream-only 167.2 µs (0.945× hipblas) + chain-only 109.8 µs (0.620×, 84% of usable MMA peak) = 229.8 µs, so only 43% of the compute overlaps and perfect overlap would win. More cover is unreachable (LDS caps `ns` at 2, split-depth is planner-blocked, `bm<M` re-reads B). | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-20f) |
-| 2026-10-21 | **The unrolled k-loop is the per-step lever**: a symbolic stage index `(k+d)%3` costs 13% (`v_readfirstlane` on the `matrix_load` address path), and the shipped loop already had both barriers. U6 takes down M=96 195.8→155.2 µs and o 71.4→58.7 (0.79/0.82× pipelined, 0.88/0.94× hipblas); unrolled, the M>96 tile reverses to bn96/t512/u8 (down 182.2 vs 214.7), i.e. 1.00-1.06×. Deeper cover re-falsified (A2B3 174.6 vs 155.2); LDS footprint still free. Every N=5120 tile takes U8: M=64 down 160.3→127.0 (0.925×, was 1.164) and o 57.0→49.6 (0.951×); M=1 is 2-3% (the residual there is the launch-fixed cost, untouched). M=64's tile does *not* move — bm96 would pad 50% of its MMA rows. | [link](docs/optimization/fp8_decode_m_le_128.md#2026-10-21-d10x) |
+| 2026-10-15 | M≤16 was already a win (~78% of nominal) and a single full-M block + `setprio` took M=64/128 from −89%/−225% to −7.2%/+0.3% (the exact numbers are handoff-only, below). | [link](docs/optimization/fp8_decode_gemm.md#m-le-16-h2h) |
+| undated (early) | Pre-MLS standing on effective BW: behind at M=32 (53.8% vs 66.8%) and M=64 (49.7% vs 62.2%), ahead at M=128 (47.9% vs 46.0%). | [link](docs/optimization/fp8_decode_gemm.md#m-ge-32) |
+| undated (early) | `bm16/bn32/bk256/ns1/t256` is the M≤16 winner; growing `block_M` to 32/64/128 is where the kernel loses. | [link](docs/optimization/fp8_decode_gemm.md#m-le-16) |
+| undated (early) | First generated-code reading of the M=32..128 gap (hipblas A→VGPR, B→LDS) — later refuted: the native kernel is the reverse. | [link](docs/optimization/fp8_decode_gemm.md#layout-a) |
+| 2026-10-16 | M=64's root cause is A's LDS write traffic, not DRAM: A staged once is 217.0 vs 246.9 µs, and pinning B saves only 8 µs for 262 MB. | [link](docs/optimization/fp8_decode_gemm.md#m64-root-cause) |
+| 2026-10-16b | The 71.6% "70% target" needs the excluded Layout A reorder; hipblas's no-reorder baseline is 68.4% (213.0 µs), so the in-scope gap is 34 µs, and grouping A's loads (249.3 µs) does not close it. | [link](docs/optimization/fp8_decode_gemm.md#layout-a) |
+| 2026-10-16c | M=64 is LDS-port-bound, not bandwidth-bound: LDS bytes/output is identical to hipblas (0.15625) and the paired gap is 5.8% contended / 7.3% idle. | [link](docs/optimization/fp8_decode_gemm.md#m64-paired) |
+| 2026-10-17b | B-direct-VGPR dies on two independent costs: 4× m-warp redundancy (loader-only 3.62×) and the 8-consec-k half-sector penalty (~2×); the full GEMM is 975.4 vs 243.4 µs. | [link](docs/optimization/fp8_decode_gemm.md#h-b-direct) |
+| 2026-10-17c | The native SASS reverses the operand roles (B→VGPR with no M coordinate, A→LDS), yet B-direct at `WarpM=1` is still 2.1× slower (513.8 vs 246.2 µs). | [link](docs/optimization/fp8_decode_gemm.md#h-b-direct) |
+| 2026-10-17d | Both B-fetch levers close: the 16-consec-k swap is worth at most 93.9 µs against a 267.6 µs gap, and the faster 64×32 MLS atom makes the full GEMM 15-16% slower (287.2 vs 246.2 µs). | [link](docs/optimization/fp8_decode_gemm.md#h-b-direct) |
+| 2026-10-17e | The "fine-grained `vmcnt(4)`" premise was a patched-file artifact; the real knob is `num_stages`, worth 1.2% (`bk128/ns2` 243.5 vs 246.6 µs), and `bk=192` is silently wrong (rel 1.61). | [link](docs/optimization/fp8_decode_gemm.md#async-wait) |
+| 2026-10-17f | A shape-aware chooser is a real win (o M=1 42.9→38.6 µs); split-K is 10-21% slower and its block-starvation premise was a confound; the M=32 thread fix is 1.60-1.71×; `ns>1` is silently wrong outside bm64/bn64. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-17f) |
+| 2026-10-17g | `qkv` M=32 wants `bn32/bk128/t128` (9-10%, 1.14× → 1.03×), the earlier ratios had used a `setprio=0` baseline, and `ns=2` at bn16 is 40/40 wrong or slower. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-17g) |
+| 2026-10-17h | The load path already beats hipblas on all four o/down cells (0.917-0.977), so the deficit is the mmac side and scales with K; the packed-stage stride bug is root-caused and fixed. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-17h) |
+| 2026-10-17i | Re-timed `ns=2` is 29-45% slower (the "fast" candidates had been measuring garbage), independent chains are 1.52-1.64× slower, and the deficit is the 16-20% where neither pipe is busy — 0.98× needs ~8× the blocks. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-17i) |
+| 2026-10-18 | N-split is closed hard (2-3× worse) and `ns>1` has a second, independent stage-index defect (bk128/ns2 rel ≈ 1119-3504, exact in the four configs the old tests happened to cover). | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-18) |
+| 2026-10-18b | The "2016 GB/s ceiling" was ~17% too high (1725 GB/s measured) and accumulator splitting is neutral (1.012-1.014×) — the exposure is not the mmac chain. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-18b) |
+| 2026-10-18c | The exposure is volumetric and per-iteration (half gemm +4.0 µs, double +13.6 µs at o M=16) and A-direct-to-VGPR is closed again (`r_mls` 1.935×/2.592× slower). | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-18c) |
+| 2026-10-18d | Split-K is not merely slow but inexpressible — the MLS K-slice offset is silently wrong for any nonzero base — and double buffering is worth ~1%. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-18d) |
+| 2026-10-19 | `warp_k`/`FullColK` is built and correct but 0.97-1.03× with mixed sign: a substitute for `setprio`, not a complement; the MLS `moffset` is a signed 10-bit immediate, so `block_K ≤ 512`. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-19-warpk) |
+| 2026-10-19 | `__builtin_hcu_matrix_load_b8` exists, but its per-lane layout is 4 consec-k × 4 n, not the mmac's 8 consec-k at one mn; bridging needs a full cross-lane permutation. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-19-matrixload) |
+| 2026-10-19 | hipblas launches 54 blocks × 256 threads (N macro-tile = N/54), so A is read 54× not 320×; reproducing that structure through MLS is still slower. | [link](docs/optimization/fp8_decode_gemm.md#2026-10-19-hipblas-launch) |
+| 2026-10-19 | The gap is an LDS-capacity invariant, `total = const × w × (L + C·ns)`: 5→4 blocks/CU costs 80% (93.7→168.9 µs) and `bk`/`ns` cancel; the producer rotation worth ~3% needs an emitter change. | [link](docs/optimization/fp8_decode_gemm.md#2026-10-19-lds) |
+| 2026-10-20 | Dense MLS packing (6144→4096 B) lets `bn96/bk256/ns2` land, a stable 5-7% win, and the disk kernel cache is blind to codegen changes. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-20) |
+| 2026-10-20b | The wide tile never cut A's re-read (A's address has no warp-id term, so blocks × warps is invariant); warp count is the lever, U-shaped, and `t192` is 0.952-0.962× of t384. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-20b) |
+| 2026-10-20c | Producer A de-replication is bit-exact but 1.044-1.358× slower: gating A out of `cp_async_wait<1>` drops a prefetch level (t192 `vmcnt(8)→(4)`). | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-20c) |
+| 2026-10-20d | The M=64 tile neighbourhood is closed (ship 1.178× down / 1.083× o; every `bn`/depth/width arm loses) and wave quantization is refuted — the exactly-64-block `bn80` is 1.177× slower. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-20d) |
+| 2026-10-20e | M in (64,128] was losing 1.8-2.3×; `bn96` (54 blocks, hipblas's own macro-tile) + `ns2` + a `bm96` arm for M=96 takes it to 1.30× down / 1.26× o (M=96: 1.12/1.14). `ns=1` is the serialized one, so "prefetch distance is zero" is scoped to M≤32. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-20e) |
+| 2026-10-20f | Decomposed the band: stream-only 167.2 µs (0.945× hipblas) + chain-only 109.8 µs (0.620×, 84% of usable MMA peak) = 229.8 µs, so only 43% of the compute overlaps and perfect overlap would win. More cover is unreachable (LDS caps `ns` at 2, split-depth is planner-blocked, `bm<M` re-reads B). | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-20f) |
+| 2026-10-21 | **The unrolled k-loop is the per-step lever**: a symbolic stage index `(k+d)%3` costs 13% (`v_readfirstlane` on the `matrix_load` address path), and the shipped loop already had both barriers. U6 takes down M=96 195.8→155.2 µs and o 71.4→58.7 (0.79/0.82× pipelined, 0.88/0.94× hipblas); unrolled, the M>96 tile reverses to bn96/t512/u8 (down 182.2 vs 214.7), i.e. 1.00-1.06×. Deeper cover re-falsified (A2B3 174.6 vs 155.2); LDS footprint still free. Every N=5120 tile takes U8: M=64 down 160.3→127.0 (0.925×, was 1.164) and o 57.0→49.6 (0.951×); M=1 is 2-3% (the residual there is the launch-fixed cost, untouched). M=64's tile does *not* move — bm96 would pad 50% of its MMA rows. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-21-d10x) |
+| 2026-10-21b | **The bandwidth audit and the wide-N mid band.** Time tracks *issued* bytes (`ceil(N/bn)·M·K + N·K`) at a flat ~1.5-2.0 TB/s, not DRAM bytes: at M≤16 we are at the ceiling (gate_up M=1 97%, down M=1 89%) while the DRAM-min number falls to 34-49% at M=128 purely from A's L2-served duplicates, and the whole M=128 o/down gap is the issue rate (1693 vs hipblas 1755 GB/s). The closed form `A_issued = N·M·K/bn` (bn only, bm cancels) makes bn the sole lever — and bn ≤ 128 is a hard MLS cap (bn160 does not build). Wide-N mid band taken by block count then MMA padding: gate_up M=96/128 1.020/1.002→**0.990/0.966** (bn128/ns2/U8), qkv M=80/96 1.202/1.246→**1.070/1.048** (bm96/bn96). Wave packing (bm split, bn80) closed at 1.03-4.19×. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-21b) |
+| 2026-10-21c | **qkv M=80..128 closed.** 10 arms at M=96 (bn80 1.052, ns1-to-get-2-blocks/CU 1.084, t256 1.177, bk256/ns1 1.531, bk64/ns4 1.785) and bm80 variants at M=80 — none beat the shipped tiles; the gap is structural (105 MB issued vs hipblas 78.9). M=128 moves to the o/down `bn96/ns2/t512` tile, 1.178→**1.153**: both tiles launch the same 80/107 blocks, so only MMA padding distinguishes M=112 (prefers bn128 by 1.4%) from M=128 (prefers bn96 by 1.3%) — switch at M>112. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-21c) |
+| 2026-10-21d | **gate_up M in (64,96] takes `bm96/bn128`.** bm128 ran 48/128 (M=80) and 32/128 (M=96) of its MMA rows as padding while `A_issued = ceil(N/bn)·M·K` has no `bm` in it, so the swap is byte-free. M=80 293.1→285.4 µs (**0.962×**), M=96 296.0→286.7 (**0.953×**); the thread optimum flips inside the band (t512 wins at M=80 by 0.9%, t256 at M=96 by 3.7%), so the chooser splits at 80. bn96 (the qkv tile) loses 1.016 — at 400 blocks bn buys nothing. 10 kernels M ∈ {65,72,80,88,96} × t ∈ {256,512} all `rel=0`. gate_up M=64 closed at 11 arms. | [link](docs/optimization/fp8_decode_gemm.md#h-2026-10-21d) |
 
 ## Authorized optimization levers (user-approved: may edit C++/pass, M<=64 may use pass changes)
 
@@ -202,6 +260,13 @@ the read ceiling, the `ns>1` mechanism) — the doc says where.
   the afternoon of 2026-10-20). Check `hy-smi` for an HCU% ≈ 0 card and pin it
   with `HIP_VISIBLE_DEVICES=<idle>` (`CUDA_VISIBLE_DEVICES` also works); re-check
   before trusting a measurement, and keep a sanity band on the hipblas arm.
+- **`hy-smi` lies about contention; calibrate inside every run.** On 2026-10-21 it
+  reported 0% HCU on all eight cards while hipblas measured 4-10× its quiet-card
+  time (card 5: 760 µs for a 70 µs GEMM; card 6 gave 75 µs and 102 µs on two
+  consecutive launches). Never trust an absolute or a ratio from a run that has
+  no in-process check: `/tmp/sc9.py` measures hipblas first and retries with a
+  30 s sleep until it is within 1.35× of the quiet-card value, and aborts rather
+  than printing. Cards 0-3 are the only ones that ever measured clean.
 - `tilelang.compile(gemm, out_idx=[4])` — use the **default target**
   (auto_detect from torch gcnArchName adds mcpu). Do NOT pass
   `target="hcu"`: `Check failed: (TargetHasMcpu(target)) is false`.
@@ -211,8 +276,10 @@ the read ceiling, the `ns>1` mechanism) — the doc says where.
 
 ## Key files
 
-- `perf/gemm/fp8_channelwise_mls.py` — production builder `fp8_mls_channelwise`
-  (MLS-MLS, block_K % 64 == 0). Reference for any pass/C++ change.
+- `tilelang/hcu/op/gemm/gemm_fp8_channelwise.py` — production builder
+  `fp8_channelwise_gemm` + `decode_cfg` (MLS-MLS, block_K % 64 == 0). Importable
+  as `tilelang.hcu.op.gemm.gemm_fp8_channelwise` (lazy export in the package
+  `__init__`). Reference for any pass/C++ change.
 - `perf/gemm/fp8_channelwise_decode_bench.py` — decode shape sweep.
 - `perf/gemm/fp8_channelwise_decode_bench_r_mls.py` — committed r_mls-vs-mls
   head-to-head + measured table (don't re-run the r_mls path for perf).
