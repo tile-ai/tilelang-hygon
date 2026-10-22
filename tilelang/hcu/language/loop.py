@@ -40,9 +40,7 @@ def Parallel(
 
 def _loop_requests_register_pipeline(ann: dict[str, Any]) -> bool:
     stages = ann.get("num_register_stages")
-    if stages is not None:
-        return int(stages) > 1
-    return bool(ann.get("enable_register_pipeline", False))
+    return stages is not None and int(stages) > 1
 
 
 def Pipelined(
@@ -60,8 +58,7 @@ def Pipelined(
 
     ``register_stages`` requests a register-resident GEMM K loop and sets the
     rotation depth (at least two); it is recorded as ``num_register_stages``
-    and read by the register-pipeline planner.  The legacy
-    ``enable_register_pipeline`` annotation still asks for the default depth.
+    and read by the register-pipeline planner.
 
     ``warp_divergence`` splits a register-pipelined K loop across two warp
     groups and is recorded as ``enable_warp_divergence``.  It only applies to

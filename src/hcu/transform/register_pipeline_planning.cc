@@ -263,9 +263,6 @@ int ResolveNumRegisterStages(const ForNode *op) {
   if (auto num_reg_stages = ReadLoopAnnotationAsInt(op, kNumRegisterStages)) {
     return static_cast<int>(num_reg_stages.value());
   }
-  if (LoopAnnotationIsTruthy(op, kEnableRegisterPipeline)) {
-    return kDefaultNumRegisterStages;
-  }
   return 0;
 }
 
@@ -274,8 +271,8 @@ int ResolveNumRegisterStages(const ForNode *op) {
  * apply.
  *
  * Loops that did not ask for a register pipeline are returned unchanged.
- * An explicit request (`num_register_stages >= 2`, or
- * `enable_register_pipeline`) that cannot be planned is a hard error.
+ * An explicit request (`num_register_stages >= 2`) that cannot be planned is
+ * a hard error.
  */
 For DeclineRegisterPipeline(const ForNode *op, const std::string &reason) {
   int requested = ResolveNumRegisterStages(op);

@@ -37,8 +37,8 @@ const software_pipeline::PipelineFlavor kRegisterPipelineFlavor = [] {
   flavor.versioned_locals_key = kRegisterPipelineVersionedLocals;
   flavor.consumed_keys = {kRegisterPipelineStage, kRegisterPipelineOrder,
                           kRegisterPipelineAsyncStages};
-  flavor.preserved_keys = {"num_stages", kEnableRegisterPipeline,
-                           kNumRegisterStages, kEnableWarpDivergence};
+  flavor.preserved_keys = {"num_stages", kNumRegisterStages,
+                           kEnableWarpDivergence};
   flavor.versions_other = false;
   flavor.fatal_on_partial_schedule = false;
   flavor.owns_barrier_buffers = false;

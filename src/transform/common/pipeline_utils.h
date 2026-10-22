@@ -47,8 +47,6 @@ static constexpr const char *kRegisterPipelineOrder =
     "tl_register_pipeline_order";
 static constexpr const char *kRegisterPipelineAsyncStages =
     "tl_register_pipeline_async_stages";
-static constexpr const char *kEnableRegisterPipeline =
-    "enable_register_pipeline";
 static constexpr const char *kNumRegisterStages = "num_register_stages";
 static constexpr const char *kEnableWarpDivergence = "enable_warp_divergence";
 static constexpr const char *kRegisterPipelineApplied =
@@ -96,16 +94,10 @@ inline bool LoopAnnotationIsTruthy(const ForNode *loop, const char *key) {
 
 /*!
  * \brief Whether the loop asks for a register-resident pipeline.
- *
- * The request is what the frontend wrote: num_register_stages, or the
- * enable_register_pipeline flag asking for the default depth.
  */
 inline bool LoopRequestsRegisterPipeline(const ForNode *loop) {
-  if (auto num_register_stages =
-          ReadLoopAnnotationAsInt(loop, kNumRegisterStages)) {
-    return num_register_stages.value() > 1;
-  }
-  return LoopAnnotationIsTruthy(loop, kEnableRegisterPipeline);
+  auto num_register_stages = ReadLoopAnnotationAsInt(loop, kNumRegisterStages);
+  return num_register_stages.has_value() && num_register_stages.value() > 1;
 }
 
 /*!

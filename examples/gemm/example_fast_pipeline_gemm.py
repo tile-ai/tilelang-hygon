@@ -24,7 +24,7 @@ def matmul(A, B, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float
             T.ceildiv(K, block_K),
             num_stages=4,
             annotations={
-                "enable_register_pipeline": 1,
+                "num_register_stages": 2,
                 "enable_warp_divergence": 1,
             },
         ):
