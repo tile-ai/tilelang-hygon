@@ -48,14 +48,40 @@ pytestmark = [
 ]
 
 
+def _chunk_rows(N, K, bytes_per_elem=4, budget=64 << 20):
+    """Rows of N that fit in `budget` bytes at `bytes_per_elem` per element."""
+    return max(1, budget // max(1, bytes_per_elem * K))
+
+
 def _ref_program(A, B, scale_a, scale_b):
-    return (A.float() @ B.float().T) * scale_a[:, None] * scale_b[None, :]
+    # Chunked over N: B.float() alone is 1.05 GiB at (51200, 5120) and this card
+    # gives one process ~1.5 GiB, so the unchunked form OOMs before the kernel
+    # under test is even reached.  The k-reduction is not chunked and the two
+    # scale multiplications are applied in the original order, so every element
+    # is bit-identical to the unchunked expression.
+    N, K = B.shape
+    step = _chunk_rows(N, K)
+    if step >= N:
+        return (A.float() @ B.float().T) * scale_a[:, None] * scale_b[None, :]
+    Af = A.float()
+    out = torch.empty((A.shape[0], N), dtype=torch.float32, device=A.device)
+    for i in range(0, N, step):
+        j = min(i + step, N)
+        out[:, i:j] = ((Af @ B[i:j].float().T) * scale_a[:, None]
+                       * scale_b[i:j][None, :])
+    return out
 
 
 def _make_inputs(M, N, K, seed=0):
     torch.manual_seed(seed)
     A = torch.randn(M, K, device="cuda").to(torch.float8_e4m3fn)
-    B = torch.randn(N, K, device="cuda").to(torch.float8_e4m3fn)
+    # Same reason as _ref_program: torch.randn(N, K) is a 1.0 GiB fp32 temporary
+    # at gate_up's shape.  Fill B in row chunks and cast each one in place.
+    B = torch.empty((N, K), dtype=torch.float8_e4m3fn, device="cuda")
+    step = _chunk_rows(N, K)
+    for i in range(0, N, step):
+        j = min(i + step, N)
+        B[i:j] = torch.randn(j - i, K, device="cuda").to(torch.float8_e4m3fn)
     scale_a = torch.rand(M, device="cuda", dtype=torch.float32) + 0.5
     scale_b = torch.rand(N, device="cuda", dtype=torch.float32) + 0.5
     return A, B, scale_a, scale_b
@@ -80,8 +106,17 @@ def test_hcu_gemm_fp8_channelwise_validated_config():
     ref = _ref_program(A, B, scale_a, scale_b)
     rel = (C - ref).abs().max().item() / ref.abs().max().item()
     assert rel < 0.01, f"fp8 MLS channelwise GEMM rel error {rel:.6f} >= 0.01"
+    del C, ref
 
-    kernel.get_profiler().assert_allclose(_ref_program, atol=1e-2, rtol=1e-2)
+    # The profiler harness is exercised on a small shape on purpose: its
+    # assert_allclose materialises its own A/B/out plus a reference plus the
+    # isclose temporaries, ~1.6 GiB at 8192^2, which does not fit in this box's
+    # ~1.5 GiB per-process quota.  Correctness at 8192^2 is the `rel` check
+    # above; this one is about the jit/profiler plumbing, which is shape-blind.
+    del A, B, scale_a, scale_b
+    torch.cuda.empty_cache()
+    small = fp8_channelwise_gemm(2048, 2048, 2048, 128, 128, 64, num_stages=1, threads=256)
+    small.get_profiler().assert_allclose(_ref_program, atol=1e-2, rtol=1e-2)
 
 
 def test_hcu_gemm_fp8_channelwise_small():
@@ -115,6 +150,20 @@ def test_decode_cfg_is_shape_aware():
     narrow = decode_cfg(1, 5120, 25600)
     assert (narrow.block_N, narrow.threads, narrow.num_stages) == (96, 192, 2)
     assert decode_cfg(1, 5120, 8192).block_N == 96
+
+    # N in (5120, 10240) used to fall through to the bn=16 fallback.  Only 27B's
+    # in_proj_z (6144x5120) lands there and it was the worst cell in the table:
+    # 384 blocks each re-reading the whole A tile (A_issued = 384*32*5120 = 62.9
+    # MB + 31.5 MB of B ~ 1970 GB/s, above the 1725 GB/s read ceiling).  It now
+    # takes the same fat tile as N=5120 but at t128 -- the grid is exactly 64
+    # blocks, so two warps is 128 warps on 64 CUs; the N=5120 control still
+    # prefers t192 in the same process, so this is a property of the 64-block
+    # grid, not a general rule.  Measured through this chooser, every arm exact
+    # (rel == 0), paired vs hipblas: M=1 0.813, 8 0.823, 16 0.834, 24 0.833,
+    # 32 0.879 (was 1.068 / 1.276 / 1.981 / 1.816 at bn16).
+    for M in (1, 16, 24, 32):
+        z = decode_cfg(M, 6144, 5120)
+        assert (z.block_N, z.block_K, z.num_stages, z.threads) == (96, 256, 2, 128), (M, z)
 
     # The fat tile's thread count is pinned by the N-atom split, so unlike the
     # old bn16 tile it does NOT scale with block_M -- bm32 keeps t192.  Three
@@ -161,10 +210,16 @@ def test_decode_cfg_is_shape_aware():
     # waves), so ns2 loses there (1.261/1.277) and instead it shrinks to
     # bm96/bn96 while M <= 96 fits in one tile row: 1.202 -> 1.070 at M=80 and
     # 1.246 -> 1.048 at M=96 (bn is NOT the lever there -- bm128/bn96 is 1.248).
+    # 2026-10-21e: bk64/ns2 splits the step in half, so the per-block LDS halves
+    # and a second block becomes resident (2 blocks/CU), which is what hides the
+    # cp_async wait.  It needs the grid to fill both slots -- here 107 blocks at
+    # bn96 -- and is worth qkv32 M=96 1.0467 -> 0.9633 vs hipblas (paired, every
+    # arm bit-exact).  z27 (48 blocks) and o/down (40) stay on bk128: bk64 there
+    # measures 1.20-1.41x because the second slot sits idle.
     for M in (65, 80, 96):
         q = decode_cfg(M, 10240, 5120)
-        assert (q.block_M, q.block_N, q.block_K, q.num_stages, q.threads) == \
-            (96, 96, 128, 2, 384), (M, q)
+        assert (q.block_M, q.block_N, q.block_K, q.num_stages, q.threads,
+                q.setprio) == (96, 96, 64, 2, 384, 1), (M, q)
     # gate_up M in (64,96] takes bm96/bn128: bm128 spent 25-37% of its MMA rows on
     # padding, and bm96 removes it at zero byte cost (A_issued has no bm in it).
     # Paired 2x each: M=80 293.1/293.3 (bm128/t512) vs 285.4/285.6 (bm96/t512);
@@ -175,17 +230,41 @@ def test_decode_cfg_is_shape_aware():
         g = decode_cfg(M, 51200, 5120)
         assert (g.block_M, g.block_N, g.block_K, g.num_stages, g.threads) == \
             (96, 128, 128, 2, threads), (M, g)
-    # qkv M in (112,128] keeps the bn128/ns1 tile, M=128 takes the o/down one.
-    # Both tiles launch the same 80/107 blocks for any M<=128, so the only
-    # difference is MMA padding: at M=112 it is 12.5% (MMA per byte low, bn96's
-    # +17% A bytes are not repaid: 86.56/86.72 vs 87.84us), at M=128 it is zero
-    # (87.52/87.84 vs 88.64/88.96us for bn96).  Paired, 7 rounds, idle card.
-    q = decode_cfg(112, 10240, 5120)
-    assert (q.block_M, q.block_N, q.block_K, q.num_stages, q.threads, q.setprio) == \
-        (128, 128, 128, 1, 512, 0), q
+    # The M in (96,128] band takes bk64 across the WHOLE band (2026-10-22), not
+    # just above M=112.  The old `M > 112` gate sent M=97..112 to bn128/bk128/ns1
+    # -- no pipeline stage, 1 block/CU -- and was never measured there because
+    # bk128 was the only bk in the table when the boundary was drawn.  At M=112
+    # that is a 16.5% hole (qkv32, paired same-process, 7 rounds, min-of-rounds,
+    # every arm bit-exact at rel=0.0, same hipblas 65.2us):
+    #   bk128/ns1 (was shipped) 79.68us 1.221x | bk64/ns2 66.52 1.020x
+    #   bn96/bk128/ns2 78.67 1.206x            | bn128/bk128/ns2 82.74 1.266x
+    # Re-checked through this chooser at both a boundary and an interior point:
+    # M=104 66.03us 1.014, M=112 66.67 1.020 (qkv32); M=104 74.85 0.998,
+    # M=112 77.34 1.034 (qkv27); M=128 0.974/0.963.  M<=96 keeps bm96 (its own
+    # branch, where bm96/bn96/bk64 is 61.30 against this tile's 65.78).
+    for M in (104, 112):
+        q = decode_cfg(M, 10240, 5120)
+        assert (q.block_M, q.block_N, q.block_K, q.num_stages, q.threads,
+                q.setprio) == (128, 128, 64, 2, 512, 1), (M, q)
+    # ...while z27 (N=6144, 48 bn128-blocks) must still fall through: bk64 there
+    # is 1.20-1.28x because the second LDS slot sits idle.  Below the 112
+    # boundary it keeps bn128/bk128/ns1, above it the 72-block bn96 tile.
+    for M in (104, 112):
+        z = decode_cfg(M, 6144, 5120)
+        assert (z.block_M, z.block_N, z.block_K, z.num_stages) == \
+            (128, 128, 128, 1), (M, z)
+    for M in (113, 128):
+        z = decode_cfg(M, 6144, 5120)
+        assert (z.block_M, z.block_N, z.block_K, z.num_stages) == \
+            (128, 96, 128, 2), (M, z)
+    # qkv M=128 with bk64 (2026-10-21e): the grid at bn128 is 80 blocks, which
+    # does fill the second resident slot, so it takes bk128 -> bk64 and bn96 ->
+    # bn128: 1.5782 -> 1.1021 vs hipblas for qkv27 (M=128) and 1.1268 -> 0.9807
+    # for qkv32.  gate_up is wide enough (400 blocks) that bk128 already has two
+    # blocks resident, so it keeps the tile -- bk64 buys nothing there.
     q = decode_cfg(128, 10240, 5120)
     assert (q.block_M, q.block_N, q.block_K, q.num_stages, q.threads, q.setprio) == \
-        (128, 96, 128, 2, 512, 1), q
+        (128, 128, 64, 2, 512, 1), q
     for M in (112, 128):
         g = decode_cfg(M, 51200, 5120)
         assert (g.block_M, g.block_N, g.block_K, g.num_stages, g.threads) == \
@@ -274,21 +353,54 @@ def test_small_m_decode_configs_are_exact(M, N, K):
     assert rel < 1e-3, f"decode_cfg({M}, {N}, {K}) = {cfg} rel error {rel:.6f}"
 
 
-@pytest.mark.parametrize("N,K", ((10240, 5120), (51200, 5120)))
-@pytest.mark.parametrize("M", (80, 96, 128))
+@pytest.mark.parametrize("M,N,K", ((16, 5120, 5120), (16, 10240, 5120)))
+def test_per_tensor_scale_a_is_exact(M, N, K):
+    """``per_tensor_a=True`` must be the same GEMM with a 1-element ``scale_a``.
+
+    It exists for the M == 1 decode step, where vLLM's ``scale_a`` is [1, 1]:
+    declaring ``scale_a`` as ``(block_M,)`` would force the caller to
+    materialise a band-length buffer, and on this card *one* DtoD copy node
+    costs ~5 us of GPU time regardless of size.  Pinned by comparing against
+    the per-row variant on a constant scale, so a wrong broadcast (``[0]`` vs
+    ``[i]``, or a mis-sized read) shows up as a numeric error.
+    """
+    cfg = decode_cfg(M, N, K)
+    A, B, scale_a, scale_b = _make_inputs(M, N, K)
+    common = dict(block_M=cfg.block_M, block_N=cfg.block_N, block_K=cfg.block_K,
+                  num_stages=cfg.num_stages, threads=cfg.threads, setprio=cfg.setprio)
+    per_row = fp8_channelwise_gemm(M, N, K, **common)
+    per_tensor = fp8_channelwise_gemm(M, N, K, per_tensor_a=True, **common)
+
+    flat = scale_a[:1].reshape(1).contiguous()       # the M == 1 spelling
+    C_ten = per_tensor(A, B, flat, scale_b)
+
+    const = flat[0].expand(M).contiguous()           # makes the arms comparable
+    C_row = per_row(A, B, const, scale_b)            # same GEMM, per-row spelling
+    ref = _ref_program(A, B, const, scale_b)
+    for name, C in (("per-row", C_row), ("per-tensor", C_ten)):
+        assert torch.isfinite(C).all(), f"{name} produced non-finite output"
+        rel = (C - ref).abs().max().item() / ref.abs().max().item()
+        assert rel < 1e-3, f"{name} rel error {rel:.6f} at decode_cfg({M}, {N}, {K})"
+
+
+@pytest.mark.parametrize("M,N,K", (
+    (80, 10240, 5120), (96, 10240, 5120), (104, 10240, 5120),
+    (112, 10240, 5120), (128, 10240, 5120),
+    (80, 51200, 5120), (96, 51200, 5120), (128, 51200, 5120),
+))
 def test_wide_n_mid_band_is_exact(M, N, K):
     """The M in (64,128] wide-N rule (2026-10-21/21d) on both shapes it serves.
 
-    Six arms, and each one is a tile that was previously unshipped: qkv M=96
-    takes bm96/bn96/ns2/U8, qkv M=128 takes bm128/bn96/ns2/t512/setprio (the
-    o/down M>96 tile -- 1.3% faster than bm128/bn128/ns1 because M=128 pads the
-    bm=128 tile zero, so the extra 107-vs-80 blocks pay for their +17% A bytes;
-    M=112 is the opposite, 1.4% the other way), gate_up takes
+    Eight arms, and each one is a tile that was previously unshipped: qkv M=96
+    takes bm96/bn96/ns2/U8, qkv M in (96,128] takes bm128/bn128/bk64/ns2/t512
+    (2026-10-22f: the bk64 arm -- 2 blocks/CU -- over the whole band, not just
+    above the old M=112 gate), and gate_up takes
     bm96/bn128/ns2/U8 at M=80/96 (2026-10-21d: bm96 deletes 48/128 and 32/128
-    padded MMA rows at zero byte cost) and bm128/bn128/ns2/U8 at M=128.  All of
+    padded MMA rows at zero byte cost) and bm128/bn128/ns2/U8 at M>96.  All of
     them are ns>1 *or* a bm that does not
     equal M, so this pins the predicated copies and the unrolled path where the
-    pre-2026-10-17h code was silently wrong.
+    pre-2026-10-17h code was silently wrong.  M=104/112 are the interior points
+    the old band boundary was never measured at.
     """
     cfg = decode_cfg(M, N, K)
     A, B, scale_a, scale_b = _make_inputs(M, N, K)

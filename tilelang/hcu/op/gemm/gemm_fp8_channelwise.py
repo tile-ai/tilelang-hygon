@@ -51,6 +51,22 @@ class DecodeCfg:
     split_k: int = 1
 
 
+# bk64 tiles admitted for num_stages=2 (2026-10-21).  Halving block_K halves the
+# per-block LDS (and the per-step bytes), which doubles the resident blocks/CU
+# from 1 to 2 -- the prefetch depth this path pays for in LDS rather than VGPRs.
+# It only pays when the grid still fills those slots, i.e. more blocks than CUs
+# (see decode_cfg).  Measured paired same-process, graph replay, 7 rounds, idle
+# card, every arm bit-exact (rel == 0.0), ratio = ours/hipblas:
+#   96x96x64/ns2/t384/u8   qkv32 M= 96  0.9633   (shipped bn96/bk128 1.0467)
+#   96x128x64/ns2/t512/u8  qkv27 M= 96  0.9392   (shipped bn128/bk128 ns1 1.0272,
+#                                                shipped bm96/bn96 1.3392)
+#   128x128x64/ns2/t512/u8 qkv32 M=128  0.9807   (shipped bn96/bk128 1.1268)
+#   128x128x64/ns2/t512/u8 qkv27 M=128  1.1021   (shipped bn96/bk128 1.5782)
+# Negative controls, same protocol: z27 (N=6144, 64 blocks) 1.20-1.28x with bk64
+# against 0.89-1.05x with bk128, o32 (N=5120) 1.32 vs 1.04, gu32 (N=51200) a tie.
+_NS2_BK64_TILES = {(96, 96, 64), (96, 128, 64), (128, 128, 64)}
+
+
 def _validate_cfg(cfg, M, N, K):
     """Fail at selection time, with the shape in the message, rather than deep
     inside tilelang.compile.  Every assert here has been a real silent-wrong-answer
@@ -82,7 +98,8 @@ def _validate_cfg(cfg, M, N, K):
     # depends on (bm,bn,bk) and the A copy extent on M, so both were swept.
     _wide_exact = (bn == 96 and bk == 256 and ns <= 2) or (bn == 96 and bk == 128 and bm >= 64 and ns <= 2) \
         or (bm == 128 and bn == 128 and bk == 128 and ns <= 2) \
-        or (bm == 96 and bn == 128 and bk == 128 and ns <= 2)
+        or (bm == 96 and bn == 128 and bk == 128 and ns <= 2) \
+        or ((bm, bn, bk) in _NS2_BK64_TILES and ns <= 2)
     assert ns <= 1 or (bm, bn) == (64, 64) or _wide_exact, (
         f"shape {M}x{N}x{K}: num_stages={ns} is only tuned for bm=bn=64 or the bn96 wide tile "
         f"(bm={bm}, bn={bn}, bk={bk})")
@@ -218,8 +235,9 @@ def decode_cfg(M, N, K):
         # M in (96, 128] cannot use bm96 (two 96-row tiles = 192 rows for <=128,
         # 50% padding) and every wave-packing variant loses: bm64/bn128 1.467,
         # bm64/bn96 1.705, bn80/128 blocks 1.214, bn96 1.172, bn128/ns1 1.178.
-        # qkv at this M is the one cell this path does not win; 80 blocks on 64
-        # CUs (1.25 waves) is not fixable by any legal tile (bn160 is illegal).
+        # (These are the bm96/bm128 *bk128* arms. qkv's remaining hole in this
+        # band was the bk, not bm or bn -- see the bk64 hoist below, which takes
+        # it to 1.02 at M=112 and 0.97 at M=128.)
         # Closed here 2026-10-21 (all paired, bit-exact, worse than the shipped
         # tile): bm96/bn96 ns1 76.48us/1.084 and bk256/ns1 108.00us/1.531 at
         # M=96; t256 at bm96/bn96 83.04/1.177; bk320 does not launch; at M=128
@@ -248,22 +266,67 @@ def decode_cfg(M, N, K):
                 return _validate_cfg(DecodeCfg(96, 128, 128, 2, 256, 0), M, N, K)
             return _validate_cfg(DecodeCfg(128, 128, 128, 2, 512, 0), M, N, K)
         if M <= 96:
+            # bk64/ns2 (2026-10-21): halves the LDS per block, so 2 blocks/CU fit
+            # and the second one hides the cp_async wait.  It needs the grid to
+            # fill both slots -- more blocks than CUs -- which is the same
+            # condition as "one wave at 2 blocks/CU" below 256 blocks:
+            #   blocks <=  64  -> keep bk128 (z27: 64 blocks, 0.89-1.05x; bk64
+            #                     1.20-1.28x, i.e. the second slot sits idle)
+            #   blocks <= 128  -> bn96/bk64 (qkv32: 107 blocks, 0.9633x)
+            #   else           -> bn128/bk64 (qkv27: 150 at bn96 = 2 waves, 1.44x;
+            #                     112 at bn128 = 1 wave, 0.9392x)
+            if K % 64 == 0 and -(-N // 96) > 64:
+                if -(-N // 96) <= 128:
+                    return _validate_cfg(DecodeCfg(96, 96, 64, 2, 384, 1), M, N, K)
+                return _validate_cfg(DecodeCfg(96, 128, 64, 2, 512, 1), M, N, K)
             return _validate_cfg(DecodeCfg(96, 96, 128, 2, 384, 0), M, N, K)
-        # M in (112,128] takes the o/down M>96 tile instead: bn96's 107 blocks
-        # beat bn128's 80 (1.25 waves, 62.5% fill) once the block carries a full
-        # bm=128 of MMA rows.  The switch is at 112, not 96, because both tiles
-        # launch the SAME 80/107 blocks at any M<=128 -- only the padding moves:
-        # at M=112, 12.5% of the tile's MMA rows are wasted, so MMA per byte is
-        # low and the +17% A bytes of bn96 are not repaid (2026-10-21, paired,
-        # 7 rounds, idle card, min-of-rounds, ratio = ours/hipblas):
+        # What is LEFT in M in (112,128] after the bk64 hoist below: only shapes
+        # whose bn128 grid is <= 64 blocks, i.e. ceil(N/128) <= 64 -> N <= 8192.
+        # o/down (N=5120) never get here (they take the N==5120 branch), so in
+        # practice this is z27 (N=6144, 48 blocks) alone.  For it, bn96's 72
+        # blocks beat bn128's 48 (0.75 waves) once the block carries a full
+        # bm=128 of MMA rows -- the o/down M>96 tile.  The switch is at 112, not
+        # 96, because both tiles launch the same block count at any M<=128 -- only
+        # the padding moves: at M=112, 12.5% of the tile's MMA rows are wasted, so
+        # MMA per byte is low and the +17% A bytes of bn96 are not repaid
+        # (2026-10-21, paired, 7 rounds, idle card, min-of-rounds, ours/hipblas):
         #   M=112  bn128/ns1 86.56/86.72  bn96/ns2 87.84   -> bn128 by 1.4%
         #   M=128  bn128/ns1 88.64/88.96  bn96/ns2 87.52/87.84 -> bn96 by 1.3%
         # (M=128 has zero padding, so the extra blocks do pay).  Both arms
-        # bit-exact (rel=0).  qkv M=128 1.178 -> 1.153 as a result -- still the
-        # one losing cell: winning it needs issued bytes < hipblas's 78.9MB,
-        # i.e. bn >= 190, which is not an MLS tile, and split-K (the only other
-        # block-count lever) is closed on correctness.
+        # bit-exact (rel=0).  qkv does NOT reach this branch any more: its bn128
+        # grid is 80/112 blocks, so it takes the bk64 arm above and wins there
+        # (M=128 0.9739, M=112 1.0203 vs the 1.221 this branch used to give it).
+        # M in (96, 128] -- the whole band, not just M=128.  The bk64 arm below
+        # used to be gated on `M > 112`, a boundary tuned when bk128 was the only
+        # bk in the table; the arm was then only ever measured above it.  It is
+        # legal over the whole band, and at M=112 the old fall-through
+        # (bn128/bk128/ns1, i.e. no pipeline stage and 1 block/CU) is a 16.5%
+        # hole: qkv32 M=112, paired same-process, graph replay, 7 rounds,
+        # min-of-rounds, all arms bit-exact (rel == 0.0), same hipblas 65.2us:
+        #   bk128/ns1 (was shipped here) 79.68us 1.221x
+        #   bk64/ns2  (this arm)         66.52us 1.020x   <- 0.835x of the old arm
+        #   bn96/bk128/ns2              78.67us 1.206x
+        #   bn128/bk128/ns2             82.74us 1.266x
+        # For reference at the two ends of the band, same process: M=96 bk64/bn128
+        # 65.78 vs the bm96/bn96/bk64 arm's 61.30 (the bm96 tile wins there, which
+        # is why M<=96 keeps its own branch), and M=128 bk64 67.14 vs 67.94 for the
+        # identical config through the old path (same tile, so this is noise).
+        # z27 (48 bn128-blocks) still falls through to bn96/bk128 below.
+        if K % 64 == 0 and -(-N // 128) > 64:
+            return _validate_cfg(DecodeCfg(128, 128, 64, 2, 512, 1), M, N, K)
         if M > 112:
+            # Same bk64 trade as the M<=96 branch, one level up: at bm=128 a
+            # bn96 tile is 107 (qkv32) / 150 (qkv27) blocks and bn128 is
+            # 80 / 112.  Measured at M=128 (paired, 7 rounds, p1/u8 on the new
+            # tile): qkv32 bn128 0.9807 (shipped bn96/bk128 1.1268), qkv27
+            # bn128 1.1021 (shipped 1.5782, i.e. -30%).  bm128/bn96/bk64 is
+            # qkv27's 2-wave trap (1.66x) and qkv32's second best (1.0192);
+            # bn256/bk64 ties bn128 on qkv27 (1.1053) but fails LDS at bk128.
+            # The test is on the bn128 block count -- the tile the new arm
+            # actually launches -- not on bn96's: qkv32 = 80 (>64, wins),
+            # qkv27 = 112 (>64, wins), while z27 (48), o (40) and down (40)
+            # must keep bn96/bk128 (z27 M=128 0.8915 with it vs 1.12-1.20 on
+            # every bk64 arm; o32 M=128 1.0410 vs 1.32-1.41).
             return _validate_cfg(DecodeCfg(128, 96, 128, 2, 512, 1), M, N, K)
         return _validate_cfg(DecodeCfg(128, 128, 128, 1, 512, 0), M, N, K)
 
@@ -319,6 +382,27 @@ def decode_cfg(M, N, K):
         # beats it (0.935).  Do not pick t64/t128: both regress.
         if N == 5120 and K % 256 == 0:
             return _validate_cfg(DecodeCfg(bm, 96, 256, 2, 192, sp), M, N, K)
+        # The same wide tile for N in (5120, 10240) -- measured on the only real
+        # weight in that window, 27B's in_proj_z (N=6144, K=5120).  This used to
+        # fall through to bn16 below and was the worst cell in the whole decode
+        # table: paired vs hipblas 1.0678 (M=1), 1.2755 (M=8), 1.981 (M=24),
+        # 1.816 (M=32).  bn16 = 384 blocks each re-reading the whole A tile
+        # (A_issued = 384*32*5120 = 62.9 MB + 31.5 MB of B ~ 1970 GB/s, i.e. above
+        # the 1725 GB/s ceiling), which is the entire loss; hipblas's bn96 grid
+        # issues 10.5 MB of A.  Measured 2026-10-22, paired same-process,
+        # graph replay, 7 rounds, bitexact 0.0e+00 vs the fp32 reference:
+        #   M=24  bn16/t256 49.10 (1.818)  bn96/t192 23.42 (0.867)  [-52%]
+        #   M=32  bn16/t256 48.76 (1.827)  bn96/t192 24.86 (0.931)  [-49%]
+        # t128, not t192: at N=6144 the grid is exactly 64 blocks, so 2 warps is
+        # 128 warps on 64 CUs; at N=5120 (54 blocks) t192 still wins, so this is
+        # a property of the 64-block grid, carried as the measured point:
+        #   M=16  t192 22.17  t128 20.12 (-9%)     M=32  t192 24.63  t128 23.78
+        #   control N=5120: M=16 t192 20.19 vs t128 20.86; M=32 23.57 vs 26.76
+        # (t64 loses at both: 24.32 / 32.22 -- too few warps to hide latency.)
+        # k_unroll stays 1 at bm16 (u8 is +1.5%: 20.63 vs 20.12) and is 8 at bm32
+        # (22.79 vs 23.61) -- see _UNROLL_TILES.
+        if N < 10240 and K % 256 == 0:
+            return _validate_cfg(DecodeCfg(bm, 96, 256, 2, 128, sp), M, N, K)
         bn = 16
         # threads must scale with block_M: at bn16 a bm32 tile has two 16x16 M-atoms,
         # and giving them ONE warp (t=64) makes the block MMA-issue-bound instead of
@@ -336,12 +420,24 @@ def decode_cfg(M, N, K):
 _UNROLL_TILES = {
     (16, 96, 256, 2, 192): 8,      # o/down, M <= 16
     (32, 96, 256, 2, 192): 8,      # o/down, M in (16, 32]
+    # 27B in_proj_z (N=6144) M in (16,32].  Same tile as above but t128; u8 wins
+    # there (23.61 -> 22.79 us) while at bm16/t128 u8 LOSES (20.12 -> 20.63), so
+    # only the bm32 entry is listed.
+    (32, 96, 256, 2, 128): 8,
     (64, 64, 128, 2, 256): 8,      # o/down, M in (32, 64]
     (96, 96, 128, 2, 384): 8,      # o/down + qkv, M in (64, 96]
-    (128, 96, 128, 2, 512): 8,     # o/down M in (96,128]; qkv at M in (112,128]
+    # only o32/down32 ever reach this tile (qkv/gu bm128 are bn128).  u12 beats
+    # u8 in 4/4 paired runs on both shapes: o 60.93/60.96 -> 60.63, down
+    # 176.10/176.08 -> 174.80us (ratio 1.006 -> 1.000 on both).  u10 is between
+    # the two, u16 is 7% worse.  Re-swept u8/u10/u12/u16 at every other shipped
+    # tile: all within +-0.5% (noise), so 8 stands there.
+    (128, 96, 128, 2, 512): 12,    # o/down M in (96,128]
     (128, 128, 128, 2, 512): 8,    # gate_up, M in (96, 128]
     (96, 128, 128, 2, 512): 8,     # gate_up, M in (64, 80]
     (96, 128, 128, 2, 256): 8,     # gate_up, M in (80, 96]
+    (96, 96, 64, 2, 384): 8,       # qkv32, M in (64, 96]  (bn96 <= 128 blocks)
+    (96, 128, 64, 2, 512): 8,      # qkv27, M in (64, 96]  (bn128, 1 wave)
+    (128, 128, 64, 2, 512): 8,     # qkv,   M in (96, 128] (bk64: 2 blocks/CU)
     # Measured and NOT taken (2026-10-21, paired): at M=128 bn128/40 blocks
     # 71.0/214.7us, bn64/80 blocks 104.0us, bn80 -- illegal MLS tile, t1024
     # 88.5us, bm112 90.6us (2 blocks/row group instead of a clean warp split);
@@ -372,8 +468,17 @@ def fp8_channelwise_gemm(
     setprio=0,
     policy=None,
     k_unroll="auto",
+    out_dtype=None,
+    per_tensor_a=False,
 ):
     """Channelwise fp8 GEMM using MLS (matrix-LDS-read) A/B producers.
+
+    ``out_dtype`` sets the dtype of the ``C`` tensor only (the accumulator and
+    the scale epilogue stay ``accum_dtype``); ``None`` keeps ``C`` in
+    ``accum_dtype``.  Passing ``"bfloat16"`` fuses the fp32->bf16 cast into the
+    copy-out, which is what a ``torch._scaled_mm(out_dtype=bf16)`` drop-in needs:
+    without it the caller pays a second pass over ``block_M x N`` fp32
+    (~11 us on gate_up at M=64).
 
     ``block_K`` must be a multiple of 64 (the trans-B fp8 MLS atom width).
 
@@ -424,7 +529,17 @@ def fp8_channelwise_gemm(
     — each recovers the same ~7-11% and they do not stack. ``decode_cfg``
     therefore never selects it. It is kept because it is correct and removes an
     artificial limitation, not because it wins.
+
+    ``per_tensor_a=True`` declares ``scale_a`` as one element instead of
+    ``(block_M,)`` and multiplies by ``scale_a[0]``.  It exists for the M == 1
+    decode step, where vLLM's ``scale_a`` is ``[1, 1]``: the caller would
+    otherwise have to materialise a band-length buffer, and on this card *each*
+    DtoD copy node costs ~5 us of GPU time regardless of size (profiled: a
+    4-byte ``copy_`` is 5.0 us, i.e. as much as a quarter of the M=1 kernel).
+    20 cycles of the epilogue become one broadcast read; the loop, the LDS
+    accounting and the copy-out are unchanged.
     """
+    c_dtype = out_dtype or accum_dtype
     assert block_K % 64 == 0, "fp8 MLS channelwise GEMM requires block_K % 64 == 0"
     # block_K % 64 is necessary (trans-B atom) but not sufficient: the pipelined
     # T.copy reads a whole block_K tile per step, so a non-dividing block_K runs
@@ -477,7 +592,8 @@ def fp8_channelwise_gemm(
     _wide_exact = (block_N == 96 and block_K == 256 and num_stages <= 2) or (
         block_N == 96 and block_K == 128 and block_M >= 64 and num_stages <= 2) or (
         block_M == 128 and block_N == 128 and block_K == 128 and num_stages <= 2) or (
-        block_M == 96 and block_N == 128 and block_K == 128 and num_stages <= 2)
+        block_M == 96 and block_N == 128 and block_K == 128 and num_stages <= 2) or (
+        (block_M, block_N, block_K) in _NS2_BK64_TILES and num_stages <= 2)
     assert num_stages <= 1 or (block_M, block_N) == (64, 64) or _wide_exact or _ns_escape, (
         f"num_stages={num_stages} is only tuned for block_M=block_N=64 on HCU "
         f"(got block_M={block_M}, block_N={block_N}); multi-stage small tiles are correct "
@@ -508,9 +624,9 @@ def fp8_channelwise_gemm(
     def gemm(
         A: T.Tensor((M, K), "float8_e4m3fn"),
         B: T.Tensor((N, K), "float8_e4m3fn"),
-        scale_a: T.Tensor((M,), "float32"),
+        scale_a: T.Tensor((1 if per_tensor_a else M,), "float32"),
         scale_b: T.Tensor((N,), "float32"),
-        C: T.Tensor((M, N), accum_dtype),
+        C: T.Tensor((M, N), c_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             C_l = T.alloc_fragment((block_M, block_N), accum_dtype)
@@ -590,7 +706,9 @@ def fp8_channelwise_gemm(
                 # so this is mandatory, not an optimization.
                 T.reduce_sum_warp(C_l, C_l, clear=False)
             for i, j in T.Parallel(block_M, block_N):
-                C_l[i, j] = C_l[i, j] * scale_a[by * block_M + i] * scale_b[bx * block_N + j]
+                C_l[i, j] = (C_l[i, j] * (scale_a[0] if per_tensor_a
+                                          else scale_a[by * block_M + i])
+                             * scale_b[bx * block_N + j])
             T.copy(C_l, C[by * block_M, bx * block_N])
 
     # The unrolled loop inserts its barriers explicitly, so the automatic
