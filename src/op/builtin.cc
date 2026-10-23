@@ -5,6 +5,8 @@
 
 #include "builtin.h"
 
+#include <vector>
+
 #include <tvm/ir/transform.h>
 
 #include "builtin_registry.h"
@@ -319,6 +321,33 @@ TIR_DEFINE_TL_BUILTIN(device_assert_with_msg)
     .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
+
+namespace {
+/*!
+ * \brief Process-wide registry of backend async wait intrinsics.
+ *
+ * Holds strong references so a registered op stays interned for the life of
+ * the process, which lets the lookup compare op identities directly.
+ */
+std::vector<Op> &AsyncWaitOps() {
+  static std::vector<Op> ops;
+  return ops;
+}
+} // namespace
+
+void RegisterAsyncWaitOp(const Op &op) { AsyncWaitOps().push_back(op); }
+
+bool IsRegisteredAsyncWaitOp(const tirx::CallNode *call) {
+  if (call == nullptr) {
+    return false;
+  }
+  for (const Op &op : AsyncWaitOps()) {
+    if (call->op.same_as(op)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 } // namespace tl
 } // namespace tvm

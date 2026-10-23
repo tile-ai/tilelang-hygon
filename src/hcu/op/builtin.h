@@ -22,9 +22,22 @@ static constexpr const char *kHcuBufferOpsRebaseMap =
 
 static constexpr const char *kEnableHcuWdra = "tl.enable_hcu_wdra";
 
+// Pass config: unroll factor for the GEMM K loop after software pipelining.
+// Consumed by MaterializeRegisterPipelineStages, which rounds it up to a whole
+// number of register rotation periods. (Integer, default 4.)
+static constexpr const char *kPipelinedKUnrollFactor =
+    "tl.pipelined_k_unroll_factor";
+
 TVM_DLL const Op &hcu_cp_async_idxen();
 TVM_DLL const Op &ds_read_vector();
 TVM_DLL const Op &async_gld_sld_fence();
+/*!
+ * \brief HCU async global-load wait with an explicit group count.
+ *
+ * Registered via RegisterAsyncWaitOp so backend-agnostic commit/wait invariant
+ * checks recognize it as a wait.
+ */
+TVM_DLL const Op &async_gld_fence();
 TVM_DLL const Op &get_wave_id();
 TVM_DLL const Op &hcu_wdra_init();
 TVM_DLL const Op &abarrier_init();

@@ -12,6 +12,8 @@
 #define TVM_TL_TRANSFORM_COMMON_PIPELINE_UTILS_H_
 
 #include "support/check.h"
+#include <optional>
+#include <string>
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/cast.h>
 #include <tvm/s_tir/stmt.h>
@@ -38,6 +40,90 @@ static constexpr const char *kPipelineAsyncProducerGroups =
 /*! Per-original-statement replayable scalar Bind flag (1 = replayable). */
 static constexpr const char *kPipelineReplayableScalarBinds =
     "software_pipeline_replayable_scalar_binds";
+
+static constexpr const char *kRegisterPipelineStage =
+    "tl_register_pipeline_stage";
+static constexpr const char *kRegisterPipelineOrder =
+    "tl_register_pipeline_order";
+static constexpr const char *kRegisterPipelineAsyncStages =
+    "tl_register_pipeline_async_stages";
+static constexpr const char *kNumRegisterStages = "num_register_stages";
+static constexpr const char *kEnableWarpDivergence = "enable_warp_divergence";
+static constexpr const char *kRegisterPipelineApplied =
+    "tl_register_pipeline_applied";
+/*! Loop annotation recording the local buffers the injector versioned, as a
+ * map from buffer name to version count. */
+static constexpr const char *kRegisterPipelineVersionedLocals =
+    "tl_register_pipeline_versioned_locals";
+/*! Loop annotation recording how many pipeline iterations the stage
+ * materializer folded into one, for passes that count per-iteration work in
+ * the rewritten body. */
+static constexpr const char *kRegisterPipelinePhaseUnroll =
+    "tl_register_pipeline_phase_unroll";
+static constexpr int kDefaultNumRegisterStages = 2;
+static constexpr const char *kRegisterPipelineBufferSuffix = "_reg_pipe";
+
+/*! \brief Read an integer loop annotation, accepting both storage shapes.
+ *
+ * A loop annotation reaches a pass in one of two shapes: the compiler writes
+ * its own bookkeeping as an `IntImm` object, while an entry of a user
+ * `annotations` dict passed to `T.Pipelined` arrives as a primitive integer or
+ * boolean from the Python frontend. Accepting both keeps the vendor
+ * annotations readable no matter which side wrote them.
+ */
+inline std::optional<int64_t> ReadLoopAnnotationAsInt(const ForNode *loop,
+                                                      const char *key) {
+  if (loop == nullptr) {
+    return std::nullopt;
+  }
+  auto val = loop->annotations.Get(key);
+  if (!val.has_value()) {
+    return std::nullopt;
+  }
+  const ffi::Any &any = val.value();
+  if (const auto *imm = any.as<IntImmNode>()) {
+    return static_cast<int64_t>(imm->value);
+  }
+  return any.try_cast<int64_t>();
+}
+
+inline bool LoopAnnotationIsTruthy(const ForNode *loop, const char *key) {
+  auto value = ReadLoopAnnotationAsInt(loop, key);
+  return value.has_value() && value.value() != 0;
+}
+
+/*!
+ * \brief Whether the loop asks for a register-resident pipeline.
+ */
+inline bool LoopRequestsRegisterPipeline(const ForNode *loop) {
+  auto num_register_stages = ReadLoopAnnotationAsInt(loop, kNumRegisterStages);
+  return num_register_stages.has_value() && num_register_stages.value() > 1;
+}
+
+/*!
+ * \brief Whether the register injector actually rewrote this loop.
+ *
+ * Passes after the injector must key off the applied marker, never off the
+ * request: a loop that asked for a register pipeline but was not planned for
+ * one keeps its request annotation, while its body is an ordinary
+ * shared-memory pipeline that these passes would then misread.
+ */
+inline bool LoopHasAppliedRegisterPipeline(const ForNode *loop) {
+  return LoopAnnotationIsTruthy(loop, kRegisterPipelineApplied);
+}
+
+inline bool LoopHasWarpDivergence(const ForNode *loop) {
+  return LoopAnnotationIsTruthy(loop, kEnableWarpDivergence);
+}
+
+inline bool IsRegisterPipelineBufferScope(const ffi::String &scope) {
+  std::string s = scope;
+  return s == "local" || (s.size() > 6 && s.compare(0, 6, "local.") == 0);
+}
+
+inline bool IsRegisterPipelineBuffer(const Buffer &buffer) {
+  return buffer.defined() && IsRegisterPipelineBufferScope(buffer.scope());
+}
 
 /*! \brief Whether a flat TIRX statement declares pipeline-local buffer storage.
  *
@@ -104,6 +190,27 @@ inline ffi::Optional<Integer> GetPipelineNumStages(const ForNode *loop) {
     }
     if (max_stage >= 0) {
       return Integer(max_stage + 1);
+    }
+  }
+  return ffi::Optional<Integer>();
+}
+
+/*!
+ * \brief Stage count from T.Pipelined / InjectSoftwarePipeline only.
+ *
+ * Reads num_stages / tl_pipelined_num_stages; does not use
+ * software_pipeline_stage.
+ */
+inline ffi::Optional<Integer>
+GetExplicitPipelinedNumStages(const ForNode *loop) {
+  if (auto num_stages = loop->annotations.Get("num_stages")) {
+    if (const auto *imm = num_stages->as<IntImmNode>()) {
+      return Integer(static_cast<int>(imm->value));
+    }
+  }
+  if (auto num_stages = loop->annotations.Get("tl_pipelined_num_stages")) {
+    if (const auto *imm = num_stages->as<IntImmNode>()) {
+      return Integer(static_cast<int>(imm->value));
     }
   }
   return ffi::Optional<Integer>();

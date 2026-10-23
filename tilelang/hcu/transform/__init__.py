@@ -74,6 +74,56 @@ def MaterializeHcuDeviceAttrs():
     return _ffi_api.MaterializeHcuDeviceAttrs()  # type: ignore
 
 
+def RegisterPipelinePlanning():
+    """Plan register-resident fragments and rewrite GEMMs for the register pipeline."""
+    return _ffi_api.RegisterPipelinePlanning()  # type: ignore
+
+
+def InjectRegisterSoftwarePipeline():
+    """Inject the software pipeline of the register-resident K loop."""
+    return _ffi_api.InjectRegisterSoftwarePipeline()  # type: ignore
+
+
+def MarkFencePlannerOwnership():
+    """Record whether the fence planner will own this kernel's async waits."""
+    return _ffi_api.MarkFencePlannerOwnership()  # type: ignore
+
+
+def InjectAsyncGlobalLoadFence():
+    """Lower async wait scopes and insert G2S barriers."""
+    return _ffi_api.InjectAsyncGlobalLoadFence()  # type: ignore
+
+
+def LowerAsyncCommitWait():
+    """Lower async commit/wait attributes to concrete intrinsics."""
+    return _ffi_api.LowerAsyncCommitWait()  # type: ignore
+
+
+def MaterializeRegisterPipelineStages():
+    """Give every rotated register-pipeline slot its own same-shape buffer."""
+    return _ffi_api.MaterializeRegisterPipelineStages()  # type: ignore
+
+
+def InjectAsyncMmaFence():
+    """Insert LDS waits before MMA."""
+    return _ffi_api.InjectAsyncMmaFence()  # type: ignore
+
+
+def InjectWarpDivergence():
+    """Split a register-pipelined K loop across two warp groups."""
+    return _ffi_api.InjectWarpDivergence()  # type: ignore
+
+
+def InjectRegisterPipelineSchedBarrier():
+    """Wrap MMA clusters with sched_barrier when the register pipeline is on."""
+    return _ffi_api.InjectRegisterPipelineSchedBarrier()  # type: ignore
+
+
+def VerifyPipelineSync():
+    """Verify ownership and wait/barrier structure of fence-planned K loops."""
+    return _ffi_api.VerifyPipelineSync()  # type: ignore
+
+
 __all__ = (
     "AnnotateMlsGemmDep",
     "MaterializeHcuGemmLdsStrategy",
@@ -89,4 +139,14 @@ __all__ = (
     "LowerAndValidateHcuWdra",
     "LowerHcuBlockAnnotations",
     "MaterializeHcuDeviceAttrs",
+    "RegisterPipelinePlanning",
+    "InjectRegisterSoftwarePipeline",
+    "MarkFencePlannerOwnership",
+    "InjectAsyncGlobalLoadFence",
+    "LowerAsyncCommitWait",
+    "MaterializeRegisterPipelineStages",
+    "InjectAsyncMmaFence",
+    "InjectWarpDivergence",
+    "InjectRegisterPipelineSchedBarrier",
+    "VerifyPipelineSync",
 )

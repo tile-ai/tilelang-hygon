@@ -24,6 +24,7 @@
 #include "./common/thread_sync_types.h"
 #include "arith/ir_mutator_with_analyzer.h"
 #include "common/attr.h"
+#include "common/pipeline_utils.h"
 #include "cuda/op/builtin.h"
 #include "op/builtin.h"
 #include "runtime/thread_storage_scope.h"
@@ -73,11 +74,20 @@ using runtime::StorageScope;
 //
 // This rewriter conservatively inserts a shared-memory storage sync
 // immediately after every ptx_wait_group statement unless an identical sync
-// already follows.
+// already follows. A loop marked as an owned scope is left untouched: the
+// lowering that marked it pairs its own waits with barriers, so the waits
+// inside are already accounted for there.
 class ThreadSyncAfterWaitGroupInserter : public StmtExprMutator {
 public:
   explicit ThreadSyncAfterWaitGroupInserter(StorageScope sync_scope)
       : sync_scope_(std::move(sync_scope)) {}
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    if (LoopAnnotationIsTruthy(op, attr::kSyncOwnedScope)) {
+      return GetRef<Stmt>(op);
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {
     Array<Stmt> visited;
@@ -655,6 +665,9 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
      *         (e.g., inside a TMA load) and therefore multiple writes
      *         among themselves should not force barriers between them. */
     bool is_async_copy = false;
+    /*! \brief Whether the access sits inside a scope whose synchronization an
+     *         owning backend lowering provides. */
+    bool in_owned_scope = false;
     /*! \brief Whether this access is part of an atomic RMW (e.g., atomic_add).
      *
      * If both sides of a dependency are atomic, we should not insert a thread
@@ -678,6 +691,15 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
   StorageScope GetScope(Var buffer_var) const {
     return StorageScope::Create(GetPtrStorageScope(std::move(buffer_var)));
   }
+
+  /*! \brief Start an access entry, tagged with the scope it appears in. */
+  AccessEntry MakeAccessEntry() const {
+    AccessEntry e;
+    e.cset = {constr_stack_};
+    e.in_owned_scope = (owned_scope_depth_ > 0);
+    return e;
+  }
+
   bool IsSharedDynPointer(const Var &buffer_var) const {
     return buffer_var->type_annotation.as<PointerTypeNode>() &&
            GetPtrStorageScope(buffer_var) == "shared.dyn";
@@ -822,7 +844,7 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
     if (Enabled(buf.get(), scope)) {
       ICHECK(allow_append_)
           << GetRef<BufferLoad>(op) << " " << scope.to_string();
-      AccessEntry e{.cset = {constr_stack_}};
+      AccessEntry e = MakeAccessEntry();
       e.threads = env_threads();
       e.buffer = buf;
       e.buffer_name = op->buffer;
@@ -849,7 +871,7 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
     buffer_data_to_buffer_.Set(GetRef<Var>(buf.get()), op->buffer);
     StorageScope scope = GetScope(buf);
     if (Enabled(buf.get(), scope)) {
-      AccessEntry e{.cset = {constr_stack_}};
+      AccessEntry e = MakeAccessEntry();
       e.threads = env_threads();
       e.buffer = buf;
       e.buffer_name = op->buffer;
@@ -937,12 +959,22 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
   }
 
   void VisitStmt_(const ForNode *op) final {
+    // A loop marked as an owned scope is synchronized by the lowering that
+    // marked it: its accesses are recorded as owned so the conflicts they
+    // carry stay with that lowering.
+    const bool owned = LoopAnnotationIsTruthy(op, attr::kSyncOwnedScope);
+    if (owned) {
+      owned_scope_depth_++;
+    }
     scope_.push_back(std::vector<StmtEntry>());
     ConstrVisitor::VisitStmt_(op);
     StmtEntry s;
     s.stmt = op;
     s.access = Summarize(std::move(scope_.back()), op);
     scope_.pop_back();
+    if (owned) {
+      owned_scope_depth_--;
+    }
     if (!s.access.empty()) {
       // relax the touched set to contain all ranges in the loop.
       std::unordered_map<const VarNode *, arith::IntSet> relax_map;
@@ -1244,7 +1276,7 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
         }
         if (Enabled(buffer_var, scope)) {
           ICHECK(allow_append_);
-          AccessEntry e{.cset = {constr_stack_}};
+          AccessEntry e = MakeAccessEntry();
           e.threads = env_threads();
           e.dtype = dtype;
           e.buffer = Downcast<Var>(buffer->data);
@@ -1318,7 +1350,7 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
                 start_indices[i], end_indices[i] - start_indices[i]));
           }
         }
-        AccessEntry e{.cset = {constr_stack_}};
+        AccessEntry e = MakeAccessEntry();
         e.threads = env_threads();
         e.dtype = dtype;
         e.buffer = GetRef<Var>(buffer_var);
@@ -1347,7 +1379,7 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
       const std::string &s = op->args[0].as<StringImmNode>()->value;
       if (s != "warp" && s != "cluster") {
         StorageScope scope = StorageScope::Create(s);
-        AccessEntry e{.cset = {constr_stack_}};
+        AccessEntry e = MakeAccessEntry();
         e.threads = env_threads();
         e.type = kSync;
         e.scope = StorageScope::Create(s);
@@ -1358,7 +1390,7 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
       // memory fence, so it subsumes a block-level barrier for any storage
       // scope planned here.
       ICHECK(allow_append_);
-      AccessEntry e{.cset = {constr_stack_}};
+      AccessEntry e = MakeAccessEntry();
       e.threads = env_threads();
       e.type = kSync;
       e.scope = sync_scope_;
@@ -1606,6 +1638,8 @@ private:
   StorageScope sync_scope_;
   // warp size from target
   int warp_size_;
+  // nesting depth of the scopes an owning lowering provides synchronization for
+  int owned_scope_depth_{0};
 
   void insert_syncs(const Object *obj) {
     if (syncs_inserted_.count(obj))
@@ -1930,6 +1964,15 @@ private:
         curr.is_async_copy) {
       return false;
     }
+    // Inside an owned scope every wait the owner emits comes with a block-wide
+    // barrier, so the read/write conflicts around an async copy are covered
+    // there. Edges that leave the scope keep the conservative handling: the
+    // owner's schedule stops at the scope boundary.
+    if (prev.in_owned_scope && curr.in_owned_scope &&
+        ((prev.is_async_copy && prev.type == kWrite && curr.type == kRead) ||
+         (curr.is_async_copy && curr.type == kWrite && prev.type == kRead))) {
+      return false;
+    }
     // Access to different buffers does not conflict.
     if (!prev.buffer.same_as(curr.buffer)) {
       return false;
@@ -2237,16 +2280,19 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
   }
   auto *n = func.CopyOnWrite();
   auto stmt = n->body;
-  if (sync_scope.rank == StorageRank::kShared && sync_scope.tag.empty()) {
-    stmt = ThreadSyncAfterWaitGroupInserter(sync_scope)(stmt);
-  }
-  // Get warp size from target, defaulting to 32 if not available
   int warp_size = 32;
   if (auto target = func->GetAttr<Target>(tvm::attr::kTarget)) {
     warp_size = target.value()
                     ->GetAttr<Integer>("thread_warp_size", 32)
                     .value()
                     .IntValue();
+  }
+  // A wait plan that a lowering owns already carries a barrier with every
+  // fence, so an owned scope skips the generic barrier after a wait_group; the
+  // rest of the function still needs it, as wait_asyncmark only orders the
+  // waiting wave's own copies while shared memory is consumed block-wide.
+  if (sync_scope.rank == StorageRank::kShared && sync_scope.tag.empty()) {
+    stmt = ThreadSyncAfterWaitGroupInserter(sync_scope)(stmt);
   }
   TileLangThreadSyncPlanner planner(sync_scope, warp_size);
   for (const auto &[_, buffer] : func->buffer_map) {

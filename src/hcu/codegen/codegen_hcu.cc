@@ -2595,7 +2595,6 @@ void CodeGenTileLangHCU::PrintStorageSync(const CallNode *op) {
       this->stream << "tl::ebarrier_sync_cnt(" << barrier_id->value << ", "
                    << thread_count->value / warp_size << ");\n";
     } else {
-      // Preserve the existing behavior on HCU targets without EBarrier.
       this->stream << "__syncthreads();\n";
     }
   }
@@ -3040,6 +3039,8 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     print_extern_call_stmt(func_name, 1);
   } else if (op->op.same_as(tl::async_gld_sld_fence())) {
     print_extern_call_stmt("tl::async_gld_sld_fence");
+  } else if (op->op.same_as(tl::async_gld_fence())) {
+    print_extern_call_stmt("tl::async_gld_fence");
   } else if (op->op.same_as(builtin::create_barriers())) {
     this->PrintIndent();
     int barrier_count = Downcast<IntImm>(op->args[0])->value;

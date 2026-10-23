@@ -9,6 +9,7 @@ namespace tl {
 using namespace tirx;
 
 TVM_REGISTER_PASS_CONFIG_OPTION(kEnableHcuWdra, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kPipelinedKUnrollFactor, Integer);
 
 #define TIR_DEFINE_HCU_BUILTIN(Name, Inputs, Effect)                           \
   const Op &Name() {                                                           \
@@ -24,6 +25,7 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kEnableHcuWdra, Bool);
 TIR_DEFINE_HCU_BUILTIN(hcu_cp_async_idxen, 6, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(ds_read_vector, 3, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(async_gld_sld_fence, 1, kOpaque);
+TIR_DEFINE_HCU_BUILTIN(async_gld_fence, 1, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(get_wave_id, 0, kPure);
 TIR_DEFINE_HCU_BUILTIN(hcu_wdra_init, -1, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(abarrier_init, 2, kOpaque);
@@ -50,5 +52,16 @@ TIR_DEFINE_HCU_BUILTIN(hcu_wmma, -1, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(hcu_wmma_store, -1, kOpaque);
 
 #undef TIR_DEFINE_HCU_BUILTIN
+
+namespace {
+// Tell backend-agnostic passes that a wait on the HCU side is
+// tl.async_gld_fence. Defined after the op itself so registration order inside
+// this unit is fixed.
+const bool async_gld_fence_registered = [] {
+  RegisterAsyncWaitOp(async_gld_fence());
+  return true;
+}();
+} // namespace
+
 } // namespace tl
 } // namespace tvm
