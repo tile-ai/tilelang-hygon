@@ -3,7 +3,7 @@
 
 /*!
  * \file scale_buffer.hpp
- * \brief HCU scale_buffer helpers: ds_scale_copy + mmac_scale_fp4_body (v10).
+ * \brief HCU descriptor-driven scale copy and page-grouped scale MMAC.
  *
  * Each scale buffer is split into MnWarps MN segments (the GEMM's m_seg or
  * n_seg count):
@@ -11,13 +11,17 @@
  *   phys_k = ScaleShapeK * ((MmacK == 64 && GranularityK >= 64) ? 2 : 1)
  *   rows_mn_per_seg = rows_mn / MnWarps
  *   logical_rows_per_seg = rows_mn_per_seg * phys_k
- *   aligned_rows_per_seg = Align8(logical_rows_per_seg)
- * The identity-format row within a segment is mn_local * phys_k + k_phys;
- * interleaved formats use ScaleFormatLogicalToRow / their copy policy.
+ *   physical_rows_per_seg = RowLayout::SegmentRows
+ * ScaleRowLayout describes DenseXor, KPhasePacked or FixedBank placement.
+ * Copy inverts physical rows to the original format/RowOrder stream before
+ * applying its source policy; MMAC maps logical coordinates directly through
+ * the same descriptor. Base addresses never encode polarity or layout mode.
  *
  * TotalWarps fill all segments: warp_id % MnWarps selects the segment and
- * warp_id / MnWarps selects a copy warp within it. MMAC offsets are relative
- * to m0, which points at the consuming wave's aligned segment base.
+ * warp_id / MnWarps selects a copy warp within it. Copy waves round-robin
+ * four-row chunks without filling another segment's alignment padding.
+ * MMAC offsets are five-bit immediates relative to an eight-aligned m0 base;
+ * large segments are consumed in compile-time page groups at each K atom.
  *
  * ScalePhysK, ScaleLogicalToRow, ds_scale_copy, and mmac_scale_fp4_body share
  * the same MmacK parameter. MmacK=64 uses the FP4 intrinsic; MmacK=32 uses the
@@ -26,9 +30,12 @@
  * ds_scale_copy dispatches ScaleFormat to a format-specific policy after
  * validating OpCtrl, MmacK, ScaleShapeK, and layout constraints.
  * DsScaleCopyFill schedules fill batches; Policy::Map converts each batch to
- * its destination scale-buffer row and source LDS byte offset.
+ * the original format stream and source LDS byte offset.
  */
 #pragma once
+
+#include "scale_row_layout.hpp"
+#include <type_traits>
 
 #include <tl_templates/hcu/common.h>
 #include <tl_templates/hcu/core.hpp>
@@ -48,8 +55,6 @@ TL_DEVICE void ds_scale_copy_ds2buf(TL_LDS_ADDR int *lds_data, int soffset) {
   __builtin_hcu_ds_scale_copy_ds2buf(lds_data, soffset, OpCtrl, Offset0,
                                      Offset1);
 }
-
-constexpr TL_DEVICE int ScaleAlign8(int rows) { return (rows + 7) / 8 * 8; }
 
 template <int ScaleShapeMN, int GranularityMN> struct ScaleRowsMN {
   static_assert(GranularityMN > 0, "GranularityMN must be positive");
@@ -438,7 +443,7 @@ struct DsScaleLdsOpctrl2MN4Interleave {
  */
 template <int ScaleShapeMN, int ScaleShapeK, int GranularityMN,
           int GranularityK, int MnWarps, int TotalWarps, int MmacK,
-          typename Policy>
+          typename Policy, typename RowLayout>
 TL_DEVICE void DsScaleCopyFill(const void *lds_scale, int dst_row_base,
                                int warp_id, int origin_mn, int origin_k) {
   static_assert(MnWarps >= 1 && TotalWarps >= 1, "warps >= 1");
@@ -446,14 +451,13 @@ TL_DEVICE void DsScaleCopyFill(const void *lds_scale, int dst_row_base,
   static_assert(TotalWarps % MnWarps == 0,
                 "TotalWarps must be divisible by MnWarps");
 
-  constexpr int kFillGroupsPerWarp = 4;
   constexpr int kRowsPerFill = Policy::kRowsPerFill;
   constexpr int kPhysK = Policy::kPhysK;
   constexpr int rows_mn = ScaleRowsMN<ScaleShapeMN, GranularityMN>::value;
   static_assert(rows_mn % MnWarps == 0, "rows_mn must be divisible by MnWarps");
   constexpr int rows_mn_per_seg = rows_mn / MnWarps;
   constexpr int logical_rows_per_seg = rows_mn_per_seg * kPhysK;
-  constexpr int aligned_rows_per_seg = ScaleAlign8(logical_rows_per_seg);
+  constexpr auto layout = RowLayout::descriptor;
   constexpr int copy_warps_per_seg = TotalWarps / MnWarps;
   static_assert(logical_rows_per_seg % kRowsPerFill == 0,
                 "logical_rows_per_seg must be divisible by RowsPerFill");
@@ -461,49 +465,75 @@ TL_DEVICE void DsScaleCopyFill(const void *lds_scale, int dst_row_base,
   const int lane = static_cast<int>(threadIdx.x) & 63;
   const int tx16 = lane & 15;
   const int fill_group = lane >> 4;
-  auto *src_u8 = reinterpret_cast<const uint8_t *>(lds_scale);
+  // Convert the shared base once, before adding per-issue byte offsets.
+  // Keeping arithmetic in the LDS address space avoids repeated generic-to-LDS
+  // conversions obscuring common lane addresses after issue unrolling. Do not
+  // assume the storage layout is affine: Policy::Map still computes each
+  // offset.
+  auto *src_u8 =
+      reinterpret_cast<TL_LDS_ADDR uint8_t *>(const_cast<void *>(lds_scale));
 
-  const int seg = warp_id % MnWarps;
-  const int seg_local_warp = warp_id / MnWarps;
-
-  constexpr int num_fill_batches_seg = logical_rows_per_seg / kRowsPerFill;
-  constexpr int fill_batches_per_copy_warp =
-      (num_fill_batches_seg + copy_warps_per_seg - 1) / copy_warps_per_seg;
-  constexpr int full_iters = fill_batches_per_copy_warp / kFillGroupsPerWarp;
-  constexpr int rem_fill_groups =
-      fill_batches_per_copy_warp % kFillGroupsPerWarp;
-  constexpr bool has_ceil_tail =
-      (copy_warps_per_seg * fill_batches_per_copy_warp) != num_fill_batches_seg;
-
-  const int seg_row_base = dst_row_base + seg * aligned_rows_per_seg;
+  constexpr int groups_per_issue = layout.CopyIssueGroups(kRowsPerFill);
+  constexpr int chunks_per_issue = layout.CopyIssueChunks(kRowsPerFill);
+  constexpr int chunks_per_seg = layout.CopyChunkCount();
+  constexpr int issues_per_seg =
+      (chunks_per_seg + chunks_per_issue - 1) / chunks_per_issue;
+  constexpr int iterations =
+      (issues_per_seg + copy_warps_per_seg - 1) / copy_warps_per_seg;
+  constexpr bool partial_round = issues_per_seg % copy_warps_per_seg != 0;
+  const int work_rank =
+      partial_round ? ScaleCopyWaveRank(warp_id, TotalWarps) : warp_id;
+  const int seg = work_rank % MnWarps;
+  const int seg_local_warp = (work_rank / MnWarps) % copy_warps_per_seg;
+  const int seg_row_base = dst_row_base + RowLayout::SegmentOffset(seg);
   const int mn_row0 = seg * rows_mn_per_seg;
 
-  auto issue_fill_batch = [&](int fill_batch) {
-    if constexpr (has_ceil_tail) {
-      if (fill_batch >= num_fill_batches_seg) {
-        return;
+  // soffset is wave-uniform. Combine physically compatible groups in one
+  // issue; inactive groups must never write padding or the other bank.
+  tl::static_for<0, iterations, 1>{}([&](auto iteration) {
+    const int ordinal = seg_local_warp + iteration * copy_warps_per_seg;
+    const int chunk = layout.CopyChunk(ordinal * chunks_per_issue);
+    const int physical_row = chunk * 4 + fill_group * kRowsPerFill;
+    constexpr bool full_chunks = layout.CopyHalfRows(0) % 4 == 0 &&
+                                 layout.CopyHalfRows(1) % 4 == 0 &&
+                                 chunks_per_seg % chunks_per_issue == 0;
+    constexpr bool fixed_k4 =
+        layout.mode == ScaleRowMode::FixedBank && kRowsPerFill == 4;
+    // Each useful half-chunk is assigned once. The only lane predicate is
+    // the instruction group mask (and a genuine tail, if one exists).
+    // In particular never form a -1 raw row then divide it as a signed int.
+    if (ordinal < issues_per_seg && fill_group < groups_per_issue &&
+        (!fixed_k4 || fill_group % 2 == 0) &&
+        (full_chunks ||
+         layout.CopyGroupValid(physical_row / 4, physical_row % 4))) {
+      const unsigned raw_row = layout.CopyRawRow(physical_row);
+      const int fill_batch = raw_row / kRowsPerFill;
+      int logical_row = 0;
+      int lds_byte = 0;
+      Policy::Map(fill_batch, 0, mn_row0, rows_mn_per_seg, tx16, origin_mn,
+                  origin_k, &logical_row, &lds_byte);
+      auto *lds_ptr = reinterpret_cast<TL_LDS_ADDR int *>(src_u8 + lds_byte);
+      if constexpr (fixed_k4 && iterations > 1) {
+        // Anchor repeated K4 issues at the first valid lane address. Keep the
+        // exact per-issue difference: an explicit source layout may be XORed,
+        // so a constant linear stride must not be assumed. Evaluate the anchor
+        // inside the active-group guard, never for padding or idle waves.
+        const int first_chunk =
+            layout.CopyChunk(seg_local_warp * chunks_per_issue);
+        const unsigned first_raw =
+            layout.CopyRawRow(first_chunk * 4 + fill_group * kRowsPerFill);
+        int first_logical_row = 0;
+        int first_lds_byte = 0;
+        Policy::Map(first_raw / kRowsPerFill, 0, mn_row0, rows_mn_per_seg, tx16,
+                    origin_mn, origin_k, &first_logical_row, &first_lds_byte);
+        auto *lane_src = src_u8 + first_lds_byte;
+        lds_ptr = reinterpret_cast<TL_LDS_ADDR int *>(
+            lane_src + (lds_byte - first_lds_byte));
       }
+      ds_scale_copy_ds2buf<static_cast<char>(Policy::kOpCtrl)>(
+          lds_ptr, seg_row_base + chunk * 4);
     }
-    int dst_row = 0;
-    int lds_byte = 0;
-    Policy::Map(fill_batch, seg_row_base, mn_row0, rows_mn_per_seg, tx16,
-                origin_mn, origin_k, &dst_row, &lds_byte);
-    auto *lds_ptr = reinterpret_cast<TL_LDS_ADDR int *>(
-        const_cast<uint8_t *>(src_u8 + lds_byte));
-    ds_scale_copy_ds2buf<static_cast<char>(Policy::kOpCtrl)>(lds_ptr, dst_row);
-  };
-
-  int fill_batch = seg_local_warp * fill_batches_per_copy_warp + fill_group;
-  tl::static_for<0, full_iters, 1>{}([&](auto) {
-    issue_fill_batch(fill_batch);
-    fill_batch += kFillGroupsPerWarp;
   });
-
-  if constexpr (rem_fill_groups > 0) {
-    if (fill_group < rem_fill_groups) {
-      issue_fill_batch(fill_batch);
-    }
-  }
 }
 
 /*!
@@ -515,7 +545,7 @@ template <int OpCtrl, int ScaleFormatId, int ParentScaleMN, int ParentScaleK,
           int GranularityK, int ScaleKMajor, int MnWarps, int TotalWarps,
           typename StorageLayout =
               ScaleLdsLinearLayout<ParentScaleMN, ParentScaleK, ScaleKMajor>,
-          int MmacK = 64, int RowOrder = 0>
+          int MmacK = 64, int RowOrder = 0, typename RowLayout = void>
 TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
                              int warp_id, int origin_mn, int origin_k) {
   static_assert(OpCtrl >= 0 && OpCtrl <= 2, "OpCtrl must be 0/1/2");
@@ -544,7 +574,7 @@ TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
                                   ScaleShapeK, GranularityMN, GranularityK,
                                   ScaleKMajor, MmacK, RowOrder, StorageLayout>;
       DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
-                      MnWarps, TotalWarps, MmacK, Policy>(
+                      MnWarps, TotalWarps, MmacK, Policy, RowLayout>(
           lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
     } else {
       static_assert(ScaleKMajor == 1,
@@ -553,7 +583,7 @@ TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
           OpCtrl, ParentScaleMN, ParentScaleK, ScaleShapeMN, ScaleShapeK,
           GranularityMN, GranularityK, MmacK, RowOrder, StorageLayout>;
       DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
-                      MnWarps, TotalWarps, MmacK, Policy>(
+                      MnWarps, TotalWarps, MmacK, Policy, RowLayout>(
           lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
     }
   } else if constexpr (ScaleFormat == DsScaleFormat::kK2Interleave) {
@@ -565,7 +595,7 @@ TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
                                       ScaleShapeK, GranularityMN, GranularityK,
                                       MmacK, RowOrder, StorageLayout>;
     DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
-                    MnWarps, TotalWarps, MmacK, Policy>(
+                    MnWarps, TotalWarps, MmacK, Policy, RowLayout>(
         lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
   } else if constexpr (ScaleFormat == DsScaleFormat::kMN2Interleave) {
     static_assert(OpCtrl == 1 && MmacK == 32,
@@ -574,7 +604,7 @@ TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
         ParentScaleMN, ParentScaleK, ScaleShapeMN, ScaleShapeK, GranularityMN,
         GranularityK, MmacK, RowOrder, StorageLayout>;
     DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
-                    MnWarps, TotalWarps, MmacK, Policy>(
+                    MnWarps, TotalWarps, MmacK, Policy, RowLayout>(
         lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
   } else if constexpr (ScaleFormat == DsScaleFormat::kK4Interleave) {
     static_assert(OpCtrl == 2, "K4 format requires OpCtrl==2");
@@ -585,7 +615,7 @@ TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
                                       ScaleShapeK, GranularityMN, GranularityK,
                                       MmacK, RowOrder, StorageLayout>;
     DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
-                    MnWarps, TotalWarps, MmacK, Policy>(
+                    MnWarps, TotalWarps, MmacK, Policy, RowLayout>(
         lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
   } else if constexpr (ScaleFormat == DsScaleFormat::kK2MN2Interleave) {
     static_assert(OpCtrl == 2, "K2MN2 format requires OpCtrl==2");
@@ -595,7 +625,7 @@ TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
         ParentScaleMN, ParentScaleK, ScaleShapeMN, ScaleShapeK, GranularityMN,
         GranularityK, MmacK, RowOrder, StorageLayout>;
     DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
-                    MnWarps, TotalWarps, MmacK, Policy>(
+                    MnWarps, TotalWarps, MmacK, Policy, RowLayout>(
         lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
   } else if constexpr (ScaleFormat == DsScaleFormat::kMN4Interleave) {
     static_assert(OpCtrl == 2 && MmacK == 32,
@@ -604,7 +634,7 @@ TL_DEVICE void ds_scale_copy(const void *lds_scale, int dst_row_base,
         ParentScaleMN, ParentScaleK, ScaleShapeMN, ScaleShapeK, GranularityMN,
         GranularityK, MmacK, RowOrder, StorageLayout>;
     DsScaleCopyFill<ScaleShapeMN, ScaleShapeK, GranularityMN, GranularityK,
-                    MnWarps, TotalWarps, MmacK, Policy>(
+                    MnWarps, TotalWarps, MmacK, Policy, RowLayout>(
         lds_scale, dst_row_base, warp_id, origin_mn, origin_k);
   } else {
     static_assert(OpCtrl == -1, "unsupported ScaleFormat for ds_scale_copy");
@@ -621,10 +651,8 @@ TL_DEVICE CVec mmac_scale_f8f6f4(AVec a, BVec b, CVec c, int off_a, int off_b) {
 
 template <int WarpRows, int WarpCols, int NumKAtoms, int GranularityM,
           int GranularityK_A, int GranularityN, int GranularityK_B,
-          int ScaleShapeM, int ScaleShapeKA, int ScaleShapeN, int ScaleShapeKB,
-          int ScaleFormatA = 0, int ScaleFormatB = 0, int KPack = 1,
-          int MmacK = 64, int RealABType = 24, int RowOrderA = 0,
-          int RowOrderB = 0>
+          int ScaleShapeKA, int ScaleShapeKB, int KPack, int MmacK,
+          int RealABType, typename RowLayoutA, typename RowLayoutB>
 TL_DEVICE void mmac_scale_fp4_body(const void *a, const void *b, float *c,
                                    int m0_wave_base) {
   constexpr int MMAC_MN = 16;
@@ -639,8 +667,12 @@ TL_DEVICE void mmac_scale_fp4_body(const void *a, const void *b, float *c,
       GranularityN >= MMAC_MN ? (WarpCols * MMAC_MN / GranularityN) : WarpCols;
   static_assert(rows_mn_a > 0 && rows_mn_b > 0,
                 "each MMAC wave must consume at least one scale MN row");
-
-  set_scale_m0(m0_wave_base);
+  // Hardware requires BOTH m0 row fields to be eight-aligned. The lowering
+  // checks the allocated base; this check preserves alignment for every wave.
+  // Bank polarity stays in RowOffset, not in the base (in particular no +4).
+  static_assert(RowLayoutA::SegmentRows % 8 == 0 &&
+                    RowLayoutB::SegmentRows % 8 == 0,
+                "scale m0 segment strides must be 8-row aligned");
 
   using a_vec_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
   using b_vec_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
@@ -650,41 +682,213 @@ TL_DEVICE void mmac_scale_fp4_body(const void *a, const void *b, float *c,
   auto *b_v = reinterpret_cast<const b_vec_t *>(b);
   auto *c_v = reinterpret_cast<c_vec_t *>(c);
 
-  tl::static_for<0, NumKAtoms, 1>{}([&](auto ki) {
-    tl::static_for<0, KPack, 1>{}([&](auto kp) {
-      tl::static_for<0, WarpRows, 1>{}([&](auto i) {
-        tl::static_for<0, WarpCols, 1>{}([&](auto j) {
-          constexpr int kii = decltype(ki)::value;
-          constexpr int kpp = decltype(kp)::value;
-          constexpr int ii = decltype(i)::value;
-          constexpr int jj = decltype(j)::value;
-          constexpr int k_atom = kii * KPack + kpp;
-          constexpr int scale_m = (ii * MMAC_MN) / GranularityM;
-          constexpr int scale_ka = (k_atom * MMAC_K) / GranularityK_A;
-          constexpr int scale_n = (jj * MMAC_MN) / GranularityN;
-          constexpr int scale_kb = (k_atom * MMAC_K) / GranularityK_B;
-          constexpr int off_a = ScaleBufferLogicalToRow<
-              ScaleFormatA, RowOrderA, rows_mn_a, scale_m, scale_ka,
-              GranularityM, ScaleShapeKA, GranularityK_A, MMAC_K>::value;
-          constexpr int off_b = ScaleBufferLogicalToRow<
-              ScaleFormatB, RowOrderB, rows_mn_b, scale_n, scale_kb,
-              GranularityN, ScaleShapeKB, GranularityK_B, MMAC_K>::value;
-          a_vec_t a_vec = a_v[(kii * WarpRows + ii) * KPack + kpp];
-          b_vec_t b_vec = b_v[(kii * WarpCols + jj) * KPack + kpp];
-          if constexpr (MMAC_K == 64) {
-            static_assert(off_a % 2 == 0 && off_b % 2 == 0,
-                          "mmac_k=64 scale offsets must be 2-row aligned");
-            c_v[ii * WarpCols + jj] =
-                __builtin_hcu_mmac_scale_f32_16x16x64_fp4_lit_lts(
-                    a_vec, b_vec, c_v[ii * WarpCols + jj], /*lit=*/true,
-                    /*lts=*/false, off_a, off_b);
+  // Canonical addressing uses the actual consumer shape and row order, not
+  // an assumed 2x2 wave partition. The ordinal is a compile-time ki/kp/i/j
+  // coordinate; it does not dictate the paged path's M/N emission order.
+  constexpr auto physical_offsets = [](auto ordinal) {
+    constexpr int atom = decltype(ordinal)::value;
+    constexpr int k_atom = atom / (WarpRows * WarpCols);
+    constexpr int i = atom / WarpCols % WarpRows;
+    constexpr int j = atom % WarpCols;
+    constexpr int mn_a =
+        ScaleMNToRow<i * MMAC_MN / GranularityM, GranularityM>::value;
+    constexpr int mn_b =
+        ScaleMNToRow<j * MMAC_MN / GranularityN, GranularityN>::value;
+    constexpr int dup_a =
+        ScalePhysK<ScaleShapeKA, GranularityK_A, MMAC_K>::k_dup;
+    constexpr int dup_b =
+        ScalePhysK<ScaleShapeKB, GranularityK_B, MMAC_K>::k_dup;
+    constexpr int physical_a =
+        RowLayoutA::RowOffset(mn_a, k_atom * MMAC_K / GranularityK_A * dup_a);
+    constexpr int physical_b =
+        RowLayoutB::RowOffset(mn_b, k_atom * MMAC_K / GranularityK_B * dup_b);
+    return physical_a | (physical_b << 16);
+  };
+
+  // All layout modes use the same five-bit immediate protection.
+  constexpr int pages_a = (RowLayoutA::SegmentRows + 31) / 32;
+  constexpr int pages_b = (RowLayoutB::SegmentRows + 31) / 32;
+  static_assert(pages_a <= 16 && pages_b <= 16,
+                "scale segment exceeds the 512-row physical address space");
+
+  // Hoist page selection across K only after proving that each output atom
+  // stays in the same A/B page pair for the entire reduction. Independent
+  // outputs can then be grouped by page while preserving every accumulator's
+  // exact ki/kp order. This is not generally valid for K-dependent layouts.
+  constexpr bool pages_stable_across_k = [=]() {
+    bool stable = true;
+    tl::static_for<0, NumKAtoms * KPack, 1>{}([&](auto k) {
+      tl::static_for<0, WarpRows * WarpCols, 1>{}([&](auto mn) {
+        constexpr int first = decltype(mn)::value;
+        constexpr int ordinal =
+            decltype(k)::value * WarpRows * WarpCols + first;
+        constexpr int initial =
+            physical_offsets(std::integral_constant<int, first>{});
+        constexpr int current =
+            physical_offsets(std::integral_constant<int, ordinal>{});
+        stable &= (initial & ~0x001f001f) == (current & ~0x001f001f);
+      });
+    });
+    return stable;
+  }();
+
+  constexpr int outer_pages = pages_stable_across_k ? pages_a * pages_b : 1;
+  tl::static_for<0, outer_pages, 1>{}([&](auto page) {
+    constexpr int outer_delta = (decltype(page)::value / pages_b * 32) |
+                                (decltype(page)::value % pages_b * 32 << 16);
+    constexpr bool occupied = [=]() {
+      if constexpr (!pages_stable_across_k)
+        return true;
+      bool found = false;
+      tl::static_for<0, WarpRows * WarpCols, 1>{}([&](auto mn) {
+        constexpr int offsets = physical_offsets(mn);
+        found |= (offsets & ~0x001f001f) == outer_delta;
+      });
+      return found;
+    }();
+    if constexpr (occupied) {
+      if constexpr (pages_stable_across_k) {
+        static_assert((outer_delta & 0x00070007) == 0,
+                      "scale paging must preserve both m0 alignments");
+        set_scale_m0(m0_wave_base + outer_delta);
+      }
+
+      tl::static_for<0, NumKAtoms, 1>{}([&](auto ki) {
+        tl::static_for<0, KPack, 1>{}([&](auto kp) {
+          constexpr int k_atom =
+              decltype(ki)::value * KPack + decltype(kp)::value;
+          auto emit_atom = [&](auto i, auto j) {
+            constexpr int kii = decltype(ki)::value;
+            constexpr int kpp = decltype(kp)::value;
+            constexpr int ii = decltype(i)::value;
+            constexpr int jj = decltype(j)::value;
+            constexpr int ordinal = (k_atom * WarpRows + ii) * WarpCols + jj;
+            constexpr int offsets =
+                physical_offsets(std::integral_constant<int, ordinal>{});
+            // Scale offset modifiers encode only five bits. Move each 32-row
+            // page into the eight-aligned m0 base, retaining bank selection in
+            // the immediate. All page arithmetic here is compile-time constant.
+            constexpr int off_a = offsets & 31;
+            constexpr int off_b = (offsets >> 16) & 31;
+            a_vec_t a_vec = a_v[(kii * WarpRows + ii) * KPack + kpp];
+            b_vec_t b_vec = b_v[(kii * WarpCols + jj) * KPack + kpp];
+            if constexpr (MMAC_K == 64) {
+              static_assert(off_a % 2 == 0 && off_b % 2 == 0,
+                            "mmac_k=64 scale offsets must be 2-row aligned");
+              c_v[ii * WarpCols + jj] =
+                  __builtin_hcu_mmac_scale_f32_16x16x64_fp4_lit_lts(
+                      a_vec, b_vec, c_v[ii * WarpCols + jj], /*lit=*/true,
+                      /*lts=*/false, off_a, off_b);
+            } else {
+              c_v[ii * WarpCols + jj] = mmac_scale_f8f6f4<RealABType>(
+                  a_vec, b_vec, c_v[ii * WarpCols + jj], off_a, off_b);
+            }
+          };
+          if constexpr (pages_stable_across_k) {
+            tl::static_for<0, WarpRows, 1>{}([&](auto i) {
+              tl::static_for<0, WarpCols, 1>{}([&](auto j) {
+                constexpr int ordinal =
+                    (k_atom * WarpRows + decltype(i)::value) * WarpCols +
+                    decltype(j)::value;
+                constexpr int offsets =
+                    physical_offsets(std::integral_constant<int, ordinal>{});
+                if constexpr ((offsets & ~0x001f001f) == outer_delta)
+                  emit_atom(i, j);
+              });
+            });
           } else {
-            c_v[ii * WarpCols + jj] = mmac_scale_f8f6f4<RealABType>(
-                a_vec, b_vec, c_v[ii * WarpCols + jj], off_a, off_b);
+            // Determine occupied pages independently for this K atom. A depends
+            // only on i, B only on j; their occupied-page Cartesian product is
+            // exactly the set of nonempty MMAC groups. No runtime masks or
+            // tests.
+            constexpr unsigned a_mask = [=]() {
+              unsigned mask = 0;
+              tl::static_for<0, WarpRows, 1>{}([&](auto i) {
+                constexpr int ordinal =
+                    (k_atom * WarpRows + decltype(i)::value) * WarpCols;
+                constexpr int offset =
+                    physical_offsets(std::integral_constant<int, ordinal>{}) &
+                    0xffff;
+                mask |= 1u << (offset / 32);
+              });
+              return mask;
+            }();
+            constexpr unsigned b_mask = [=]() {
+              unsigned mask = 0;
+              tl::static_for<0, WarpCols, 1>{}([&](auto j) {
+                constexpr int ordinal =
+                    k_atom * WarpRows * WarpCols + decltype(j)::value;
+                constexpr int offset =
+                    physical_offsets(std::integral_constant<int, ordinal>{}) >>
+                    16;
+                mask |= 1u << (offset / 32);
+              });
+              return mask;
+            }();
+            // Page grouping is outside the M/N compute loops. Reorder only
+            // independent output atoms at fixed K: every accumulator retains
+            // exactly the original ki/kp reduction order. Moving a page loop
+            // outside K would break that invariant for some ScaleFormats.
+            tl::static_for<0, pages_a, 1>{}([&](auto pa) {
+              constexpr int page_a = decltype(pa)::value;
+              if constexpr ((a_mask & (1u << page_a)) != 0) {
+                tl::static_for<0, pages_b, 1>{}([&](auto pb) {
+                  constexpr int page_b = decltype(pb)::value;
+                  if constexpr ((b_mask & (1u << page_b)) != 0) {
+                    constexpr int page_delta =
+                        (page_a * 32) | (page_b * 32 << 16);
+                    static_assert(
+                        (page_delta & 0x00070007) == 0,
+                        "scale paging must preserve both m0 alignments");
+                    // The first group of this K atom may reuse the final
+                    // page of the preceding atom. Compare compile-time page
+                    // values, not a runtime m0 shadow or an assumed K stride.
+                    constexpr bool reuse_previous = [=]() {
+                      if constexpr (k_atom == 0)
+                        return false;
+                      constexpr bool first =
+                          (a_mask & ((1u << page_a) - 1)) == 0 &&
+                          (b_mask & ((1u << page_b) - 1)) == 0;
+                      int previous_last = 0;
+                      if constexpr (k_atom > 0 && first) {
+                        tl::static_for<0, WarpRows * WarpCols, 1>{}(
+                            [&](auto mn) {
+                              constexpr int ordinal =
+                                  (k_atom - 1) * WarpRows * WarpCols +
+                                  decltype(mn)::value;
+                              constexpr int delta =
+                                  physical_offsets(
+                                      std::integral_constant<int, ordinal>{}) &
+                                  ~0x001f001f;
+                              previous_last =
+                                  delta > previous_last ? delta : previous_last;
+                            });
+                      }
+                      return first && previous_last == page_delta;
+                    }();
+                    if constexpr (!reuse_previous)
+                      set_scale_m0(m0_wave_base + page_delta);
+                    tl::static_for<0, WarpRows, 1>{}([&](auto i) {
+                      tl::static_for<0, WarpCols, 1>{}([&](auto j) {
+                        constexpr int ordinal =
+                            (k_atom * WarpRows + decltype(i)::value) *
+                                WarpCols +
+                            decltype(j)::value;
+                        constexpr int offsets = physical_offsets(
+                            std::integral_constant<int, ordinal>{});
+                        if constexpr ((offsets & ~0x001f001f) == page_delta) {
+                          emit_atom(i, j);
+                        }
+                      });
+                    });
+                  }
+                });
+              }
+            });
           }
         });
       });
-    });
+    }
   });
 }
 

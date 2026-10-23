@@ -10,11 +10,20 @@
 
 #include "hcu/op/scale_format.h"
 #include "op/operator.h"
+#include "tl_templates/hcu/scale/scale_row_layout.hpp"
+#include <array>
+#include <optional>
 
 namespace tvm {
 namespace tl {
 class CopyScaleNode;
 namespace hcu {
+
+std::optional<std::array<int, 3>>
+ScoreScaleRowLayout(const CopyScaleNode *op,
+                    const ::tl::hcu::ScaleRowLayoutDesc &layout, int block_size,
+                    Target target,
+                    ffi::Optional<Layout> resolved_layout = std::nullopt);
 
 ffi::Optional<Layout> SelectAutoScaleLdsLayout(const CopyScaleNode *op,
                                                const LayoutInferArgs &args);

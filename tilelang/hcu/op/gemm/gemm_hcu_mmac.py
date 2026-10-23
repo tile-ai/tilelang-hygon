@@ -286,33 +286,6 @@ def _ann_expr(annotations, key: str) -> tirx.PrimExpr:
     raise TypeError(f"annotation {key} must be PrimExpr, got {type(val)}")
 
 
-def _scale_rows_mn(scale_shape_mn: int, gran_mn: int) -> int:
-    if gran_mn >= 16:
-        return scale_shape_mn
-    return scale_shape_mn * gran_mn // 16
-
-
-def _scale_phys_k(scale_shape_k: int, gran_k: int, mmac_k: int = 64) -> int:
-    k_dup = 2 if (mmac_k == 64 and gran_k >= 64) else 1
-    return scale_shape_k * k_dup
-
-
-def _scale_aligned_rows_per_wave(
-    scale_shape_mn: int, scale_shape_k: int, gran_mn: int, gran_k: int, mn_warps: int, mmac_k: int = 64
-) -> int:
-    rows_mn = _scale_rows_mn(scale_shape_mn, gran_mn)
-    assert rows_mn % mn_warps == 0, f"rows_mn={rows_mn} not divisible by mn_warps={mn_warps}"
-    phys_k = _scale_phys_k(scale_shape_k, gran_k, mmac_k)
-    logical = (rows_mn // mn_warps) * phys_k
-    return (logical + 7) // 8 * 8
-
-
-def _scale_mn_to_row(mn_idx: tirx.PrimExpr | int, gran_mn: int) -> tirx.PrimExpr:
-    if gran_mn >= 16:
-        return tirx.Cast("int32", mn_idx) if not isinstance(mn_idx, tirx.PrimExpr) else mn_idx
-    return (tirx.Cast("int32", mn_idx) if not isinstance(mn_idx, int) else mn_idx) * gran_mn // 16
-
-
 def _parse_scale_shape(shape, k_major: bool) -> tuple[int, int]:
     """Return (scale_shape_mn, scale_shape_k)."""
     if k_major:
@@ -436,10 +409,17 @@ class GemmHCUMMAC(GemmBase):
         b_k_major = bool(_ann_int(annotations, "tl.hcu.b_scale_k_major", 0))
         row_base_a = _ann_expr(annotations, "tl.hcu.scale_a_row_base")
         row_base_b = _ann_expr(annotations, "tl.hcu.scale_b_row_base")
-        scale_format_a = _ann_int(annotations, "tl.hcu.scale_a_format")
+        row_layout_a = str(annotations["tl.hcu.scale_a_row_layout"].value)
+        row_layout_b = str(annotations["tl.hcu.scale_b_row_layout"].value)
+        segment_rows_a = _ann_int(annotations, "tl.hcu.scale_a_segment_rows")
+        segment_rows_b = _ann_int(annotations, "tl.hcu.scale_b_segment_rows")
+        # Check both m0 fields independently. A bank1 +4 displacement belongs
+        # to RowLayout's instruction offset, never to the m0 base itself.
+        if any(int(base) % 8 for base in (row_base_a, row_base_b)):
+            raise ValueError("HCU scale m0 A/B bases must be 8-row aligned")
+        if any(rows <= 0 or rows % 8 for rows in (segment_rows_a, segment_rows_b)):
+            raise ValueError("HCU scale segment strides must be positive and 8-row aligned")
         scale_format_b = _ann_int(annotations, "tl.hcu.scale_b_format")
-        scale_row_order_a = _ann_int(annotations, "tl.hcu.scale_a_row_order", 0)
-        scale_row_order_b = _ann_int(annotations, "tl.hcu.scale_b_row_order", 0)
 
         thread_nums = int(thread_bounds.extent)
         meta = _resolve_hcu_mls_meta(self.gemm_node, self.A, self.B, thread_nums, target)
@@ -459,8 +439,8 @@ class GemmHCUMMAC(GemmBase):
 
         sfa = self.SFARegion.buffer
         sfb = self.SFBRegion.buffer
-        scale_m, scale_ka = _parse_scale_shape(sfa.shape, a_k_major)
-        scale_n, scale_kb = _parse_scale_shape(sfb.shape, b_k_major)
+        _scale_m, scale_ka = _parse_scale_shape(sfa.shape, a_k_major)
+        _scale_n, scale_kb = _parse_scale_shape(sfb.shape, b_k_major)
 
         a_from_mls = int(meta.a_from_mls)
         b_from_mls = int(meta.b_from_mls)
@@ -506,15 +486,12 @@ class GemmHCUMMAC(GemmBase):
             tx, warp_n_idx, warp_m_idx = emitter.extract_thread_binding(thread_binding)
             _ = tx
             # Per-wave segment bases (non-recompute MN), matching ds_scale_copy.
-            m_seg = int(emitter.block_row_warps)
             n_seg = int(emitter.block_col_warps_no_recompute)
-            a_align = _scale_aligned_rows_per_wave(scale_m, scale_ka, gran_m, gran_ka, m_seg, mmac_k)
-            b_align = _scale_aligned_rows_per_wave(scale_n, scale_kb, gran_n, gran_kb, n_seg, mmac_k)
-            a_row = row_base_a + warp_m_idx * a_align
+            a_row = row_base_a + warp_m_idx * segment_rows_a
             # N-recompute waves share the same physical ScaleB segment.
             if emitter.block_col_warps_no_recompute != emitter.block_col_warps:
                 warp_n_idx = warp_n_idx % n_seg
-            b_row = row_base_b + warp_n_idx * b_align
+            b_row = row_base_b + warp_n_idx * segment_rows_b
             return (b_row << 16) | a_row
 
         if use_gemm_mls and a_from_mls and b_from_mls and _is_shared_like(self.A) and _is_shared_like(self.B):
@@ -532,18 +509,15 @@ class GemmHCUMMAC(GemmBase):
                     B_local,
                     C_buf,
                     m0_wave_base=_build_m0(),
+                    row_layout_a=row_layout_a,
+                    row_layout_b=row_layout_b,
                     gran_m=gran_m,
                     gran_ka=gran_ka,
                     gran_n=gran_n,
                     gran_kb=gran_kb,
-                    scale_shape_m=scale_m,
                     scale_shape_ka=scale_ka,
-                    scale_shape_n=scale_n,
                     scale_shape_kb=scale_kb,
-                    scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
-                    scale_row_order_a=scale_row_order_a,
-                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -563,18 +537,15 @@ class GemmHCUMMAC(GemmBase):
                     B_local,
                     C_buf,
                     m0_wave_base=_build_m0(),
+                    row_layout_a=row_layout_a,
+                    row_layout_b=row_layout_b,
                     gran_m=gran_m,
                     gran_ka=gran_ka,
                     gran_n=gran_n,
                     gran_kb=gran_kb,
-                    scale_shape_m=scale_m,
                     scale_shape_ka=scale_ka,
-                    scale_shape_n=scale_n,
                     scale_shape_kb=scale_kb,
-                    scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
-                    scale_row_order_a=scale_row_order_a,
-                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -594,18 +565,15 @@ class GemmHCUMMAC(GemmBase):
                     B_buf,
                     C_buf,
                     m0_wave_base=_build_m0(),
+                    row_layout_a=row_layout_a,
+                    row_layout_b=row_layout_b,
                     gran_m=gran_m,
                     gran_ka=gran_ka,
                     gran_n=gran_n,
                     gran_kb=gran_kb,
-                    scale_shape_m=scale_m,
                     scale_shape_ka=scale_ka,
-                    scale_shape_n=scale_n,
                     scale_shape_kb=scale_kb,
-                    scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
-                    scale_row_order_a=scale_row_order_a,
-                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -628,18 +596,15 @@ class GemmHCUMMAC(GemmBase):
                     B_local,
                     C_buf,
                     m0_wave_base=_build_m0(),
+                    row_layout_a=row_layout_a,
+                    row_layout_b=row_layout_b,
                     gran_m=gran_m,
                     gran_ka=gran_ka,
                     gran_n=gran_n,
                     gran_kb=gran_kb,
-                    scale_shape_m=scale_m,
                     scale_shape_ka=scale_ka,
-                    scale_shape_n=scale_n,
                     scale_shape_kb=scale_kb,
-                    scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
-                    scale_row_order_a=scale_row_order_a,
-                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -662,18 +627,15 @@ class GemmHCUMMAC(GemmBase):
                     B_local,
                     C_buf,
                     m0_wave_base=_build_m0(),
+                    row_layout_a=row_layout_a,
+                    row_layout_b=row_layout_b,
                     gran_m=gran_m,
                     gran_ka=gran_ka,
                     gran_n=gran_n,
                     gran_kb=gran_kb,
-                    scale_shape_m=scale_m,
                     scale_shape_ka=scale_ka,
-                    scale_shape_n=scale_n,
                     scale_shape_kb=scale_kb,
-                    scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
-                    scale_row_order_a=scale_row_order_a,
-                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -695,18 +657,15 @@ class GemmHCUMMAC(GemmBase):
                     B_buf,
                     C_buf,
                     m0_wave_base=_build_m0(),
+                    row_layout_a=row_layout_a,
+                    row_layout_b=row_layout_b,
                     gran_m=gran_m,
                     gran_ka=gran_ka,
                     gran_n=gran_n,
                     gran_kb=gran_kb,
-                    scale_shape_m=scale_m,
                     scale_shape_ka=scale_ka,
-                    scale_shape_n=scale_n,
                     scale_shape_kb=scale_kb,
-                    scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
-                    scale_row_order_a=scale_row_order_a,
-                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -728,18 +687,15 @@ class GemmHCUMMAC(GemmBase):
                     B_local,
                     C_buf,
                     m0_wave_base=_build_m0(),
+                    row_layout_a=row_layout_a,
+                    row_layout_b=row_layout_b,
                     gran_m=gran_m,
                     gran_ka=gran_ka,
                     gran_n=gran_n,
                     gran_kb=gran_kb,
-                    scale_shape_m=scale_m,
                     scale_shape_ka=scale_ka,
-                    scale_shape_n=scale_n,
                     scale_shape_kb=scale_kb,
-                    scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
-                    scale_row_order_a=scale_row_order_a,
-                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
@@ -758,18 +714,15 @@ class GemmHCUMMAC(GemmBase):
                     B_buf,
                     C_buf,
                     m0_wave_base=_build_m0(),
+                    row_layout_a=row_layout_a,
+                    row_layout_b=row_layout_b,
                     gran_m=gran_m,
                     gran_ka=gran_ka,
                     gran_n=gran_n,
                     gran_kb=gran_kb,
-                    scale_shape_m=scale_m,
                     scale_shape_ka=scale_ka,
-                    scale_shape_n=scale_n,
                     scale_shape_kb=scale_kb,
-                    scale_format_a=scale_format_a,
                     scale_format_b=scale_format_b,
-                    scale_row_order_a=scale_row_order_a,
-                    scale_row_order_b=scale_row_order_b,
                     real_ab_type=meta.real_ab_type,
                 )
 
