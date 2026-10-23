@@ -64,6 +64,8 @@ struct AutoLayoutConfig {
   ScaleBufferRowOrder row_order{ScaleBufferRowOrder::kKInner};
   size_t leading_stage_dims{0};
   std::vector<int> physical_shape;
+  Optional<Layout> resolved_layout;
+  mutable bool addresses_known{true};
 };
 
 size_t ScaleFormatPhysicalRank(ScaleLdsFormat format) {
@@ -82,6 +84,26 @@ int ScaleMnIndex(int mn_row, int tx16, int gran_mn) {
 
 int FlattenPhysical(const AutoLayoutConfig &cfg, std::vector<int> coord,
                     int xor_shift) {
+  if (cfg.resolved_layout.defined()) {
+    Array<PrimExpr> inputs;
+    for (size_t i = 0; i < cfg.leading_stage_dims; ++i)
+      inputs.push_back(Integer(0));
+    for (int value : coord)
+      inputs.push_back(Integer(value));
+    const auto output = cfg.resolved_layout.value()->Forward(inputs);
+    const auto shape = cfg.resolved_layout.value()->OutputShape();
+    PrimExpr offset = Integer(0);
+    for (size_t i = 0; i < output.size(); ++i)
+      offset = offset * shape[i] + output[i];
+    arith::Analyzer analyzer;
+    offset = analyzer.Simplify(offset);
+    const int64_t *value = as_const_int(offset);
+    if (!value) {
+      cfg.addresses_known = false;
+      return -1;
+    }
+    return static_cast<int>(*value);
+  }
   if (xor_shift != 0 && cfg.format != ScaleLdsFormat::kK2MN2Interleave) {
     const int outer_dim = 0;
     const int mn_dim = 1;
@@ -172,6 +194,8 @@ void AppendGroupWords(const AutoLayoutConfig &cfg, int fill_batch, int mn_row0,
     }
 
     const int byte_offset = FlattenPhysical(cfg, coord, xor_shift);
+    if (byte_offset < 0)
+      continue;
     const int bytes_per_lane = rows_per_fill;
     const int first_word = byte_offset / kBankBytes;
     const int last_word = (byte_offset + bytes_per_lane - 1) / kBankBytes;
@@ -193,38 +217,56 @@ void AccumulateBatch(const std::set<int> &word_ids, ConflictScore *score) {
   }
 }
 
-ConflictScore ScoreLayout(const AutoLayoutConfig &cfg, int xor_shift) {
+ConflictScore
+ScoreLayout(const AutoLayoutConfig &cfg, int xor_shift,
+            const ::tl::hcu::ScaleRowLayoutDesc *layout = nullptr) {
   ConflictScore score;
   const int rows_mn =
       cfg.gran_mn >= 16 ? cfg.tile_mn : cfg.tile_mn * cfg.gran_mn / 16;
   const int rows_per_fill = 1 << cfg.op_ctrl;
   const int rows_mn_per_seg = rows_mn / cfg.mn_warps;
-  const int batches_per_seg = rows_mn_per_seg * cfg.tile_k / rows_per_fill;
+  const int k_dup = cfg.mmac_k == 64 && cfg.gran_k >= 64 ? 2 : 1;
+  const int logical_rows = rows_mn_per_seg * cfg.tile_k * k_dup;
+  const int batches_per_seg = logical_rows / rows_per_fill;
   const int copy_warps_per_seg = cfg.total_warps / cfg.mn_warps;
-  const int batches_per_warp =
-      (batches_per_seg + copy_warps_per_seg - 1) / copy_warps_per_seg;
-  const int issue_iters = (batches_per_warp + 3) / 4;
+  const int groups_per_issue =
+      layout ? layout->CopyIssueGroups(rows_per_fill) : 4 / rows_per_fill;
+  const int chunks_per_issue =
+      layout ? layout->CopyIssueChunks(rows_per_fill) : 1;
+  const int chunks_per_seg =
+      layout ? layout->CopyChunkCount() : (logical_rows + 3) / 4;
+  const int issues_per_seg =
+      (chunks_per_seg + chunks_per_issue - 1) / chunks_per_issue;
+  const int issue_iters =
+      (issues_per_seg + copy_warps_per_seg - 1) / copy_warps_per_seg;
 
   for (int warp = 0; warp < cfg.total_warps; ++warp) {
-    const int seg = warp % cfg.mn_warps;
-    const int local_warp = warp / cfg.mn_warps;
+    const int work_rank =
+        issues_per_seg % copy_warps_per_seg != 0
+            ? ::tl::hcu::ScaleCopyWaveRank(warp, cfg.total_warps)
+            : warp;
+    const int seg = work_rank % cfg.mn_warps;
+    const int local_warp = work_rank / cfg.mn_warps;
     const int mn_row0 = seg * rows_mn_per_seg;
     for (int iter = 0; iter < issue_iters; ++iter) {
-      const int group_base = local_warp * batches_per_warp + iter * 4;
-      const int hardware_batches = cfg.op_ctrl == 2 ? 2 : 1;
-      for (int hw = 0; hw < hardware_batches; ++hw) {
-        std::set<int> words;
-        const int group_begin = cfg.op_ctrl == 2 ? hw * 2 : 0;
-        const int group_end = cfg.op_ctrl == 2 ? group_begin + 2 : 4;
-        for (int group = group_begin; group < group_end; ++group) {
-          const int fill_batch = group_base + group;
-          if (fill_batch < batches_per_seg)
-            AppendGroupWords(cfg, fill_batch, mn_row0, rows_mn_per_seg,
-                             xor_shift, &words);
-        }
-        if (!words.empty())
-          AccumulateBatch(words, &score);
+      const int ordinal = local_warp + iter * copy_warps_per_seg;
+      if (ordinal >= issues_per_seg)
+        continue;
+      const int chunk =
+          layout ? layout->CopyChunk(ordinal * chunks_per_issue) : ordinal;
+      std::set<int> words;
+      for (int group = 0; group < groups_per_issue; ++group) {
+        const int raw =
+            layout
+                ? layout->RawRowFromPhysical(chunk * 4 + group * rows_per_fill)
+                : chunk * 4 + group * rows_per_fill;
+        const int fill_batch = raw / rows_per_fill;
+        if (raw >= 0 && fill_batch < batches_per_seg)
+          AppendGroupWords(cfg, fill_batch, mn_row0, rows_mn_per_seg, xor_shift,
+                           &words);
       }
+      if (!words.empty())
+        AccumulateBatch(words, &score);
     }
   }
   return score;
@@ -404,6 +446,27 @@ ScaleBufferRowOrder SelectRowOrder(const CopyScaleNode *op, int block_size,
 } // namespace
 
 namespace hcu {
+
+std::optional<std::array<int, 3>>
+ScoreScaleRowLayout(const CopyScaleNode *op,
+                    const ::tl::hcu::ScaleRowLayoutDesc &layout, int block_size,
+                    Target target, Optional<Layout> resolved_layout) {
+  // Async provenance guarantees a linear LDS anchor. Do not guess an
+  // already-inferred explicit/swizzled layout for ordinary-copy producers.
+  if (!op->lds_from_async_copy_ && !resolved_layout.defined())
+    return std::nullopt;
+  auto config = BuildConfig(op, block_size, target);
+  if (!config.has_value())
+    return std::nullopt;
+  AutoLayoutConfig cfg = config.value();
+  cfg.resolved_layout = resolved_layout;
+  cfg.row_order = static_cast<ScaleBufferRowOrder>(layout.row_order);
+  const auto score = ScoreLayout(cfg, 0, &layout);
+  if (!cfg.addresses_known)
+    return std::nullopt;
+  return std::array<int, 3>{score.max_multiplicity, score.serialized_dwords,
+                            score.conflicting_banks};
+}
 
 Optional<Layout> SelectAutoScaleLdsLayout(const CopyScaleNode *op,
                                           const LayoutInferArgs &args) {

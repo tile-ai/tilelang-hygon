@@ -9,8 +9,8 @@
  * Uses AnnotateScaleGemmDep clues + threadIdx.x extent to ComputeScaleWarpSeg
  * and size each shared.scale — no separate PlanScaleBufferRows pass.
  *
- * Fallback when scale metadata is unavailable: treat buffer as (K, MN) and use
- *   alignedRows = align8((shape[-2] * shape[-1] + 15) / 16)
+ * Row layout is explicit metadata; allocation owns its complete physical
+ * interval, including padding. Missing warp clues use a single segment.
  */
 
 #include "hcu/op/builtin.h"
@@ -18,17 +18,23 @@
 #include "hcu/op/gemm_partition.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/scale_gemm_dep.h"
+#include "hcu/utils/scale_lds_layout.h"
 #include "op/gemm.h"
 #include "op/gemm_blockscaled.h"
 #include "op/operator.h"
+#include "tl_templates/hcu/scale/scale_row_layout.hpp"
 
 #include <tvm/ir/transform.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <sstream>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -43,8 +49,6 @@ namespace {
 constexpr int kMmacMn = 16;
 constexpr int kRowsPerSlot = 16;
 constexpr int kMaxScaleSlots = 32;
-
-int Align8(int rows) { return (rows + 7) / 8 * 8; }
 
 Optional<int> GetIntAnn(const Map<String, ObjectRef> &annotations,
                         const char *key) {
@@ -76,9 +80,16 @@ struct ScaleBufferPlan {
   int b_mls_trans{1};
   int min_m_per_warp{0};
   int min_n_per_warp{0};
-  int aligned_rows{0};
+  int reserved_rows{0};
   int start_row{0};
   bool used_fallback{false};
+  int mn_warps{1};
+  int scale_format{0};
+  int row_order{0};
+  int op_ctrl{0};
+  ::tl::hcu::ScaleRowLayoutDesc layout{};
+  CopyScale copy_op;
+  Optional<Layout> source_layout;
 };
 
 int ComputeRowsMn(int scale_shape_mn, int granularity_mn) {
@@ -88,31 +99,6 @@ int ComputeRowsMn(int scale_shape_mn, int granularity_mn) {
   ICHECK(kMmacMn % granularity_mn == 0) << "granularity_mn=" << granularity_mn
                                         << " must divide mmac_mn=" << kMmacMn;
   return scale_shape_mn * granularity_mn / kMmacMn;
-}
-
-int ComputeAlignedRows(int scale_shape_mn, int scale_shape_k,
-                       int granularity_mn, int granularity_k, int mn_warps,
-                       int mmac_k = 64) {
-  ICHECK(mn_warps >= 1);
-  const int rows_mn = ComputeRowsMn(scale_shape_mn, granularity_mn);
-  ICHECK_EQ(rows_mn % mn_warps, 0)
-      << "rows_mn=" << rows_mn << " not divisible by mn_warps=" << mn_warps;
-  const int k_dup = (mmac_k == 64 && granularity_k >= 64) ? 2 : 1;
-  const int phys_k = scale_shape_k * k_dup;
-  const int logical_per_seg = (rows_mn / mn_warps) * phys_k;
-  return mn_warps * Align8(logical_per_seg);
-}
-
-int FallbackAlignedRows(const Buffer &buf) {
-  ICHECK_EQ(buf->shape.size(), 2u)
-      << "allocate_scale_buffer requires 2D scale_buffer, got rank="
-      << buf->shape.size();
-  const int64_t *dim_k = as_const_int(buf->shape[0]);
-  const int64_t *dim_mn = as_const_int(buf->shape[1]);
-  ICHECK(dim_k && dim_mn)
-      << "allocate_scale_buffer fallback requires static scale buffer shape";
-  const int64_t product = (*dim_k) * (*dim_mn);
-  return Align8(static_cast<int>((product + 15) / 16));
 }
 
 std::pair<int, int> ParseScaleShape(const Buffer &buf, int scale_k_major) {
@@ -133,10 +119,25 @@ public:
       plans;
 
 private:
+  LayoutMap source_layouts_;
+
+  void VisitStmt_(const SBlockNode *op) final {
+    if (auto layouts = op->annotations.Get(attr::kLayoutMap)) {
+      for (const auto &[buffer, layout] : Downcast<LayoutMap>(layouts.value()))
+        source_layouts_.Set(buffer, layout);
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
   void RecordFromCopyScale(const CopyScaleNode *cs,
                            const Map<String, ObjectRef> &ann) {
     ScaleBufferPlan plan;
     plan.buffer = cs->dst;
+    plan.copy_op = tvm::ffi::GetRef<CopyScale>(cs);
+    plan.source_layout = source_layouts_.Get(cs->src);
+    plan.scale_format = cs->scale_format_;
+    plan.row_order = cs->row_order_;
+    plan.op_ctrl = cs->op_ctrl_;
     plan.granularity_mn =
         GetIntAnn(ann, attr::kScaleGranularityMN).value_or(cs->granularity_mn_);
     plan.granularity_k =
@@ -217,6 +218,11 @@ private:
     }
     existing.scale_k_major = incoming.scale_k_major;
     if (incoming.gemm_m > 0) {
+      existing.copy_op = incoming.copy_op;
+      existing.source_layout = incoming.source_layout;
+      existing.scale_format = incoming.scale_format;
+      existing.row_order = incoming.row_order;
+      existing.op_ctrl = incoming.op_ctrl;
       existing.role = incoming.role;
       existing.gemm_m = incoming.gemm_m;
       existing.gemm_n = incoming.gemm_n;
@@ -328,6 +334,7 @@ public:
   };
 
   std::unordered_map<Buffer, LiveRange, ObjectPtrHash, ObjectPtrEqual> ranges;
+  std::vector<std::pair<Buffer, Buffer>> consumers;
 
 private:
   int stmt_index_{0};
@@ -363,6 +370,8 @@ private:
           auto gemm = Downcast<GemmBlockScaled>(
               ParseOperator(tvm::ffi::GetRef<Call>(call)));
           if (gemm->sfaRegion_.defined() && gemm->sfbRegion_.defined()) {
+            consumers.emplace_back(gemm->sfaRegion_->buffer,
+                                   gemm->sfbRegion_->buffer);
             TouchRead(gemm->sfaRegion_->buffer);
             TouchRead(gemm->sfbRegion_->buffer);
             ++stmt_index_;
@@ -453,9 +462,9 @@ private:
   }
 };
 
-void FillAlignedRows(const std::vector<Buffer> &scale_buffers,
-                     ScaleBufferMetaCollector *meta_collector, Target target,
-                     int block_size) {
+void PlanWaveRows(const std::vector<Buffer> &scale_buffers,
+                  ScaleBufferMetaCollector *meta_collector, Target target,
+                  int block_size) {
   for (const Buffer &buf : scale_buffers) {
     ScaleBufferPlan plan;
     plan.buffer = buf;
@@ -479,20 +488,139 @@ void FillAlignedRows(const std::vector<Buffer> &scale_buffers,
       ICHECK_EQ(seg.k_warp, 1)
           << "allocate_scale_buffer requires k_warp==1 for blockscaled";
       const int mn_warps = (plan.role == 0) ? seg.m_seg : seg.n_seg;
-      plan.aligned_rows = ComputeAlignedRows(
-          plan.scale_shape_mn, plan.scale_shape_k, plan.granularity_mn,
-          plan.granularity_k, mn_warps, plan.gemm_elem_bits == 8 ? 32 : 64);
-    } else if (plan.scale_shape_mn > 0 && plan.scale_shape_k > 0) {
-      // Fallback without warp clues: single segment.
-      plan.aligned_rows =
-          ComputeAlignedRows(plan.scale_shape_mn, plan.scale_shape_k,
-                             plan.granularity_mn, plan.granularity_k, 1);
-      plan.used_fallback = true;
+      plan.mn_warps = mn_warps;
     } else {
+      // Pass-only callers without producer/consumer warp clues use a single
+      // segment. No compact-K search is attempted without a known GEMM K.
       plan.used_fallback = true;
-      plan.aligned_rows = FallbackAlignedRows(buf);
     }
+    const int mmac_k = plan.gemm_elem_bits == 8 ? 32 : 64;
+    const int atom_mn = plan.scale_format == 5 ? 4
+                        : (plan.scale_format == 3 || plan.scale_format == 4)
+                            ? 2
+                            : 1;
+    int atom_k = plan.scale_format == 2 ? 4
+                 : (plan.scale_format == 1 || plan.scale_format == 3 ||
+                    (plan.scale_format == 0 && mmac_k == 64))
+                     ? 2
+                     : 1;
+    // K-major Identity can copy a K4 atom even when MMAC consumes K2.
+    if (plan.scale_format == 0 && plan.op_ctrl > 0) {
+      atom_k = std::max(atom_k, 1 << plan.op_ctrl);
+    }
+    ICHECK_EQ(ComputeRowsMn(plan.scale_shape_mn, plan.granularity_mn) %
+                  plan.mn_warps,
+              0)
+        << "Scale MN rows must divide the consumer wave segments";
+    plan.layout = {::tl::hcu::ScaleRowMode::FixedBank,
+                   0,
+                   ComputeRowsMn(plan.scale_shape_mn, plan.granularity_mn) /
+                       plan.mn_warps,
+                   plan.scale_shape_k *
+                       ((mmac_k == 64 && plan.granularity_k >= 64) ? 2 : 1),
+                   atom_mn,
+                   atom_k,
+                   plan.row_order,
+                   atom_k};
+    ICHECK(plan.layout.Valid()) << "Invalid scale row layout for " << buf->name;
+    plan.reserved_rows = plan.mn_warps * plan.layout.SegmentRows();
     meta_collector->plans[buf] = plan;
+  }
+}
+
+// Choose the common K phase and per-operand row permutations separately
+// from physical allocation. The callback replays the actual lifetime timeline
+// for a trial footprint without coupling row algebra to the free-list policy.
+void PlanComponentRows(const std::vector<Buffer> &component,
+                       ScaleBufferMetaCollector *meta_collector, Target target,
+                       int block_size,
+                       const std::function<int()> &evaluate_peak) {
+  using Mode = ::tl::hcu::ScaleRowMode;
+  int k_limit = 0;
+  for (size_t node = 0; node < component.size(); ++node)
+    k_limit =
+        std::max(k_limit, meta_collector->plans.at(component[node]).gemm_k);
+  std::vector<::tl::hcu::ScaleRowLayoutDesc> best;
+  auto best_score = std::make_tuple(std::numeric_limits<int>::max(),
+                                    std::numeric_limits<int>::max(),
+                                    std::numeric_limits<int>::max());
+  // A common logical-K width must not split either side's reuse range or
+  // copy atom. Score RowOrder alternatives against the preceding LDS plan;
+  // changing the row order must not rewrite an already resolved source layout.
+  for (int width = 32; width <= k_limit; width += 32) {
+    std::vector<::tl::hcu::ScaleRowLayoutDesc> candidate;
+    bool valid = true;
+    int rows = 0;
+    int lds_cost = 0;
+    for (size_t node = 0; node < component.size(); ++node) {
+      const auto &plan = meta_collector->plans.at(component[node]);
+      auto layout = plan.layout;
+      if (width % plan.granularity_k != 0) {
+        valid = false;
+        break;
+      }
+      layout.phase_k_rows =
+          width / plan.granularity_k * (layout.physical_k / plan.scale_shape_k);
+      layout.mode = Mode::KPhasePacked;
+      if (!layout.Valid()) {
+        valid = false;
+        break;
+      }
+      if (layout.DensePhaseCompatible())
+        layout.mode = Mode::DenseXor;
+      // RowOrder changes only the within-phase rank. A common K phase
+      // therefore permits independently ranked A/B candidates while
+      // preserving the joint per-MMAC bank constraint.
+      if (plan.copy_op.defined()) {
+        auto current = hcu::ScoreScaleRowLayout(
+            plan.copy_op.get(), layout, block_size, target, plan.source_layout);
+        if (current.has_value()) {
+          auto alternative = layout;
+          alternative.row_order ^= 1;
+          alternative.mode = alternative.DensePhaseCompatible()
+                                 ? Mode::DenseXor
+                                 : Mode::KPhasePacked;
+          auto other =
+              hcu::ScoreScaleRowLayout(plan.copy_op.get(), alternative,
+                                       block_size, target, plan.source_layout);
+          if (other.has_value() &&
+              std::make_pair(alternative.SegmentRows(), other.value()) <
+                  std::make_pair(layout.SegmentRows(), current.value())) {
+            layout = alternative;
+            current = other;
+          }
+          lds_cost += current.value()[1];
+        }
+      }
+      candidate.push_back(layout);
+      rows += plan.mn_warps * layout.SegmentRows();
+    }
+    if (!valid)
+      continue;
+    std::vector<int> saved;
+    for (size_t pos = 0; pos < component.size(); ++pos) {
+      auto &plan = meta_collector->plans.at(component[pos]);
+      saved.push_back(plan.reserved_rows);
+      plan.reserved_rows = plan.mn_warps * candidate[pos].SegmentRows();
+    }
+    auto cost = std::make_tuple(evaluate_peak(), rows, lds_cost);
+    for (size_t pos = 0; pos < component.size(); ++pos)
+      meta_collector->plans.at(component[pos]).reserved_rows = saved[pos];
+    if (cost < best_score) {
+      best_score = cost;
+      best = std::move(candidate);
+    }
+  }
+  bool alternating = false;
+  for (const auto &layout : best)
+    alternating |= layout.PhaseAtoms(1) > 0;
+  if (alternating) {
+    // Preserve one common phase even when one operand has no size saving.
+    for (size_t pos = 0; pos < component.size(); ++pos) {
+      auto &plan = meta_collector->plans.at(component[pos]);
+      plan.layout = best[pos];
+      plan.reserved_rows = plan.mn_warps * plan.layout.SegmentRows();
+    }
   }
 }
 
@@ -500,14 +628,13 @@ std::pair<std::unordered_map<Buffer, int, ObjectPtrHash, ObjectPtrEqual>, int>
 BuildStartRowMap(const std::vector<Buffer> &scale_buffers,
                  ScaleBufferMetaCollector *meta_collector, const Stmt &body,
                  Target target, int block_size) {
-  FillAlignedRows(scale_buffers, meta_collector, target, block_size);
+  PlanWaveRows(scale_buffers, meta_collector, target, block_size);
 
   ScaleLivenessFinder finder;
   finder(body);
 
   struct Item {
     Buffer buf;
-    int aligned_rows{0};
     int gen{0};
     int kill{0};
   };
@@ -516,7 +643,6 @@ BuildStartRowMap(const std::vector<Buffer> &scale_buffers,
   for (const Buffer &buf : scale_buffers) {
     Item item;
     item.buf = buf;
-    item.aligned_rows = meta_collector->plans[buf].aligned_rows;
     auto rit = finder.ranges.find(buf);
     if (rit != finder.ranges.end() && rit->second.gen >= 0) {
       item.gen = rit->second.gen;
@@ -546,48 +672,192 @@ BuildStartRowMap(const std::vector<Buffer> &scale_buffers,
     if (a.time != b.time) {
       return a.time < b.time;
     }
-    return a.kind < b.kind;
+    return std::tie(a.kind, a.idx) < std::tie(b.kind, b.idx);
   });
 
-  std::vector<FreeInterval> free_list;
-  std::unordered_map<Buffer, int, ObjectPtrHash, ObjectPtrEqual> start_rows;
-  int high_water = 0;
-  for (const Event &ev : events) {
-    const Item &item = items[ev.idx];
-    if (ev.kind == 0) {
-      auto it = start_rows.find(item.buf);
-      if (it != start_rows.end()) {
-        FreeToFreelist(&free_list, it->second, item.aligned_rows);
-      }
-    } else {
-      if (start_rows.count(item.buf)) {
-        continue; // already allocated (duplicate gen)
-      }
-      const int start =
-          AllocateFromFreelist(&free_list, item.aligned_rows, &high_water);
-      start_rows.emplace(item.buf, start);
-      meta_collector->plans[item.buf].start_row = start;
-    }
+  std::unordered_map<Buffer, size_t, ObjectPtrHash, ObjectPtrEqual> indices;
+  for (size_t i = 0; i < items.size(); ++i) {
+    indices.emplace(items[i].buf, i);
+  }
+  std::vector<std::pair<size_t, size_t>> edges;
+  std::vector<std::vector<size_t>> neighbors(items.size());
+  for (const auto &[a, b] : finder.consumers) {
+    const size_t ai = indices.at(a), bi = indices.at(b);
+    edges.emplace_back(ai, bi);
+    neighbors[ai].push_back(bi);
+    neighbors[bi].push_back(ai);
   }
 
-  // Buffers with no events still need a placement.
-  for (const Item &item : items) {
-    if (!start_rows.count(item.buf)) {
-      const int start =
-          AllocateFromFreelist(&free_list, item.aligned_rows, &high_water);
-      start_rows.emplace(item.buf, start);
-      meta_collector->plans[item.buf].start_row = start;
+  struct Placement {
+    std::vector<int> starts;
+    int high_water{0};
+  };
+  // Own a complete physical interval, including padding, for each lifetime.
+  auto place = [&](const std::vector<int> &banks) {
+    Placement result;
+    result.starts.resize(items.size(), -1);
+    std::vector<FreeInterval> free_list;
+    for (const Event &ev : events) {
+      if (banks[ev.idx] < 0)
+        continue;
+      const int rows =
+          meta_collector->plans.at(items[ev.idx].buf).reserved_rows;
+      if (ev.kind == 0)
+        FreeToFreelist(&free_list, result.starts[ev.idx], rows);
+      else
+        result.starts[ev.idx] =
+            AllocateFromFreelist(&free_list, rows, &result.high_water);
+    }
+    return result;
+  };
+  auto score = [&](const std::vector<int> &banks) {
+    int conflicts = 0;
+    for (const auto &[a, b] : edges)
+      conflicts += banks[a] >= 0 && banks[a] == banks[b];
+    return conflicts;
+  };
+
+  std::vector<int> banks(items.size(), -1), colors(items.size(), -1);
+  for (size_t root = 0; root < items.size(); ++root) {
+    if (colors[root] >= 0) {
+      continue;
+    }
+    std::vector<size_t> component{root};
+    colors[root] = 0;
+    bool bipartite = true;
+    for (size_t pos = 0; pos < component.size(); ++pos) {
+      const size_t node = component[pos];
+      for (size_t other : neighbors[node]) {
+        if (colors[other] < 0) {
+          colors[other] = colors[node] ^ 1;
+          component.push_back(other);
+        } else if (colors[other] == colors[node]) {
+          bipartite = false;
+        }
+      }
+    }
+    if (bipartite) {
+      auto trial_banks = banks;
+      std::vector<Buffer> buffers;
+      for (size_t node : component) {
+        trial_banks[node] = colors[node];
+        buffers.push_back(items[node].buf);
+      }
+      PlanComponentRows(buffers, meta_collector, target, block_size,
+                        [&]() { return place(trial_banks).high_water; });
+    }
+    if (bipartite) {
+      auto flipped = banks;
+      for (size_t node : component) {
+        banks[node] = colors[node];
+        flipped[node] = colors[node] ^ 1;
+      }
+      if (score(flipped) < score(banks)) {
+        banks = std::move(flipped);
+      }
+    } else {
+      // Odd cycles / self edges cannot be separated with one stored copy.
+      // Greedily minimize already determined conflicts, then row footprint.
+      for (size_t node : component) {
+        banks[node] = 0;
+        auto alternative = banks;
+        alternative[node] = 1;
+        if (score(alternative) < score(banks)) {
+          banks = std::move(alternative);
+        }
+      }
     }
   }
-  return {start_rows, high_water};
+  const Placement result = place(banks);
+  ICHECK_LE(result.high_water, 512)
+      << "Scale-buffer capacity exceeded: rows=" << result.high_water
+      << ", capacity=512 rows including layout padding";
+  for (const auto &[a, b] : edges) {
+    if (banks[a] == banks[b]) {
+      LOG(WARNING) << "GEMM scale bank conflict: ScaleA=" << items[a].buf->name
+                   << ", ScaleB=" << items[b].buf->name << ", both in bank"
+                   << banks[a]
+                   << "; retaining one copy with correct row addressing";
+    } else {
+      const auto &pa = meta_collector->plans.at(items[a].buf);
+      const auto &pb = meta_collector->plans.at(items[b].buf);
+      const int k_extent = std::min(pa.gemm_k, pb.gemm_k);
+      const int mmac_k = pa.gemm_elem_bits == 8 ? 32 : 64;
+      // Check actual paired consumption, including unequal MN lengths and
+      // different scale granularities. A polarity-only check is insufficient
+      // when the operands use different layout modes or RowOrders.
+      for (int k = 0; k < k_extent; k += mmac_k) {
+        const int ka =
+            k / pa.granularity_k * (pa.layout.physical_k / pa.scale_shape_k);
+        const int kb =
+            k / pb.granularity_k * (pb.layout.physical_k / pb.scale_shape_k);
+        ICHECK_LT(ka, pa.layout.physical_k);
+        ICHECK_LT(kb, pb.layout.physical_k);
+        for (int m = 0; m < pa.layout.rows_mn; ++m) {
+          for (int n = 0; n < pb.layout.rows_mn; ++n) {
+            ICHECK_NE((pa.layout.RowOffset(m, ka) / 4 % 2) ^ banks[a],
+                      (pb.layout.RowOffset(n, kb) / 4 % 2) ^ banks[b])
+                << "Inconsistent scale layout for paired MMAC consumption";
+          }
+        }
+      }
+    }
+  }
+  std::unordered_map<Buffer, int, ObjectPtrHash, ObjectPtrEqual> start_rows;
+  for (size_t i = 0; i < items.size(); ++i) {
+    const int physical_start = result.starts[i];
+    ICHECK_EQ(physical_start % 8, 0)
+        << "Scale-buffer interval base must be 8-row aligned for m0";
+    auto &plan = meta_collector->plans[items[i].buf];
+    ICHECK_EQ(plan.layout.SegmentRows() % 8, 0)
+        << "Every consumer wave's scale base must remain 8-row aligned";
+    plan.layout.polarity = banks[i];
+    for (int mn = 0; mn < plan.layout.rows_mn; ++mn) {
+      for (int k = 0; k < plan.layout.physical_k; ++k) {
+        const int row = plan.layout.RowOffset(mn, k);
+        ICHECK_GE(row, 0);
+        ICHECK_LT(row, plan.layout.SegmentRows());
+        ICHECK_EQ(plan.layout.RawRowFromPhysical(row),
+                  plan.layout.RawRow(mn, k))
+            << "Scale copy/consumer row maps disagree for "
+            << items[i].buf->name;
+      }
+    }
+    if (plan.layout.mode == ::tl::hcu::ScaleRowMode::FixedBank) {
+      LOG(WARNING) << "FixedBank fallback: buffer=" << items[i].buf->name
+                   << "; no selected compact common-K layout; effective_rows="
+                   << plan.mn_warps * plan.layout.rows_mn *
+                          plan.layout.physical_k
+                   << ", padding_rows="
+                   << plan.reserved_rows - plan.mn_warps * plan.layout.rows_mn *
+                                               plan.layout.physical_k
+                   << ", reserved_rows=" << plan.reserved_rows;
+    }
+    start_rows.emplace(items[i].buf, physical_start);
+    meta_collector->plans[items[i].buf].start_row = physical_start;
+  }
+  return {start_rows, result.high_water};
 }
 
 class AllocateScaleBufferMutator : public StmtExprMutator {
 public:
   explicit AllocateScaleBufferMutator(
       const std::unordered_map<Buffer, int, ObjectPtrHash, ObjectPtrEqual>
-          &start_rows)
-      : start_rows_(start_rows) {}
+          &start_rows,
+      const ScaleBufferMetaCollector &meta)
+      : start_rows_(start_rows) {
+    for (const auto &[buf, plan] : meta.plans) {
+      const auto &d = plan.layout;
+      std::ostringstream type;
+      type << "tl::hcu::ScaleRowLayout<" << static_cast<int>(d.mode) << ", "
+           << d.polarity << ", " << d.rows_mn << ", " << d.physical_k << ", "
+           << d.atom_mn << ", " << d.atom_k << ", " << d.row_order << ", "
+           << d.phase_k_rows << ">";
+      layout_types_.emplace(buf, StringImm(type.str()));
+      segment_rows_.emplace(buf, Integer(d.SegmentRows()));
+      row_orders_.emplace(buf, Integer(d.row_order));
+    }
+  }
 
   static PrimFunc Substitute(PrimFunc f) {
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
@@ -620,7 +890,7 @@ public:
         << "HCU scale_buffer requires <= " << kMaxScaleSlots << " slots, got "
         << slots << " rows=" << max_end_row;
 
-    AllocateScaleBufferMutator mutator(start_rows);
+    AllocateScaleBufferMutator mutator(start_rows, meta_collector);
     Stmt body = mutator(f->body);
     // Carry the HCU-only value inside the device body. AnnotateDeviceRegions
     // will enclose this marker, so the backend-neutral SplitHostDevice moves
@@ -633,6 +903,19 @@ public:
   }
 
 private:
+  std::unordered_map<Buffer, StringImm, ObjectPtrHash, ObjectPtrEqual>
+      layout_types_;
+  std::unordered_map<Buffer, Integer, ObjectPtrHash, ObjectPtrEqual>
+      segment_rows_;
+  std::unordered_map<Buffer, Integer, ObjectPtrHash, ObjectPtrEqual>
+      row_orders_;
+
+  void AttachLayout(Map<String, ObjectRef> *annotations, const Buffer &buf,
+                    const char *type_key, const char *rows_key) const {
+    annotations->Set(type_key, layout_types_.at(buf));
+    annotations->Set(rows_key, segment_rows_.at(buf));
+  }
+
   Optional<IntImm> LookupStartRow(const Buffer &buf) const {
     auto it = start_rows_.find(buf);
     if (it == start_rows_.end()) {
@@ -678,6 +961,9 @@ private:
                 ParseOperator(tvm::ffi::GetRef<Call>(call)));
             if (auto start = LookupStartRow(cs->dst)) {
               annotations.Set(attr::kScaleRowBase, start.value());
+              AttachLayout(&annotations, cs->dst, "tl.hcu.scale_row_layout",
+                           "tl.hcu.scale_segment_rows");
+              annotations.Set(attr::kScaleRowOrder, row_orders_.at(cs->dst));
               changed = true;
             }
           } else {
@@ -686,12 +972,22 @@ private:
             if (gemm->sfaRegion_.defined()) {
               if (auto start = LookupStartRow(gemm->sfaRegion_->buffer)) {
                 annotations.Set(attr::kScaleARowBase, start.value());
+                AttachLayout(&annotations, gemm->sfaRegion_->buffer,
+                             "tl.hcu.scale_a_row_layout",
+                             "tl.hcu.scale_a_segment_rows");
+                annotations.Set(attr::kScaleARowOrder,
+                                row_orders_.at(gemm->sfaRegion_->buffer));
                 changed = true;
               }
             }
             if (gemm->sfbRegion_.defined()) {
               if (auto start = LookupStartRow(gemm->sfbRegion_->buffer)) {
                 annotations.Set(attr::kScaleBRowBase, start.value());
+                AttachLayout(&annotations, gemm->sfbRegion_->buffer,
+                             "tl.hcu.scale_b_row_layout",
+                             "tl.hcu.scale_b_segment_rows");
+                annotations.Set(attr::kScaleBRowOrder,
+                                row_orders_.at(gemm->sfbRegion_->buffer));
                 changed = true;
               }
             }

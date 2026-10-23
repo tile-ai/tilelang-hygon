@@ -167,6 +167,9 @@ CopyScale::CopyScale(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   node->scale_k_major_ = GetIntAnnOrDefault(annotations, attr::kScaleKMajor, 0);
   node->role_ = GetIntAnnOrDefault(annotations, attr::kScaleRole, 0);
   node->row_order_ = GetIntAnnOrDefault(annotations, attr::kScaleRowOrder, 0);
+  if (auto layout = annotations.Get("tl.hcu.scale_row_layout")) {
+    node->row_layout_type_ = Downcast<StringImm>(layout.value())->value;
+  }
   node->lds_from_async_copy_ =
       GetIntAnnOrDefault(annotations, attr::kScaleLdsFromAsync, 0);
   node->gemm_m_ = GetIntAnnOrDefault(annotations, attr::kScaleGemmM, 0);
@@ -517,12 +520,14 @@ Stmt CopyScaleNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       leading_stage_dims);
 
   std::stringstream ss;
+  ICHECK(!row_layout_type_.empty())
+      << "copy_scale missing allocated ScaleRowLayout descriptor";
   ss << "tl::hcu::ds_scale_copy<" << op_ctrl_ << ", " << scale_format_ << ", "
      << parent_scale_mn << ", " << parent_scale_k << ", " << scale_shape_mn
      << ", " << scale_shape_k << ", " << granularity_mn_ << ", "
      << granularity_k_ << ", " << scale_k_major_ << ", " << mn_warps << ", "
      << seg.total_warps << ", " << generated_layout.name << ", " << kMmacK
-     << ", " << row_order_ << ">";
+     << ", " << row_order_ << ", " << row_layout_type_ << ">";
 
   Array<PrimExpr> call_args;
   call_args.push_back(StringImm(ss.str()));
