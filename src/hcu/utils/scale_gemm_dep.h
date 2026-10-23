@@ -13,6 +13,12 @@ namespace tvm {
 namespace tl {
 
 namespace attr {
+// Actual tile-op thread domains, distinct from the enclosing CTA extent.
+static constexpr const char *kScaleThreadMin = "tl.hcu.scale_thread_min";
+static constexpr const char *kScaleThreads = "tl.hcu.scale_threads";
+static constexpr const char *kScalePartitioned = "tl.hcu.scale_partitioned";
+static constexpr const char *kScaleGemmThreads = "tl.hcu.scale_gemm_threads";
+static constexpr const char *kScaleResident = "tl.hcu.scale_resident";
 static constexpr const char *kScaleGemmDep = "tl.hcu.scale_gemm_dep";
 static constexpr const char *kScaleRowBase = "tl.hcu.scale_row_base";
 static constexpr const char *kScaleARowBase = "tl.hcu.scale_a_row_base";

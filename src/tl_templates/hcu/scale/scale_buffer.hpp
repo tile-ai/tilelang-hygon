@@ -17,9 +17,10 @@
  * applying its source policy; MMAC maps logical coordinates directly through
  * the same descriptor. Base addresses never encode polarity or layout mode.
  *
- * TotalWarps fill all segments: warp_id % MnWarps selects the segment and
- * warp_id / MnWarps selects a copy warp within it. Copy waves round-robin
- * four-row chunks without filling another segment's alignment padding.
+ * TotalWarps belong to the copy thread domain, not the consumer GEMM domain.
+ * Copy waves round-robin (issue, segment) jobs without filling another
+ * segment's alignment padding. When TotalWarps is divisible by MnWarps,
+ * each copy wave retains a fixed segment across all issue rounds.
  * MMAC offsets are five-bit immediates relative to an eight-aligned m0 base;
  * large segments are consumed in compile-time page groups at each K atom.
  *
@@ -448,8 +449,6 @@ TL_DEVICE void DsScaleCopyFill(const void *lds_scale, int dst_row_base,
                                int warp_id, int origin_mn, int origin_k) {
   static_assert(MnWarps >= 1 && TotalWarps >= 1, "warps >= 1");
   static_assert(GranularityK % 32 == 0, "GranularityK must be divisible by 32");
-  static_assert(TotalWarps % MnWarps == 0,
-                "TotalWarps must be divisible by MnWarps");
 
   constexpr int kRowsPerFill = Policy::kRowsPerFill;
   constexpr int kPhysK = Policy::kPhysK;
@@ -458,7 +457,6 @@ TL_DEVICE void DsScaleCopyFill(const void *lds_scale, int dst_row_base,
   constexpr int rows_mn_per_seg = rows_mn / MnWarps;
   constexpr int logical_rows_per_seg = rows_mn_per_seg * kPhysK;
   constexpr auto layout = RowLayout::descriptor;
-  constexpr int copy_warps_per_seg = TotalWarps / MnWarps;
   static_assert(logical_rows_per_seg % kRowsPerFill == 0,
                 "logical_rows_per_seg must be divisible by RowsPerFill");
 
@@ -478,20 +476,23 @@ TL_DEVICE void DsScaleCopyFill(const void *lds_scale, int dst_row_base,
   constexpr int chunks_per_seg = layout.CopyChunkCount();
   constexpr int issues_per_seg =
       (chunks_per_seg + chunks_per_issue - 1) / chunks_per_issue;
-  constexpr int iterations =
-      (issues_per_seg + copy_warps_per_seg - 1) / copy_warps_per_seg;
-  constexpr bool partial_round = issues_per_seg % copy_warps_per_seg != 0;
+  constexpr int total_issues = issues_per_seg * MnWarps;
+  constexpr int iterations = (total_issues + TotalWarps - 1) / TotalWarps;
+  constexpr bool partial_round = total_issues % TotalWarps != 0;
   const int work_rank =
       partial_round ? ScaleCopyWaveRank(warp_id, TotalWarps) : warp_id;
-  const int seg = work_rank % MnWarps;
-  const int seg_local_warp = (work_rank / MnWarps) % copy_warps_per_seg;
-  const int seg_row_base = dst_row_base + RowLayout::SegmentOffset(seg);
-  const int mn_row0 = seg * rows_mn_per_seg;
 
   // soffset is wave-uniform. Combine physically compatible groups in one
   // issue; inactive groups must never write padding or the other bank.
   tl::static_for<0, iterations, 1>{}([&](auto iteration) {
-    const int ordinal = seg_local_warp + iteration * copy_warps_per_seg;
+    // Flatten (issue, consumer segment) work across the copy scope. Even a
+    // single copy wave can fill multiple consumer segments; the two domains
+    // need not have the same wave count or divide one another.
+    const int job = work_rank + iteration * TotalWarps;
+    const int seg = job % MnWarps;
+    const int ordinal = job / MnWarps;
+    const int seg_row_base = dst_row_base + RowLayout::SegmentOffset(seg);
+    const int mn_row0 = seg * rows_mn_per_seg;
     const int chunk = layout.CopyChunk(ordinal * chunks_per_issue);
     const int physical_row = chunk * 4 + fill_group * kRowsPerFill;
     constexpr bool full_chunks = layout.CopyHalfRows(0) % 4 == 0 &&
@@ -502,7 +503,7 @@ TL_DEVICE void DsScaleCopyFill(const void *lds_scale, int dst_row_base,
     // Each useful half-chunk is assigned once. The only lane predicate is
     // the instruction group mask (and a genuine tail, if one exists).
     // In particular never form a -1 raw row then divide it as a signed int.
-    if (ordinal < issues_per_seg && fill_group < groups_per_issue &&
+    if (job < total_issues && fill_group < groups_per_issue &&
         (!fixed_k4 || fill_group % 2 == 0) &&
         (full_chunks ||
          layout.CopyGroupValid(physical_row / 4, physical_row % 4))) {
@@ -513,13 +514,13 @@ TL_DEVICE void DsScaleCopyFill(const void *lds_scale, int dst_row_base,
       Policy::Map(fill_batch, 0, mn_row0, rows_mn_per_seg, tx16, origin_mn,
                   origin_k, &logical_row, &lds_byte);
       auto *lds_ptr = reinterpret_cast<TL_LDS_ADDR int *>(src_u8 + lds_byte);
-      if constexpr (fixed_k4 && iterations > 1) {
+      if constexpr (fixed_k4 && iterations > 1 && TotalWarps % MnWarps == 0) {
         // Anchor repeated K4 issues at the first valid lane address. Keep the
         // exact per-issue difference: an explicit source layout may be XORed,
         // so a constant linear stride must not be assumed. Evaluate the anchor
         // inside the active-group guard, never for padding or idle waves.
         const int first_chunk =
-            layout.CopyChunk(seg_local_warp * chunks_per_issue);
+            layout.CopyChunk((work_rank / MnWarps) * chunks_per_issue);
         const unsigned first_raw =
             layout.CopyRawRow(first_chunk * 4 + fill_group * kRowsPerFill);
         int first_logical_row = 0;

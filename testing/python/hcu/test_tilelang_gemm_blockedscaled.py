@@ -1842,5 +1842,126 @@ def test_gemm_blockscaled_scale_bank_pairs_correctness(same_buffer):
     _check_blockscaled_out(kernel.get_profiler().func(a, b, s0, s1).cpu(), expected)
 
 
+def _manual_ws_program(producer_threads, consumer_threads, copy_on_producer, nonlinear):
+    # Each HCU specialization branch is exactly four waves, not a multiple
+    # chosen from the total CTA size. The two consumers own separate buffers.
+    assert producer_threads == consumer_threads == 256
+    m, k, sk = 64, 128, 4
+    threads = producer_threads + 2 * consumer_threads
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((m, k), "float4_e2m1fn"),
+        B: T.Tensor((m, k), "float4_e2m1fn"),
+        SA: T.Tensor((sk, m), "uint8"),
+        SB: T.Tensor((sk, m), "uint8"),
+        C: T.Tensor((2, m, m), "float32"),
+    ):
+        with T.Kernel(1, threads=threads):
+            tx = T.get_thread_binding()
+            a0 = T.alloc_shared((m, k), "float4_e2m1fn")
+            b0 = T.alloc_shared((m, k), "float4_e2m1fn")
+            a1 = T.alloc_shared((m, k), "float4_e2m1fn")
+            b1 = T.alloc_shared((m, k), "float4_e2m1fn")
+            la0 = T.alloc_shared((sk, m), "uint8")
+            lb0 = T.alloc_shared((sk, m), "uint8")
+            la1 = T.alloc_shared((sk, m), "uint8")
+            lb1 = T.alloc_shared((sk, m), "uint8")
+            sa0 = T.alloc_scale_buffer((sk, m))
+            sb0 = T.alloc_scale_buffer((sk, m))
+            sa1 = T.alloc_scale_buffer((sk, m))
+            sb1 = T.alloc_scale_buffer((sk, m))
+            if nonlinear:
+                T.annotate_layout(
+                    {
+                        la0: T.Layout((sk, m), lambda s, n: [s, n ^ (s * 8)]),
+                        lb0: T.Layout((sk, m), lambda s, n: [s, n ^ (s * 8)]),
+                        la1: T.Layout((sk, m), lambda s, n: [s, n ^ (s * 8)]),
+                        lb1: T.Layout((sk, m), lambda s, n: [s, n ^ (s * 8)]),
+                    }
+                )
+            if tx < producer_threads:
+                T.copy(A, a0)
+                T.copy(B, b0)
+                T.copy(A, a1)
+                T.copy(B, b1)
+                T.copy(SA, la0)
+                T.copy(SB, lb0)
+                T.copy(SA, la1)
+                T.copy(SB, lb1)
+                if copy_on_producer:
+                    # Only producer-side scale reads need this group barrier.
+                    # Otherwise the all-group handoff below protects LDS reads.
+                    T.ebarrier_sync_cnt(1, producer_threads // 64)
+                    T.copy_scale(la0, sa0)
+                    T.copy_scale(lb0, sb0)
+                    T.copy_scale(la1, sa1)
+                    T.copy_scale(lb1, sb1)
+                T.ebarrier_sync_cnt(0, threads // 64)
+            elif tx < producer_threads + consumer_threads:
+                c0 = T.alloc_fragment((m, m), "float32")
+                T.clear(c0)
+                T.ebarrier_sync_cnt(0, threads // 64)
+                if not copy_on_producer:
+                    T.copy_scale(la0, sa0)
+                    T.copy_scale(lb0, sb0)
+                    T.ebarrier_sync_cnt(2, consumer_threads // 64)
+                T.gemm_blockscaled(a0, b0, c0, sa0, sb0, transpose_B=True, sf_a_granularity_k=32, sf_b_granularity_k=32)
+                T.copy(c0, C[0, :, :])
+            else:
+                c1 = T.alloc_fragment((m, m), "float32")
+                T.clear(c1)
+                T.ebarrier_sync_cnt(0, threads // 64)
+                if not copy_on_producer:
+                    T.copy_scale(la1, sa1)
+                    T.copy_scale(lb1, sb1)
+                    T.ebarrier_sync_cnt(3, consumer_threads // 64)
+                T.gemm_blockscaled(a1, b1, c1, sa1, sb1, transpose_B=True, sf_a_granularity_k=32, sf_b_granularity_k=32)
+                T.copy(c1, C[1, :, :])
+
+    return main
+
+
+@requires_blockscaled
+@pytest.mark.parametrize(
+    "producer_threads,consumer_threads,copy_on_producer,nonlinear",
+    [
+        (256, 256, True, False),
+        (256, 256, False, False),
+        (256, 256, True, True),
+        (256, 256, False, True),
+    ],
+)
+def test_gemm_blockscaled_manual_ws(producer_threads, consumer_threads, copy_on_producer, nonlinear):
+    program = _manual_ws_program(producer_threads, consumer_threads, copy_on_producer, nonlinear)
+    kernel = tl.compile(program, out_idx=[4], pass_configs={"tl.disable_thread_storage_sync": True})
+    source = kernel.get_kernel_source()
+    assert "__syncthreads" not in source
+    copies = re.findall(r"ds_scale_copy<([^;]+?)>\([^;]+?\), (\d+),", source)
+    assert len(copies) == 4
+    intervals = []
+    for params, base in copies:
+        head, descriptor = params.split("tl::hcu::ScaleRowLayout<")
+        args = head.split(",")
+        segments, copy_waves = int(args[9]), int(args[10])
+        assert copy_waves == (producer_threads if copy_on_producer else consumer_threads) // 64
+        layout = list(map(int, descriptor.rstrip("> ").split(",")))
+        # ScaleK=4, native FP4 K2: these examples are balanced compact layouts.
+        assert layout[0] in (1, 2)
+        extent = segments * ((layout[2] * layout[3] + 7) // 8 * 8)
+        interval = set(range(int(base), int(base) + extent))
+        assert int(base) % 8 == 0
+        assert all(interval.isdisjoint(other) for other in intervals)
+        intervals.append(interval)
+    al, bl, a, b = _make_fp4_inputs(64, 64, 128)
+    sa, sb = _make_e8m0_scales(4, 64, 64, non_unit_scale=True)
+    expected = blockscaled_fp4_cpu_ref(
+        al, bl, sa, sb, sf_a_granularity_m=1, sf_a_granularity_k=32, sf_b_granularity_n=1, sf_b_granularity_k=32
+    )
+    actual = kernel.get_profiler().func(a, b, sa, sb).cpu()
+    _check_blockscaled_out(actual[0], expected)
+    _check_blockscaled_out(actual[1], expected)
+
+
 if __name__ == "__main__":
     tilelang.testing.main()
