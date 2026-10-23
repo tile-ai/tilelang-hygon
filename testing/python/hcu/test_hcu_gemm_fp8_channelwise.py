@@ -389,6 +389,76 @@ def test_m128_wide_tile_is_exact(K):
     assert rel < 1e-3, f"decode_cfg(128, {N}, {K}) = {cfg} rel error {rel:.6f}"
 
 
+def test_wide_m_decode_cfg_is_shape_aware():
+    """M in (128,256] -- the speculative-decode band (2026-10-23).
+
+    Two structural facts, both of which the chooser would silently violate if
+    someone widened a tile "for more parallelism":
+
+    1. ``(bm + bn) * bk * ns <= 65536`` at bk128/ns2 is exactly ``bm + bn <= 256``.
+       Band 160 therefore must take bn96 -- bm160/bn128 needs 73728 B.
+    2. The N < 10240 and N >= 10240 groups differ in BOTH knobs, and neither
+       difference is noise: setprio is worth +5-13% on the ns2 tile and costs
+       11% on the ns1 tile (gate_up27 0.974 -> 1.078).
+    """
+    # N < 10240: the double-buffered, unrolled, prio-boosted tile.
+    for M in (129, 160):
+        for N, K in ((5120, 8192), (5120, 6144), (5120, 17408), (6144, 5120)):
+            c = decode_cfg(M, N, K)
+            assert (c.block_M, c.block_N, c.block_K, c.num_stages, c.threads,
+                    c.setprio) == (160, 96, 128, 2, 256, 1), (M, N, K, c)
+            _validate_cfg(c, M, N, K)
+    # N >= 10240: one stage, no setprio.  gate_up27 is the only win here (0.974);
+    # qkv32 measured 0.995 (inside the 2% gate) and gate_up32 1.179.
+    for M in (129, 160):
+        for N, K in ((34816, 5120), (10240, 5120), (51200, 5120)):
+            c = decode_cfg(M, N, K)
+            assert (c.block_M, c.block_N, c.block_K, c.num_stages, c.threads,
+                    c.setprio) == (160, 96, 128, 1, 256, 0), (M, N, K, c)
+            _validate_cfg(c, M, N, K)
+    # Band 192 is the ns2 bn192 tile: (192 + 192) * 64 * 2 = 49152 B -> 4
+    # blocks/CU.  It is the gate_up27 M=192 winner (3 clean runs 0.973-0.979);
+    # decode_cfg serves it for every (N, K) and the *gate* (gemm_sweep) admits
+    # only (34816, 5120) -- the other shapes' M=192 stay on hipblas there, the
+    # same split as band 160 (which also serves a losing down32 tile).
+    for M in (161, 192):
+        for N, K in ((34816, 5120), (6144, 5120), (5120, 6144)):
+            c = decode_cfg(M, N, K)
+            assert (c.block_M, c.block_N, c.block_K, c.num_stages, c.threads,
+                    c.setprio) == (192, 192, 64, 2, 384, 0), (M, N, K, c)
+            _validate_cfg(c, M, N, K)
+    # The band stops deliberately.  M=256's best arm is a 1.000 tie, and a ratio
+    # of exactly 1.0 read at M >= 193 is the hipblas fallback (`band(M)` is
+    # None), not a win -- so no config may be selected for it.
+    for M in (193, 256):
+        with pytest.raises(AssertionError, match="M > block_M"):
+            _validate_cfg(decode_cfg(M, 5120, 8192), M, 5120, 8192)
+
+
+@pytest.mark.parametrize("M,N,K", (
+    (160, 5120, 6144),    # o27   -- ns2/sp1, u8
+    (160, 6144, 5120),    # z27   -- ns2/sp1, 64 k-steps
+    (160, 34816, 5120),   # gate_up27 -- ns1/sp0
+    (192, 34816, 5120),   # band 192 -- bn192/ns2 (gate_up27 M=192 winner)
+))
+def test_wide_m_decode_configs_are_exact(M, N, K):
+    """Band 160/192 are ns>1 (or bk64) tiles the pre-2026-10-17h code got wrong.
+
+    bm160 > M is the normal case here (the band pads A), and band 192 uses bk64
+    at ns=1, so this pins both the slice-form predicated copies and the stage
+    stride at a tile nothing else in the suite covers.
+    """
+    cfg = decode_cfg(M, N, K)
+    A, B, scale_a, scale_b = _make_inputs(M, N, K)
+    kernel = fp8_channelwise_gemm(M, N, K, cfg.block_M, cfg.block_N, cfg.block_K,
+                                  cfg.num_stages, cfg.threads, setprio=cfg.setprio)
+    C = kernel(A, B, scale_a, scale_b)
+    ref = _ref_program(A, B, scale_a, scale_b)
+    assert torch.isfinite(C).all(), f"decode_cfg({M}, {N}, {K}) produced non-finite output"
+    rel = (C - ref).abs().max().item() / ref.abs().max().item()
+    assert rel < 1e-3, f"decode_cfg({M}, {N}, {K}) = {cfg} rel error {rel:.6f}"
+
+
 @pytest.mark.parametrize("N,K", _DECODE_SHAPES)
 @pytest.mark.parametrize("M", (1, 16, 32))
 def test_small_m_decode_configs_are_exact(M, N, K):

@@ -101,6 +101,14 @@ _BN192_BM96_NK = frozenset({(34816, 5120)})
 # different mechanism.
 _NS2_VENDOR_TILES = {(16, 48, 256), (64, 192, 128), (96, 192, 64)}
 
+# _NS2_WIDE_M_TILES (2026-10-23): the speculative-decode band-192 tile
+# (bm192/bn192/bk64).  It is bk64 but NOT the _NS2_BK64_TILES "2 blocks/CU"
+# family -- single-row bm192 at ns2 is 4 blocks/CU.  Validated at the gate:
+# 3 clean runs on gate_up27 M=192 (0.973/0.979/0.976, ctl 0.998-1.001), bit
+# exact (rel 2.0e-3).  The band-160 tile (bm160/bn96/bk128) needs no entry
+# here: it already matches the `bn==96 and bk==128 and bm>=64` clause below.
+_NS2_WIDE_M_TILES = {(192, 192, 64)}
+
 
 def _validate_cfg(cfg, M, N, K):
     """Fail at selection time, with the shape in the message, rather than deep
@@ -117,7 +125,15 @@ def _validate_cfg(cfg, M, N, K):
     assert bm % MIN_TILE == 0 and bn % MIN_TILE == 0, f"shape {M}x{N}x{K}: block_M/block_N must be multiples of {MIN_TILE}"
     lds = (bm + bn) * bk * ns
     assert lds <= LDS_LIMIT, f"shape {M}x{N}x{K}: LDS {lds}B > {LDS_LIMIT}B (bm={bm}, bn={bn}, bk={bk}, ns={ns})"
-    assert M <= bm, f"shape {M}x{N}x{K}: M > block_M={bm} (we never split M -- it re-reads B)"
+    # M > block_M is legal ONLY as an exact multiple: the grid gets
+    # ceildiv(M, block_M) block rows and row r covers A[r*bm:(r+1)*bm], so a
+    # non-dividing M would run the last row past the end of A (silent OOB, the
+    # same defect as a non-dividing block_K).  M <= block_M keeps the original
+    # band semantics: the caller pads A to the band, tail rows are read but
+    # their outputs are sliced away.
+    assert M <= bm or M % bm == 0, (
+        f"shape {M}x{N}x{K}: M > block_M={bm} and M % block_M != 0 "
+        f"(a partial second block row reads A past row M)")
     # num_stages > 1 outside bm64/bn64 is now CORRECT (the packed-stride defect it
     # used to hit was fixed 2026-10-17h -- see the doc section of that name), but
     # it is still untuned: no ns>1 tile below bm64/bn64 has been benchmarked
@@ -135,11 +151,90 @@ def _validate_cfg(cfg, M, N, K):
         or (bm == 128 and bn == 128 and bk == 128 and ns <= 2) \
         or (bm == 96 and bn == 128 and bk == 128 and ns <= 2) \
         or ((bm, bn, bk) in _NS2_BK64_TILES and ns <= 2) \
-        or ((bm, bn, bk) in _NS2_VENDOR_TILES and ns <= 2)
+        or ((bm, bn, bk) in _NS2_VENDOR_TILES and ns <= 2) \
+        or ((bm, bn, bk) in _NS2_WIDE_M_TILES and ns <= 2)
     assert ns <= 1 or (bm, bn) == (64, 64) or _wide_exact, (
         f"shape {M}x{N}x{K}: num_stages={ns} is only tuned for bm=bn=64 or the bn96 wide tile "
         f"(bm={bm}, bn={bn}, bk={bk})")
     return cfg
+
+
+def _decode_cfg_wide_m(M, N, K):
+    """M in (128, 256] -- speculative-decode batches (3 drafts + 1) at high
+    concurrency, the band M <= 128 never covered.
+
+    Two structural facts drive every choice here, both measured 2026-10-23:
+
+    1. ``bm + bn <= 256`` at bk128/ns2``.  The LDS budget is
+       ``(bm + bn) * bk * ns <= 65536``; at bk128/ns2 that is exactly
+       ``bm + bn <= 256``.  So a single-row block at M=160 can still keep the
+       k-loop double-buffered and unrolled, but only with bn96 -- bn128 at
+       bm160 needs 73728 B and is rejected.  Dropping to bk64/ns2 buys bn back
+       and loses more than it gains (o27 M=256: bk64 1.11 vs bk128 1.00).
+    2. Wide bn only pays while the grid stays above the 64 CUs.  bn96 at
+       bm160 gives ceil(N/96) blocks (54 on N=5120, 64 on N=6144), which is
+       the same block count the M<=128 band already runs at those N, so the
+       tile transfers unchanged.
+
+    Measured, paired same-process, per-round ratios vs hipblas, dup-hipblas
+    control in [0.998, 1.001] on every cell, bit-exact against an fp32
+    reference on every arm (``/tmp/final256h.log``, 2026-10-23):
+
+      band 160, bm160/bn96/bk128/ns2/t256/sp1/u8  (N < 10240)
+        down27 (5120,17408) M=160  0.873
+        o32    (5120, 8192) M=160  0.882
+        z27    (6144, 5120) M=160  0.887
+        o27    (5120, 6144) M=160  0.900
+        down32 (5120,25600) M=160  LOSES, 1.05-1.10 with u1 and 1.9-3.4 with
+                                    u8 -- see the K=25600 note below.  This
+                                    cell falls back to hipblas.
+      band 160, bm160/bn96/bk128/ns1/t256/sp0 (N >= 10240)
+        gate_up27 (34816,5120) M=160  0.974
+        qkv32     (10240,5120) M=160  0.995   <- under the 2% gate: hipblas
+        gate_up32 (51200,5120) M=160  1.179   <- hipblas
+      band 192, bm192/bn192/bk64/ns2/t384/sp0/u8
+        gate_up27 M=192 0.973/0.979/0.976 across 3 clean runs (ctl
+        0.998/1.001/0.999) -- SHIPPED, gated to (34816,5120) only.  The tile
+        the old band-192 line served, bm192/bn128/bk64/ns1/t256/sp1, measured
+        1.159 the same day (and sp0 on it 0.980, still behind bn192).
+        gate_up32 M=192 1.198, z27 1.033, o27 1.081, down27 1.147, qkv27 1.236
+        (single clean run each) -- all stay on hipblas, so the gate only admits
+        (34816,5120).
+
+    ``setprio`` is NOT a free default here.  On the N<10240 tile it is worth
+    5-13% (down27 1.008 -> 0.873, down32 1.031 -> 0.946, o27 0.924 -> 0.900),
+    while on the N>=10240 tile it LOSES 10% (gate_up27 ns1 0.974 -> 1.078) --
+    the two groups get different values for that reason, not from tuning noise.
+
+    M=256 is deliberately NOT served: its best arm is bm256/bn96/bk64/ns2/
+    t512/sp1/u8 at 1.000 (a tie, not a win) and every bk128 arm is >= 1.21.
+
+    ``M`` here is the compile-time band, not the caller's row count: the band
+    machinery pads A up to it, which is what makes bm160 safe for a 137-row
+    call.  The gate is what decides whether that padded call is worth making.
+    """
+    if M <= 160 and K % 128 == 0:
+        if N >= 10240:
+            # gate_up/qkv grid: ceil(N/96) >= 107 blocks, so the second
+            # pipeline stage has nothing to overlap and sp1 actively hurts
+            # (0.974 -> 1.078 on gate_up27).  20480 B -> 3 blocks/CU.
+            return _validate_cfg(DecodeCfg(160, 96, 128, 1, 256, 0), M, N, K)
+        # (160+96)*128*2 = 65536 exactly.
+        return _validate_cfg(DecodeCfg(160, 96, 128, 2, 256, 1), M, N, K)
+    if M <= 192 and K % 64 == 0:
+        # (192+192)*64*2 = 49152 B -> 4 blocks/CU.  The bn192 twin of the
+        # vendor-tuner bm64/bm96 tiles, picked for gate_up27 M=192: 3 clean
+        # runs (ctl 0.998/1.001/0.999) at 0.973/0.979/0.976, the previous
+        # bm192/bn128/bk64/ns1/t256/sp1 at 1.159 the same day.  setprio=0 is
+        # the same grid-size split as N>=10240 band 160.  Only gate_up27 is
+        # gated to it; the other shapes' M=192 measured 1.03-1.24 and stay on
+        # hipblas via the gate.
+        return _validate_cfg(DecodeCfg(192, 192, 64, 2, 384, 0), M, N, K)
+    if K % 256 == 0:
+        return _validate_cfg(DecodeCfg(160, 96, 256, 1, 256, 1), M, N, K)
+    # Last resort: the shipped M<=128 tile, two block rows.  Only legal when M
+    # is an exact multiple of 128 (M == 256), which `_validate_cfg` enforces.
+    return _validate_cfg(DecodeCfg(128, 96, 128, 2, 512, 1), M, N, K)
 
 
 def decode_cfg(M, N, K):
@@ -199,6 +294,8 @@ def decode_cfg(M, N, K):
     block_M stays the pow2 band rather than M -- block_M = M would break
     ``M % kMPerWarp == 0`` for non-pow2 M.
     """
+    if M > 128:
+        return _decode_cfg_wide_m(M, N, K)
     if M <= 16:
         bm, sp = 16, 1
         # bn48 (2026-10-23, from the hipblaslt tuner's MT32x48x256): the widest
@@ -250,6 +347,19 @@ def decode_cfg(M, N, K):
         # Out of scope, and a measured structural optimum: bk128 ns2 (double-buffered)
         # beats bk256 ns1 by 1.2% (243.5 vs 246.6us). The gain is cross-k-step overlap,
         # NOT wait granularity -- at fixed bk256, ns=2 is 1.6% SLOWER.
+        #
+        # Neighbourhood re-swept 2026-10-22 on all six 27B shapes (paired
+        # same-process, dup-hipblas ctl, 7 rounds, min-of-rounds): setprio=0
+        # loses 1-8% at every shape, and the two bk64 arms (LDS 8192/12288 B ->
+        # 6-8 blocks/CU, i.e. no second block to hide the cp_async wait) lose
+        # 23-160% (bk64 ns2 t256 1.23-1.84x, bk64 ns2 t128 1.60-2.46x).  This
+        # tile stays.  Same sweep at M in (64,128]: every t384/t256 neighbour
+        # is an INVALID MLS tile at bm=96/128 ("No valid MLS tile config for
+        # trans" / warp-product check), so the shipped thread count is the ONLY
+        # legal one there -- the thread axis does not exist in that band; and
+        # the few legal neighbours that do exist (ipz M=128 bn128/bk128, qkv27
+        # M=96 bk128, in_proj_qkv M=96 bn128) all lose or tie (<1%, sign-flips
+        # across 3 reps).  No tile in decode_cfg loses to a measured neighbour.
         return _validate_cfg(DecodeCfg(64, 64, 128, 2, 256, 1), M, N, K)
     elif N == 5120 and K % 128 == 0:
         # M in (64, 128] -- the band that the chooser used to serve with ONE tile
@@ -556,6 +666,21 @@ _UNROLL_TILES = {
     (128, 128, 128, 2, 512): 8,    # gate_up, M in (96, 128]
     (96, 128, 128, 2, 512): 8,     # gate_up, M in (64, 80]
     (96, 128, 128, 2, 256): 8,     # gate_up, M in (80, 96]
+    # M in (128,160] band.  u8 is the same 5-9% the other bk128/ns2 tiles get;
+    # swept u4/u8/u10/u12/u16 at M=160 on o27 and down27, u8 best or tied on
+    # both (down27 M=160: u8 0.860, u12 0.968, u16 1.03 -- sp1 on every arm).
+    (160, 96, 128, 2, 256): 8,     # o/down/z27, M in (128, 160]
+    # band 192 is now ns2 (the 2026-10-23 bn192 tile), so it takes u8 too --
+    # the unrolled loop needs the second pipeline stage.
+    (192, 192, 64, 2, 384): 8,     # gate_up27, M in (160, 192]
+    # ... except at K=25600 (down32), where ANY unroll > 1 is catastrophic:
+    # u8 1.9-3.4, u4 3.96 vs "auto"/u1 1.07-1.10 (paired, ctl in [0.999,1.001],
+    # /tmp/final32b.log, /tmp/final256g.log, /tmp/down32_sp.log,
+    # /tmp/down32_m.log).  Same K trap that already forced u8 off at other
+    # tiles.  u1 is still a LOSS there (1.05-1.10), so down32 is gated to
+    # hipblas -- the entry exists only so that a future arm does not silently
+    # inherit u8 from the row above.
+    (160, 96, 128, 2, 256, 25600): 1,
     (96, 96, 64, 2, 384): 8,       # qkv32, M in (64, 96]  (bn96 <= 128 blocks)
     (96, 128, 64, 2, 512): 8,      # qkv27, M in (64, 96]  (bn128, 1 wave)
     (128, 128, 64, 2, 512): 8,     # qkv,   M in (96, 128] (bk64: 2 blocks/CU)
@@ -723,7 +848,8 @@ def fp8_channelwise_gemm(
         block_M == 128 and block_N == 128 and block_K == 128 and num_stages <= 2) or (
         block_M == 96 and block_N == 128 and block_K == 128 and num_stages <= 2) or (
         (block_M, block_N, block_K) in _NS2_BK64_TILES and num_stages <= 2) or (
-        (block_M, block_N, block_K) in _NS2_VENDOR_TILES and num_stages <= 2)
+        (block_M, block_N, block_K) in _NS2_VENDOR_TILES and num_stages <= 2) or (
+        (block_M, block_N, block_K) in _NS2_WIDE_M_TILES and num_stages <= 2)
     # _NS2_VENDOR_TILES (2026-10-23): the three tiles taken from the vendor
     # tuner's own picks -- bn48/bk256 at bm16, bn192/bk128 at bm64 and
     # bn192/bk64 at bm96.  Each was built through this function and checked
@@ -738,7 +864,11 @@ def fp8_channelwise_gemm(
     if policy is None:
         policy = T.GemmWarpPolicy.Square
     if k_unroll == "auto":
-        k_unroll = _UNROLL_TILES.get((block_M, block_N, block_K, num_stages, threads), 1)
+        # A K-specific entry (6-tuple) wins over the tile-wide one (5-tuple).  The
+        # unrolled loop is a per-shape measurement, not a per-tile law: see the
+        # K=25600 entry in _UNROLL_TILES.
+        key = (block_M, block_N, block_K, num_stages, threads)
+        k_unroll = _UNROLL_TILES.get(key + (K,), _UNROLL_TILES.get(key, 1))
         if k_unroll > 1 and K // block_K < k_unroll + 4:
             # short K: the measured tiles assume the decode shapes' step counts,
             # so fall back to the pipelined loop instead of failing.
