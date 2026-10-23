@@ -160,8 +160,11 @@ def test_decode_cfg_is_shape_aware():
     # prefers t192 in the same process, so this is a property of the 64-block
     # grid, not a general rule.  Measured through this chooser, every arm exact
     # (rel == 0), paired vs hipblas: M=1 0.813, 8 0.823, 16 0.834, 24 0.833,
-    # 32 0.879 (was 1.068 / 1.276 / 1.981 / 1.816 at bn16).
-    for M in (1, 16, 24, 32):
+    # 32 0.879 (was 1.068 / 1.276 / 1.981 / 1.816 at bn16).  Since 2026-10-23
+    # M <= 16 leaves this arm for bn48 (see
+    # test_decode_cfg_vendor_tiles_are_shape_gated), so what is pinned here is
+    # the band it still owns.
+    for M in (17, 24, 32):
         z = decode_cfg(M, 6144, 5120)
         assert (z.block_N, z.block_K, z.num_stages, z.threads) == (96, 256, 2, 128), (M, z)
 
@@ -270,6 +273,61 @@ def test_decode_cfg_is_shape_aware():
         assert (g.block_M, g.block_N, g.block_K, g.num_stages, g.threads) == \
             (128, 128, 128, 2, 512), (M, g)
         _validate_cfg(decode_cfg(M, 10240, 5120), M, 10240, 5120)
+
+
+def test_decode_cfg_vendor_tiles_are_shape_gated():
+    """The three 2026-10-23 arms (from the hipblaslt tuner's own kernels) are
+    selected on an explicit (N, K) list, and the list is the whole point: all
+    three tiles LOSE on shapes one step away, so a forgotten gate is a real
+    regression rather than a missed optimisation.
+
+      bn48  (16x48x256/ns2/t64/p1)  wins on 5 of the 6 decode shapes.  It loses
+            on 10240x5120, the strongest cell of the table (0.82x hipblas),
+            which keeps its bn32/bk256/ns1 tile.
+      bn192 bm64 (64x192x128/ns2/t512/p1) wins on N = 34816 and 10240 only, and
+            is 1.4-1.6x slower on N = 14336 and 6144.
+      bn192 bm96 (96x192x64/ns2/t384/p0) wins on 34816x5120 only: at 10240x5120
+            it is inside noise (69.60 vs 69.92us) and setprio=1 costs 2.5%, so
+            that shape keeps its shipped bm96/bn96/bk64 tile.
+    """
+    # Selected shapes.
+    for N, K in ((5120, 6144), (5120, 17408), (6144, 5120), (14336, 5120),
+                 (34816, 5120)):
+        c = decode_cfg(16, N, K)
+        assert (c.block_M, c.block_N, c.block_K, c.num_stages, c.threads,
+                c.setprio) == (16, 48, 256, 2, 64, 1), (N, K, c)
+    for M in (33, 48, 64):
+        for N, K in ((10240, 5120), (34816, 5120)):
+            c = decode_cfg(M, N, K)
+            assert (c.block_M, c.block_N, c.block_K, c.num_stages, c.threads,
+                    c.setprio) == (64, 192, 128, 2, 512, 1), (M, N, K, c)
+    # The M=96 band takes the bk64 form of the same tile -- at bm96, bn192 needs
+    # (96+192)*128*2 = 73728 B of LDS, above the 65536 B cap -- and the one
+    # shape where it wins, at setprio=0.
+    c = decode_cfg(80, 34816, 5120)
+    assert (c.block_M, c.block_N, c.block_K, c.num_stages, c.threads,
+            c.setprio) == (96, 192, 64, 2, 384, 0), c
+
+    # Excluded shapes keep the tile they had.  in_proj_qkv at M<=16 is bn32, not
+    # bn48; qkv27/in_proj_z never take bn192 at any M; in_proj_qkv at M=96 keeps
+    # bn96/bk64.
+    c = decode_cfg(16, 10240, 5120)
+    assert (c.block_N, c.block_K, c.num_stages) == (32, 256, 1), c
+    for M in (48, 64):
+        for N, K in ((14336, 5120), (6144, 5120)):
+            c = decode_cfg(M, N, K)
+            assert (c.block_M, c.block_N, c.block_K, c.num_stages) == \
+                (64, 64, 128, 2), (M, N, K, c)
+    c = decode_cfg(96, 10240, 5120)
+    assert (c.block_M, c.block_N, c.block_K, c.num_stages) == (96, 96, 64, 2), c
+
+    # K gates: bn48 needs bk256 and bn192 needs bk128/bk64, both of which divide
+    # K only for some shapes.  A version of these shapes with K=8192 (a
+    # non-multiple of 5120's neighbours) must fall back, not fail to validate.
+    for M in (16, 48, 96):
+        c = decode_cfg(M, 5120, 8192)
+        assert c.block_N != 48 or M != 16, c
+        _validate_cfg(c, M, 5120, 8192)
 
 
 def test_validate_cfg_rejects_the_k8192_bk320_trap():

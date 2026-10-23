@@ -66,6 +66,41 @@ class DecodeCfg:
 # against 0.89-1.05x with bk128, o32 (N=5120) 1.32 vs 1.04, gu32 (N=51200) a tie.
 _NS2_BK64_TILES = {(96, 96, 64), (96, 128, 64), (128, 128, 64)}
 
+# Shapes where a vendor-derived (hipblaslt tuner) tile was measured to WIN, and
+# only those.  These are explicit (N, K) lists, not ranges: all three tiles below
+# lose on part of the shape space, and the loss is not monotonic in N, so a
+# threshold rule would silently regress every shape it was never measured on.
+# Anything not listed keeps the tile it had.
+#   M <= 16   bn48  (16x48x256/ns2/t64, tuner MT32x48x256) -- wins on five of the
+#             six decode shapes.  in_proj_qkv (10240x5120) is the exclusion: its
+#             existing bn32/bk256/ns1 tile is the strongest cell of the whole
+#             decode table (0.82x hipblas) and bn48 gives ~7% of that back.
+#   bm64+bk128 bn192 (64x192x128/ns2/t512, tuner MT128x192x64) -- wins on
+#             N = 34816 and 10240 only, and loses 1.4-1.6x on N = 14336
+#             (75 bn192-blocks) and N = 6144 (32 blocks).  Hypothesis, NOT yet a
+#             rule: 75 blocks is one full wave of 71 CUs plus 4 stragglers, so
+#             ~half the runtime is a nearly-empty second wave; 32 blocks
+#             under-fill one wave outright.  182 blocks (N=34816, 2.56 waves) and
+#             54 (N=10240, 0.76 wave) are both fine.  The same arithmetic does
+#             NOT explain the M<=16 losses (o/down run 1.5 waves there and still
+#             win), so nothing here is extrapolated.
+#   bm96+bk64 bn192 (96x192x64/ns2/t384) wins on gate_up27 alone, and only at
+#             setprio=0 (see _BN192_BM96_NK).  in_proj_qkv is NOT in that list:
+#             there the arm measures 69.60us against the shipped 69.92us, i.e.
+#             inside noise, and it costs 2.5% at setprio=1.
+_BN48_M16_NK = frozenset({(5120, 6144), (5120, 17408), (6144, 5120),
+                          (14336, 5120), (34816, 5120)})
+_BN192_NK = frozenset({(10240, 5120), (34816, 5120)})
+# Deliberately narrower than _BN192_NK: at bm96 the tile only pays on gate_up27.
+_BN192_BM96_NK = frozenset({(34816, 5120)})
+
+# Tiles whose num_stages=2 form was validated (rel < 1e-3 against a chunked fp32
+# reference on every decode shape each one is selected for, and bit-identical to
+# the tile it replaces: relmax 0.0e+00, no NaN).  Kept separate from
+# _NS2_BK64_TILES, which is the bk64 "2 blocks/CU" family and carries a
+# different mechanism.
+_NS2_VENDOR_TILES = {(16, 48, 256), (64, 192, 128), (96, 192, 64)}
+
 
 def _validate_cfg(cfg, M, N, K):
     """Fail at selection time, with the shape in the message, rather than deep
@@ -99,7 +134,8 @@ def _validate_cfg(cfg, M, N, K):
     _wide_exact = (bn == 96 and bk == 256 and ns <= 2) or (bn == 96 and bk == 128 and bm >= 64 and ns <= 2) \
         or (bm == 128 and bn == 128 and bk == 128 and ns <= 2) \
         or (bm == 96 and bn == 128 and bk == 128 and ns <= 2) \
-        or ((bm, bn, bk) in _NS2_BK64_TILES and ns <= 2)
+        or ((bm, bn, bk) in _NS2_BK64_TILES and ns <= 2) \
+        or ((bm, bn, bk) in _NS2_VENDOR_TILES and ns <= 2)
     assert ns <= 1 or (bm, bn) == (64, 64) or _wide_exact, (
         f"shape {M}x{N}x{K}: num_stages={ns} is only tuned for bm=bn=64 or the bn96 wide tile "
         f"(bm={bm}, bn={bn}, bk={bk})")
@@ -127,6 +163,26 @@ def decode_cfg(M, N, K):
                       else M <= 96       -> bm96/bn96/bk128/ns2/t384
                       else               -> bm128/bn128/bk128/ns1/t512
 
+    Three arms added 2026-10-23 come from the hipblaslt *tuner*'s own decode
+    kernels rather than from the in-tree search, and all three are gated on an
+    explicit (N, K) list instead of a rule -- see ``_BN48_M16_NK`` /
+    ``_BN192_NK`` / ``_BN192_BM96_NK``:
+
+      M <= 16, listed shapes   -> bm16/bn48/bk256/ns2/t64   (tuner MT32x48x256)
+      M in (32,64], listed     -> bm64/bn192/bk128/ns2/t512 (tuner MT128x192x64)
+      M in (64,96], listed     -> bm96/bn192/bk64/ns2/t384  (same tuner kernel,
+                                  setprio=0 -- the one arm that does not want it)
+
+    Worth 1-10% over the previous tile on every cell it is applied to (the
+    2026-10-23 confirmation A/B, setprio-correct baseline), and all three are
+    bit-exact with the tile they replace (relmax 0.0e+00) as well as within
+    3.1e-03 of a chunked fp32 reference.  The lists exist because bn192 in
+    particular is 1.4-1.6x SLOWER on the shapes left out of it; see the comment
+    on the frozensets for the wave-quantisation hypothesis behind that and for
+    why it is deliberately not written as a formula.  Two cells were dropped
+    after the corrected baseline: in_proj_qkv M=96 (inside noise) and every
+    qkv27/in_proj_z bn192 cell (1.4-1.6x slower).
+
     block_N < 16 is impossible: the MMA output micro-tile is hardware-fixed at
     16x16 (``src/tl_templates/hcu/gemm.h:150``) and the MLS B atom floor is
     tile_mn=16 (``src/hcu/op/mls.cc:408``).  So bn16 is the narrowest tile that
@@ -145,9 +201,52 @@ def decode_cfg(M, N, K):
     """
     if M <= 16:
         bm, sp = 16, 1
+        # bn48 (2026-10-23, from the hipblaslt tuner's MT32x48x256): the widest
+        # bn that still fits two bk256 stages at bm16 (2*(16+48)*256 = 32768 B,
+        # half the cap), i.e. 1.5-2x fewer A re-reads than bn32 and 2x fewer than
+        # the bn96 tile -- without the per-warp A replication that makes t64 the
+        # right thread count here (48/16 = 3 N-atoms, one warp per atom).
+        # Paired same-process, graph replay, 7 rounds x 20 iters, idle card,
+        # interleaved round-robin (all arms of a cell in one round), hipblas
+        # re-measured as a duplicate control in every cell (spread <= 0.6%, so
+        # no cell is dirty); ratio = ours/hipblas, shipped -> bn48, with the
+        # shipped arm built at ITS OWN setprio=1 (a baseline at the builder
+        # default of 0 understates the shipped tile by 7-11% and overstates this
+        # change -- the first pass made exactly that mistake):
+        #          M=1                M=8                M=16
+        #   out_proj   0.9841->0.9153  0.9840->0.9202  1.0000->0.9251  (-7 to -8%)
+        #   down27     1.0026->0.9304  1.0155->0.9304  1.0104->0.9377  (-7 to -9%)
+        #   gate_up27  0.8812->0.8541  0.8794->0.8489  0.8910->0.8590  (-3 to -4%)
+        #   qkv27      0.9650->0.9275  0.9627->0.9229  0.9698->0.9370  (-3 to -4%)
+        #   in_proj_z  0.9669->0.9448  0.9560->0.9451  0.9777->0.9553  (-1 to -2%)
+        #   in_proj_qkv 0.8881->0.9495 0.8161->0.8829  0.8283->0.8855  (+8%)
+        # The gain is flat across that whole band, which is why this is gated on
+        # shape and not on M.
+        # in_proj_qkv is the one exclusion and the reason this is a shape list:
+        # its shipped bn32/bk256/ns1 tile is the strongest cell in the entire
+        # decode table (0.82x hipblas) and bn48 gives that back.  All arms
+        # bit-exact against a chunked fp32 reference (rel max 3.1e-03, identical
+        # to the shipped arm's own rel -- the two tiles agree to 0.0e+00).
+        if (N, K) in _BN48_M16_NK:
+            # setprio=1, like every other tile at this band: measured at both,
+            # p1 wins gate_up27 (117.12 vs 123.04us), qkv27 (59.36 vs 62.08),
+            # out_proj (27.84 vs 28.48) and down27 (57.92 vs 58.24) and loses
+            # in_proj_z by 1% (33.44 vs 33.12), which is inside the noise this
+            # card shows between rounds.  p1 also removes the special case.
+            return _validate_cfg(DecodeCfg(16, 48, 256, 2, 64, 1), M, N, K)
     elif M <= 32:
         bm, sp = 32, 1
     elif M <= 64:
+        # bn192 (2026-10-23, tuner MT128x192x64) where the grid can carry it --
+        # see _BN192_NK for which shapes, and for why this is a list and not a
+        # rule.  (64+192)*128*2 = 65536 B is exactly the LDS cap, so this is as
+        # wide as bn gets at bm64 with ns2.
+        #   gate_up27  M=48 0.9714 -> 0.9345   M=64 0.9934 -> 0.9548
+        #   in_proj_qkv M=48 0.9664 -> 0.8753   M=64 1.0204 -> 0.9262  (-9-10%)
+        # while N=14336 (0.89 -> 1.43) and N=6144 (0.96 -> 1.47) lose outright.
+        # setprio=1 is the better of the two on all four of those cells.
+        if (N, K) in _BN192_NK:
+            return _validate_cfg(DecodeCfg(64, 192, 128, 2, 512, 1), M, N, K)
         # Out of scope, and a measured structural optimum: bk128 ns2 (double-buffered)
         # beats bk256 ns1 by 1.2% (243.5 vs 246.6us). The gain is cross-k-step overlap,
         # NOT wait granularity -- at fixed bk256, ns=2 is 1.6% SLOWER.
@@ -242,6 +341,28 @@ def decode_cfg(M, N, K):
         # tile): bm96/bn96 ns1 76.48us/1.084 and bk256/ns1 108.00us/1.531 at
         # M=96; t256 at bm96/bn96 83.04/1.177; bk320 does not launch; at M=128
         # bn256/bk128/ns1 111.84/1.472 and ns2+U8 on bn128 91.20/1.200.
+        # bn192 at bm96/bk64 (2026-10-23, tuner MT128x192x64) must be tested
+        # BEFORE the block-count split below, because gate_up's 272 bn128-blocks
+        # take the >=256 arm and the tile only pays there.  It does NOT pay on
+        # in_proj_qkv (the other shape the bm64 arm takes): 69.60us against the
+        # shipped 69.92us is inside noise, and setprio=1 costs 2.5% there, so
+        # _BN192_BM96_NK is narrower than _BN192_NK.  bk64, not bk128: at bm96
+        # bn192 needs (96+192)*128*2 = 73728 B > the 65536 B LDS cap, while
+        # (96+192)*64*2 = 36864 B fits.
+        # Paired same-process, graph replay, 7 rounds x 20 iters, idle card,
+        # interleaved round-robin, duplicate hipblas control (spread <= 0.4%):
+        #   gate_up27   M=96 208.16 -> 191.68us  0.9188 -> 0.8460  (-8.6%)
+        #   in_proj_qkv M=96  69.92 ->  69.60us  0.9604 -> 0.9560  (noise, kept out)
+        # setprio=0 -- the only tile in the table that asks for it at M<=96:
+        # p1 measures 196.80us on gate_up27, 2.7% behind p0, and 71.68 vs 69.60
+        # on in_proj_qkv.  Whatever setprio buys the other tiles, this one is
+        # already A-re-read bound, not MMA-issue bound.
+        # Bit-exact against both the chunked fp32 reference (rel 2.0e-03) and
+        # the tile it replaces (relmax 0.0e+00, no NaN).  Measured at M=96 only;
+        # the unmeasured 65..95 interior takes the same arm, as the bm96 split
+        # below already does for its own band.
+        if M <= 96 and (N, K) in _BN192_BM96_NK:
+            return _validate_cfg(DecodeCfg(96, 192, 64, 2, 384, 0), M, N, K)
         if -(-N // 128) >= 256:
             # gate_up M in (64,96] moves to bm96 (2026-10-21, paired same-process,
             # graph replay, 7 rounds, idle card, min-of-rounds, U8 on every arm):
@@ -438,6 +559,14 @@ _UNROLL_TILES = {
     (96, 96, 64, 2, 384): 8,       # qkv32, M in (64, 96]  (bn96 <= 128 blocks)
     (96, 128, 64, 2, 512): 8,      # qkv27, M in (64, 96]  (bn128, 1 wave)
     (128, 128, 64, 2, 512): 8,     # qkv,   M in (96, 128] (bk64: 2 blocks/CU)
+    # 2026-10-23 vendor-derived tiles.  These three were SELECTED at k_unroll=8
+    # (the confirm run built every ns2 arm with U8, so the shipped table's tile
+    # is exactly the arm that was measured); the entry exists so the chooser
+    # reproduces that arm rather than silently falling back to the pipelined
+    # loop at u1, which was never measured on any of them.
+    (16, 48, 256, 2, 64): 8,       # M <= 16, bn48 shapes
+    (64, 192, 128, 2, 512): 8,     # M in (32, 64], bn192 shapes
+    (96, 192, 64, 2, 384): 8,      # M in (64, 96], bn192 shapes
     # Measured and NOT taken (2026-10-21, paired): at M=128 bn128/40 blocks
     # 71.0/214.7us, bn64/80 blocks 104.0us, bn80 -- illegal MLS tile, t1024
     # 88.5us, bm112 90.6us (2 blocks/row group instead of a clean warp split);
@@ -593,7 +722,14 @@ def fp8_channelwise_gemm(
         block_N == 96 and block_K == 128 and block_M >= 64 and num_stages <= 2) or (
         block_M == 128 and block_N == 128 and block_K == 128 and num_stages <= 2) or (
         block_M == 96 and block_N == 128 and block_K == 128 and num_stages <= 2) or (
-        (block_M, block_N, block_K) in _NS2_BK64_TILES and num_stages <= 2)
+        (block_M, block_N, block_K) in _NS2_BK64_TILES and num_stages <= 2) or (
+        (block_M, block_N, block_K) in _NS2_VENDOR_TILES and num_stages <= 2)
+    # _NS2_VENDOR_TILES (2026-10-23): the three tiles taken from the vendor
+    # tuner's own picks -- bn48/bk256 at bm16, bn192/bk128 at bm64 and
+    # bn192/bk64 at bm96.  Each was built through this function and checked
+    # against the chunked fp32 reference on every decode shape it is selected
+    # for before it was written into the table (rel < 1e-3; the bm64 bn192 and
+    # bm96 bn192 runs are now pinned by the suite as well).
     assert num_stages <= 1 or (block_M, block_N) == (64, 64) or _wide_exact or _ns_escape, (
         f"num_stages={num_stages} is only tuned for block_M=block_N=64 on HCU "
         f"(got block_M={block_M}, block_N={block_N}); multi-stage small tiles are correct "

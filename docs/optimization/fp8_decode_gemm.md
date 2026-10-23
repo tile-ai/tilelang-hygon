@@ -36,6 +36,18 @@ ns2 / t512`; otherwise (qkv) M ≤ 96 takes `bm96 / bn96 / bk128 / ns2 / t384`, 
 above it the o/down M>96 tile with `setprio=1` (log §2026-10-21b, §2026-10-21c,
 §2026-10-21d).
 
+Three arms added 2026-10-23 come from the hipblasLt **tuner's** own decode kernels
+rather than from the in-tree search, and all three are gated on an explicit
+`(N, K)` list — not a rule, because each tile loses on shapes one step away:
+M ≤ 16 on five of the six 27B shapes → `bm16 / bn48 / bk256 / ns2 / t64` (tuner
+`MT32x48x256`); M in (32,64] on N = 34816/10240 → `bm64 / bn192 / bk128 / ns2 /
+t512` (tuner `MT128x192x64`); M in (64,96] on N=34816 only → `bm96 / bn192 /
+bk64 / ns2 / t384`, the one arm in the table that wants `setprio=0`. The lists
+live in `_BN48_M16_NK` / `_BN192_NK` / `_BN192_BM96_NK`. Worth 1–10% over the tile
+each replaces, bit-identical to it (`relmax 0.0e+00`). `bn192` also **retires the
+"`bn ≤ 128` is the hard cap" claim** that stood in the closed-lever index: the cap
+is a property of the (bm, bk, ns, threads) combination, not of `bn`.
+
 **Current standing** (paired same-process, idle card, `rel=0`; ratio =
 ours/hipblas, **< 1 is a win**). Shipped `decode_cfg`, measured 2026-10-21:
 
@@ -56,6 +68,16 @@ where the work is (3 of 4 cells lose), and `qkv` is the worst row overall
 (4 of 7 losses, worst cell 1.153). Full loss list: o M=1/128, down M=1/16/128,
 gate_up M=64, qkv M=64/80/96/128. These numbers supersede the M ≤ 32-only table
 that stood here (o 1.069/1.027/1.024, down 1.110/1.042/0.928).
+
+The table above is the 2026-10-21 measurement and **predates the three 2026-10-23
+arms**, which move the M ≤ 16 row (all shapes but N=10240), `M=64` on gate_up and
+the gate_up `M=96` cell. The per-tile confirmation runs that justified those arms
+are the authoritative numbers for them (1.03–1.16× over the tile each replaced,
+see the paragraph above); the whole-table re-measurement against hipblas was
+**drift-dominated** — the paired-ratio column moved 10 cells up and 12 down
+against 2026-10-22 while the hipblas arm itself got 4–19% faster in the same
+session, i.e. absolute time improved on 22 of 24 cells but the ratio did not
+resolve. No dispatch-gate verdict flipped in that run.
 
 ## Contents
 
@@ -157,7 +179,7 @@ untried; do not re-open any of these without new evidence.
 | **MMA density / hipblas warp mapping** | `v_mmac` costs **0.5%** — the MMA itself is free. Copying hipblas's 54-block, 8-warp, N-tile-96 structure through MLS is worse at every cell (adding warps to a wide tile loses blocks/CU), and the largest remaining term is the transposing LDS read, **9.3%**. | [2026-10-19 (b)](#2026-10-19-hipblas-launch) |
 | **MLS producer atom / partition swap** | The 128×16 atom is ~20% slower standalone than 64×32 (1600 vs 1892 GB/s), but swapping to the faster atom makes the full GEMM **15-16% slower** (287.2 vs 246.2 µs): the kernel is overlap-quality-bound, not producer-throughput-bound. | MLS producer (log §mls-producer) |
 | **N-split / widening bn** | N-split is **2-3× worse** and A's LDS read scales with the warp count. At t=64, wider bn is 1.077/1.123 (bn32) and 1.191/1.340 (bn64) at o M=16 / down M=16: the loss is blocks, not A's duplicated LDS read. | N-split (log §n-split), 2026-10-18c (log) |
-| **bn > 128** | bn160 is **not a legal MLS tile** (`No valid MLS tile config for trans: block_mn=160`); bn256 forces bk64 or ns1, measured **1.48-1.59×** slower. bn ≤ 128 is the hard cap of this path. | 2026-10-21b (log) |
+| **bn > 128** | bn160 is **not a legal MLS tile** (`No valid MLS tile config for trans: block_mn=160`); bn256 forces bk64 or ns1, measured **1.48-1.59×** slower. bn ≤ 128 is the hard cap of this path. **Partially retracted 2026-10-23:** `bn192` is a legal MLB tile at `bk128/t512` (bm64) and `bk64/t384` (bm96) and wins on the shapes it is gated to, so 128 is a cap of the *tried* combinations, not of `bn`. What stays closed is `bn ≥ 256`. | 2026-10-21b (log), 2026-10-23 (log) |
 | **Wave packing (bm split, bn80)** | Buying whole waves by halving bm is **1.13-4.19×** worse (the MMA-efficiency loss dominates), and bn80 for an exact 1.00/2.00-wave grid is 1.03-1.09× worse (A's issued traffic is `N·M·K/bn`, so a narrower bn pays more than the tail saves). | 2026-10-21b (log) |
 | **Layout A (out of scope)** | The 71.6% "70% target" is reached only via Layout A (blocked weight reorder), which is excluded; hipblas's own no-reorder baseline is **213.0 µs = 68.4%**. | [Layout A](#layout-a) |
 | **Producer A de-replication** | Bit-exact but slower everywhere (**1.044-1.358×**). `cp_async_wait<1>` sizes its vmcnt constant from the unconditional async loads, so putting A behind `if (owner)` drops a prefetch level; A's duplicates are L2-served and were never on the critical path. | 2026-10-20c (log) |
@@ -586,3 +608,4 @@ that makes re-opening pointless is in the log.
 | <a id="h-2026-10-21b"></a>2026-10-21b | The bandwidth audit: time tracks *issued* bytes at a flat 1.5–2.0 TB/s, `bm` cancels, `bn` is the only A lever, `bn ≤ 128` caps it. Wide-N mid band splits by block count: gate_up takes `bm96/bn128`, qkv takes `bm96/bn96`. | adopted |
 | <a id="h-2026-10-21c"></a>2026-10-21c | `qkv` M=80..128: the pursuit is closed — every remaining arm at that shape loses, and the wave-packing alternatives cost more A traffic than they save. | closed |
 | <a id="h-2026-10-21d"></a>2026-10-21d | gate_up M=(64,96]: `bm96/bn128` removes 48/128 (M=80) and 32/128 (M=96) padded MMA rows at zero byte cost → 0.962 / 0.953. M=64 re-closed at 11 arms. | adopted |
+| <a id="h-2026-10-23"></a>2026-10-23 | Three tiles lifted from the hipblasLt **tuner's** own decode kernels and gated on explicit `(N,K)` lists: `bm16/bn48/bk256` (5 of 6 shapes at M ≤ 16, 1.03–1.12× over the tile it replaces), `bm64/bn192/bk128` (N=34816/10240 at M ∈ (32,64], 1.04–1.16×), `bm96/bn192/bk64` (N=34816 at M ∈ (64,96], 1.03–1.09×). All bit-identical to the tile they replace. `bn192` is legal — it retires the `bn ≤ 128` cap for the (bm,bk,ns,threads) combos now in the table; `bn ≥ 256` stays closed. The e2e A/B is drift-dominated (10 cells up / 12 down vs 2026-10-22, hipblas itself 4–19% faster), but no dispatch-gate verdict flipped. | adopted |
