@@ -26,7 +26,6 @@ TIR_DEFINE_HCU_BUILTIN(hcu_cp_async_idxen, 6, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(ds_read_vector, 3, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(async_gld_sld_fence, 1, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(async_gld_fence, 1, kOpaque);
-TIR_DEFINE_HCU_BUILTIN(wave_barrier, 0, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(get_wave_id, 0, kPure);
 TIR_DEFINE_HCU_BUILTIN(hcu_wdra_init, -1, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(abarrier_init, 2, kOpaque);

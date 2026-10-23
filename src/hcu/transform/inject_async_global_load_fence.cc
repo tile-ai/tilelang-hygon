@@ -68,15 +68,6 @@ bool IsAsyncGldFenceStmt(const Stmt &stmt) {
   return false;
 }
 
-bool IsWaveBarrierStmt(const Stmt &stmt) {
-  if (const auto *eval = stmt.as<EvaluateNode>()) {
-    if (const auto *call = eval->value.as<CallNode>()) {
-      return call->op.same_as(wave_barrier());
-    }
-  }
-  return false;
-}
-
 bool IsSyncWarpStmt(const Stmt &stmt) {
   if (const auto *eval = stmt.as<EvaluateNode>()) {
     if (const auto *call = eval->value.as<CallNode>()) {
@@ -86,10 +77,7 @@ bool IsSyncWarpStmt(const Stmt &stmt) {
   return false;
 }
 
-// HCU: wave_barrier is asm s_barrier; sync_warp is __builtin_amdgcn_s_barrier.
-bool IsSBarrierStmt(const Stmt &stmt) {
-  return IsWaveBarrierStmt(stmt) || IsSyncWarpStmt(stmt);
-}
+bool IsSBarrierStmt(const Stmt &stmt) { return IsSyncWarpStmt(stmt); }
 
 Stmt MakePtxWaitGroupStmt(int wait_count) {
   if (wait_count < 0) {
@@ -1144,8 +1132,8 @@ private:
   // after its last commit (the commit-stage handling in VisitStmt_(SeqStmt));
   // the fence+barrier pairs before the LDS read clusters only order the
   // producer->consumer direction and do not cover this one. sync_warp lowers
-  // to the same s_barrier as wave_barrier but is visible to the AMDGPU machine
-  // scheduler, which matters for a call site inside the K loop.
+  // to __builtin_amdgcn_s_barrier, which the AMDGPU machine scheduler can see
+  // through; that matters for a call site inside the K loop.
   Stmt InsertLoopEntryReleaseBarrier(const Stmt &body) {
     // Only the stage-wise compiler pipeline reuses a slot this way; a register
     // pipeline keeps its own release discipline and a loop without commits per
@@ -1302,7 +1290,12 @@ namespace transform {
 using namespace tirx::transform;
 
 Pass InjectAsyncGlobalLoadFence() {
-  auto pass_func = [](PrimFunc f, IRModule, PassContext) {
+  auto pass_func = [](PrimFunc f, IRModule, const PassContext &ctx) {
+    bool disable_thread_storage_sync =
+        ctx->GetConfig(kDisableThreadStorageSync, Bool(false)).value()->value;
+    if (disable_thread_storage_sync) {
+      return f;
+    }
     Target target = f->GetAttr<Target>(tvm::attr::kTarget).value_or(Target());
     if (!target.defined() || !TargetIsHCU(target)) {
       return f;
@@ -1389,7 +1382,12 @@ private:
 } // namespace
 
 Pass MarkFencePlannerOwnership() {
-  auto pass_func = [](PrimFunc f, IRModule, PassContext) {
+  auto pass_func = [](PrimFunc f, IRModule, const PassContext &ctx) {
+    bool disable_thread_storage_sync =
+        ctx->GetConfig(kDisableThreadStorageSync, Bool(false)).value()->value;
+    if (disable_thread_storage_sync) {
+      return f;
+    }
     Target target = f->GetAttr<Target>(tvm::attr::kTarget).value_or(Target());
     if (!target.defined() || !TargetIsHCU(target)) {
       return f;

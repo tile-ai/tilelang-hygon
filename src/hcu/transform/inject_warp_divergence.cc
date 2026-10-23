@@ -238,7 +238,12 @@ namespace transform {
 
 tirx::transform::Pass InjectWarpDivergence() {
   using namespace tirx::transform;
-  auto pass_func = [=](PrimFunc f, const IRModule &, const PassContext &) {
+  auto pass_func = [=](PrimFunc f, const IRModule &, const PassContext &ctx) {
+    bool disable_thread_storage_sync =
+        ctx->GetConfig(kDisableThreadStorageSync, Bool(false)).value()->value;
+    if (disable_thread_storage_sync) {
+      return f;
+    }
     Target target = f->GetAttr<Target>(tvm::attr::kTarget).value_or(Target());
     if (!target.defined() || !TargetIsHCU(target)) {
       return f;

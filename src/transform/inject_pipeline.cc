@@ -4214,10 +4214,14 @@ tirx::transform::Pass InjectSoftwarePipeline() {
 
 tirx::transform::Pass LowerAsyncCommitWait() {
   using namespace tirx::transform;
-  auto pass_func = [=](PrimFunc f, const IRModule &, const PassContext &) {
+  auto pass_func = [=](PrimFunc f, const IRModule &, const PassContext &ctx) {
     auto *fptr = f.CopyOnWrite();
     fptr->body = software_pipeline::LowerAsyncCommitWaitAttrs(fptr->body);
-    software_pipeline::VerifyAsyncCommitWaits(fptr->body);
+    bool disable_thread_storage_sync =
+        ctx->GetConfig(kDisableThreadStorageSync, Bool(false)).value()->value;
+    if (!disable_thread_storage_sync) {
+      software_pipeline::VerifyAsyncCommitWaits(fptr->body);
+    }
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.LowerAsyncCommitWait", {});

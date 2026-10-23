@@ -278,7 +278,7 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
             # flags.append("-mllvm=-hcu-trust-special-waitcnt-for-lds-dma=true")
         # aicc defaults to code-object ABI 6. Pin COV 5 when this DTK has no ABI-6 bitcode.
         bitcode_dir = os.path.join(os.environ.get("ROCM_PATH", "/opt/dtk"), "amdgcn", "bitcode")
-        if os.path.isdir(bitcode_dir) and not os.path.isfile(os.path.join(bitcode_dir, "oclc_abi_version_6.bc")):
+        if os.path.isdir(bitcode_dir) and not os.path.isfile(os.path.join(bitcode_dir, "oclc_abi_version_600.bc")):
             flags.append(f"--rocm-device-lib-path={bitcode_dir}")
             flags.append("-mcode-object-version=5")
         # Clang 22 aicc does not predefine this; DTK HIP headers require it. gfx9 is wave64.

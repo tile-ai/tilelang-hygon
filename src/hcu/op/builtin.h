@@ -38,8 +38,6 @@ TVM_DLL const Op &async_gld_sld_fence();
  * checks recognize it as a wait.
  */
 TVM_DLL const Op &async_gld_fence();
-/*! \brief HCU block-wide wave barrier (asm s_barrier). */
-TVM_DLL const Op &wave_barrier();
 TVM_DLL const Op &get_wave_id();
 TVM_DLL const Op &hcu_wdra_init();
 TVM_DLL const Op &abarrier_init();

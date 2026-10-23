@@ -56,7 +56,7 @@ bool IsBarrierCall(const CallNode *call) {
   if (call == nullptr) {
     return false;
   }
-  if (call->op.same_as(wave_barrier()) || call->op.same_as(sync_warp())) {
+  if (call->op.same_as(sync_warp())) {
     return true;
   }
   if (!call->op.same_as(builtin::tvm_storage_sync())) {

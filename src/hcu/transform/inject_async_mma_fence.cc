@@ -34,10 +34,6 @@ using ffi::GetRef;
 
 namespace {
 
-Stmt MakeWaveBarrierStmt() {
-  return Evaluate(Call(DataType::Void(), wave_barrier(), {}));
-}
-
 Stmt MakeSldFenceStmt(int wait_count) {
   constexpr int kLgkmcntMax = 15;
   if (wait_count < 0) {
@@ -266,9 +262,6 @@ public:
     int pending_load_count = 0;
     auto insert_conservative_sld_sync = [&]() {
       new_seq.push_back(MakeSldFenceStmt(0));
-      if (phase_ != PipelinePhase::kAfterMainLoop) {
-        new_seq.push_back(MakeWaveBarrierStmt());
-      }
     };
     for (const Stmt &stmt : seq_op->seq) {
       if (IsMmaCluster(stmt)) {
@@ -352,7 +345,12 @@ namespace transform {
 
 tirx::transform::Pass InjectAsyncMmaFence() {
   using namespace tirx::transform;
-  auto pass_func = [=](PrimFunc f, IRModule, PassContext) {
+  auto pass_func = [=](PrimFunc f, IRModule, const PassContext &ctx) {
+    bool disable_thread_storage_sync =
+        ctx->GetConfig(kDisableThreadStorageSync, Bool(false)).value()->value;
+    if (disable_thread_storage_sync) {
+      return f;
+    }
     Target target = f->GetAttr<Target>(tvm::attr::kTarget).value_or(Target());
     if (!target.defined() || !TargetIsHCU(target)) {
       return f;
