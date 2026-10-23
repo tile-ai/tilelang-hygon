@@ -1146,6 +1146,27 @@ private:
     }
     const bool glob_k_inner = glob_k >= 0 && (glob_mn < 0 || glob_mn < glob_k);
     const bool glob_mn_inner = glob_mn >= 0 && (glob_k < 0 || glob_mn > glob_k);
+    if (glob_k_inner || glob_mn_inner) {
+      // Loop-variable dependence alone does not establish a shared window.
+      // After a single K-pair is simplified, ping/pong can have constant K
+      // origins 0 and 64 while MN still varies in the persistent loop.  An
+      // MN-only rebase would silently load ping again for pong.  Likewise,
+      // K-only rebases must not discard distinct constant MN origins.
+      // A one-axis update is valid only when every load shares the other
+      // coordinate.  Otherwise retain the resource object but initialize
+      // its complete window at each load.
+      const int slow_arg = glob_mn_inner ? 6 : 5;
+      arith::Analyzer analyzer;
+      for (const CallNode *c : call_program_order_) {
+        const auto *csym = c->args[0].as<StringImmNode>();
+        if (csym != nullptr &&
+            ResourceKey(MlsBaseTemplateFromLoadTile(csym->value), c) == key &&
+            !analyzer.CanProveEqual(c->args[slow_arg], rep->args[slow_arg])) {
+          full_window_each_load_.insert(key);
+          return;
+        }
+      }
+    }
     if (glob_mn_inner) {
       fast_is_mn_.insert(key);
     }
@@ -1284,6 +1305,21 @@ private:
                                     const std::vector<const ForNode *> &stack,
                                     int inner_depth, int coord_arg,
                                     bool inner_is_mn) {
+    // Advancing only the fast axis is valid only while the other coordinate
+    // is shared by every load of this resource.  In particular, an unrolled
+    // K loop can leave distinct constant K origins inside a linear MN loop;
+    // selecting move_mn_base would otherwise keep reading the first K tile.
+    // Reject before recording any forward moves and let absolute addressing
+    // choose its conservative per-load window initialization.
+    const int slow_arg = inner_is_mn ? 6 : 5;
+    arith::Analyzer slow_axis_analyzer;
+    for (const CallNode *call : calls) {
+      if (!slow_axis_analyzer.CanProveEqual(call->args[slow_arg],
+                                            representative->args[slow_arg])) {
+        return false;
+      }
+    }
+
     struct AxisGroup {
       const ForNode *inner{nullptr};
       std::vector<const CallNode *> head;

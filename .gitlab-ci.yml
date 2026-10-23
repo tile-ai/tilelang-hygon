@@ -3,11 +3,10 @@ stages:
   - publish
 
 variables:
-  PIP_INDEX_URL: "http://10.16.1.201:9929/nightly/dtk2604/+simple/"
-  PIP_TRUSTED_HOST: "10.16.1.201"
-  DTK_PKG: "/ArchivedFile/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz"
-  DEVPI_URL: "http://10.16.1.201:9929/"
   CISMI_TIMEOUT: "3600"
+  AICC_INSTALLER_URL: "http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh"
+
+  TILEKERNELS_GIT_URL: "https://github.com/HYGON-AI/TileKernels-das.git"
   TILEKERNELS_REF: "staging"
   TILEKERNELS_DIR: "/opt/TileKernels"
 
@@ -28,22 +27,32 @@ default:
     when: always
   - when: never
 
+
 test:
   stage: test
   rules: *test_rules
+  image: $DTK_IMAGE
   variables:
     GIT_SUBMODULE_STRATEGY: recursive
-    TORCH_VERSION: "2.11.0"
+  parallel:
+    matrix:
+      # 26.04：torch 2.11.0；26.10：torch 2.11.0
+      - DTK_IMAGE: "10.16.1.152:5000/hcu/base/dtk:26.04-rockylinux8.6-py3.10"
+        TORCH_VERSION: "2.11.0"
+      - DTK_IMAGE: "10.16.1.152:5000/hcu/base/dtk:26.10-rockylinux8.6-py3.12"
+        TORCH_VERSION: "2.11.0"
   script:
-    # 安装 DTK
-    - cp -f ${DTK_PKG} /opt/
-    - cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
-    - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
-    # 安装 AICC
-    - src_dir="/ArchivedFile/ai_cc/nightly"
-    - latest_run=$(cd "$src_dir" && ls -t dtk_llvm_*.run 2>/dev/null | head -n1)
-    - 'echo "完整安装包路径: ${src_dir}/${latest_run}"'
-    - test -n "${latest_run}" && cp "${src_dir}/${latest_run}" ./ && chmod +x "${latest_run}" && yes | bash "${latest_run}" && echo "AICC 安装完成" || echo "跳过 AICC 安装"
+    # DTK 已预装在基础镜像中，只需加载环境
+    - source /opt/dtk/env.sh
+    # DTK 版本号（如 26.10 -> 2610）
+    - export DTK_VER=$(tr -d '.' < /opt/dtk/.info/version-dev)
+    # pip 变量：按 DTK 版本推导 nightly 源
+    - export PIP_INDEX_URL="${PYPI_URL}/nightly/dtk${DTK_VER}/+simple/"
+    - export PIP_TRUSTED_HOST=$(echo ${PYPI_URL} | sed -E 's#^https?://##; s#[:/].*##')
+    # 安装最新版 AICC（公共安装脚本）
+    - curl -fsSL --retry 3 --retry-delay 5 -o /tmp/hcu_llvm_installer.sh "${AICC_INSTALLER_URL}"
+    # 2604 -> AICC 1.0.0，其余(2610) -> 2.0.0
+    - 'AICC_MAJOR=1.0.0; [ "${DTK_VER}" = "2610" ] && AICC_MAJOR=2.0.0; bash /tmp/hcu_llvm_installer.sh --major "${AICC_MAJOR}"'
     # 合并目标分支
     - git config user.email "ci@tilelang.local" && git config user.name "CI"
     - git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
@@ -54,10 +63,21 @@ test:
     - pip install -r requirements.txt -r requirements-dev.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     - NO_TOOLCHAIN_VERSION=1 NO_GIT_VERSION=1 bash das-build.sh
     - pip install dist/*.whl
-    - pip install "numpy>=1.26,<2" allure-pytest pytest-xdist
+    - pip install "numpy>=2" allure-pytest pytest-xdist einops -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    # flash-attn：参考 das-install 方式，按 torch 版本标签从对应 dtk nightly 源匹配安装
+    - 'fa_tag="torch${TORCH_VERSION//./}"; fa_index="${PYPI_URL}/nightly/dtk${DTK_VER}/+simple/"'
+    - 'ver=$(pip index versions flash-attn --index-url "$fa_index" 2>&1 | grep -Eo "[0-9][^() ]*${fa_tag}[^() ]*" | head -n1) || true'
+    - 'echo "flash-attn candidate for ${fa_tag}: ${ver:-NOT-FOUND}"'
+    - 'if [ -n "$ver" ]; then pip install "flash-attn==$ver" --index-url "$fa_index" --trusted-host "$PIP_TRUSTED_HOST" --no-deps; else echo "WARN: no flash-attn matching ${fa_tag} on dtk${DTK_VER}, skip"; fi'
     # 回归测试
-    - test -n "${HCU_TILEKERNELS_GIT_URL}" || (echo "HCU_TILEKERNELS_GIT_URL is not set" && exit 1)
-    - git clone -b ${TILEKERNELS_REF} http://gitlab-ci-token:${CI_JOB_TOKEN}@${HCU_TILEKERNELS_GIT_URL} ${TILEKERNELS_DIR}
+    - >-
+      git clone
+      --depth 1
+      --single-branch
+      --branch "${TILEKERNELS_REF}"
+      "${TILEKERNELS_GIT_URL}"
+      "${TILEKERNELS_DIR}"
+    - git -C "${TILEKERNELS_DIR}" rev-parse HEAD
     - export HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout ${CISMI_TIMEOUT})
     - >-
       REPO_DIR=${TILEKERNELS_DIR}
@@ -76,27 +96,40 @@ test:
 publish:
   stage: publish
   rules: *publish_rules
+  image: $DTK_IMAGE
   variables:
     GIT_SUBMODULE_STRATEGY: recursive
   parallel:
-    matrix: *torch_matrix
+    matrix:
+      # 26.04：torch 2.10.0 / 2.11.0
+      - DTK_IMAGE: "10.16.1.152:5000/hcu/base/dtk:26.04-rockylinux8.6-py3.10"
+        TORCH_VERSION: ["2.10.0", "2.11.0"]
+      # 26.10：仅 torch 2.11.0
+      - DTK_IMAGE: "10.16.1.152:5000/hcu/base/dtk:26.10-rockylinux8.6-py3.12"
+        TORCH_VERSION: "2.11.0"
   script:
-    # 安装 DTK
-    - cp -f ${DTK_PKG} /opt/
-    - cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
-    - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
-    # 安装 AICC
-    - src_dir="/ArchivedFile/ai_cc/nightly"
-    - latest_run=$(cd "$src_dir" && ls -t dtk_llvm_*.run 2>/dev/null | head -n1)
-    - 'echo "完整安装包路径: ${src_dir}/${latest_run}"'
-    - test -n "${latest_run}" && cp "${src_dir}/${latest_run}" ./ && chmod +x "${latest_run}" && yes | bash "${latest_run}" && echo "AICC 安装完成" || echo "跳过 AICC 安装"
+    # DTK 已预装在基础镜像中，只需加载环境
+    - source /opt/dtk/env.sh
+    # DTK 版本号（如 26.10 -> 2610）
+    - export DTK_VER=$(tr -d '.' < /opt/dtk/.info/version-dev)
+    # pip 变量：按 DTK 版本推导 nightly 源
+    - export PIP_INDEX_URL="${PYPI_URL}/nightly/dtk${DTK_VER}/+simple/"
+    - export PIP_TRUSTED_HOST=$(echo ${PYPI_URL} | sed -E 's#^https?://##; s#[:/].*##')
+    # 安装最新版 AICC（公共安装脚本）
+    - curl -fsSL --retry 3 --retry-delay 5 -o /tmp/hcu_llvm_installer.sh "${AICC_INSTALLER_URL}"
+    # 2604 -> AICC 1.0.0，其余(2610) -> 2.0.0
+    - 'AICC_MAJOR=1.0.0; [ "${DTK_VER}" = "2610" ] && AICC_MAJOR=2.0.0; bash /tmp/hcu_llvm_installer.sh --major "${AICC_MAJOR}"'
     - git submodule update --init --recursive
     # 编译
     - pip install torch==${TORCH_VERSION} ciupload hcusmi
     - pip install -r requirements.txt -r requirements-dev.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     - NO_TOOLCHAIN_VERSION=1 NO_GIT_VERSION=1 bash das-build.sh
     # repair wheel
-    - DTK_VER=$(echo ${DTK_PKG} | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
-    - CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VERSION} --git_commit $(git rev-parse --short=6 HEAD) -f dist/*.whl
+    - CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VERSION} --git_commit $(git rev-parse --short=6 HEAD) --outputdir output -f dist/*.whl
     # upload
-    - CIUpload --devpi_url ${DEVPI_URL} --devpi_user ${devpi_nightly_user} --devpi_password ${devpi_nightly_password} --dtk_pkg_name $(basename ${DTK_PKG}) -f output/*.whl
+    - >-
+      CIUpload NIGHTLY
+      --dtk_version "${DTK_VER}"
+      --password "${devpi_nightly_password}"
+      --record
+      -f output/*.whl
