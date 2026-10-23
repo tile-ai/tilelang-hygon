@@ -87,6 +87,8 @@ struct ScaleBufferPlan {
   int scale_format{0};
   int row_order{0};
   int op_ctrl{0};
+  int gemm_threads{0};
+  bool resident{false};
   ::tl::hcu::ScaleRowLayoutDesc layout{};
   CopyScale copy_op;
   Optional<Layout> source_layout;
@@ -138,6 +140,8 @@ private:
     plan.scale_format = cs->scale_format_;
     plan.row_order = cs->row_order_;
     plan.op_ctrl = cs->op_ctrl_;
+    plan.gemm_threads = cs->gemm_threads_;
+    plan.resident = GetIntAnn(ann, attr::kScaleResident).value_or(0) != 0;
     plan.granularity_mn =
         GetIntAnn(ann, attr::kScaleGranularityMN).value_or(cs->granularity_mn_);
     plan.granularity_k =
@@ -217,12 +221,14 @@ private:
       existing.granularity_k = incoming.granularity_k;
     }
     existing.scale_k_major = incoming.scale_k_major;
+    existing.resident |= incoming.resident;
     if (incoming.gemm_m > 0) {
       existing.copy_op = incoming.copy_op;
       existing.source_layout = incoming.source_layout;
       existing.scale_format = incoming.scale_format;
       existing.row_order = incoming.row_order;
       existing.op_ctrl = incoming.op_ctrl;
+      existing.gemm_threads = incoming.gemm_threads;
       existing.role = incoming.role;
       existing.gemm_m = incoming.gemm_m;
       existing.gemm_n = incoming.gemm_n;
@@ -482,7 +488,8 @@ void PlanWaveRows(const std::vector<Buffer> &scale_buffers,
       auto policy = GemmWarpPolicy(plan.gemm_policy);
       hcu::ScaleWarpSeg seg = hcu::ComputeScaleWarpSeg(
           *policy.get(), plan.gemm_m, plan.gemm_n, plan.gemm_k,
-          plan.gemm_k_pack, plan.gemm_elem_bits, block_size, target,
+          plan.gemm_k_pack, plan.gemm_elem_bits,
+          plan.gemm_threads > 0 ? plan.gemm_threads : block_size, target,
           plan.a_from_mls != 0, plan.b_from_mls != 0, plan.a_mls_trans != 0,
           plan.b_mls_trans != 0, plan.min_m_per_warp, plan.min_n_per_warp);
       ICHECK_EQ(seg.k_warp, 1)
@@ -649,6 +656,13 @@ BuildStartRowMap(const std::vector<Buffer> &scale_buffers,
       item.kill = rit->second.kill >= 0 ? rit->second.kill : rit->second.gen;
     } else {
       // No touches: allocate at the beginning, never free (conservative).
+      item.gen = 0;
+      item.kill = std::numeric_limits<int>::max() / 4;
+    }
+    if (meta_collector->plans.at(buf).resident) {
+      // First-stage manual WS support: lexical order is not a happens-before
+      // relation between thread groups. Own the whole physical interval for
+      // the entire kernel, including every alignment/padding hole.
       item.gen = 0;
       item.kill = std::numeric_limits<int>::max() / 4;
     }

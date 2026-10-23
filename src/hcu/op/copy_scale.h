@@ -36,6 +36,8 @@ public:
   int role_{0};      // 0=A(M), 1=B(N)
   int row_order_{0}; // ScaleBufferRowOrder, compiler-selected.
   String row_layout_type_;
+  int gemm_threads_{0};
+  int copy_threads_{0};
   int lds_from_async_copy_{0};
   // Deferred ComputeWarpPartitionHCU clues (not precomputed WarpM/N).
   int gemm_m_{0};

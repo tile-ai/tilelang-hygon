@@ -228,7 +228,6 @@ ScoreLayout(const AutoLayoutConfig &cfg, int xor_shift,
   const int k_dup = cfg.mmac_k == 64 && cfg.gran_k >= 64 ? 2 : 1;
   const int logical_rows = rows_mn_per_seg * cfg.tile_k * k_dup;
   const int batches_per_seg = logical_rows / rows_per_fill;
-  const int copy_warps_per_seg = cfg.total_warps / cfg.mn_warps;
   const int groups_per_issue =
       layout ? layout->CopyIssueGroups(rows_per_fill) : 4 / rows_per_fill;
   const int chunks_per_issue =
@@ -237,21 +236,22 @@ ScoreLayout(const AutoLayoutConfig &cfg, int xor_shift,
       layout ? layout->CopyChunkCount() : (logical_rows + 3) / 4;
   const int issues_per_seg =
       (chunks_per_seg + chunks_per_issue - 1) / chunks_per_issue;
+  const int total_issues = issues_per_seg * cfg.mn_warps;
   const int issue_iters =
-      (issues_per_seg + copy_warps_per_seg - 1) / copy_warps_per_seg;
+      (total_issues + cfg.total_warps - 1) / cfg.total_warps;
 
   for (int warp = 0; warp < cfg.total_warps; ++warp) {
     const int work_rank =
-        issues_per_seg % copy_warps_per_seg != 0
+        total_issues % cfg.total_warps != 0
             ? ::tl::hcu::ScaleCopyWaveRank(warp, cfg.total_warps)
             : warp;
-    const int seg = work_rank % cfg.mn_warps;
-    const int local_warp = work_rank / cfg.mn_warps;
-    const int mn_row0 = seg * rows_mn_per_seg;
     for (int iter = 0; iter < issue_iters; ++iter) {
-      const int ordinal = local_warp + iter * copy_warps_per_seg;
-      if (ordinal >= issues_per_seg)
+      const int job = work_rank + iter * cfg.total_warps;
+      if (job >= total_issues)
         continue;
+      const int seg = job % cfg.mn_warps;
+      const int ordinal = job / cfg.mn_warps;
+      const int mn_row0 = seg * rows_mn_per_seg;
       const int chunk =
           layout ? layout->CopyChunk(ordinal * chunks_per_issue) : ordinal;
       std::set<int> words;
@@ -361,14 +361,17 @@ Optional<AutoLayoutConfig> BuildConfig(const CopyScaleNode *op, int block_size,
   auto policy = GemmWarpPolicy(op->gemm_policy_);
   hcu::ScaleWarpSeg seg = hcu::ComputeScaleWarpSeg(
       *policy.get(), op->gemm_m_, op->gemm_n_, op->gemm_k_, op->gemm_k_pack_,
-      op->gemm_elem_bits_, block_size, target, op->a_from_mls_ != 0,
-      op->b_from_mls_ != 0, op->a_mls_trans_ != 0, op->b_mls_trans_ != 0,
-      op->min_m_per_warp_, op->min_n_per_warp_);
+      op->gemm_elem_bits_,
+      op->gemm_threads_ > 0 ? op->gemm_threads_ : block_size, target,
+      op->a_from_mls_ != 0, op->b_from_mls_ != 0, op->a_mls_trans_ != 0,
+      op->b_mls_trans_ != 0, op->min_m_per_warp_, op->min_n_per_warp_);
   cfg.mn_warps = op->role_ == 0 ? seg.m_seg : seg.n_seg;
-  cfg.total_warps = seg.total_warps;
+  const int copy_threads =
+      op->copy_threads_ > 0 ? op->copy_threads_ : block_size;
+  cfg.total_warps = copy_threads / TargetHcuGetWarpSize(target);
   // These are not StorageLayout legality checks. They are prerequisites for
   // reproducing the exact DsScaleCopyFill issue grouping used by ScoreLayout.
-  if (cfg.mn_warps <= 0 || cfg.total_warps % cfg.mn_warps != 0)
+  if (cfg.mn_warps <= 0 || cfg.total_warps <= 0)
     return std::nullopt;
   const int rows_mn =
       cfg.gran_mn >= 16 ? cfg.tile_mn : cfg.tile_mn * cfg.gran_mn / 16;

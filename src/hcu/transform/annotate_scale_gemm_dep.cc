@@ -7,6 +7,7 @@
  * consumers.
  */
 
+#include "arith/ir_mutator_with_analyzer.h"
 #include "hcu/op/copy_scale.h"
 #include "hcu/op/ds_read_format.h"
 #include "hcu/op/gemm_partition.h"
@@ -16,6 +17,7 @@
 #include "hcu/utils/scale_gemm_dep.h"
 #include "op/gemm_blockscaled.h"
 #include "op/operator.h"
+#include "transform/common/pipeline_utils.h"
 
 #include <tvm/ir/transform.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -32,6 +34,56 @@ namespace tl {
 using namespace tirx;
 
 namespace {
+
+// Run before dependency matching, while the analyzer can see the original
+// thread predicates. A copy's execution domain must never stand in for the
+// consumer GEMM domain when computing scale segments.
+class ScaleThreadDomainAnnotator : public arith::IRMutatorWithAnalyzer {
+public:
+  explicit ScaleThreadDomainAnnotator(arith::Analyzer *analyzer)
+      : arith::IRMutatorWithAnalyzer(analyzer) {}
+
+private:
+  IterVar thread_;
+  int cta_threads_{0};
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    auto previous = thread_;
+    const int previous_extent = cta_threads_;
+    if (op->attr_key == tirx::attr::thread_extent) {
+      if (const auto *iv = op->node.as<IterVarNode>()) {
+        if (iv->thread_tag == "threadIdx.x") {
+          thread_ = GetRef<IterVar>(iv);
+          const int64_t *extent = as_const_int(op->value);
+          ICHECK(extent) << "Scale tileops require a static CTA thread extent";
+          cta_threads_ = *extent;
+        }
+      }
+    }
+    Stmt result = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
+    thread_ = previous;
+    cta_threads_ = previous_extent;
+    return result;
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    if (!call || (!call->op.same_as(CopyScale::Get()) &&
+                  !call->op.same_as(GemmBlockScaled::Get())))
+      return arith::IRMutatorWithAnalyzer::VisitStmt_(op);
+    ICHECK(thread_.defined());
+    Range bounds = ComputeThreadBounds(thread_, *analyzer_);
+    const int64_t *min = as_const_int(bounds->min);
+    const int64_t *extent = as_const_int(bounds->extent);
+    ICHECK(min && extent && *extent > 0 && *min % 64 == 0 && *extent % 64 == 0)
+        << "Scale tileops require a contiguous, wave-aligned thread domain";
+    auto ann = call->annotations;
+    ann.Set(attr::kScaleThreadMin, bounds->min);
+    ann.Set(attr::kScaleThreads, bounds->extent);
+    ann.Set(attr::kScalePartitioned, Integer(*extent != cta_threads_));
+    return Evaluate(Call(call->dtype, call->op, call->args, ann, call->span));
+  }
+};
 
 Optional<int> GetIntAnn(const Map<String, ObjectRef> &annotations,
                         const char *key) {
@@ -58,6 +110,9 @@ struct ScaleBufferMeta {
   int gemm_policy{0};
   int gemm_k_pack{1};
   int gemm_elem_bits{4};
+  int gemm_threads{0};
+  int gemm_thread_min{0};
+  bool resident{false};
   int a_from_mls{0};
   int b_from_mls{0};
   int a_mls_trans{1};
@@ -92,6 +147,8 @@ void MergeScaleBufferMeta(ScaleBufferMeta *meta, int granularity_mn,
   }
   const int gemm_policy = gemm->policy_->policy_type;
   const int gemm_k_pack = gemm->kPack_;
+  const int gemm_threads = get_flag(attr::kScaleThreads, 0);
+  const int gemm_thread_min = get_flag(attr::kScaleThreadMin, 0);
 
   if (!meta->defined) {
     meta->granularity_mn = granularity_mn;
@@ -105,6 +162,9 @@ void MergeScaleBufferMeta(ScaleBufferMeta *meta, int granularity_mn,
     meta->gemm_policy = gemm_policy;
     meta->gemm_k_pack = gemm_k_pack;
     meta->gemm_elem_bits = gemm_elem_bits;
+    meta->gemm_threads = gemm_threads;
+    meta->gemm_thread_min = gemm_thread_min;
+    meta->resident = get_flag(attr::kScalePartitioned, 0) != 0;
     meta->a_from_mls = a_from;
     meta->b_from_mls = b_from;
     meta->a_mls_trans = a_trans;
@@ -115,6 +175,10 @@ void MergeScaleBufferMeta(ScaleBufferMeta *meta, int granularity_mn,
   }
   meta->format_min_mn_per_warp =
       std::max(meta->format_min_mn_per_warp, format_min_mn_per_warp);
+  ICHECK(meta->gemm_threads == gemm_threads &&
+         meta->gemm_thread_min == gemm_thread_min)
+      << "Separate consumer thread groups require separate scale buffers: "
+      << buf;
 
   // Scale geometry must always match.
   ICHECK_EQ(meta->granularity_mn, granularity_mn)
@@ -350,6 +414,9 @@ public:
       return f;
     }
 
+    arith::Analyzer analyzer;
+    ScaleThreadDomainAnnotator domains(&analyzer);
+    f.CopyOnWrite()->body = domains(f->body);
     ScaleSiteCollector collector;
     collector(f->body);
     ICHECK_GT(collector.thread_x_extent, 0)
@@ -493,6 +560,12 @@ private:
             min_n = mins_it->second.second;
           }
           auto annotations = call->annotations;
+          annotations.Set(attr::kScaleGemmThreads, Integer(meta.gemm_threads));
+          annotations.Set(
+              attr::kScaleResident,
+              Integer(
+                  meta.resident ||
+                  GetIntAnn(annotations, attr::kScalePartitioned).value_or(0)));
           annotations.Set(attr::kScaleGranularityMN,
                           IntImm(DataType::Int(32), meta.granularity_mn));
           annotations.Set(attr::kScaleGranularityK,
