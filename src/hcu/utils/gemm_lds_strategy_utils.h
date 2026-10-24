@@ -8,12 +8,14 @@
 #ifndef TVM_TL_HCU_UTILS_GEMM_LDS_STRATEGY_UTILS_H_
 #define TVM_TL_HCU_UTILS_GEMM_LDS_STRATEGY_UTILS_H_
 
+#include "hcu/utils/gemm_lds_access.h"
 #include "layout/layout.h"
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/target/target.h>
 
 #include <optional>
+#include <vector>
 
 namespace tvm {
 namespace tl {
@@ -21,6 +23,9 @@ namespace tl {
 namespace attr {
 static constexpr const char *kHcuGemmLdsCopyStrategy =
     "tl.hcu_gemm_lds_copy_strategy";
+// Marks an ordinary LDS producer. Its storage Layout lives in kLayoutMap.
+static constexpr const char *kHcuPlainGemmLdsCopy =
+    "tl.hcu_plain_gemm_lds_copy";
 static constexpr const char *kHcuCopyAsyncPromotable =
     "tl.hcu_copy_async_promotable";
 static constexpr const char *kHcuLdsWrapIndex = "tl.hcu_lds_wrap_index";
@@ -59,6 +64,24 @@ public:
                                                 ffi::ObjectRef,
                                                 HcuGemmLdsCopyStrategyNode);
 };
+
+/*! \brief Per-consumer read contract, independent of async copy geometry. */
+struct HcuGemmLdsReadPattern {
+  int element_bits;
+  int read_tile_k;
+  int read_tile_mn;
+  int elements_per_read;
+  int read_bytes_per_lane;
+  HcuGemmLdsAccessKind consumer_kind;
+  int consumer_k_pack;
+};
+
+/*! \brief Closed-form ordinary-copy layout; leading dimensions are unchanged.
+ */
+Optional<Layout>
+MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
+                          int bank_width_bytes,
+                          const std::vector<HcuGemmLdsReadPattern> &consumers);
 
 struct HcuGemmLdsCopyGeometry {
   int bank_count{0};

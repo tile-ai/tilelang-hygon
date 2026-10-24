@@ -97,10 +97,11 @@ bool ContainsMlsTileOps(const Stmt &body) {
   return checker.found();
 }
 
-class PendingCopyCallCollector : public StmtExprVisitor {
+class PipelineCopyCallCollector : public StmtExprVisitor {
 public:
   void VisitExpr_(const CallNode *op) final {
-    if (op->annotations.count(kPendingGemmLdsCopyStrategy)) {
+    if (op->op.same_as(Copy::Get()) ||
+        op->op.same_as(Op::Get("tl.tileop.async_copy"))) {
       calls.insert(GetRef<Call>(op));
     }
     StmtExprVisitor::VisitExpr_(op);
@@ -150,7 +151,7 @@ private:
       }
       ICHECK_LT(flag_index, flags.size());
       if (!is_zero(flags[flag_index])) {
-        PendingCopyCallCollector calls;
+        PipelineCopyCallCollector calls;
         calls(stmt);
         selected_calls_.insert(calls.calls.begin(), calls.calls.end());
       }
@@ -166,6 +167,84 @@ private:
 
   std::unordered_set<Call, ObjectPtrHash, ObjectPtrEqual> selected_calls_;
 };
+
+bool HasAsyncCopySemantics(const Call &call) {
+  if (!call->op.same_as(Copy::Get()))
+    return true;
+  for (const char *key : {"is_async_copy", "force_cp_async",
+                          attr::kAsyncCopyNoImplicitCommitWait}) {
+    if (auto value = call->annotations.Get(key)) {
+      if (const auto *imm = value.value().as<IntImmNode>(); !imm || imm->value)
+        return true;
+    }
+  }
+  return false;
+}
+
+class PlainCopyWriterGate : public StmtExprVisitor {
+public:
+  std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual> blocked;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> blocked_data;
+
+private:
+  void VisitStmt_(const BufferStoreNode *op) final {
+    blocked.insert(op->buffer);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    // Region bridge loads are metadata and are handled below. Scalar reads
+    // are outside the supported GEMM-only consumer set.
+    blocked.insert(op->buffer);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(region()))
+      return;
+    if (async_loop_depth_ && op->op.same_as(Copy::Get())) {
+      auto copy = Downcast<Copy>(ParseOperator(GetRef<Call>(op)));
+      blocked.insert(copy->dst);
+    }
+    for (const PrimExpr &arg : op->args) {
+      if (const auto *var = arg.as<VarNode>(); var && var->dtype.is_handle())
+        blocked_data.insert(GetRef<Var>(var));
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    bool async_loop = false;
+    for (const char *key :
+         {attr::kLoopPreferAsync, attr::kParallelAsyncWithoutAsyncCommitWait}) {
+      if (auto value = op->annotations.Get(key)) {
+        if (const auto *imm = value.value().as<IntImmNode>())
+          async_loop |= imm->value != 0;
+      }
+    }
+    async_loop_depth_ += async_loop;
+    StmtExprVisitor::VisitStmt_(op);
+    async_loop_depth_ -= async_loop;
+  }
+
+  void VisitStmt_(const SBlockNode *op) final {
+    for (const auto &match : op->match_buffers)
+      blocked.insert(match->source->buffer);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  int async_loop_depth_{0};
+};
+
+PrimExpr MakePlainFragmentRegion(const Buffer &buffer, int access_mask) {
+  Array<PrimExpr> zeros;
+  for (const PrimExpr &extent : buffer->shape)
+    zeros.push_back(make_zero(extent.dtype()));
+  Array<PrimExpr> args{BufferLoad(buffer, zeros), Integer(access_mask)};
+  for (const PrimExpr &extent : buffer->shape)
+    args.push_back(extent);
+  return Call(DataType::Handle(), region(), args);
+}
 
 bool IsStaticMultipleOf(const PrimExpr &expr, int64_t value) {
   const auto *imm = expr.as<IntImmNode>();
@@ -415,6 +494,10 @@ public:
     AnnotateMlsGemmDepMutator mutator(
         &collector, target.value(), thread.block_threads, thread.thread_var,
         &analyzer, Mode::kMaterialize, std::move(selected_calls));
+    PlainCopyWriterGate writer_gate;
+    writer_gate(f->body);
+    mutator.blocked_plain_buffers_ = std::move(writer_gate.blocked);
+    mutator.blocked_plain_data_ = std::move(writer_gate.blocked_data);
     PrimFuncNode *fn = f.CopyOnWrite();
     fn->body = mutator(f->body);
     mutator.ValidateAutoLayoutsAttached();
@@ -550,6 +633,102 @@ private:
     return IRMutatorWithAnalyzer::VisitStmt_(updated.get());
   }
 
+  bool IsFullPlainRegion(const BufferRegion &region) const {
+    const Buffer &buffer = region->buffer;
+    if (region->region.size() != buffer->shape.size() ||
+        !buffer->strides.empty())
+      return false;
+    for (size_t i = 0; i < buffer->shape.size(); ++i) {
+      if (!is_zero(region->region[i]->min) ||
+          !analyzer_->CanProveEqual(region->region[i]->extent,
+                                    buffer->shape[i]))
+        return false;
+    }
+    return true;
+  }
+
+  Optional<Layout> TryMakePlainLayout(const Buffer &buffer) const {
+    if (block_threads_ < TargetHcuGetWarpSize(target_) ||
+        block_threads_ % TargetHcuGetWarpSize(target_) != 0 ||
+        !IsSharedBuffer(buffer) || HasAnnotatedLayout(buffer) ||
+        blocked_plain_buffers_.count(buffer) ||
+        blocked_plain_data_.count(buffer->data) ||
+        !(buffer->dtype.is_float16() || buffer->dtype.is_bfloat16()) ||
+        buffer->dtype.lanes() != 1 || !buffer->strides.empty() ||
+        buffer->shape.size() != 2 || !is_zero(buffer->elem_offset))
+      return std::nullopt;
+    auto writers = collector_->GetProducerRecords(buffer);
+    if (writers.empty())
+      return std::nullopt;
+    for (const auto &writer : writers) {
+      if (!writer.call)
+        return std::nullopt;
+      Call call = GetRef<Call>(writer.call);
+      if (HasAsyncCopySemantics(call) || selected_calls_.count(call))
+        return std::nullopt;
+      auto parsed = ParseOperator(call);
+      const auto *copy = parsed.as<CopyNode>();
+      if (!copy || IsMatrixLoadPreferredCopy(*copy) ||
+          !IsGlobalLikeBuffer(copy->src) || copy->src->dtype != buffer->dtype ||
+          !IsFullPlainRegion(BufferRegion(buffer, copy->dst_range)))
+        return std::nullopt;
+      if (copy->src_range.size() < 2 ||
+          !analyzer_->CanProveEqual(floormod(copy->src_range.back()->min, 8),
+                                    0))
+        return std::nullopt;
+    }
+    auto consumers = GetExclusiveGemmConsumersAfterCall(buffer, nullptr);
+    if (!consumers || consumers->empty())
+      return std::nullopt;
+    std::vector<HcuGemmLdsReadPattern> reads;
+    for (const GemmWithInput &consumer : *consumers) {
+      const Gemm &gemm = consumer.gemm;
+      if (gemm->a_.same_as(gemm->b_) ||
+          gemm->IsInstance<GemmBlockScaledNode>() ||
+          gemm->k_ % (16 * gemm->kPack_) != 0 ||
+          gemm->a_->dtype != buffer->dtype || gemm->b_->dtype != buffer->dtype)
+        return std::nullopt;
+      bool feeds_a = consumer.input.same_as(gemm->a_);
+      HcuGemmLdsAccessKind kind = GetHcuGemmLdsAccessKind(*gemm.get(), feeds_a);
+      const BufferRegion &input = feeds_a ? gemm->aRegion_ : gemm->bRegion_;
+      // First-stage scope is full compact tiles, including identity relays.
+      if (!IsFullPlainRegion(input))
+        return std::nullopt;
+      if (!consumer.input.same_as(buffer)) {
+        for (const auto &relay : collector_->GetReaderCalls(buffer)) {
+          if (relay.call && GemmWithInputFromReaderCall(relay.call, buffer))
+            continue;
+          if (!relay.call || !relay.call->op.same_as(Copy::Get()))
+            return std::nullopt;
+          auto copy = Downcast<Copy>(ParseOperator(GetRef<Call>(relay.call)));
+          if (!IsFullPlainRegion(BufferRegion(copy->src, copy->src_range)) ||
+              !IsFullPlainRegion(BufferRegion(copy->dst, copy->dst_range)) ||
+              !StructuralEqual()(copy->src->shape, copy->dst->shape) ||
+              copy->dst.scope() != "local.fragment")
+            return std::nullopt;
+        }
+      }
+      if (kind == HcuGemmLdsAccessKind::kAnBt) {
+        if (gemm->kPack_ != 1 ||
+            GetHcuGemmLdsMnExtent(*gemm.get(), feeds_a) % 32)
+          return std::nullopt;
+        GemmWarpPolicy policy(gemm->policy_->policy_type);
+        hcu::ComputeWarpPartitionHCU(
+            *policy.get(), gemm->m_, gemm->n_, gemm->k_, gemm->kPack_,
+            buffer->dtype.bits(), block_threads_, target_, feeds_a, !feeds_a,
+            !gemm->transA_, gemm->transB_);
+        int warp_mn = feeds_a ? policy->m_warp : policy->n_warp;
+        int mn = GetHcuGemmLdsMnExtent(*gemm.get(), feeds_a);
+        if (policy->k_warp != 1 || mn % warp_mn || (mn / warp_mn) % 32)
+          return std::nullopt;
+      }
+      reads.push_back({16, 16, 32, 8, 16, kind, gemm->kPack_});
+    }
+    return MakeHcuPlainGemmLdsLayout(
+        buffer->shape, TargetHcuGetLdsBankCount(target_),
+        TargetHcuGetLdsBankWidthBytes(target_), reads);
+  }
+
   Range CurrentStrategyThreadBounds() const {
     if (thread_var_.defined()) {
       Range bounds = ComputeThreadBounds(thread_var_, *analyzer_);
@@ -580,9 +759,20 @@ private:
       }
     }
     annotated_layout_maps_stack_.push_back(block_layout_map);
+    if (mode_ == Mode::kMaterialize) {
+      for (const Buffer &buffer : op->alloc_buffers) {
+        if (Optional<Layout> layout = TryMakePlainLayout(buffer)) {
+          plain_layouts_.emplace(buffer->data, layout.value());
+          block_layout_map.Set(buffer->data, layout.value());
+          annotated_layout_maps_stack_.back().Set(buffer->data, layout.value());
+        }
+      }
+    }
 
     SBlock block = Downcast<SBlock>(IRMutatorWithAnalyzer::VisitStmt_(op));
     bool layout_map_changed = false;
+    for (const Buffer &buffer : op->alloc_buffers)
+      layout_map_changed |= plain_layouts_.count(buffer->data) != 0;
     // Materialize auto layouts at the shared buffer's allocation scope, just
     // like an explicit T.annotate_layout entry.
     for (const Buffer &buffer : block->alloc_buffers) {
@@ -995,6 +1185,56 @@ private:
     return annotations;
   }
 
+  Stmt MaterializePlainGemm(const Call &call, const Gemm &gemm,
+                            Map<String, ObjectRef> annotations) {
+    Array<PrimExpr> args = call->args;
+    Array<Buffer> fragments;
+    Array<Stmt> statements;
+    bool convert_a =
+        plain_layouts_.count(gemm->a_->data) && !IsAtBnAccess({gemm, gemm->a_});
+    bool convert_b =
+        plain_layouts_.count(gemm->b_->data) && !IsAtBnAccess({gemm, gemm->b_});
+    for (int slot = 0; slot < 2; ++slot) {
+      const Buffer &input = slot == 0 ? gemm->a_ : gemm->b_;
+      if (!plain_layouts_.count(input->data))
+        continue;
+      annotations.Set(slot == 0 ? attr::kHcuARespectLayoutMap
+                                : attr::kHcuBRespectLayoutMap,
+                      Integer(1));
+      if (!(slot == 0 ? convert_a : convert_b))
+        continue;
+      Buffer fragment =
+          decl_buffer(input->shape, input->dtype,
+                      input->name + "_plain_fragment", "local.fragment");
+      fragments.push_back(fragment);
+      Map<String, ObjectRef> read_annotations;
+      read_annotations.Set(attr::kHcuLinearDsRead, Integer(1));
+      read_annotations.Set(attr::kHcuLayoutDsRead, Integer(1));
+      read_annotations.Set(
+          attr::kMlsGemmDep,
+          BuildCopyToGemmLinearMeta(
+              {gemm, input}, convert_a || IsFromMls(gemm->a_, collector_),
+              convert_b || IsFromMls(gemm->b_, collector_), target_));
+      statements.push_back(Evaluate(
+          Call(call->dtype, DsReadFormat::Get(),
+               {args[slot], MakePlainFragmentRegion(fragment, kAccessWrite)},
+               read_annotations)));
+      args.Set(slot, MakePlainFragmentRegion(fragment, kAccessRead));
+      annotations.Set(slot == 0 ? attr::kHcuAFromMls : attr::kHcuBFromMls,
+                      Integer(1));
+    }
+    statements.push_back(
+        Evaluate(Call(call->dtype, call->op, args, annotations, call->span)));
+    if (fragments.empty())
+      return statements[0];
+    // Preserve a single planner statement while giving temporary fragments a
+    // lexical allocation scope; pipeline rewriting sees all source accesses.
+    SBlock block({}, {gemm->aRegion_, gemm->bRegion_}, {gemm->cRegion_},
+                 "plain_gemm_read", SeqStmt(statements), std::nullopt,
+                 fragments);
+    return SBlockRealize({}, const_true(), block);
+  }
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
     auto call = op->value.as<CallNode>();
     if (call == nullptr || !call->op.as<OpNode>()) {
@@ -1090,6 +1330,17 @@ private:
 
     if (IsCopyLikeOp(tir_op)) {
       auto copy = Downcast<Copy>(ParseOperator(ffi::GetRef<Call>(call)));
+      if (mode_ == Mode::kMaterialize &&
+          plain_layouts_.count(copy->dst->data)) {
+        auto annotations = call->annotations;
+        annotations.erase(kPendingGemmLdsCopyStrategy);
+        annotations.erase(kPendingGemmAtBnLdsStrategy);
+        annotations.erase(kPendingGemmAnBtLdsStrategy);
+        annotations.erase(attr::kHcuCopyAsyncPromotable);
+        annotations.Set(attr::kHcuPlainGemmLdsCopy, Integer(1));
+        return Evaluate(
+            Call(call->dtype, call->op, call->args, annotations, call->span));
+      }
       if (mode_ == Mode::kMaterialize &&
           call->annotations.count(kPendingGemmLdsCopyStrategy)) {
         const bool selected =
@@ -1253,6 +1504,11 @@ private:
         annotations.Set(attr::kHcuBFromAsyncCopyLinear,
                         IntImm(DataType::Int(32), 1));
       }
+      if (mode_ == Mode::kMaterialize &&
+          (plain_layouts_.count(gemm->a_->data) ||
+           plain_layouts_.count(gemm->b_->data))) {
+        return MaterializePlainGemm(GetRef<Call>(call), gemm, annotations);
+      }
       Call new_call(call->dtype, call->op, call->args, annotations, call->span);
       return Evaluate(new_call);
     }
@@ -1260,6 +1516,10 @@ private:
     return IRMutatorWithAnalyzer::VisitStmt_(op);
   }
 
+  std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
+      blocked_plain_buffers_;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> blocked_plain_data_;
+  std::unordered_map<Var, Layout, ObjectPtrHash, ObjectPtrEqual> plain_layouts_;
   PropagationTirCollector *collector_;
   Target target_;
   int block_threads_{-1};

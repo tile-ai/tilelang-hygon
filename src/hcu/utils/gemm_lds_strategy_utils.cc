@@ -10,6 +10,7 @@
 
 #include "hcu/target_utils.h"
 
+#include <climits>
 #include <numeric>
 
 namespace tvm {
@@ -20,6 +21,75 @@ namespace {
 bool IsPowerOfTwo(int value) { return value > 0 && (value & (value - 1)) == 0; }
 
 } // namespace
+
+Optional<Layout>
+MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
+                          int bank_width_bytes,
+                          const std::vector<HcuGemmLdsReadPattern> &consumers) {
+  if (shape.size() < 2 || (bank_count != 32 && bank_count != 64) ||
+      bank_width_bytes != 4 || consumers.empty()) {
+    return std::nullopt;
+  }
+  for (const PrimExpr &extent : shape) {
+    const int64_t *value = as_const_int(extent);
+    if (!value || *value <= 0)
+      return std::nullopt;
+  }
+  const int64_t rows = *as_const_int(shape[shape.size() - 2]);
+  const int64_t width = *as_const_int(shape.back());
+  if (rows < 16 || width < 32 || rows > INT_MAX || width > INT_MAX ||
+      !IsPowerOfTwo(rows) || !IsPowerOfTwo(width)) {
+    return std::nullopt;
+  }
+  bool has_an_bt = false;
+  bool has_at_bn = false;
+  for (const auto &read : consumers) {
+    // Only the b16 contract is enabled in this stage.
+    if (read.element_bits != 16 || read.read_tile_k != 16 ||
+        read.read_tile_mn != 32 || read.elements_per_read != 8 ||
+        read.read_bytes_per_lane != 16)
+      return std::nullopt;
+    if (read.consumer_kind == HcuGemmLdsAccessKind::kAnBt) {
+      if (read.consumer_k_pack != 1)
+        return std::nullopt;
+      has_an_bt = true;
+    } else {
+      if (read.consumer_k_pack != 1 && read.consumer_k_pack != 2)
+        return std::nullopt;
+      has_at_bn = true;
+    }
+  }
+  if (!has_an_bt)
+    return std::nullopt;
+  PrimExpr row = InputPlaceholder(0);
+  PrimExpr col = InputPlaceholder(1);
+  PrimExpr shift = Integer(0);
+  if (!has_at_bn) {
+    const int row_period = bank_count / std::gcd(bank_count, int(width / 2));
+    if (row_period == 1)
+      shift = (row & 1) << 5;
+  } else if (bank_count == 64) {
+    shift = (row & 12) << 1;
+    if (width == 64)
+      shift = shift ^ ((row & 2) << 4);
+    if (width >= 128)
+      shift = shift ^ ((row & 3) << 5);
+  } else {
+    shift = ((row & 2) << 3) ^ ((row & 4) << 1);
+    if (width >= 64)
+      shift = shift ^ ((row & 1) << 5);
+  }
+  // Express the preserved vector bits explicitly so vectorization and the
+  // symbolic ds-read contiguity check can see the N8 affine suffix.
+  PrimExpr physical_col =
+      ((floordiv(col, 8) ^ floordiv(shift, 8)) * 8) + floormod(col, 8);
+  Layout layout(Array<PrimExpr>{Integer(rows), Integer(width)},
+                {row, physical_col});
+  Array<PrimExpr> leading;
+  for (size_t i = 0; i + 2 < shape.size(); ++i)
+    leading.push_back(shape[i]);
+  return layout->Expand(leading);
+}
 
 void HcuGemmLdsCopyStrategyNode::RegisterReflection() {
   namespace refl = ffi::reflection;
@@ -150,6 +220,26 @@ HcuGemmLdsCopyStrategy MakeHcuGemmLdsCopyStrategy(
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   HcuGemmLdsCopyStrategyNode::RegisterReflection();
+  ffi::reflection::GlobalDef().def(
+      "tl.hcu.MakePlainGemmLdsLayout",
+      [](Array<PrimExpr> shape, int bank_count, int bank_width_bytes,
+         int element_bits, int read_tile_k, int read_tile_mn,
+         int elements_per_read, int read_bytes_per_lane,
+         Array<Integer> consumer_kinds, Array<Integer> consumer_k_packs) {
+        ICHECK_EQ(consumer_kinds.size(), consumer_k_packs.size());
+        std::vector<HcuGemmLdsReadPattern> consumers;
+        for (size_t i = 0; i < consumer_kinds.size(); ++i) {
+          ICHECK(consumer_kinds[i]->value == 0 ||
+                 consumer_kinds[i]->value == 1);
+          consumers.push_back(
+              {element_bits, read_tile_k, read_tile_mn, elements_per_read,
+               read_bytes_per_lane,
+               static_cast<HcuGemmLdsAccessKind>(consumer_kinds[i]->value),
+               int(consumer_k_packs[i]->value)});
+        }
+        return MakeHcuPlainGemmLdsLayout(shape, bank_count, bank_width_bytes,
+                                         consumers);
+      });
 }
 
 } // namespace tl

@@ -342,6 +342,13 @@ struct Copy {
   static CopyInst SelectInst(const CopyNode &op, Target target,
                              const LayoutMap &layout_map,
                              arith::Analyzer *analyzer) {
+    if (op.annotations.count(attr::kHcuPlainGemmLdsCopy)) {
+      ICHECK(!IsMatrixLoadPreferredCopy(op) && !GetIsAsyncCopy(op) &&
+             !GetNoImplicitAsyncCommitWait(op))
+          << "An ordinary HCU LDS layout cannot acquire async producer "
+             "semantics";
+      return CopyInst::kNormal;
+    }
     if (IsMatrixLoadPreferredCopy(op)) {
       return CopyInst::kMatrixLoad;
     }
