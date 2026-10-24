@@ -95,7 +95,8 @@ const PipelineFlavor kSharedPipelineFlavor = [] {
                           kPipelineAsyncProducerGroups,
                           kPipelineTmaCopies,
                           kPipelineReplayableScalarBinds,
-                          "num_stages"};
+                          "num_stages",
+                          "tl_pipelined_num_stages"};
   return flavor;
 }();
 
