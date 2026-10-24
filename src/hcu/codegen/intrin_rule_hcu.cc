@@ -216,7 +216,7 @@ TVM_REGISTER_OP("tirx.tan")
 
 TVM_REGISTER_OP("tirx.cos")
     .set_attr<FLowerIntrinsic>("hcu.FLowerIntrinsic",
-                               DispatchPureExternScalarized<HCUFastMath>);
+                               DispatchPureExternScalarized<HCUMath>);
 
 TVM_REGISTER_OP("tirx.cosh")
     .set_attr<FLowerIntrinsic>("hcu.FLowerIntrinsic",
@@ -224,7 +224,7 @@ TVM_REGISTER_OP("tirx.cosh")
 
 TVM_REGISTER_OP("tirx.sin")
     .set_attr<FLowerIntrinsic>("hcu.FLowerIntrinsic",
-                               DispatchPureExternScalarized<HCUFastMath>);
+                               DispatchPureExternScalarized<HCUMath>);
 
 TVM_REGISTER_OP("tirx.sinh")
     .set_attr<FLowerIntrinsic>("hcu.FLowerIntrinsic",
