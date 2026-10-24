@@ -887,6 +887,55 @@ SharedPipelineWaitPlan MakeWaitPlan(const Stmt &root) {
 
 enum class PipelinePhase { kPrologue, kMainLoop, kEpilogue };
 
+// Copy statements only: no shared read and no MMA. The release is placed in
+// front of the whole cluster, so an inner copy loop does not emit another.
+bool IsSharedPipelineCopyCluster(const Stmt &stmt) {
+  struct Checker : public StmtExprVisitor {
+    bool has_async{false};
+    bool has_shared_read{false};
+    bool has_mma{false};
+
+    void VisitExpr_(const BufferLoadNode *op) override {
+      if (IsSharedBuffer(op->buffer, true)) {
+        has_shared_read = true;
+      }
+      ExprVisitor::VisitExpr_(op);
+    }
+
+    void VisitStmt_(const BufferStoreNode *op) override {
+      if (IsSharedBuffer(op->buffer, true)) {
+        has_shared_read = true;
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+
+    void VisitExpr_(const CallNode *op) override {
+      if (IsAsyncCopyCall(op)) {
+        has_async = true;
+        return;
+      }
+      if (IsMmaCall(op)) {
+        has_mma = true;
+      }
+      if (op->op.same_as(ds_read_vector()) ||
+          op->op.same_as(ds_read_tr16_b64()) ||
+          op->op.same_as(ds_read_tr8_b64())) {
+        has_shared_read = true;
+        return;
+      }
+      ExprVisitor::VisitExpr_(op);
+    }
+  };
+  Checker checker;
+  checker(stmt);
+  return checker.has_async && !checker.has_shared_read && !checker.has_mma;
+}
+
+Stmt MakeLgkmcntFenceStmt() {
+  return Evaluate(
+      Call(DataType::Void(), async_gld_sld_fence(), {Integer(0)}));
+}
+
 class InjectAsyncGlobalLoadFenceMutator : public StmtMutator {
 public:
   explicit InjectAsyncGlobalLoadFenceMutator(const Stmt &root)
@@ -969,6 +1018,7 @@ public:
     Array<Stmt> result;
     result.reserve(seq_op->seq.size() + 8);
     bool in_lds_cluster = false;
+    bool in_copy_run = false;
     int prologue_stage_commits = 0;
     auto append_stmt = [&](const Stmt &stmt) {
       if (const auto *inner = stmt.as<SeqStmtNode>()) {
@@ -977,6 +1027,29 @@ public:
         }
       } else {
         result.push_back(stmt);
+      }
+    };
+    // Shared-memory K loop only. Register pipelines keep their own LDS wait.
+    auto visit_lowered = [&](const Stmt &stmt) {
+      const bool shared_pipeline_k = !plan_.register_pipeline &&
+                                     plan_.num_stages >= 2 &&
+                                     phase_ == PipelinePhase::kMainLoop;
+      const bool copy_cluster = shared_pipeline_k &&
+                                suppress_copy_release_ == 0 &&
+                                IsSharedPipelineCopyCluster(stmt);
+      if (copy_cluster && !in_copy_run) {
+        result.push_back(MakeLgkmcntFenceStmt());
+        AppendWaveBarrierIfNeeded(result);
+      }
+      if (shared_pipeline_k) {
+        in_copy_run = copy_cluster;
+      }
+      if (copy_cluster) {
+        ++suppress_copy_release_;
+      }
+      append_stmt(VisitStmt(stmt));
+      if (copy_cluster) {
+        --suppress_copy_release_;
       }
     };
 
@@ -992,10 +1065,18 @@ public:
           pending_pipeline_waits_.push_back(wait_count);
         }
         if (IsWaitPlaceholder(s)) {
+          if (!plan_.register_pipeline && plan_.num_stages >= 2 &&
+              phase_ == PipelinePhase::kMainLoop) {
+            in_copy_run = false;
+          }
           continue;
         }
       }
       if (IsAsyncGldFenceStmt(cur) || IsPtxWaitGroupStmt(cur)) {
+        if (!plan_.register_pipeline && plan_.num_stages >= 2 &&
+            phase_ == PipelinePhase::kMainLoop) {
+          in_copy_run = false;
+        }
         continue;
       }
 
@@ -1005,7 +1086,7 @@ public:
               (phase_ == PipelinePhase::kMainLoop ||
                phase_ == PipelinePhase::kEpilogue))) {
           in_lds_cluster = false;
-          append_stmt(VisitStmt(cur));
+          visit_lowered(cur);
           if (plan_.num_stages >= 2 && phase_ == PipelinePhase::kPrologue &&
               i + 1 < seq_op->seq.size() &&
               IsSBarrierStmt(UnwrapWaitAttrs(seq_op->seq[i + 1]))) {
@@ -1087,7 +1168,7 @@ public:
       if (inserted_here) {
         ++suppress_inner_lds_insert_;
       }
-      append_stmt(VisitStmt(cur));
+      visit_lowered(cur);
       if (inserted_here) {
         --suppress_inner_lds_insert_;
       }
@@ -1280,6 +1361,7 @@ private:
   int epi_consumers_in_group_{0};
   int outstanding_{0};
   int suppress_inner_lds_insert_{0};
+  int suppress_copy_release_{0};
   int epilogue_gld_insert_idx_{0};
   std::vector<int> pending_pipeline_waits_;
 };
