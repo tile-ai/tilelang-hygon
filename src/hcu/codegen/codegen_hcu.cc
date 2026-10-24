@@ -4,6 +4,7 @@
 
 #include "codegen_hcu.h"
 #include "arith/pattern_match.h"
+#include "backend/common/codegen/codegen_utils.h"
 #include "support/check.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/extra/structural_equal.h>
@@ -4046,9 +4047,11 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
     } else if (std::isnan(op->value)) {
       temp << ((op->dtype.bits() == 32) ? "NAN" : "NAN");
     } else {
-      temp << std::scientific << op->value;
+      // temp << std::scientific << op->value;
+      temp << FlexibleHexFormat(op->value);
       if (op->dtype.bits() == 32)
         temp << 'f';
+      temp << "/*" << std::scientific << op->value << "*/";
     }
     p->MarkConst(temp.str());
     os << temp.str();
