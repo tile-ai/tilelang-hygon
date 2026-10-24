@@ -854,14 +854,14 @@ private:
   bool IsWarpReduction(const std::vector<DataType> &types, int group_extent,
                        int reduce_extent, int contiguous_reduce_extent) {
     if ((target_->kind->name != "cuda") && (target_->kind->name != "rocm") &&
-        (target_->kind->name != "metal")) {
+        (target_->kind->name != "metal") && (target_->kind->name != "hcu")) {
       return false;
     }
 
     need_warp_shuffle_mask_ = target_->kind->name != "metal";
 
-    // rocm only supports 32 bit operands for shuffling at the moment
-    if ((target_->kind->name == "rocm") &&
+    // rocm/hcu only supports 32 bit operands for shuffling at the moment
+    if ((target_->kind->name == "rocm" || target_->kind->name == "hcu") &&
         (std::any_of(types.begin(), types.end(), [](DataType ty) {
           if (ty.is_fixed_length_vector())
             return ty.bits() * ty.lanes() != 32;
@@ -891,7 +891,7 @@ private:
     }
 
     // whether reduce_extent and group_extent are valid for warp reduction.
-    if (target_->kind->name == "rocm") {
+    if (target_->kind->name == "rocm" || target_->kind->name == "hcu") {
       return reduce_extent == warp_size_;
     } else {
       if (reduce_extent == 1) {
