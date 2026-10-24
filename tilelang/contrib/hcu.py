@@ -281,8 +281,6 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
         if os.path.isdir(bitcode_dir) and not os.path.isfile(os.path.join(bitcode_dir, "oclc_abi_version_600.bc")):
             flags.append(f"--rocm-device-lib-path={bitcode_dir}")
             flags.append("-mcode-object-version=5")
-        # Clang 22 aicc does not predefine this; DTK HIP headers require it. gfx9 is wave64.
-        flags.append("-D__AMDGCN_WAVEFRONT_SIZE=64")
         return flags
     else:
         raise ValueError(f"Unsupported architecture: {arch}")

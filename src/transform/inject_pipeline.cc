@@ -558,11 +558,40 @@ Stmt LowerAsyncCommitWaitAttrs(const Stmt &stmt) {
 }
 
 /*!
- * \brief Check that the kernel never commits async copies without waiting.
+ * \brief Whether a pipeline of at least two stages is present.
+ *
+ * InjectAsyncGlobalLoadFence inserts waits only for that depth. A loop with
+ * fewer stages keeps the plain async-copy form and orders copies with
+ * __syncthreads, so a missing ptx_wait_group is not a lowering failure.
+ */
+bool RequiresAsyncCommitWaitCheck(const Stmt &stmt) {
+  bool required = false;
+  PostOrderVisit(stmt, [&](const ObjectRef &node) {
+    if (required) {
+      return;
+    }
+    const auto *loop = node.as<ForNode>();
+    if (loop == nullptr) {
+      return;
+    }
+    if (auto ns = GetExplicitPipelinedNumStages(loop)) {
+      if (static_cast<int>(ns.value()->value) >= 2) {
+        required = true;
+      }
+    }
+  });
+  return required;
+}
+
+/*!
+ * \brief Check that a pipeline of at least two stages waits on its commits.
  *
  * \param stmt The statement to inspect.
  */
 void VerifyAsyncCommitWaits(const Stmt &stmt) {
+  if (!RequiresAsyncCommitWaitCheck(stmt)) {
+    return;
+  }
   class Counter : public StmtExprVisitor {
   public:
     int commits{0};
@@ -589,9 +618,9 @@ void VerifyAsyncCommitWaits(const Stmt &stmt) {
   ICHECK(counter.commits == 0 || counter.waits > 0)
       << "async copies are committed but never waited on: this kernel has "
       << counter.commits
-      << " commit group(s) and no wait. InjectAsyncGlobalLoadFence owns the "
-         "waits of the K loops it recognizes and the pipeline lowering covers "
-         "every other kernel, so losing all waits means one of them failed.";
+      << " commit group(s) and no wait. InjectAsyncGlobalLoadFence owns waits "
+         "for a pipeline of at least two stages, so losing all of them means "
+         "that pass failed.";
 }
 
 /*!
