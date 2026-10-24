@@ -1906,6 +1906,19 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
     if (CanUseVMBufferOps(op->buffer.get(), value_dtype.lanes())) {
       std::string value = PrintExpr(op->value);
 
+      // C/C++ integer promotion widens scalar int8/uint8/int16/uint16
+      // arithmetic and bitwise expressions to int.  So restore that
+      // width to result dtype before bit_cast
+      const bool is_narrow_integer =
+          (value_dtype.is_int() || value_dtype.is_uint()) &&
+          (value_dtype.bits() == 8 || value_dtype.bits() == 16);
+      if (desc.num_elements == 1 && value_dtype.is_scalar() &&
+          is_narrow_integer) {
+        std::ostringstream scalar_type;
+        PrintType(value_dtype, scalar_type);
+        value = "static_cast<" + scalar_type.str() + ">(" + value + ")";
+      }
+
       // Convert the value expression to a thread_buffer using bit_cast.
       // For lanes==1 this becomes thread_buffer<T,1>.
       std::string data_type = HcuCkTemplateElemType(value_dtype);
