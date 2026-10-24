@@ -3,7 +3,6 @@
 # ROCm target helpers and intrinsic rules are pure C++ registrations used by
 # common code and source generation. Compile them regardless of USE_ROCM.
 file(GLOB TILE_LANG_ROCM_ALWAYS_SRCS
-  src/rocm/codegen/intrin_rule_hip.cc
   src/rocm/op/builtin.cc
   src/rocm/target_utils.cc
 )
@@ -135,6 +134,7 @@ if(TILELANG_USE_HIP_STUBS)
 endif()
 
 file(GLOB TILE_LANG_ROCM_ACTIVE_SRCS
+  src/rocm/codegen/intrin_rule_hip.cc
   src/rocm/codegen/codegen_hip.cc
   src/rocm/codegen/rt_mod_hip.cc
   src/rocm/op/*.cc
