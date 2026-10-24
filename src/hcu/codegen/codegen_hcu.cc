@@ -11,6 +11,7 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ir/cast.h>
 #include <tvm/s_tir/stmt.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/index_map.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -3935,19 +3936,29 @@ void CodeGenTileLangHCU::VisitExpr_(const ShuffleNode *op,
 void CodeGenTileLangHCU::VisitExpr_(const BroadcastNode *op,
                                     std::ostream &os) { // NOLINT(*)
   int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
-  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8 &&
-      lanes == 4) {
-    // make_int8x4
+  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8) {
     const int64_t *p = as_const_int(op->value);
-    ICHECK(p);
-    int64_t v = *p & 0xFF;
-    v = (v << 24) | (v << 16) | (v << 8) | v;
-    if (op->dtype.is_uint()) {
-      os << "(uint)" << v;
-    } else {
-      os << "(int)" << v;
+    if (p && lanes == 4) {
+      // make_int8x4
+      ICHECK(p);
+      int64_t v = *p & 0xFF;
+      v = (v << 24) | (v << 16) | (v << 8) | v;
+      if (op->dtype.is_uint()) {
+        os << "(uint)" << v;
+      } else {
+        os << "(int)" << v;
+      }
+      return;
     }
-    return;
+    // Replicate the byte across the carrier type (int/int2/int4).
+    if ((lanes == 4 || lanes == 8 || lanes == 16) &&
+        tirx::SideEffect(op->value) <= tirx::CallEffectKind::kReadState) {
+      std::string sval = SSAGetID(PrintExpr(op->value), op->value.dtype());
+      os << "tl::broadcast<";
+      PrintType(op->dtype, os);
+      os << ">(" << sval << ")";
+      return;
+    }
   }
 
   if (op->dtype.is_float16()) {

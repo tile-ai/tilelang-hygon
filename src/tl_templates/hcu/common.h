@@ -183,6 +183,22 @@ TL_DEVICE unsigned __pack_bfloat162(const bfloat16_t x, const bfloat16_t y) {
 
 namespace tl {
 
+// Replicate a small repeating unit across a wider vector type. Works
+// for any (V, U) with sizeof(V) % sizeof(U) == 0, so codegen does not
+// need a make_<type> constructor for every lane count.
+template <typename V, typename U> TL_DEVICE V broadcast(const U unit) {
+  static_assert(sizeof(V) % sizeof(U) == 0,
+                "tl::broadcast requires the vector size to be a multiple of "
+                "the unit size");
+  V result;
+  U *parts = reinterpret_cast<U *>(&result);
+#pragma unroll
+  for (int i = 0; i < static_cast<int>(sizeof(V) / sizeof(U)); ++i) {
+    parts[i] = unit;
+  }
+  return result;
+}
+
 namespace detail {
 
 TL_DEVICE constexpr int default_warp_size() { return 64; }
