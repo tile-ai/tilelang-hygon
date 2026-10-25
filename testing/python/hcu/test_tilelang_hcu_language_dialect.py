@@ -16,6 +16,7 @@ HCU_COMPATIBILITY_MARKERS = {
 HCU_OVERRIDE_NAMES = {
     "Kernel",
     "Parallel",
+    "Pipelined",
     "copy",
     "gemm",
     "gemm_blockscaled",

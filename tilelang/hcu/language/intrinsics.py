@@ -126,28 +126,6 @@ def sched_barrier(mask: int = 0):
     return tirx.call_extern("void", "__builtin_amdgcn_sched_barrier", tirx.IntImm("int32", mask))
 
 
-def async_commit_group():
-    """Close the current asynchronous-copy group.
-
-    Target-neutral spelling of ``T.ptx_commit_group`` for HCU kernels: the
-    copies issued since the previous commit form one group, and a later
-    :func:`async_wait_group` releases the groups older than its argument.
-    """
-    return tirx.op.ptx_commit_group()
-
-
-def async_wait_group(count: int = 0):
-    """Wait until at most ``count`` asynchronous-copy groups remain.
-
-    Target-neutral spelling of ``T.ptx_wait_group`` for HCU kernels.  ``0``
-    drains every committed group; a larger value keeps that many groups in
-    flight so the next pipeline stages can overlap with the current one.
-    """
-    if not isinstance(count, int) or count < 0:
-        raise ValueError(f"async_wait_group expects a non-negative int, got {count!r}.")
-    return tirx.op.ptx_wait_group(count)
-
-
 __all__ = (
     "abarrier_init",
     "abarrier_inv",
@@ -175,6 +153,4 @@ __all__ = (
     "ieee_fmaf",
     "s_waitcnt",
     "sched_barrier",
-    "async_commit_group",
-    "async_wait_group",
 )

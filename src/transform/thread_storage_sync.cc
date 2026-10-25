@@ -2280,19 +2280,20 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
   }
   auto *n = func.CopyOnWrite();
   auto stmt = n->body;
-  int warp_size = 32;
-  if (auto target = func->GetAttr<Target>(tvm::attr::kTarget)) {
-    warp_size = target.value()
-                    ->GetAttr<Integer>("thread_warp_size", 32)
-                    .value()
-                    .IntValue();
-  }
   // A wait plan that a lowering owns already carries a barrier with every
   // fence, so an owned scope skips the generic barrier after a wait_group; the
   // rest of the function still needs it, as wait_asyncmark only orders the
   // waiting wave's own copies while shared memory is consumed block-wide.
   if (sync_scope.rank == StorageRank::kShared && sync_scope.tag.empty()) {
     stmt = ThreadSyncAfterWaitGroupInserter(sync_scope)(stmt);
+  }
+  // Get warp size from target, defaulting to 32 if not available
+  int warp_size = 32;
+  if (auto target = func->GetAttr<Target>(tvm::attr::kTarget)) {
+    warp_size = target.value()
+                    ->GetAttr<Integer>("thread_warp_size", 32)
+                    .value()
+                    .IntValue();
   }
   TileLangThreadSyncPlanner planner(sync_scope, warp_size);
   for (const auto &[_, buffer] : func->buffer_map) {

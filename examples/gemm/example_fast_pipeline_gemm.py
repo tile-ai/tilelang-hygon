@@ -1,9 +1,6 @@
 import tilelang
 import tilelang.language as T
 
-tilelang.disable_cache()
-
-
 @tilelang.jit
 def matmul(A, B, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
     M, N, K = T.const("M, N, K")
@@ -23,10 +20,8 @@ def matmul(A, B, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float
         for k in T.Pipelined(
             T.ceildiv(K, block_K),
             num_stages=4,
-            annotations={
-                "num_register_stages": 2,
-                "enable_warp_divergence": 1,
-            },
+            register_stages=2,
+            warp_divergence=True,
         ):
             T.async_copy(A[by * block_M, k * block_K], A_shared)
             T.async_copy(B[k * block_K, bx * block_N], B_shared)

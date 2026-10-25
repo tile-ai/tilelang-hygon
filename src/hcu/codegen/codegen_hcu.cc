@@ -2595,6 +2595,7 @@ void CodeGenTileLangHCU::PrintStorageSync(const CallNode *op) {
       this->stream << "tl::ebarrier_sync_cnt(" << barrier_id->value << ", "
                    << thread_count->value / warp_size << ");\n";
     } else {
+      // Preserve the existing behavior on HCU targets without EBarrier.
       this->stream << "__syncthreads();\n";
     }
   }
