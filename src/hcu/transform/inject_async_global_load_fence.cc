@@ -932,8 +932,7 @@ bool IsSharedPipelineCopyCluster(const Stmt &stmt) {
 }
 
 Stmt MakeLgkmcntFenceStmt() {
-  return Evaluate(
-      Call(DataType::Void(), async_gld_sld_fence(), {Integer(0)}));
+  return Evaluate(Call(DataType::Void(), async_gld_sld_fence(), {Integer(0)}));
 }
 
 class InjectAsyncGlobalLoadFenceMutator : public StmtMutator {
