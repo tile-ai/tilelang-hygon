@@ -76,8 +76,11 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
       shift = shift ^ ((row & 3) << 5);
   } else {
     shift = ((row & 2) << 3) ^ ((row & 4) << 1);
+    // Mix the fourth row bit as well: scalar AnBt reads can access rows
+    // eight apart in the same wave. Preserve the N8 vector suffix.
     if (width >= 64)
-      shift = shift ^ ((row & 1) << 5);
+      shift = ((row & 1) << 4) ^ ((row & 2) << 2) ^ ((row & 4) << 3) ^
+              ((row & 8) << 1);
   }
   // Express the preserved vector bits explicitly so vectorization and the
   // symbolic ds-read contiguity check can see the N8 affine suffix.

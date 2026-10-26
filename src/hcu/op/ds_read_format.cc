@@ -388,8 +388,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
         *policy.get(), meta->gemm_m, meta->gemm_n, meta->gemm_k,
         meta->gemm_k_pack, dst->dtype.bits(), block_size, T.target,
         meta->a_from_mls, meta->b_from_mls, !meta->gemm_trans_a,
-        meta->gemm_trans_b, meta->min_m_per_warp,
-        feeds_a ? meta->min_n_per_warp : std::max(meta->min_n_per_warp, 32),
+        meta->gemm_trans_b, meta->min_m_per_warp, meta->min_n_per_warp,
         meta->gemm_mmac_k);
     int warp_mn = feeds_a ? policy->m_warp : policy->n_warp;
     int warp_k = policy->k_warp;
@@ -500,6 +499,26 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     ICHECK(!feeds_a)
         << "GEMM AN linear ds_read requires a compiler-derived or explicit "
            "LDS layout";
+    // Unmapped pointer arithmetic in the external template is legal only
+    // for a final row-major layout. Selection precedes LayoutInference.
+    if (T.layout_map.count(src)) {
+      Layout source_layout = T.layout_map.at(src);
+      Layout linear_layout = MakeLinearLayout(src->shape);
+      arith::Analyzer layout_analyzer;
+      Array<PrimExpr> input_vars = source_layout->GetForwardVars();
+      ICHECK_EQ(input_vars.size(), src->shape.size());
+      for (size_t axis = 0; axis < input_vars.size(); ++axis) {
+        layout_analyzer.Bind(Downcast<Var>(input_vars[axis]),
+                             Range(make_zero(input_vars[axis].dtype()),
+                                   source_layout->InputShape()[axis]));
+      }
+      ICHECK(layout_analyzer.CanProveEqual(
+          source_layout->GetLinearizedForwardIndex(),
+          linear_layout->GetLinearizedForwardIndex()))
+          << "Unmapped linear ds_read of buffer " << src->name
+          << " requires a final row-major source layout; use a compatible "
+             "N8 layout and layout-aware ds_read_vector for swizzled LDS";
+    }
     std::string dtype_str = DsReadFormatDTypeString(src->dtype);
     int total_warp = block_size / TargetHcuGetWarpSize(T.target);
     std::stringstream ss;

@@ -1252,8 +1252,11 @@ private:
 
           for (; stmt_it != gen_kill_seq.end(); ++stmt_it) {
             auto next_it = stmt_it + 1;
+            // Stop both on returning to the generation level and on leaving
+            // it. Otherwise a trailing nested use can extend the lifetime
+            // past its containing loop into unrelated outer-scope work.
             if (next_it == gen_kill_seq.end() ||
-                stmt_attrs.at(next_it->stmt).level == gen_level) {
+                stmt_attrs.at(next_it->stmt).level <= gen_level) {
               last_stmt_at_level = stmt_it->stmt;
               break;
             }

@@ -216,6 +216,12 @@ def sparse_mla_fwd(
     kv_serial_count = BI // warps_line_stride
     kpack = min((kv_vectorized + 3) // 4, 2)
 
+    # sparse_mla and sparse_mla_split comparison: keep inputs, dtype and num_split identical.
+    # The validated split comparison uses num_split=2.
+    use_mixed_lds = True  # B_mixed: compiler-selected KV layout, AnBt kPack=1.
+    # use_mixed_lds = False  # C_default: inferred layout, original kPack.
+    gemm2_kpack = 1 if use_mixed_lds else kpack
+
     mmac_k = 16 * kpack
     warps = threads // 64
     max_warp_k = D_spilt // mmac_k
@@ -392,10 +398,10 @@ def sparse_mla_fwd(
                 T.copy(KV_spilt0_shared, gemm2_kv_split0_local)
                 T.copy(acc_s, S_shared)
                 T.copy(KV_spilt3_local, KV_spilt0_shared)
-                T.gemm(S_shared, gemm2_kv_split0_local, acc_o0, k_pack=kpack, policy=gemm2_policy)
-                T.gemm(S_shared, KV_spilt1_shared, acc_o1, k_pack=kpack, policy=gemm2_policy)
-                T.gemm(S_shared, KV_spilt2_shared, acc_o2, k_pack=kpack, policy=gemm2_policy)
-                T.gemm(S_shared, KV_spilt0_shared, acc_o3, k_pack=kpack, policy=gemm2_policy)
+                T.gemm(S_shared, gemm2_kv_split0_local, acc_o0, k_pack=gemm2_kpack, policy=gemm2_policy)
+                T.gemm(S_shared, KV_spilt1_shared, acc_o1, k_pack=gemm2_kpack, policy=gemm2_policy)
+                T.gemm(S_shared, KV_spilt2_shared, acc_o2, k_pack=gemm2_kpack, policy=gemm2_policy)
+                T.gemm(S_shared, KV_spilt0_shared, acc_o3, k_pack=gemm2_kpack, policy=gemm2_policy)
             # Rescale
             for h_i, d_i in T.Parallel(H_per_block, D_spilt):
                 acc_o0[h_i, d_i] /= sumexp[h_i]
@@ -604,10 +610,10 @@ def sparse_mla_fwd(
                     T.copy(KV_spilt0_shared, gemm2_kv_split0_local)
                     T.copy(acc_s, S_shared)
                     T.copy(KV_spilt3_local, KV_spilt0_shared)
-                    T.gemm(S_shared, gemm2_kv_split0_local, acc_o0, k_pack=kpack, policy=gemm2_policy)
-                    T.gemm(S_shared, KV_spilt1_shared, acc_o1, k_pack=kpack, policy=gemm2_policy)
-                    T.gemm(S_shared, KV_spilt2_shared, acc_o2, k_pack=kpack, policy=gemm2_policy)
-                    T.gemm(S_shared, KV_spilt0_shared, acc_o3, k_pack=kpack, policy=gemm2_policy)
+                    T.gemm(S_shared, gemm2_kv_split0_local, acc_o0, k_pack=gemm2_kpack, policy=gemm2_policy)
+                    T.gemm(S_shared, KV_spilt1_shared, acc_o1, k_pack=gemm2_kpack, policy=gemm2_policy)
+                    T.gemm(S_shared, KV_spilt2_shared, acc_o2, k_pack=gemm2_kpack, policy=gemm2_policy)
+                    T.gemm(S_shared, KV_spilt0_shared, acc_o3, k_pack=gemm2_kpack, policy=gemm2_policy)
 
                 # Rescale
                 for h_i, d_i in T.Parallel(H_per_block, D_spilt):
