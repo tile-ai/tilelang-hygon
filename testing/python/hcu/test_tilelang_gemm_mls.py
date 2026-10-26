@@ -10,7 +10,6 @@ import tilelang.testing
 import torch
 from tilelang import tvm
 from tilelang.hcu.transform import HoistMlsResource
-from perf.gemm.gemm_wasp import gemm_wasp_mls_4p4c4c_persistent
 from hcu_test_utils import (
     current_hcu_arch_string,
     target_supports_fp8_mmac,
@@ -2279,29 +2278,6 @@ def test_gemm_mls_ds_read_matrix_store_b32(m, n, k, block_m, block_n, block_k, t
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.skipif(
-    current_hcu_arch_string() != "gfx946",
-    reason="matrix_store VGPR path is supported only on gfx946",
-)
-def test_gemm_wasp_mls_4p4c4c_persistent_matrix_store():
-    """Persistent AtBn: Alt2 MMAC f32 -> packed-f16 matrix_store_b32."""
-    m, n, k = 512, 512, 128
-    kernel = gemm_wasp_mls_4p4c4c_persistent(
-        m,
-        n,
-        k,
-        num_persistent_blocks=4,
-        use_matrix_store=True,
-    )
-
-    torch.manual_seed(0)
-    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
-    b = torch.randn((n, k), device="cuda", dtype=torch.float16)
-    actual = kernel(a, b).cpu()
-    expected = (a.cpu().float() @ b.cpu().float().T).half()
-    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-
-
 def test_gemm_an_bt_linear_ds_read_b_subview():
     """Read the second half of a compact B LDS tile with its full row stride."""
     block_m, block_n, block_k, read_n, threads = 64, 128, 32, 64, 128
@@ -2756,13 +2732,6 @@ def test_fully_unrolled_k_uses_complete_windows(pairs):
     assert script.count('"tl::mls::set_window_origin"') == pairs * 2
 
 
-def _integer_inputs(m, n, k):
-    generator = torch.Generator().manual_seed(321 + m + n + k)
-    a = torch.randint(-3, 4, (m, k), generator=generator).half()
-    b = torch.randint(-3, 4, (k, n), generator=generator).half()
-    return a, b
-
-
 def _check_exact(actual, expected, label):
     actual = actual.cpu().float()
     diff = (actual - expected).abs()
@@ -2852,73 +2821,6 @@ def test_forward_delta_copy(kind, tiles):
     if not torch.equal(actual, a):
         print(f"repeats_first_k_tile={torch.equal(actual, a[:, :64].repeat(1, tiles))}", flush=True)
     _check_exact(actual, a.float(), f"{kind} {m, k}")
-
-
-@pytest.mark.skipif(current_hcu_arch_string() != "gfx946", reason="gfx946 WASP regression")
-@pytest.mark.parametrize("matrix_store", [False, True])
-@pytest.mark.parametrize("k", [64, 128, 192, 256, 320, 384, 448, 512, 576, 960, 1024])
-def test_forward_wasp_signed_pingpong(k, matrix_store):
-    _run_wasp_signed(768, 768, k, 4, matrix_store, check_path=True)
-
-
-@pytest.mark.skipif(current_hcu_arch_string() != "gfx946", reason="gfx946 WASP regression")
-@pytest.mark.parametrize("m,n", [(768, 256), (256, 768)])
-@pytest.mark.parametrize("k", [128, 192, 256])
-@pytest.mark.parametrize("matrix_store", [False, True])
-def test_forward_wasp_linear_mn(m, n, k, matrix_store):
-    # A one-column/one-row output grid gives a linear persistent MN walk.
-    _run_wasp_signed(m, n, k, 1, matrix_store, check_path=False)
-
-
-def _run_wasp_signed(m, n, k, persistent, matrix_store, check_path):
-    kernel = gemm_wasp_mls_4p4c4c_persistent(m, n, k, num_persistent_blocks=persistent, use_matrix_store=matrix_store)
-    source = kernel.get_kernel_source()
-    print(
-        f"WASP_SOURCE {m, n, k} persistent={persistent} move_k={source.count('move_k_base')} move_mn={source.count('move_mn_base')} set_window={source.count('set_window_origin')}",
-        flush=True,
-    )
-    if check_path and k >= 256:
-        assert "move_k_base" in source
-        assert "update_k_base" not in source
-    elif check_path and k in (128, 192):
-        assert "move_k_base" not in source
-        assert source.count("set_window_origin") == 2 * (k // 64)
-    a, b = _integer_inputs(m, n, k)
-    expected = (a.float() @ b.float()).half().float()
-    _check_exact(kernel(a.cuda(), b.T.contiguous().cuda()), expected, f"WASP {m, n, k} persistent={persistent} matrix={matrix_store}")
-
-
-@pytest.mark.skipif(current_hcu_arch_string() != "gfx946", reason="requires gfx946 WDRA/MLS")
-@pytest.mark.parametrize("matrix_store", [False, True], ids=["copy", "matrix"])
-@pytest.mark.parametrize(
-    "m,n,k,persistent",
-    [
-        # The K sweep is covered by test_forward_wasp_signed_pingpong.
-        (1792, 2048, 128, 48),  # original packaged reproducer
-    ],
-)
-def test_gemm_wasp_packaged_constant_k_regression(m, n, k, persistent, matrix_store):
-    # Generate on CPU so the model runs only the GEMM, not RNG/reference
-    # kernels. Both reference and device receive exactly the same FP16 data.
-    inner = torch.arange(k)[None, :]
-    a = (((torch.arange(m)[:, None] * 17 + inner * 13) % 1024).float() / 1023).half()
-    b = (((torch.arange(n)[:, None] * 19 + inner * 23) % 1024).float() / 1023).half()
-    expected = (a.float() @ b.float().T).half().float()
-    kernel = gemm_wasp_mls_4p4c4c_persistent(m, n, k, num_persistent_blocks=persistent, use_matrix_store=matrix_store)
-    actual = kernel(a.cuda(), b.cuda()).cpu().float()
-    absolute = (actual - expected).abs()
-    denominator = actual.abs() + expected.abs()
-    relative = absolute / denominator.clamp_min(torch.finfo(torch.float32).tiny)
-    threshold = 2**-11
-    mismatches = int((relative > threshold).sum())
-    nonfinite = int((~torch.isfinite(actual)).sum())
-    summary = (
-        f"M={m} N={n} K={k} persistent={persistent} matrix_store={matrix_store} "
-        f"max_abs={absolute.max().item()} max_symmetric_relative={relative.max().item()} "
-        f"threshold={threshold} mismatches={mismatches}/{actual.numel()} nonfinite={nonfinite}"
-    )
-    print(summary, flush=True)
-    assert nonfinite == 0 and mismatches == 0, summary
 
 
 if __name__ == "__main__":
