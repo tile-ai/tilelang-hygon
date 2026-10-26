@@ -45,6 +45,12 @@ constexpr const char *kAssumeRequiresRuntimeCheck =
 // Compiler-internal physical buffer version count.
 constexpr const char *kBufferVersion = "tl.buffer_version";
 
+// Marks a loop whose cross-thread synchronization a backend lowering owns.
+// The owner pairs every wait it emits with a block-wide barrier, so ThreadSync
+// leaves the accesses inside that scope to it; edges that cross the scope's
+// boundary keep the conservative handling.
+constexpr const char *kSyncOwnedScope = "tl.sync_owned_scope";
+
 // Attributes to implement SourceCodeBlock
 constexpr const char *kCodeBlockSource = "code_block_source";
 constexpr const char *kCodeBlockEntryName = "code_block_entry_name";

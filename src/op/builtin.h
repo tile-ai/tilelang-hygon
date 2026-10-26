@@ -10,6 +10,7 @@
 
 #include <tvm/ir/cast.h>
 #include <tvm/runtime/logging.h>
+#include <tvm/tirx/op.h>
 
 namespace tvm {
 namespace tl {
@@ -279,6 +280,19 @@ TVM_DLL const Op &ptx_cp_async();
  * int32 pack_b16(b16_value, b16_value)
  *
  */
+/*!
+ * \brief Register a backend-owned async wait intrinsic.
+ *
+ * A backend that lowers async copies to its own wait intrinsic registers the
+ * op here, so backend-agnostic passes (e.g. the commit/wait invariant check in
+ * InjectSoftwarePipeline) can recognize a wait without naming a vendor op.
+ * Registration runs from the backend's own translation unit at static init.
+ */
+void RegisterAsyncWaitOp(const Op &op);
+
+/*! \brief Whether the call is one registered via RegisterAsyncWaitOp. */
+bool IsRegisteredAsyncWaitOp(const tirx::CallNode *call);
+
 TVM_DLL const Op &pack_b16();
 
 /*!

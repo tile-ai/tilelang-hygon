@@ -41,7 +41,17 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.IfStmtBinding()(mod)
     mod = tilelang.transform.PipelinePlanning()(mod)
+    # Two-phase HCU GEMM LDS strategy: AnnotateMlsGemmDep only parks pending
+    # layouts on plain T.copy. This pass must run after PipelinePlanning so
+    # async-producer selection is known, then rewrite AN/BT S2R copies to
+    # ds_read_m32x16.
     mod = tilelang.hcu.transform.MaterializeHcuGemmLdsStrategy()(mod)
+    mod = tilelang.hcu.transform.RegisterPipelinePlanning()(mod)
+    mod = tilelang.hcu.transform.InjectRegisterSoftwarePipeline()(mod)
+    # Give every rotated register slot its own rank-2 buffer while the slots
+    # are still statically known, so the shared lowering never sees a versioned
+    # fragment.
+    mod = tilelang.hcu.transform.MaterializeRegisterPipelineStages()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.hcu.transform.PlanScaleBufferLayout()(mod)
@@ -98,6 +108,7 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge, disable_reuse=disable_reuse)(mod)
 
     mod = tilelang.hcu.transform.HoistMlsResource()(mod)
+    mod = tilelang.hcu.transform.MarkFencePlannerOwnership()(mod)
     mod = tilelang.transform.ThreadSync("shared")(mod)
     mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
     mod = tilelang.hcu.transform.ResolveHcuEBarrier()(mod)
@@ -106,6 +117,12 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.MakePackedAPI()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
+    mod = tilelang.hcu.transform.InjectAsyncGlobalLoadFence()(mod)
+    mod = tilelang.hcu.transform.LowerAsyncCommitWait()(mod)
+    mod = tilelang.hcu.transform.InjectAsyncMmaFence()(mod)
+    mod = tilelang.hcu.transform.InjectWarpDivergence()(mod)
+    mod = tilelang.hcu.transform.InjectRegisterPipelineSchedBarrier()(mod)
+    mod = tilelang.hcu.transform.VerifyPipelineSync()(mod)
     return mod
 
 

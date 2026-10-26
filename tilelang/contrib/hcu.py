@@ -276,6 +276,13 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
             flags.append("-mllvm=-hcu-update-wait-by-reverse-search=true")
             flags.append("-mllvm=-hcu-pre-emit-load-store-opt=false")
             # flags.append("-mllvm=-hcu-trust-special-waitcnt-for-lds-dma=true")
+        # aicc defaults to code-object ABI 6. Pin COV 5 when this DTK has no ABI-6 bitcode.
+        # hipcc keeps the ROCm device library and is not given this fallback.
+        if get_hcu_compiler() == "aicc":
+            bitcode_dir = os.path.join(os.environ.get("ROCM_PATH", "/opt/dtk"), "dcc", "dccgcn", "bitcode")
+            if os.path.isdir(bitcode_dir) and not os.path.isfile(os.path.join(bitcode_dir, "oclc_abi_version_600.bc")):
+                flags.append(f"--rocm-device-lib-path={bitcode_dir}")
+                flags.append("-mcode-object-version=5")
         return flags
     else:
         raise ValueError(f"Unsupported architecture: {arch}")
