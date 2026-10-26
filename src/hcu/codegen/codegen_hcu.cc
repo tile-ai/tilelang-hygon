@@ -1657,15 +1657,20 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         const std::string base_template =
             sym.substr(resource_init_prefix.size(),
                        sym.size() - resource_init_prefix.size() - 1);
+        // PrintExpr may emit statements (for example, a Let declaration).
+        // Materialize every argument before writing any part of the call.
+        const std::string src = PrintExpr(call->args[2]);
+        const std::string stride = PrintExpr(call->args[3]);
+        const std::string mn_len = PrintExpr(call->args[4]);
+        const std::string k_len = PrintExpr(call->args[5]);
         const std::string warp_id_offset =
             call->args.size() == 7U ? PrintExpr(call->args[6]) : "0";
         PrintIndent();
         stream << "using " << obj_name << "_t = " << base_template << ";\n";
         PrintIndent();
-        stream << obj_name << "_t " << obj_name << "("
-               << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3])
-               << ", " << PrintExpr(call->args[4]) << ", "
-               << PrintExpr(call->args[5]) << ", " << warp_id_offset << ");\n";
+        stream << obj_name << "_t " << obj_name << "(" << src << ", " << stride
+               << ", " << mn_len << ", " << k_len << ", " << warp_id_offset
+               << ");\n";
         return;
       }
 
@@ -1675,11 +1680,12 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         enable_gemm_mls_ = true;
         const auto *name = call->args[1].as<StringImmNode>();
         ICHECK(name) << "MLS set_window_origin expects a string resource name";
+        const std::string mn_base = PrintExpr(call->args[2]);
+        const std::string k_base = PrintExpr(call->args[3]);
         PrintIndent();
         stream << name->value
-               << ".set_window_origin(tl::make_array<tl::index_t>("
-               << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3])
-               << "));\n";
+               << ".set_window_origin(tl::make_array<tl::index_t>(" << mn_base
+               << ", " << k_base << "));\n";
         return;
       }
 
@@ -1689,12 +1695,13 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         enable_gemm_mls_ = true;
         const auto *name = call->args[1].as<StringImmNode>();
         ICHECK(name) << "MLS update_k_base expects a string resource name";
+        const std::string k_base = PrintExpr(call->args[2]);
         PrintIndent();
         const std::string refresh_k =
             sym.substr(update_k_base_prefix.size(),
                        sym.size() - update_k_base_prefix.size() - 1);
         stream << name->value << ".template update_k_base<" << refresh_k << ">("
-               << PrintExpr(call->args[2]) << ");\n";
+               << k_base << ");\n";
         return;
       }
 
@@ -1707,10 +1714,11 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         const std::string filter_args =
             sym.substr(move_k_base_prefix.size(),
                        sym.size() - move_k_base_prefix.size() - 1);
+        const std::string k_delta = PrintExpr(call->args[2]);
+        const std::string next_k_base = PrintExpr(call->args[3]);
         PrintIndent();
         stream << name->value << ".template move_k_base<" << filter_args << ">("
-               << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3])
-               << ");\n";
+               << k_delta << ", " << next_k_base << ");\n";
         return;
       }
 
@@ -1723,10 +1731,11 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         const std::string filter_args =
             sym.substr(move_mn_base_prefix.size(),
                        sym.size() - move_mn_base_prefix.size() - 1);
+        const std::string mn_delta = PrintExpr(call->args[2]);
+        const std::string next_mn_base = PrintExpr(call->args[3]);
         PrintIndent();
         stream << name->value << ".template move_mn_base<" << filter_args
-               << ">(" << PrintExpr(call->args[2]) << ", "
-               << PrintExpr(call->args[3]) << ");\n";
+               << ">(" << mn_delta << ", " << next_mn_base << ");\n";
         return;
       }
 
@@ -1736,12 +1745,13 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         enable_gemm_mls_ = true;
         const auto *name = call->args[1].as<StringImmNode>();
         ICHECK(name) << "MLS update_mn_base expects a string resource name";
+        const std::string mn_base = PrintExpr(call->args[2]);
         PrintIndent();
         const std::string refresh_mn =
             sym.substr(update_mn_base_prefix.size(),
                        sym.size() - update_mn_base_prefix.size() - 1);
         stream << name->value << ".template update_mn_base<" << refresh_mn
-               << ">(" << PrintExpr(call->args[2]) << ");\n";
+               << ">(" << mn_base << ");\n";
         return;
       }
 
@@ -1754,12 +1764,16 @@ void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
         const std::string template_args =
             sym.substr(async_load_prefix.size(),
                        sym.size() - async_load_prefix.size() - 1);
+        const std::string dst = PrintExpr(call->args[2]);
+        const std::string k_base = PrintExpr(call->args[3]);
+        const std::string mn_base =
+            call->args.size() == 5U ? PrintExpr(call->args[4]) : "";
         PrintIndent();
         stream << name->value << ".template async_mls_load_asm<"
-               << MlsAsyncLoadTemplateArgs(template_args) << ">("
-               << PrintExpr(call->args[2]) << ", " << PrintExpr(call->args[3]);
+               << MlsAsyncLoadTemplateArgs(template_args) << ">(" << dst << ", "
+               << k_base;
         if (call->args.size() == 5U)
-          stream << ", " << PrintExpr(call->args[4]);
+          stream << ", " << mn_base;
         stream << ");\n";
         return;
       }

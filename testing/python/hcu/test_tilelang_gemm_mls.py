@@ -10,7 +10,6 @@ import tilelang.testing
 import torch
 from tilelang import tvm
 from tilelang.hcu.transform import HoistMlsResource
-from perf.gemm.gemm_wasp import gemm_wasp_mls_4p4c4c_persistent
 from hcu_test_utils import (
     current_hcu_arch_string,
     target_supports_fp8_mmac,
@@ -2279,29 +2278,6 @@ def test_gemm_mls_ds_read_matrix_store_b32(m, n, k, block_m, block_n, block_k, t
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.skipif(
-    current_hcu_arch_string() != "gfx946",
-    reason="matrix_store VGPR path is supported only on gfx946",
-)
-def test_gemm_wasp_mls_4p4c4c_persistent_matrix_store():
-    """Persistent AtBn: Alt2 MMAC f32 -> packed-f16 matrix_store_b32."""
-    m, n, k = 512, 512, 128
-    kernel = gemm_wasp_mls_4p4c4c_persistent(
-        m,
-        n,
-        k,
-        num_persistent_blocks=4,
-        use_matrix_store=True,
-    )
-
-    torch.manual_seed(0)
-    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
-    b = torch.randn((n, k), device="cuda", dtype=torch.float16)
-    actual = kernel(a, b).cpu()
-    expected = (a.cpu().float() @ b.cpu().float().T).half()
-    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-
-
 def test_gemm_an_bt_linear_ds_read_b_subview():
     """Read the second half of a compact B LDS tile with its full row stride."""
     block_m, block_n, block_k, read_n, threads = 64, 128, 32, 64, 128
@@ -2414,14 +2390,14 @@ def test_gemm_mls_ds_read_matrix_store_b32_boundary(
 @pytest.mark.parametrize(
     "dtype,torch_dtype,block_m,block_n,k,threads,num_n_tiles",
     [
-        pytest.param("float16", torch.float16, 16, 32, 32, 64, 1, id="f16_single_atom"),
-        pytest.param("bfloat16", torch.bfloat16, 16, 32, 32, 64, 1, id="bf16_single_atom"),
-        pytest.param("float16", torch.float16, 16, 32, 64, 64, 1, id="f16_two_k_tiles"),
+        pytest.param("float16", torch.float16, 32, 32, 32, 64, 1, id="f16_single_atom"),
+        pytest.param("bfloat16", torch.bfloat16, 32, 32, 32, 64, 1, id="bf16_single_atom"),
+        pytest.param("float16", torch.float16, 32, 32, 64, 64, 1, id="f16_two_k_tiles"),
         pytest.param("float16", torch.float16, 64, 64, 64, 256, 1, id="f16_multi_warp"),
         pytest.param("float16", torch.float16, 64, 64, 64, 256, 2, id="f16_two_output_tiles"),
     ],
 )
-def test_gemm_mls_ds_read_alt2_packed_b16_matrix_store_b32(
+def test_gemm_mls_ds_read_alt2_matrix_store_b16(
     dtype,
     torch_dtype,
     block_m,
@@ -2430,7 +2406,7 @@ def test_gemm_mls_ds_read_alt2_packed_b16_matrix_store_b32(
     threads,
     num_n_tiles,
 ):
-    """MLS b16 -> ds_read Alt2 -> MMAC f32 -> packed b16 -> matrix_store b32."""
+    """MLS b16 -> ds_read Alt2 -> MMAC f32 -> FP16/BF16 -> B16 store."""
     block_k = 32
     n = block_n * num_n_tiles
 
@@ -2441,7 +2417,6 @@ def test_gemm_mls_ds_read_alt2_packed_b16_matrix_store_b32(
         C: T.Tensor((block_m, n), dtype),
     ):
         with T.Kernel(1, threads=threads):
-            C_packed = T.view(C, (block_m, n // 2), dtype="uint32")
             A_shared = T.alloc_shared((block_m, block_k), dtype)
             B_shared = T.alloc_shared((block_n, block_k), dtype)
             A_fragment = T.alloc_fragment((block_m, block_k), dtype)
@@ -2465,7 +2440,7 @@ def test_gemm_mls_ds_read_alt2_packed_b16_matrix_store_b32(
                         annotations={"tl.hcu_mmac_lit": 0, "trans_c": 1},
                     )
                 T.copy(C_local, C_local_b16)
-                T.matrix_store(C_local_b16, C_packed[0, tile_n * block_n // 2])
+                T.matrix_store(C_local_b16, C[0, tile_n * block_n])
 
     rt_mod = tl.compile(kernel, target="auto")
     torch.manual_seed(0)
@@ -2485,14 +2460,14 @@ def test_gemm_mls_ds_read_alt2_packed_b16_matrix_store_b32(
 @pytest.mark.parametrize(
     "dtype,torch_dtype,block_m,block_n,k,threads,num_n_tiles",
     [
-        pytest.param("float16", torch.float16, 16, 32, 32, 64, 1, id="f16_single_atom"),
-        pytest.param("bfloat16", torch.bfloat16, 16, 32, 32, 64, 1, id="bf16_single_atom"),
-        pytest.param("float16", torch.float16, 16, 32, 64, 64, 1, id="f16_two_k_tiles"),
+        pytest.param("float16", torch.float16, 32, 32, 32, 64, 1, id="f16_single_atom"),
+        pytest.param("bfloat16", torch.bfloat16, 32, 32, 32, 64, 1, id="bf16_single_atom"),
+        pytest.param("float16", torch.float16, 32, 32, 64, 64, 1, id="f16_two_k_tiles"),
         pytest.param("float16", torch.float16, 64, 64, 64, 256, 1, id="f16_multi_warp"),
         pytest.param("float16", torch.float16, 64, 64, 64, 256, 2, id="f16_two_output_tiles"),
     ],
 )
-def test_gemm_mls_n_major_b_ds_read_alt2_packed_b16_matrix_store_b32(
+def test_gemm_mls_n_major_b_ds_read_alt2_matrix_store_b16(
     dtype,
     torch_dtype,
     block_m,
@@ -2512,7 +2487,6 @@ def test_gemm_mls_n_major_b_ds_read_alt2_packed_b16_matrix_store_b32(
         C: T.Tensor((block_m, n), dtype),
     ):
         with T.Kernel(1, threads=threads):
-            C_packed = T.view(C, (block_m, n // 2), dtype="uint32")
             A_shared = T.alloc_shared((block_m, block_k), dtype)
             B_shared = T.alloc_shared((block_k, block_n), dtype)
             A_fragment = T.alloc_fragment((block_m, block_k), dtype)
@@ -2536,7 +2510,7 @@ def test_gemm_mls_n_major_b_ds_read_alt2_packed_b16_matrix_store_b32(
                         annotations={"tl.hcu_mmac_lit": 0, "trans_c": 1},
                     )
                 T.copy(C_local, C_local_b16)
-                T.matrix_store(C_local_b16, C_packed[0, tile_n * block_n // 2])
+                T.matrix_store(C_local_b16, C[0, tile_n * block_n])
 
     rt_mod = tl.compile(kernel, target="auto")
     torch.manual_seed(0)
@@ -2547,6 +2521,72 @@ def test_gemm_mls_n_major_b_ds_read_alt2_packed_b16_matrix_store_b32(
     actual = output.cpu()
     expected = (a.float() @ b.float()).to(torch_dtype)
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "symbol,arg_count,let_positions,call_marker",
+    [
+        ("resource_init<TestResource>", 4, (1, 2, 3), "resource_t resource("),
+        ("resource_init<TestResource>", 5, (1, 2, 3, 4), "resource_t resource("),
+        ("set_window_origin", 2, (0, 1), ".set_window_origin("),
+        ("update_k_base<true>", 1, (0,), ".template update_k_base<"),
+        ("update_mn_base<true>", 1, (0,), ".template update_mn_base<"),
+        ("move_k_base<true, true>", 2, (0, 1), ".template move_k_base<"),
+        ("move_mn_base<true, true>", 2, (0, 1), ".template move_mn_base<"),
+        ("async_load<half_t, true, true>", 2, (1,), ".template async_mls_load_asm<"),
+        ("async_load<half_t, true, true>", 3, (1, 2), ".template async_mls_load_asm<"),
+    ],
+)
+def test_mls_codegen_let_arguments(symbol, arg_count, let_positions, call_marker):
+    """Let declarations must precede the MLS call, never split its arguments."""
+    tir = tvm.tirx
+    value = tir.Var("value", "int32")
+    args = [tir.IntImm("int32", 0) for _ in range(arg_count)]
+    for position in let_positions:
+        outer = tir.Var(f"outer_{position}", "int32")
+        inner = tir.Var(f"inner_{position}", "int32")
+        args[position] = tir.Let(outer, value + position, tir.Let(inner, outer + 1, inner * 64))
+    call = tir.call_extern("handle", f"tl::mls::{symbol}", "resource", *args)
+    func = tir.PrimFunc([value], tir.Evaluate(call)).with_attr({"global_symbol": "test_mls_let", "calling_conv": 2})
+    build = tvm.get_global_func("target.build.tilelang_hcu_without_compile")
+    source = build(tvm.IRModule({"main": func}), tvm.target.Target({"kind": "hcu", "mcpu": "gfx946"})).inspect_source()
+    call_start = source.index(call_marker)
+    call_end = source.index(";", call_start)
+    for position in let_positions:
+        for name in (f"outer_{position}", f"inner_{position}"):
+            declaration = re.search(rf"\bint\s+{name}\s*=", source)
+            assert declaration is not None, source
+            assert declaration.start() < call_start, source
+        assert f"inner_{position}" in source[call_start:call_end], source
+
+
+@pytest.mark.skipif(current_hcu_arch_string() != "gfx946", reason="gfx946 B16 store")
+@pytest.mark.parametrize("dtype,torch_dtype", [("float16", torch.float16), ("bfloat16", torch.bfloat16)])
+def test_matrix_store_b16_standalone_odd_filter(dtype, torch_dtype):
+    @T.prim_func
+    def kernel(C: T.Tensor((33, 35), dtype)):
+        with T.Kernel(2, 2, threads=64) as (bx, by):
+            local = T.alloc_fragment((32, 32), dtype)
+            for i, j in T.Parallel(32, 32):
+                local[i, j] = T.cast((by * 32 + i) % 7 + (bx * 32 + j) % 5, dtype)
+            T.matrix_store(local, C[by * 32, bx * 32])
+
+    module = tl.compile(kernel, out_idx=[0], execution_backend="cython")
+    expected = ((torch.arange(33)[:, None] % 7) + (torch.arange(35)[None, :] % 5)).to(torch_dtype)
+    torch.testing.assert_close(module().cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(current_hcu_arch_string() != "gfx946", reason="gfx946 store validation")
+def test_matrix_store_reject_packed_b16_to_b32():
+    @T.prim_func
+    def kernel(C: T.Tensor((32, 16), "uint32")):
+        with T.Kernel(1, threads=64):
+            local = T.alloc_fragment((32, 32), "float16")
+            T.clear(local)
+            T.matrix_store(local, C)
+
+    with pytest.raises(Exception, match="matrix_store requires matching src/dst dtype"):
+        tl.compile(kernel, execution_backend="cython")
 
 
 # MLS hoisting regressions: constant origins and WDRA forward-delta paths.
@@ -2692,13 +2732,6 @@ def test_fully_unrolled_k_uses_complete_windows(pairs):
     assert script.count('"tl::mls::set_window_origin"') == pairs * 2
 
 
-def _integer_inputs(m, n, k):
-    generator = torch.Generator().manual_seed(321 + m + n + k)
-    a = torch.randint(-3, 4, (m, k), generator=generator).half()
-    b = torch.randint(-3, 4, (k, n), generator=generator).half()
-    return a, b
-
-
 def _check_exact(actual, expected, label):
     actual = actual.cpu().float()
     diff = (actual - expected).abs()
@@ -2788,73 +2821,6 @@ def test_forward_delta_copy(kind, tiles):
     if not torch.equal(actual, a):
         print(f"repeats_first_k_tile={torch.equal(actual, a[:, :64].repeat(1, tiles))}", flush=True)
     _check_exact(actual, a.float(), f"{kind} {m, k}")
-
-
-@pytest.mark.skipif(current_hcu_arch_string() != "gfx946", reason="gfx946 WASP regression")
-@pytest.mark.parametrize("matrix_store", [False, True])
-@pytest.mark.parametrize("k", [64, 128, 192, 256, 320, 384, 448, 512, 576, 960, 1024])
-def test_forward_wasp_signed_pingpong(k, matrix_store):
-    _run_wasp_signed(768, 768, k, 4, matrix_store, check_path=True)
-
-
-@pytest.mark.skipif(current_hcu_arch_string() != "gfx946", reason="gfx946 WASP regression")
-@pytest.mark.parametrize("m,n", [(768, 256), (256, 768)])
-@pytest.mark.parametrize("k", [128, 192, 256])
-@pytest.mark.parametrize("matrix_store", [False, True])
-def test_forward_wasp_linear_mn(m, n, k, matrix_store):
-    # A one-column/one-row output grid gives a linear persistent MN walk.
-    _run_wasp_signed(m, n, k, 1, matrix_store, check_path=False)
-
-
-def _run_wasp_signed(m, n, k, persistent, matrix_store, check_path):
-    kernel = gemm_wasp_mls_4p4c4c_persistent(m, n, k, num_persistent_blocks=persistent, use_matrix_store=matrix_store)
-    source = kernel.get_kernel_source()
-    print(
-        f"WASP_SOURCE {m, n, k} persistent={persistent} move_k={source.count('move_k_base')} move_mn={source.count('move_mn_base')} set_window={source.count('set_window_origin')}",
-        flush=True,
-    )
-    if check_path and k >= 256:
-        assert "move_k_base" in source
-        assert "update_k_base" not in source
-    elif check_path and k in (128, 192):
-        assert "move_k_base" not in source
-        assert source.count("set_window_origin") == 2 * (k // 64)
-    a, b = _integer_inputs(m, n, k)
-    expected = (a.float() @ b.float()).half().float()
-    _check_exact(kernel(a.cuda(), b.T.contiguous().cuda()), expected, f"WASP {m, n, k} persistent={persistent} matrix={matrix_store}")
-
-
-@pytest.mark.skipif(current_hcu_arch_string() != "gfx946", reason="requires gfx946 WDRA/MLS")
-@pytest.mark.parametrize("matrix_store", [False, True], ids=["copy", "matrix"])
-@pytest.mark.parametrize(
-    "m,n,k,persistent",
-    [
-        # The K sweep is covered by test_forward_wasp_signed_pingpong.
-        (1792, 2048, 128, 48),  # original packaged reproducer
-    ],
-)
-def test_gemm_wasp_packaged_constant_k_regression(m, n, k, persistent, matrix_store):
-    # Generate on CPU so the model runs only the GEMM, not RNG/reference
-    # kernels. Both reference and device receive exactly the same FP16 data.
-    inner = torch.arange(k)[None, :]
-    a = (((torch.arange(m)[:, None] * 17 + inner * 13) % 1024).float() / 1023).half()
-    b = (((torch.arange(n)[:, None] * 19 + inner * 23) % 1024).float() / 1023).half()
-    expected = (a.float() @ b.float().T).half().float()
-    kernel = gemm_wasp_mls_4p4c4c_persistent(m, n, k, num_persistent_blocks=persistent, use_matrix_store=matrix_store)
-    actual = kernel(a.cuda(), b.cuda()).cpu().float()
-    absolute = (actual - expected).abs()
-    denominator = actual.abs() + expected.abs()
-    relative = absolute / denominator.clamp_min(torch.finfo(torch.float32).tiny)
-    threshold = 2**-11
-    mismatches = int((relative > threshold).sum())
-    nonfinite = int((~torch.isfinite(actual)).sum())
-    summary = (
-        f"M={m} N={n} K={k} persistent={persistent} matrix_store={matrix_store} "
-        f"max_abs={absolute.max().item()} max_symmetric_relative={relative.max().item()} "
-        f"threshold={threshold} mismatches={mismatches}/{actual.numel()} nonfinite={nonfinite}"
-    )
-    print(summary, flush=True)
-    assert nonfinite == 0 and mismatches == 0, summary
 
 
 if __name__ == "__main__":
