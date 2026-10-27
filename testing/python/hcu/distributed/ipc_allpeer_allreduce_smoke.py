@@ -103,6 +103,8 @@ def main() -> None:
             expected = float(world_size * (world_size + 1) // 2 + iteration * world_size)
             if not torch.all(out == expected):
                 raise RuntimeError(f"rank {rank}: iteration {iteration} result {out.cpu().tolist()} != {expected}")
+            # All peers finish consuming before any rank refills src.
+            dist.barrier()
         print(
             f"ipc-allpeer-allreduce rank={rank} world_size={world_size} tiles={NUM_TILES} iterations={ITERATIONS} value={out[0].item()}",
             flush=True,
@@ -112,6 +114,8 @@ def main() -> None:
         src_bf16 = tilelang.tensor((N,), torch.bfloat16, allocator=allocator)
         src_bf16.fill_(float(rank + 1))
         torch.cuda.synchronize(local_rank)
+        # Compilation/metadata initialization are not producer rendezvous.
+        dist.barrier()
         bf16_allreduce = tilelang.compile(
             allreduce_bf16_kernel(),
             out_idx=[0],

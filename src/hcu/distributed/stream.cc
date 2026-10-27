@@ -1,5 +1,5 @@
 /*!
- * \file hcu/distributed/ipc/ipc_stream.cc
+ * \file hcu/distributed/stream.cc
  * \brief TVM ROCm stream bridge for HCU IPC launches.
  */
 #include <tvm/ffi/extra/c_env_api.h>
@@ -12,7 +12,7 @@
 namespace tvm {
 namespace tl {
 namespace hcu {
-namespace ipc {
+namespace stream_bridge {
 
 int64_t GetTvmStream(int device_id) {
   return static_cast<int64_t>(
@@ -26,7 +26,7 @@ void SetTvmStream(int device_id, int64_t stream) {
       nullptr);
 }
 
-} // namespace ipc
+} // namespace stream_bridge
 } // namespace hcu
 } // namespace tl
 } // namespace tvm
@@ -34,6 +34,6 @@ void SetTvmStream(int device_id, int64_t stream) {
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
-      .def("tl.hcu.ipc.get_tvm_stream", tvm::tl::hcu::ipc::GetTvmStream)
-      .def("tl.hcu.ipc.set_tvm_stream", tvm::tl::hcu::ipc::SetTvmStream);
+      .def("tl.hcu.distributed.get_tvm_stream", tvm::tl::hcu::stream_bridge::GetTvmStream)
+      .def("tl.hcu.distributed.set_tvm_stream", tvm::tl::hcu::stream_bridge::SetTvmStream);
 }

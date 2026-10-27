@@ -472,22 +472,6 @@ PrimExpr GetBufferLoadLinearizedOffset(const BufferLoadNode *load) {
   return offset;
 }
 
-// Normal TileLang programs express a buffer slice as
-// address_of(BufferLoad), while low-level callers may pass a parameter pointer
-// directly. Both forms refer to the same kernel parameter for IPC validation.
-const VarNode *GetIpcRemoteSourceParameter(const PrimExpr &expr) {
-  if (const auto *var = expr.as<VarNode>()) {
-    return var;
-  }
-  const auto *call = expr.as<CallNode>();
-  if (!call || !call->op.same_as(builtin::address_of()) ||
-      call->args.size() != 1) {
-    return nullptr;
-  }
-  const auto *load = call->args[0].as<BufferLoadNode>();
-  return load ? load->buffer->data.get() : nullptr;
-}
-
 struct CPAsyncSourceInfo {
   const VarNode *buffer_var{nullptr};
   DataType elem_type;
@@ -717,6 +701,11 @@ private:
 
 CodeGenTileLangHCU::CodeGenTileLangHCU() { restrict_keyword_ = "__restrict__"; }
 
+void CodeGenTileLangHCU::Init(bool output_ssa) {
+  CodeGenC::Init(output_ssa);
+  uses_distributed_metadata_ = false;
+}
+
 void CodeGenTileLangHCU::PrintFuncPrefix(std::ostream &os) {
   os << "extern \"C\" __global__ ";
 }
@@ -824,17 +813,61 @@ void CodeGenTileLangHCU::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
   }
 }
 
+bool CodeGenTileLangHCU::TryEmitDistributedCall(const Call &call,
+                                             std::ostream &os) {
+  enum class DistributedCallKind { kRank, kNumRanks, kBlockGet };
+  const auto *op = call.get();
+  DistributedCallKind kind;
+  if (op->op.same_as(tl::get_rank())) {
+    kind = DistributedCallKind::kRank;
+  } else if (op->op.same_as(tl::get_num_ranks())) {
+    kind = DistributedCallKind::kNumRanks;
+  } else if (op->op.same_as(tl::get_block())) {
+    kind = DistributedCallKind::kBlockGet;
+  } else {
+    return false;
+  }
+
+  const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
+  const auto capability = kind == DistributedCallKind::kBlockGet
+      ? tl::hcu::DistributedCapability::kBlockRemoteGet
+      : tl::hcu::DistributedCapability::kRankAndWorldSize;
+  tl::hcu::RequireDistributedCapability(backend, capability);
+  switch (kind) {
+  case DistributedCallKind::kRank:
+    os << backend.EmitRankExpr();
+    break;
+  case DistributedCallKind::kNumRanks:
+    os << backend.EmitNumRanksExpr();
+    break;
+  case DistributedCallKind::kBlockGet: {
+    ICHECK_EQ(op->args.size(), 4U);
+    const std::string src = PrintExpr(op->args[0]);
+    const std::string dst = PrintExpr(op->args[1]);
+    const std::string size = PrintExpr(op->args[2]);
+    const std::string src_pe = PrintExpr(op->args[3]);
+    os << backend.EmitBlockGetExpr(src, dst, size, src_pe);
+    break;
+  }
+  }
+  uses_distributed_metadata_ = true;
+  return true;
+}
+
+void CodeGenTileLangHCU::EmitDistributedDeclarations(std::ostream &os) {
+  if (!uses_distributed_metadata_) {
+    return;
+  }
+  os << "// tilelang_distributed_metadata: 1\n";
+  const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
+  os << backend.DeviceIncludes();
+  os << backend.ModulePreamble();
+}
+
 std::string CodeGenTileLangHCU::Finish() {
   decl_stream << "#include <hip/hip_runtime.h>\n";
 
-  if (uses_distributed_metadata_) {
-    const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
-    decl_stream << "#include <tl_templates/hcu/distributed/distributed.h>\n";
-    decl_stream << backend.ModulePreamble();
-    for (const auto &name : ipc_remote_source_param_names_) {
-      decl_stream << "// tilelang_ipc_remote_source: " << name << "\n";
-    }
-  }
+  EmitDistributedDeclarations(decl_stream);
 
   if (enable_fp8_) {
     decl_stream << "#include <tl_templates/hcu/hcu_fp8.h>\n";
@@ -3578,43 +3611,8 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << wmma_replacer.rewrite(call_wmma_code);
   } else if (op->op.same_as(builtin::thread_return())) {
     os << "return";
-  } else if (op->op.same_as(tl::get_rank())) {
-    const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
-    if (!backend.Supports(tl::hcu::DistributedCapability::kRankAndWorldSize)) {
-      TVM_FFI_THROW(ValueError)
-          << "HCU distributed backend " << backend.name()
-          << " does not support rank/world-size intrinsics";
-    }
-    uses_distributed_metadata_ = true;
-    os << backend.EmitRankExpr();
-  } else if (op->op.same_as(tl::get_num_ranks())) {
-    const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
-    if (!backend.Supports(tl::hcu::DistributedCapability::kRankAndWorldSize)) {
-      TVM_FFI_THROW(ValueError)
-          << "HCU distributed backend " << backend.name()
-          << " does not support rank/world-size intrinsics";
-    }
-    uses_distributed_metadata_ = true;
-    os << backend.EmitNumRanksExpr();
-  } else if (op->op.same_as(tl::get_block())) {
-    const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
-    if (!backend.Supports(tl::hcu::DistributedCapability::kBlockRemoteGet)) {
-      TVM_FFI_THROW(ValueError) << "HCU distributed backend " << backend.name()
-                                << " does not support block remote get";
-    }
-    ICHECK_EQ(op->args.size(), 4U);
-    if (const auto *source = GetIpcRemoteSourceParameter(op->args[0]);
-        source && kernel_param_vars_.count(source)) {
-      ipc_remote_source_param_names_.insert(source->name_hint);
-    } else {
-      TVM_FFI_THROW(ValueError)
-          << "HCU IPC get_block source must be a kernel parameter or "
-             "T.address_of(kernel_parameter[...])";
-    }
-    uses_distributed_metadata_ = true;
-    os << backend.EmitBlockGetExpr(
-        PrintExpr(op->args[0]), PrintExpr(op->args[1]), PrintExpr(op->args[2]),
-        PrintExpr(op->args[3]));
+  } else if (TryEmitDistributedCall(GetRef<Call>(op), os)) {
+    // The distributed emitter owns validation and usage tracking.
   } else if (op->op.same_as(tl::loop_break())) {
     this->PrintIndent();
     this->stream << "break;\n";
@@ -4277,12 +4275,9 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   buffer_ops_rebase_param_names_.clear();
   block_index_vars_.clear();
   thread_index_vars_.clear();
-  kernel_param_vars_.clear();
-  ipc_remote_source_param_names_.clear();
-  uses_distributed_metadata_ = false;
-  for (const tirx::Var &param : f->params) {
-    kernel_param_vars_.insert(param.get());
-  }
+  auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
+  ICHECK(global_symbol.has_value())
+      << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
   PostOrderVisit(f->body, [&](const ObjectRef &object) {
     const auto *attr = object.as<AttrStmtNode>();
     if (!attr || attr->attr_key != tirx::attr::thread_extent)
@@ -4301,9 +4296,6 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   mls_resource_object_counter_ = 0;
   wdra_init_emitted_ = false;
 
-  auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
-  ICHECK(global_symbol.has_value())
-      << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
   bool no_alias = f->HasNonzeroAttr(tirx::attr::kNoAlias);
   std::unordered_set<const VarNode *> non_restrict;
   if (auto opt =
@@ -4315,7 +4307,7 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   this->PrintFuncPrefix(stream);
   CodeGenC::PrintType(f->ret_type, stream);
   this->PrintExtraAttrs(f, stream);
-  this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
+  this->stream << " " << global_symbol.value() << "(";
 
   for (size_t i = 0; i < f->params.size(); ++i) {
     tirx::Var v = f->params[i];

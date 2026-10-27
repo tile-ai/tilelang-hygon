@@ -2,11 +2,37 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from threading import RLock
+from functools import cache
 from typing import Any, Protocol
 from collections.abc import Callable
 
-from ..allocator import Allocation, DistributedAllocator
+from ..allocator import (
+    Allocation, DistributedAllocator,
+    get_distributed_backend_registration, register_distributed_backend,
+)
+
+
+@cache
+def ipc_metadata_layout() -> dict[str, int]:
+    """Common envelope plus derived IPC-private offsets (all from native FFI)."""
+    import json
+    from tilelang import tvm
+    from ..metadata import metadata_layout
+
+    layout = dict(metadata_layout())
+    private = json.loads(str(tvm.ffi.get_global_func("tl.hcu.ipc.payload_layout")()))
+    layout["arena_size"] = layout["payload"] + private["arena_size"]
+    layout["peer_base"] = layout["payload"] + private["peer_bases"]
+    layout["private_header_size"] = private["header_size"]
+    layout["max_world_size"] = private["max_world_size"]
+    for key in ("invalid_source_count", "invalid_source_span", "invalid_source_arena"):
+        layout[key] = private[key]
+    return layout
+
+
+def ipc_max_world_size() -> int:
+    return ipc_metadata_layout()["max_world_size"]
 
 
 class _IpcRuntime(Protocol):
@@ -18,20 +44,6 @@ class _IpcRuntime(Protocol):
     def can_access_peer(self, device: int, peer_device: int) -> bool: ...
 
 
-@contextmanager
-def tvm_hcu_stream(device: int, stream: int, *, get_stream=None, set_stream=None):
-    """Temporarily bind TVM's ROCm device stream to a PyTorch HIP stream."""
-    if get_stream is None or set_stream is None:
-        from tilelang import tvm
-
-        get_stream = tvm.ffi.get_global_func("tl.hcu.ipc.get_tvm_stream")
-        set_stream = tvm.ffi.get_global_func("tl.hcu.ipc.set_tvm_stream")
-    previous = int(get_stream(device))
-    set_stream(device, int(stream))
-    try:
-        yield
-    finally:
-        set_stream(device, previous)
 
 
 class _FfiIpcRuntime:
@@ -78,6 +90,8 @@ class IpcAllocator(DistributedAllocator):
     mappings in different processes.
     """
 
+    backend_name = "ipc"
+
     def __init__(
         self,
         size: int,
@@ -94,6 +108,9 @@ class IpcAllocator(DistributedAllocator):
             raise ValueError("size and alignment must be positive")
         if not 0 <= rank < world_size:
             raise ValueError("rank must be in [0, world_size)")
+        if world_size > ipc_max_world_size():
+            raise ValueError(f"IPC world_size exceeds metadata capacity (maximum {ipc_max_world_size()})")
+        self._bind_distributed_backend(self.backend_name)
         self.size, self.rank, self.world_size, self.device = int(size), int(rank), int(world_size), int(device)
         self.group, self.alignment = group, int(alignment)
         self._runtime = runtime or _FfiIpcRuntime()
@@ -103,6 +120,10 @@ class IpcAllocator(DistributedAllocator):
         self._offset = 0
         self._generation = 0
         self._closed = False
+        self._arena_device = self.device
+        self._allocations: dict[int, Allocation] = {}
+        self._storages: set[object] = set()
+        self._storage_lock = RLock()
 
     @property
     def generation(self) -> int:
@@ -110,8 +131,17 @@ class IpcAllocator(DistributedAllocator):
 
     @property
     def metadata(self) -> tuple[int, ...]:
+        """Native ABI header/status slots followed by process-local peer VAs."""
         self._require_open()
-        return (self.rank, self.world_size, *self._peer_bases)
+        layout = ipc_metadata_layout()
+        payload = [0] * layout["peer_base"]
+        payload[layout["version"]] = layout["abi_version"]
+        payload[layout["backend"]] = self.backend_id
+        payload[layout["rank"]] = self.rank
+        payload[layout["world_size"]] = self.world_size
+        payload[layout["payload_size"]] = layout["private_header_size"] + self.world_size
+        payload[layout["arena_size"]] = self.size
+        return (*payload, *self._peer_bases)
 
     @property
     def base_ptr(self) -> int:
@@ -119,6 +149,8 @@ class IpcAllocator(DistributedAllocator):
         return self._base
 
     def initialize(self, handles: list[bytes] | None = None, device_ids: list[int] | None = None) -> None:
+        if self._closed:
+            raise RuntimeError("IPC allocator cannot be initialized after close or failed initialization")
         if self._base:
             return
         # Explicit handle/device lists are useful for local tests and callers
@@ -181,17 +213,62 @@ class IpcAllocator(DistributedAllocator):
         if end > self.size:
             raise MemoryError(f"IPC arena exhausted: requested {nbytes} bytes, {self.size - offset} remain")
         self._offset = end
-        return Allocation(self._base + offset, offset, nbytes, self._generation)
+        allocation = Allocation(self._base + offset, offset, nbytes, self._generation, self, self.device)
+        self._allocations[offset] = allocation
+        return allocation
+
+    def _validate_allocation(self, allocation: Allocation, nbytes: int) -> None:
+        self._require_open()
+        if allocation.owner is not self:
+            raise RuntimeError("allocation owner does not match the allocator")
+        if allocation.generation != self.generation:
+            raise RuntimeError("allocation generation is stale")
+        if allocation.device != self.device or self.device != self._arena_device:
+            raise RuntimeError("allocation device does not match the arena device")
+        if allocation.offset < 0 or allocation.nbytes <= 0 or allocation.offset + allocation.nbytes > self.size:
+            raise ValueError("allocation offset/size is outside the arena")
+        if not self.contains(allocation.ptr, allocation.nbytes):
+            raise ValueError("allocation pointer is outside the arena")
+        if allocation.ptr != self._base + allocation.offset:
+            raise ValueError("allocation pointer does not match its arena offset")
+        if allocation.nbytes < nbytes:
+            raise ValueError("allocation is smaller than requested tensor shape")
+        if self._allocations.get(allocation.offset) is not allocation:
+            raise RuntimeError("allocation was not issued by this allocator")
+
+    def _retain_storage(self, allocation: Allocation, nbytes: int) -> object:
+        with self._storage_lock:
+            self._validate_allocation(allocation, nbytes)
+            token = object()
+            self._storages.add(token)
+            return token
+
+    def _release_storage(self, token: object) -> None:
+        with self._storage_lock:
+            self._storages.discard(token)
 
     def contains(self, ptr: int, nbytes: int) -> bool:
         return self._base <= ptr and nbytes >= 0 and ptr + nbytes <= self._base + self.size
 
     def close(self, *, collective: bool = True) -> None:
         """Release an IPC arena after all ranks stopped using its mappings."""
+        with self._storage_lock:
+            self._close(collective=collective)
+
+    def _close(self, *, collective: bool) -> None:
         if self._closed:
             return
-        self._closed = True
         coordinate = collective and self._base != 0 and self.world_size > 1 and self.group is not None
+
+        def check_views() -> None:
+            if self._storages:
+                raise RuntimeError(f"{len(self._storages)} active tensor view(s)")
+
+        # Reuse the existing status exchange: every rank learns the counts and
+        # failing ranks before anyone transitions to CLOSED or unmaps memory.
+        # Rejection leaves generation, mappings and initialization unchanged.
+        self._run_initialization_stage("close active views", check_views, coordinate)
+        self._closed = True
         failures = []
 
         if collective and self._base:
@@ -215,6 +292,7 @@ class IpcAllocator(DistributedAllocator):
             raise RuntimeError("IPC collective close failed: " + "; ".join(failures))
 
     def _release_local_resources(self) -> None:
+        self._allocations.clear()
         cleanup_errors = []
         for peer, ptr in enumerate(self._peer_bases):
             if peer != self.rank and ptr:
@@ -291,50 +369,7 @@ class IpcAllocator(DistributedAllocator):
             raise RuntimeError("IPC allocator is not initialized or has been closed")
 
 
-class IpcMetadataInitializer:
-    """Initialize an IPC module's device metadata once per allocator generation."""
-
-    def __init__(self) -> None:
-        self._initialized: dict[tuple[int, int], int] = {}
-        # Keep both the PyTorch owner and its TVM DLPack view alive until this
-        # module/device pair is initialized again for a newer generation.
-        self._metadata_payloads: dict[tuple[int, int], tuple[Any, Any]] = {}
-
-    def initialize(self, module: Any, allocator: IpcAllocator, *, metadata_tensor: Any = None) -> bool:
-        """Launch the module helper when its cached allocator generation is stale.
-
-        Returns ``True`` when a helper launch occurred and ``False`` when the
-        module/device pair was already initialized for this generation.
-        """
-        key = (id(module), allocator.device)
-        if self._initialized.get(key) == allocator.generation:
-            return False
-        helper = module.get_function("__tilelang_init_ipc_metadata", query_imports=False)
-        if helper is None:
-            raise RuntimeError("module does not contain the IPC metadata helper")
-        payload = allocator.metadata
-        if len(payload) != allocator.world_size + 2:
-            raise RuntimeError("IPC metadata count must equal world_size + 2")
-        if not 0 <= payload[0] < payload[1] or payload[1] != allocator.world_size:
-            raise RuntimeError("IPC metadata rank/world_size is inconsistent with the allocator")
-        if len(payload) > 1024:
-            raise RuntimeError("IPC metadata exceeds the device metadata capacity")
-        if metadata_tensor is None:
-            import torch
-
-            metadata_tensor = torch.tensor(payload, dtype=torch.uint64, device=f"cuda:{allocator.device}")
-        import torch
-
-        if not isinstance(metadata_tensor, torch.Tensor):
-            helper_arg = metadata_tensor
-        else:
-            import ctypes
-
-            # ROCm Module FunctionInfo declares an opaque handle.  A ctypes
-            # void pointer maps to HANDLE_TO_HANDLE; passing a Tensor/NDArray
-            # would instead pass a host-side descriptor address.
-            helper_arg = ctypes.c_void_p(metadata_tensor.data_ptr())
-        helper(helper_arg, len(payload))
-        self._metadata_payloads[key] = (metadata_tensor, helper_arg)
-        self._initialized[key] = allocator.generation
-        return True
+# Runtime implementations own their registration; the factory has no IPC branch.
+IPC_BACKEND = register_distributed_backend(
+    "ipc", 1, IpcAllocator,
+)

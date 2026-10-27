@@ -1,6 +1,6 @@
 """Two-kernel HCU IPC GEMM + AllReduce example.
 
-Launch with two same-node P2P-capable HCU ranks, for example:
+Launch with two or more same-node P2P-capable HCU ranks, for example:
 
   HSA_USE_SVM=0 HSA_FORCE_FINE_GRAIN_PCIE=1 \
   mpirun --allow-run-as-root -np 2 python3 example_gemm_ar_ipc.py
@@ -45,7 +45,7 @@ def gemm_kernel():
 
 
 def allreduce_kernel():
-    """Pull the peer partial-C to LDS and add it to this rank's partial-C."""
+    """Sum all peers, including self once, into a separate zeroed FP32 output."""
 
     @T.prim_func
     def main(
@@ -54,15 +54,20 @@ def allreduce_kernel():
     ):
         with T.Kernel(1, threads=128):
             peer_partial = T.alloc_shared((M, N), "float32")
-            T.get_block(
-                T.address_of(partial_c[0, 0]),
-                T.address_of(peer_partial[0, 0]),
-                M * N,
-                T.get_rank() ^ 1,
-            )
-            T.sync_threads()
             for i, j in T.Parallel(M, N):
-                output[i, j] = partial_c[i, j] + peer_partial[i, j]
+                output[i, j] = 0.0
+            T.sync_threads()
+            for src_pe in T.serial(T.get_num_ranks()):
+                T.get_block(
+                    T.address_of(partial_c[0, 0]),
+                    T.address_of(peer_partial[0, 0]),
+                    M * N,
+                    src_pe,
+                )
+                T.sync_threads()
+                for i, j in T.Parallel(M, N):
+                    output[i, j] += peer_partial[i, j]
+                T.sync_threads()
 
     return main
 
@@ -80,8 +85,8 @@ def main() -> None:
     rank = _rank_env("RANK")
     world_size = _rank_env("WORLD_SIZE")
     local_rank = _rank_env("LOCAL_RANK")
-    if world_size != 2:
-        raise RuntimeError(f"this IPC example requires exactly two ranks, got {world_size}")
+    if world_size < 2:
+        raise RuntimeError(f"this IPC example requires at least two ranks, got {world_size}")
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
@@ -119,7 +124,7 @@ def main() -> None:
         allreduce.initialize(allocator)
         output = allreduce(partial_c)
         torch.cuda.synchronize(local_rank)
-        expected = torch.full_like(output, float(6 * K))
+        expected = torch.full_like(output, float(K * world_size * (world_size + 1)))
         if not torch.allclose(output, expected, atol=1e-3, rtol=1e-3):
             raise RuntimeError(f"rank {rank}: GEMM+AllReduce output is incorrect")
         print(f"ipc-gemm-allreduce rank={rank} value={output[0, 0].item()}", flush=True)

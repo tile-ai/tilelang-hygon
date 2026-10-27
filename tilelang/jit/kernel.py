@@ -226,7 +226,7 @@ class JITKernel(Generic[_P, _T]):
         Non-distributed kernels are intentionally a no-op. IPC HCU kernels
         delegate to their TVM FFI adapter, which tracks allocator generations.
         """
-        initialize = getattr(self.adapter, "initialize_ipc_metadata", None)
+        initialize = getattr(self.adapter, "initialize_distributed_metadata", None)
         if initialize is None:
             return False
         return bool(initialize(allocator, stream=stream))
@@ -340,6 +340,12 @@ class JITKernel(Generic[_P, _T]):
         compile_metadata: dict[str, Any],
     ) -> BaseKernelAdapter:
         """Construct the selected execution adapter from one lowered artifact."""
+        from tilelang.distributed.metadata import reject_unsupported_execution_backend
+
+        reject_unsupported_execution_backend(
+            artifact.kernel_source, self.execution_backend,
+            supported=self.execution_backend_spec.supports_distributed_runtime,
+        )
 
         def create_adapter(adapter_cls: Callable[..., BaseKernelAdapter], **kwargs: Any) -> BaseKernelAdapter:
             with jit_phase("adapter", verbose=self.verbose, **compile_metadata):
@@ -431,6 +437,7 @@ class JITKernel(Generic[_P, _T]):
             # Handle invalid backend.
             raise ValueError(f"Invalid execution backend: {execution_backend}")
 
+        artifact.distributed_requirements = getattr(adapter, "distributed_requirements", None)
         return adapter
 
     def _create_adapter_from_database(
@@ -447,6 +454,13 @@ class JITKernel(Generic[_P, _T]):
     ) -> BaseKernelAdapter:
         target = self.target
         execution_backend = self.execution_backend
+
+        from tilelang.distributed.metadata import reject_unsupported_execution_backend
+
+        reject_unsupported_execution_backend(
+            device_kernel_source, execution_backend,
+            supported=self.execution_backend_spec.supports_distributed_runtime,
+        )
 
         # Create an adapter based on the specified execution backend.
         if execution_backend == "tvm_ffi":
@@ -797,6 +811,8 @@ class JITKernel(Generic[_P, _T]):
             runtime_module.export_library(kernel_file)
         elif not (os.path.exists(kernel_file) and os.path.samefile(cached_library, kernel_file)):
             shutil.copyfile(cached_library, kernel_file)
+        from tilelang.distributed.metadata import save_library_requirements
+        save_library_requirements(kernel_file, getattr(self.adapter, "distributed_requirements", None))
         logger.info(f"Kernel library exported to {os.path.abspath(kernel_file)}")
 
     def _get_ptx(self, verbose: bool | None = None) -> str:

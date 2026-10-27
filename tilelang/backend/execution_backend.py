@@ -27,6 +27,11 @@ class ExecutionBackendSpec:
     # environment tensor allocator, so kernels with out_idx may allocate
     # their outputs inside the generated host function.
     supports_callee_allocated_outputs: bool = False
+    # Declares the runtime hooks needed by artifacts that actually use
+    # distributed metadata: binding/initialization and lifecycle checks.
+    # Backends without these hooks must reject such artifacts
+    # instead of launching them without the required initialization.
+    supports_distributed_runtime: bool = True
 
     def matches(self, target: Target) -> bool:
         return True if self.supports_target is None else self.supports_target(target)

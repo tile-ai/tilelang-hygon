@@ -3,6 +3,9 @@
  * \brief IPC capability declaration for the HCU distributed dispatcher.
  */
 #include "hcu/distributed/backend.h"
+#include "tl_templates/hcu/distributed/ipc_payload.h"
+#include "tl_templates/hcu/distributed/metadata.h"
+#include <tvm/ffi/reflection/registry.h>
 
 namespace tvm {
 namespace tl {
@@ -13,19 +16,10 @@ class IpcDistributedBackend final : public HcuDistributedBackend {
 public:
   ffi::String name() const final { return "ipc"; }
 
-  bool Supports(DistributedCapability capability) const final {
-    switch (capability) {
-    case DistributedCapability::kRankAndWorldSize:
-    case DistributedCapability::kBlockRemoteGet:
-      return true;
-    }
-    return false;
-  }
-
-  std::string EmitRankExpr() const final { return "tl::ipc_get_rank()"; }
+  std::string EmitRankExpr() const final { return "tl::distributed_get_rank()"; }
 
   std::string EmitNumRanksExpr() const final {
-    return "tl::ipc_get_num_ranks()";
+    return "tl::distributed_get_num_ranks()";
   }
   std::string EmitBlockGetExpr(const std::string &src, const std::string &dst,
                                const std::string &size,
@@ -34,30 +28,13 @@ public:
            src_pe + ")";
   }
 
+  std::string DeviceIncludes() const final {
+    return "#include <tl_templates/hcu/distributed/distributed.h>\n";
+  }
   std::string ModulePreamble() const final {
-    return R"(
-extern "C" __device__ volatile uint64_t __tilelang_ipc_metadata[1024] = {};
+    return EmitDistributedModulePreamble("ipc", "tl::ipc_validate_payload");
+  }
 
-extern "C" __global__ void __tilelang_init_ipc_metadata(
-    const uint64_t* source, int64_t count) {
-  if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
-      threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
-    if (source == nullptr || count < 3 || count > 1024) {
-      return;
-    }
-    const uint64_t rank = source[0];
-    const uint64_t world_size = source[1];
-    if (world_size == 0 || world_size > 1022 ||
-        count != static_cast<int64_t>(world_size + 2) || rank >= world_size) {
-      return;
-    }
-    for (int64_t i = 0; i < count; ++i) {
-      __tilelang_ipc_metadata[i] = source[i];
-    }
-  }
-}
-)";
-  }
 };
 
 } // namespace
@@ -70,3 +47,23 @@ const HcuDistributedBackend &GetIpcDistributedBackend() {
 } // namespace hcu
 } // namespace tl
 } // namespace tvm
+
+// Python consumes the compiled ABI, never a separately maintained layout.
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace hcu = tvm::tl::hcu;
+  hcu::RegisterHcuDistributedBackend(
+      "ipc", ::tl::ipc_payload::kBackendId, hcu::GetIpcDistributedBackend,
+      {hcu::DistributedCapability::kRankAndWorldSize,
+       hcu::DistributedCapability::kBlockRemoteGet});
+  tvm::ffi::reflection::GlobalDef().def("tl.hcu.ipc.payload_layout", []() {
+    using namespace ::tl::ipc_payload;
+    return tvm::ffi::String(
+        "{\"invalid_source_count\":" + std::to_string(kInvalidSourceCount) +
+        ",\"invalid_source_span\":" + std::to_string(kInvalidSourceSpan) +
+        ",\"invalid_source_arena\":" + std::to_string(kInvalidSourceArena) +
+        ",\"arena_size\":" + std::to_string(kArenaSize) +
+        ",\"peer_bases\":" + std::to_string(kPeerBases) +
+        ",\"header_size\":" + std::to_string(kHeaderSize) +
+        ",\"max_world_size\":" + std::to_string(kMaxWorldSize) + "}");
+  });
+}

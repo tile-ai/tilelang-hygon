@@ -18,19 +18,24 @@ _configure_torch_extensions_dir()
 
 random.seed(0)
 
-# The opt-in IPC example starts independent HCU ranks through MPI.  Avoid
-# importing torch in the pytest parent: the import initializes HIP state and
-# can prevent pytest from exiting after IPC child teardown.
-_ipc_mpi_example = os.environ.get("TILELANG_RUN_HCU_IPC_TESTS") == "1" and any(
-    "examples/distributed" in arg.replace("\\", "/") for arg in sys.argv
-)
-if not _ipc_mpi_example:
+
+def pytest_configure(config):
+    # Avoid initializing HIP in the parent of distributed example ranks.
+    from pathlib import Path
+
+    distributed = Path(__file__).parent / "distributed"
+    if any(
+        (Path(config.invocation_params.dir) / str(arg).split("::", 1)[0]).resolve().is_relative_to(distributed)
+        for arg in config.args
+    ):
+        return
     try:
         import torch
     except ImportError:
         pass
     else:
         torch.manual_seed(0)
+
 
 try:
     import numpy as np
@@ -127,6 +132,11 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         "warnings",
         "error",
     }
+    skipped = terminalreporter.stats.get("skipped", [])
+    if skipped and all("HCU preflight:" in str(report.longrepr) for report in skipped):
+        if not any(terminalreporter.stats.get(kind) for kind in known_types.difference({"skipped", "deselected"})):
+            terminalreporter.write_sep("-", "HCU tests skipped: environment preflight requirements were not met.")
+            return
     if sum(len(terminalreporter.stats.get(k, [])) for k in known_types.difference({"skipped", "deselected"})) == 0:
         terminalreporter.write_sep(
             "!",

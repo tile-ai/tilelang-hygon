@@ -5,6 +5,7 @@
 #endif
 
 #include "codegen_hcu.h"
+#include "hcu/distributed/backend.h"
 #include "runtime/pack_args.h"
 #include "target/rocm/rocm_fallback_module.h"
 
@@ -14,7 +15,7 @@ namespace codegen {
 using namespace ffi;
 
 static Map<String, runtime::FunctionInfo>
-ExtractFuncInfo(const IRModule &mod, bool uses_distributed_metadata) {
+ExtractFuncInfo(const IRModule &mod, bool uses_distributed_metadata, const Target &target) {
   Map<String, runtime::FunctionInfo> fmap;
 
   for (auto kv : mod->functions) {
@@ -51,13 +52,13 @@ ExtractFuncInfo(const IRModule &mod, bool uses_distributed_metadata) {
                                                  launch_param_tags, {}));
   }
   if (uses_distributed_metadata) {
-    // Empty launch tags intentionally select ROCm runtime's default workload:
-    // one block with one thread.  The device helper itself also guards all
-    // thread/block indices, making this contract explicit and safe.
-    fmap.Set("__tilelang_init_ipc_metadata",
-             runtime::FunctionInfo("__tilelang_init_ipc_metadata",
-                                   {DataType::Handle(), DataType::Int(64)}, {},
-                                   {}));
+    const auto spec = tl::hcu::GetHcuDistributedBackend(target).InitSpec();
+    for (const auto &helper : {spec.initialize}) {
+      Array<DLDataType> arguments;
+      for (auto dtype : helper.argument_types) arguments.push_back(dtype);
+      // Empty launch tags select one thread/block for the common helper ABI.
+      fmap.Set(helper.name, runtime::FunctionInfo(helper.name, arguments, {}, {}));
+    }
   }
   return fmap;
 }
@@ -100,7 +101,7 @@ Module BuildTileLangHCU(IRModule mod, Target target) {
   source_map.Set("hip", code);
   return target::ROCmModuleCreateWithFallback(
       Bytes(ptx.data(), ptx.size()), String(fmt),
-      ExtractFuncInfo(mod, cg.UsesDistributedMetadata()), source_map);
+      ExtractFuncInfo(mod, cg.UsesDistributedMetadata(), target), source_map);
 }
 
 Module BuildTileLangHCUWithoutCompile(IRModule mod, Target target) {
@@ -129,7 +130,7 @@ Module BuildTileLangHCUWithoutCompile(IRModule mod, Target target) {
   static constexpr const char kDummyPtx[] = "ptx";
   return target::ROCmModuleCreateWithFallback(
       Bytes(kDummyPtx, sizeof(kDummyPtx) - 1), String("ptx"),
-      ExtractFuncInfo(mod, cg.UsesDistributedMetadata()), source_map);
+      ExtractFuncInfo(mod, cg.UsesDistributedMetadata(), target), source_map);
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
