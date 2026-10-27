@@ -166,7 +166,13 @@ CopyScale::CopyScale(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
       GetIntAnnOrDefault(annotations, attr::kScaleGranularityK, 1);
   node->scale_k_major_ = GetIntAnnOrDefault(annotations, attr::kScaleKMajor, 0);
   node->role_ = GetIntAnnOrDefault(annotations, attr::kScaleRole, 0);
+  node->gemm_threads_ =
+      GetIntAnnOrDefault(annotations, attr::kScaleGemmThreads, 0);
+  node->copy_threads_ = GetIntAnnOrDefault(annotations, attr::kScaleThreads, 0);
   node->row_order_ = GetIntAnnOrDefault(annotations, attr::kScaleRowOrder, 0);
+  if (auto layout = annotations.Get("tl.hcu.scale_row_layout")) {
+    node->row_layout_type_ = Downcast<StringImm>(layout.value())->value;
+  }
   node->lds_from_async_copy_ =
       GetIntAnnOrDefault(annotations, attr::kScaleLdsFromAsync, 0);
   node->gemm_m_ = GetIntAnnOrDefault(annotations, attr::kScaleGemmM, 0);
@@ -327,15 +333,13 @@ Stmt CopyScaleNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   auto policy = GemmWarpPolicy(gemm_policy_);
   hcu::ScaleWarpSeg seg = hcu::ComputeScaleWarpSeg(
       *policy.get(), gemm_m_, gemm_n_, gemm_k_, gemm_k_pack_, gemm_elem_bits_,
-      block_size, T.target, a_from_mls_ != 0, b_from_mls_ != 0,
-      a_mls_trans_ != 0, b_mls_trans_ != 0, min_m_per_warp_, min_n_per_warp_);
+      gemm_threads_ > 0 ? gemm_threads_ : block_size, T.target,
+      a_from_mls_ != 0, b_from_mls_ != 0, a_mls_trans_ != 0, b_mls_trans_ != 0,
+      min_m_per_warp_, min_n_per_warp_);
   ICHECK_EQ(seg.k_warp, 1)
       << "gemm_blockscaled / copy_scale requires k_warp==1, got " << seg.k_warp;
-  ICHECK_EQ(seg.total_warps, num_warps);
   const int mn_warps = (role_ == 0) ? seg.m_seg : seg.n_seg;
-  ICHECK(mn_warps >= 1 && seg.total_warps % mn_warps == 0)
-      << "copy_scale: TotalWarps=" << seg.total_warps
-      << " must be divisible by MnWarps=" << mn_warps;
+  ICHECK_GE(mn_warps, 1);
 
   PrimExpr warp_id = FloorDiv(T.thread_index - T.thread_bounds->min, warp_size);
 
@@ -517,12 +521,14 @@ Stmt CopyScaleNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       leading_stage_dims);
 
   std::stringstream ss;
+  ICHECK(!row_layout_type_.empty())
+      << "copy_scale missing allocated ScaleRowLayout descriptor";
   ss << "tl::hcu::ds_scale_copy<" << op_ctrl_ << ", " << scale_format_ << ", "
      << parent_scale_mn << ", " << parent_scale_k << ", " << scale_shape_mn
      << ", " << scale_shape_k << ", " << granularity_mn_ << ", "
      << granularity_k_ << ", " << scale_k_major_ << ", " << mn_warps << ", "
-     << seg.total_warps << ", " << generated_layout.name << ", " << kMmacK
-     << ", " << row_order_ << ">";
+     << num_warps << ", " << generated_layout.name << ", " << kMmacK << ", "
+     << row_order_ << ", " << row_layout_type_ << ">";
 
   Array<PrimExpr> call_args;
   call_args.push_back(StringImm(ss.str()));

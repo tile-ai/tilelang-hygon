@@ -716,14 +716,52 @@ def test_gemm_blockscaled_basic_correctness(M, N, K, block_M, block_N, block_K, 
     source = kernel.get_kernel_source()
     assert f", {expected_mmac_k}," in source and "mmac_scale_fp4_body" in source
     # A normal T.copy producer keeps the legacy KInner scale-buffer protocol.
-    assert re.search(r"ds_scale_copy<[^>]+, (?:32|64), 0>", source)
-    assert re.search(r"mmac_scale_fp4_body<[^>]+, (?:32|64), -?\d+, 0, 0>", source)
+    assert re.search(r"ds_scale_copy<[^>]+, (?:32|64), 0, tl::hcu::ScaleRowLayout<", source)
+    assert re.search(r"mmac_scale_fp4_body<[^>]+, (?:32|64), -?\d+, tl::hcu::ScaleRowLayout<", source)
     cache_path = getattr(kernel, "_tilelang_cache_path", None)
     if use_mls and cache_path:
         source = (Path(cache_path) / "device_kernel.cu").read_text()
         assert source.count("async_mls_load_asm<") >= 2
         assert "ds_scale_copy<" in source
         assert "mmac_scale_fp4_body" in source
+
+
+@requires_blockscaled
+def test_gemm_blockscaled_scale_copy_spreads_idle_waves():
+    # Four physical waves, but only two useful B copy issues. The copy work
+    # rank uses waves 0/2, not adjacent waves sharing one LDS port. The GEMM
+    # wave partition and the scale-buffer segment ownership remain unchanged.
+    run_blockscaled_basic_correctness(
+        M=64,
+        N=64,
+        K=64,
+        block_M=64,
+        block_N=64,
+        block_K=64,
+        gran_k=64,
+        threads=256,
+        use_mls=False,
+        non_unit_scale=True,
+    )
+
+
+@requires_blockscaled
+def test_gemm_blockscaled_k_dependent_scale_pages():
+    # One output atom spans two scale pages along K. Pages cannot be hoisted
+    # outside the reduction; consecutive K atoms within one page reuse m0.
+    # Non-unit scales detect accidentally retaining the first page throughout.
+    run_blockscaled_basic_correctness(
+        M=16,
+        N=16,
+        K=2048,
+        block_M=16,
+        block_N=16,
+        block_K=2048,
+        gran_k=32,
+        threads=64,
+        use_mls=False,
+        non_unit_scale=True,
+    )
 
 
 @requires_blockscaled
@@ -743,12 +781,12 @@ def test_gemm_blockscaled_explicit_async_scale_uses_linear_mn_inner():
     )
     source = kernel.get_kernel_source()
     assert "load_async_lds" in source or "cp_async_gs" in source
-    # RowOrder is the final ds_scale_copy template parameter and the final two
-    # mmac_scale_fp4_body parameters (A/B can be selected independently).
+    # RowOrder precedes the final ds_scale_copy layout type. In MMAC, the
+    # independent A/B row orders are encoded inside the layout types.
     assert "ds_scale_copy<" in source
-    assert re.search(r"ds_scale_copy<[^>]+, 64, 1>", source)
+    assert re.search(r"ds_scale_copy<[^>]+, 64, 1, tl::hcu::ScaleRowLayout<", source)
     assert "mmac_scale_fp4_body" in source
-    assert re.search(r"mmac_scale_fp4_body<[^>]+, 64, -?\d+, 1, 1>", source)
+    assert re.search(r"mmac_scale_fp4_body<[^>]+, 64, -?\d+, tl::hcu::ScaleRowLayout<", source)
 
 
 @requires_blockscaled
@@ -790,8 +828,8 @@ def test_gemm_blockscaled_preferred_async_parallel_scale_uses_linear_mn_inner():
     )
     source = kernel.get_kernel_source()
     assert "load_async_lds" in source or "cp_async_gs" in source
-    assert re.search(r"ds_scale_copy<[^>]+, 64, 1>", source)
-    assert re.search(r"mmac_scale_fp4_body<[^>]+, 64, -?\d+, 1, 1>", source)
+    assert re.search(r"ds_scale_copy<[^>]+, 64, 1, tl::hcu::ScaleRowLayout<", source)
+    assert re.search(r"mmac_scale_fp4_body<[^>]+, 64, -?\d+, tl::hcu::ScaleRowLayout<", source)
 
 
 def _make_scale_pipeline_program(num_stages, *, use_scale_view=False, prefer_async=True):
@@ -1313,7 +1351,7 @@ def test_gemm_blockscaled_kmajor_identity_opctrl_correctness(op_ctrl, k_pad, exp
     source = kernel.get_kernel_source()
     assert f"ds_scale_copy<{op_ctrl}, 0," in source
     assert ", 1, 1, 2, " in source
-    assert f", {expected_mmac_k}, 0>" in source
+    assert f", {expected_mmac_k}, 0, tl::hcu::ScaleRowLayout<" in source
 
     A_logical, B_logical, A, B = _make_fp4_inputs(M, N, K)
     ScaleA, ScaleB = _make_e8m0_scales(K // gran_k, M, N, non_unit_scale=True)
@@ -1665,7 +1703,7 @@ def test_gemm_blockscaled_f8f6f4_operand_combinations(a_dtype, b_dtype, unpack_s
     )
     kernel = tl.compile(program, out_idx=[4], verbose=True)
     source = kernel.get_kernel_source()
-    assert "mmac_scale_fp4_body" in source and f", 32, {real_ab_type}, 0, 0>" in source
+    assert re.search(rf"mmac_scale_fp4_body<[^>]+, 32, {real_ab_type}, tl::hcu::ScaleRowLayout<", source)
 
     A_logical, B_logical, A_fp4, B_fp4 = _make_fp4_inputs(M, N, K)
     A_fp8 = (((torch.arange(M, device="cuda")[:, None] * 3 + torch.arange(K, device="cuda")[None, :]) % 7) - 3).to(torch.float8_e4m3fn)
@@ -1686,7 +1724,7 @@ def test_gemm_blockscaled_f8f6f4_operand_combinations(a_dtype, b_dtype, unpack_s
     [pytest.param(64, 64, 256, 64, 64, 256, 32, 128, id="k8_auto_xor")],
 )
 def test_gemm_blockscaled_auto_scale_lds_layout_correctness(M, N, K, block_M, block_N, block_K, gran_k, threads):
-    """No annotation: K8 linear conflict should select an automatic XOR layout."""
+    """Auto scoring follows the four-row issue groups used by scale copy."""
     program = matmul_blockscaled(
         M=M,
         N=N,
@@ -1706,11 +1744,12 @@ def test_gemm_blockscaled_auto_scale_lds_layout_correctness(M, N, K, block_M, bl
         scale_format_name="k4",
     )
     kernel = tl.compile(program, out_idx=[4], verbose=True)
-    cache_path = getattr(kernel, "_tilelang_cache_path", None)
-    if cache_path:
-        src = (Path(cache_path) / "device_kernel.cu").read_text()
-        assert "TLGeneratedScaleLdsLayout_" in src
-        assert " ^ " in src
+    # With op_ctrl=2 only one 16-lane group writes each four-row bank chunk.
+    # Linear LDS is conflict-free for this shape; the old full-wave grouping
+    # needed XOR. Inspect scale helpers only, not unrelated A/B LDS swizzles,
+    # and check this even when the JIT cache is disabled.
+    layouts = re.findall(r"struct TLGeneratedScaleLdsLayout_\w+ \{(.*?)\n\};", kernel.get_kernel_source(), re.S)
+    assert layouts and all("^" not in body for body in layouts)
 
     A_logical, B_logical, A, B = _make_fp4_inputs(M, N, K)
     ScaleA, ScaleB = _make_e8m0_scales(8, M, N, non_unit_scale=True)
@@ -1732,6 +1771,196 @@ def test_gemm_blockscaled_auto_scale_lds_layout_correctness(M, N, K, block_M, bl
     )
     _check_blockscaled_out(lib_out, ref)
     print(f"[blockscaled-auto-scale-layout] max_abs_diff={(lib_out - ref).abs().max().item()}")
+
+
+@requires_blockscaled
+@pytest.mark.parametrize("same_buffer", [False, True], ids=["opposite_banks", "same_bank_fallback"])
+def test_gemm_blockscaled_scale_bank_pairs_correctness(same_buffer):
+    """Both orientations and both same-bank fallback pairs must address correctly."""
+    mn, k, scale_k = 64, 128, 4
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((mn, k), "float4_e2m1fn"),
+        B: T.Tensor((mn, k), "float4_e2m1fn"),
+        S0: T.Tensor((scale_k, mn), "uint8"),
+        S1: T.Tensor((scale_k, mn), "uint8"),
+        C: T.Tensor((mn, mn), "float32"),
+    ):
+        with T.Kernel(1, threads=64):
+            a = T.alloc_shared((mn, k), "float4_e2m1fn")
+            b = T.alloc_shared((mn, k), "float4_e2m1fn")
+            src0 = T.alloc_shared((scale_k, mn), "uint8")
+            src1 = T.alloc_shared((scale_k, mn), "uint8")
+            s0 = T.alloc_scale_buffer((scale_k, mn))
+            s1 = T.alloc_scale_buffer((scale_k, mn))
+            c = T.alloc_fragment((mn, mn), "float32")
+            T.copy(A, a, prefer_instruction="matrix_load")
+            T.copy(B, b, prefer_instruction="matrix_load")
+            T.copy(S0, src0)
+            T.copy(S1, src1)
+            # Overlapping lifetimes force both allocations to exist together.
+            T.copy_scale(src0, s0)
+            T.copy_scale(src1, s1)
+            T.clear(c)
+            if same_buffer:
+                T.gemm_blockscaled(a, b, c, s0, s0, transpose_B=True, sf_a_granularity_k=32, sf_b_granularity_k=32)
+                T.gemm_blockscaled(a, b, c, s1, s1, transpose_B=True, sf_a_granularity_k=32, sf_b_granularity_k=32)
+            else:
+                T.gemm_blockscaled(a, b, c, s0, s1, transpose_B=True, sf_a_granularity_k=32, sf_b_granularity_k=32)
+                T.gemm_blockscaled(a, b, c, s1, s0, transpose_B=True, sf_a_granularity_k=32, sf_b_granularity_k=32)
+            T.copy(c, C)
+
+    kernel = tl.compile(main, out_idx=[4])
+    pairs = re.findall(
+        r"mmac_scale_fp4_body<[^<]+tl::hcu::ScaleRowLayout<\d+, (\d),[^>]+>, "
+        r"tl::hcu::ScaleRowLayout<\d+, (\d),",
+        kernel.get_kernel_source(),
+    )
+    assert pairs
+    assert all((a == b) == same_buffer for a, b in pairs)
+    logical_a, logical_b, a, b = _make_fp4_inputs(mn, mn, k)
+    s0, s1 = _make_e8m0_scales(scale_k, mn, mn)
+    # Vary both dimensions so repeated/stale row addressing cannot pass.
+    for ki in range(scale_k):
+        s0[ki] = (125 + (torch.arange(mn, device=s0.device) + ki * 2) % 5).to(torch.uint8)
+        s1[ki] = (125 + (torch.arange(mn, device=s1.device) * 3 + ki) % 5).to(torch.uint8)
+
+    def reference(sa, sb):
+        return blockscaled_fp4_cpu_ref(
+            logical_a,
+            logical_b,
+            sa,
+            sb,
+            sf_a_granularity_m=1,
+            sf_a_granularity_k=32,
+            sf_b_granularity_n=1,
+            sf_b_granularity_k=32,
+        )
+
+    expected = reference(s0, s0) + reference(s1, s1) if same_buffer else reference(s0, s1) + reference(s1, s0)
+    _check_blockscaled_out(kernel.get_profiler().func(a, b, s0, s1).cpu(), expected)
+
+
+def _manual_ws_program(producer_threads, consumer_threads, copy_on_producer, nonlinear):
+    # Each HCU specialization branch is exactly four waves, not a multiple
+    # chosen from the total CTA size. The two consumers own separate buffers.
+    assert producer_threads == consumer_threads == 256
+    m, k, sk = 64, 128, 4
+    threads = producer_threads + 2 * consumer_threads
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((m, k), "float4_e2m1fn"),
+        B: T.Tensor((m, k), "float4_e2m1fn"),
+        SA: T.Tensor((sk, m), "uint8"),
+        SB: T.Tensor((sk, m), "uint8"),
+        C: T.Tensor((2, m, m), "float32"),
+    ):
+        with T.Kernel(1, threads=threads):
+            tx = T.get_thread_binding()
+            a0 = T.alloc_shared((m, k), "float4_e2m1fn")
+            b0 = T.alloc_shared((m, k), "float4_e2m1fn")
+            a1 = T.alloc_shared((m, k), "float4_e2m1fn")
+            b1 = T.alloc_shared((m, k), "float4_e2m1fn")
+            la0 = T.alloc_shared((sk, m), "uint8")
+            lb0 = T.alloc_shared((sk, m), "uint8")
+            la1 = T.alloc_shared((sk, m), "uint8")
+            lb1 = T.alloc_shared((sk, m), "uint8")
+            sa0 = T.alloc_scale_buffer((sk, m))
+            sb0 = T.alloc_scale_buffer((sk, m))
+            sa1 = T.alloc_scale_buffer((sk, m))
+            sb1 = T.alloc_scale_buffer((sk, m))
+            if nonlinear:
+                T.annotate_layout(
+                    {
+                        la0: T.Layout((sk, m), lambda s, n: [s, n ^ (s * 8)]),
+                        lb0: T.Layout((sk, m), lambda s, n: [s, n ^ (s * 8)]),
+                        la1: T.Layout((sk, m), lambda s, n: [s, n ^ (s * 8)]),
+                        lb1: T.Layout((sk, m), lambda s, n: [s, n ^ (s * 8)]),
+                    }
+                )
+            if tx < producer_threads:
+                T.copy(A, a0)
+                T.copy(B, b0)
+                T.copy(A, a1)
+                T.copy(B, b1)
+                T.copy(SA, la0)
+                T.copy(SB, lb0)
+                T.copy(SA, la1)
+                T.copy(SB, lb1)
+                if copy_on_producer:
+                    # Only producer-side scale reads need this group barrier.
+                    # Otherwise the all-group handoff below protects LDS reads.
+                    T.ebarrier_sync_cnt(1, producer_threads // 64)
+                    T.copy_scale(la0, sa0)
+                    T.copy_scale(lb0, sb0)
+                    T.copy_scale(la1, sa1)
+                    T.copy_scale(lb1, sb1)
+                T.ebarrier_sync_cnt(0, threads // 64)
+            elif tx < producer_threads + consumer_threads:
+                c0 = T.alloc_fragment((m, m), "float32")
+                T.clear(c0)
+                T.ebarrier_sync_cnt(0, threads // 64)
+                if not copy_on_producer:
+                    T.copy_scale(la0, sa0)
+                    T.copy_scale(lb0, sb0)
+                    T.ebarrier_sync_cnt(2, consumer_threads // 64)
+                T.gemm_blockscaled(a0, b0, c0, sa0, sb0, transpose_B=True, sf_a_granularity_k=32, sf_b_granularity_k=32)
+                T.copy(c0, C[0, :, :])
+            else:
+                c1 = T.alloc_fragment((m, m), "float32")
+                T.clear(c1)
+                T.ebarrier_sync_cnt(0, threads // 64)
+                if not copy_on_producer:
+                    T.copy_scale(la1, sa1)
+                    T.copy_scale(lb1, sb1)
+                    T.ebarrier_sync_cnt(3, consumer_threads // 64)
+                T.gemm_blockscaled(a1, b1, c1, sa1, sb1, transpose_B=True, sf_a_granularity_k=32, sf_b_granularity_k=32)
+                T.copy(c1, C[1, :, :])
+
+    return main
+
+
+@requires_blockscaled
+@pytest.mark.parametrize(
+    "producer_threads,consumer_threads,copy_on_producer,nonlinear",
+    [
+        (256, 256, True, False),
+        (256, 256, False, False),
+        (256, 256, True, True),
+        (256, 256, False, True),
+    ],
+)
+def test_gemm_blockscaled_manual_ws(producer_threads, consumer_threads, copy_on_producer, nonlinear):
+    program = _manual_ws_program(producer_threads, consumer_threads, copy_on_producer, nonlinear)
+    kernel = tl.compile(program, out_idx=[4], pass_configs={"tl.disable_thread_storage_sync": True})
+    source = kernel.get_kernel_source()
+    assert "__syncthreads" not in source
+    copies = re.findall(r"ds_scale_copy<([^;]+?)>\([^;]+?\), (\d+),", source)
+    assert len(copies) == 4
+    intervals = []
+    for params, base in copies:
+        head, descriptor = params.split("tl::hcu::ScaleRowLayout<")
+        args = head.split(",")
+        segments, copy_waves = int(args[9]), int(args[10])
+        assert copy_waves == (producer_threads if copy_on_producer else consumer_threads) // 64
+        layout = list(map(int, descriptor.rstrip("> ").split(",")))
+        # ScaleK=4, native FP4 K2: these examples are balanced compact layouts.
+        assert layout[0] in (1, 2)
+        extent = segments * ((layout[2] * layout[3] + 7) // 8 * 8)
+        interval = set(range(int(base), int(base) + extent))
+        assert int(base) % 8 == 0
+        assert all(interval.isdisjoint(other) for other in intervals)
+        intervals.append(interval)
+    al, bl, a, b = _make_fp4_inputs(64, 64, 128)
+    sa, sb = _make_e8m0_scales(4, 64, 64, non_unit_scale=True)
+    expected = blockscaled_fp4_cpu_ref(
+        al, bl, sa, sb, sf_a_granularity_m=1, sf_a_granularity_k=32, sf_b_granularity_n=1, sf_b_granularity_k=32
+    )
+    actual = kernel.get_profiler().func(a, b, sa, sb).cpu()
+    _check_blockscaled_out(actual[0], expected)
+    _check_blockscaled_out(actual[1], expected)
 
 
 if __name__ == "__main__":
