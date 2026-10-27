@@ -287,7 +287,7 @@ def hcu_mls_lds_bits(dtype, *, mls_trans: bool, tile_mn: int, tile_k: int, targe
     # The 64x16_fp4 atom pads fp4 to b8 while writing LDS. Other fp4 MLS
     # atoms keep LDS packed as b4; ds_read_matrix_padbyte may later expand
     # the register view to b8 when RegBits=8.
-    if arch in ("gfx92a", "gfx946") and (
+    if arch in ("gfx92a", "gfx946", "gfx948") and (
         (not mls_trans and tile_mn == 64 and tile_k == 16) or (mls_trans and tile_mn == 16 and tile_k == 64)
     ):
         return 8
@@ -312,7 +312,7 @@ def hcu_mmac_k_dim(target: Target, element_bits: int, *, use_tf32: bool = False)
             mcpu = get_hcu_arch_string(target)
             if mcpu == "gfx938":
                 return 8
-            if mcpu in ("gfx92a", "gfx946"):
+            if mcpu in ("gfx92a", "gfx946", "gfx948"):
                 return 4
         return 8
     raise ValueError(f"Unsupported element_bits for HCU MMAC: {element_bits}")

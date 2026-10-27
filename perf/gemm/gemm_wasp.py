@@ -1,7 +1,7 @@
 """
-HCU gfx946 WASP GEMM POC: warp-specialized producer/consumer handoff via ABarrier.
+HCU gfx94x WASP GEMM POC: warp-specialized producer/consumer handoff via ABarrier.
 
-Kernels (gfx946 + WDRA only): MLS 4p4c4c one-shot and persistent variants,
+Kernels (gfx946/gfx948 + WDRA): MLS 4p4c4c one-shot and persistent variants,
 with an optional packed-F16 MatrixStore output path.
 """
 
@@ -30,7 +30,7 @@ CONSUMER_PONG_EBAR_ID = 2
 MLS_PRODUCER_MAX_NREG_3BR = 4
 MLS_CONSUMER_MAX_NREG_3BR = 244
 
-GFX946_ARCH = "gfx946"
+GFX94X_ARCHES = {"gfx946", "gfx948"}
 
 WASP_PASS_CONFIGS = {
     # tl.PassConfigKey.TL_ENABLE_DUMP_IR: True,
@@ -43,10 +43,10 @@ WASP_PASS_CONFIGS = {
 }
 
 
-def require_gfx946():
+def require_gfx94x():
     arch = get_rocm_arch()
-    if arch != GFX946_ARCH:
-        raise RuntimeError(f"gemm_wasp requires HCU target {GFX946_ARCH!r}, got {arch!r}.")
+    if arch not in GFX94X_ARCHES:
+        raise RuntimeError(f"gemm_wasp requires HCU target in {sorted(GFX94X_ARCHES)}, got {arch!r}.")
 
 
 @tl.jit(
@@ -588,7 +588,7 @@ def run_check(
     device: int = 0,
     dtype: str = "float16",
 ):
-    require_gfx946()
+    require_gfx94x()
     torch.cuda.set_device(device)
     kernel_fn = KERNELS[variant]
     kernel = kernel_fn(m, n, k, dtype=dtype)
@@ -600,7 +600,7 @@ def run_check(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="gfx946 WASP ABarrier GEMM smoke tests")
+    parser = argparse.ArgumentParser(description="gfx94x WASP ABarrier GEMM smoke tests")
     parser.add_argument(
         "--variant",
         choices=[
@@ -619,7 +619,7 @@ def main():
     parser.add_argument("--dump-source", action="store_true")
     args = parser.parse_args()
 
-    require_gfx946()
+    require_gfx94x()
     torch.cuda.set_device(args.device)
 
     variants = ["mls_4p4c4c", "mls_4p4c4c_persistent"] if args.variant == "all" else [args.variant]

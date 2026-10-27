@@ -6,8 +6,13 @@ from tilelang.backend.target import TargetLike, register_target_detector, regist
 
 # LLVM device triple passed to the offline compiler (DTK toolchain).
 _HCU_DEVICE_TRIPLE = "amdgcn-amd-amdhsa-hcc"
-HCU_MCPU_SET = frozenset({"gfx928", "gfx936", "gfx938", "gfx92a", "gfx946"})
+HCU_MCPU_SET = frozenset({"gfx928", "gfx936", "gfx938", "gfx92a", "gfx946", "gfx948"})
 HCU_WARP_SIZE = 64
+HCU_LDS_SIZE_BYTES = {
+    "gfx946": 128 * 1024,
+    "gfx948": 160 * 1024,
+}
+HCU_DEFAULT_LDS_SIZE_BYTES = 64 * 1024
 
 
 def _target_ffi_api():
@@ -43,6 +48,12 @@ def with_hcu_target_attrs(target: Target) -> Target:
     target_dict.setdefault("mtriple", _HCU_DEVICE_TRIPLE)
     target_dict.setdefault("max_num_threads", 1024)
     target_dict.setdefault("max_threads_per_block", 1024)
+    # The target kind materializes its generic 64 KiB default in export().
+    # Upgrade that default for newer HCU architectures, while preserving a
+    # caller-provided non-default limit.
+    configured_lds_size = int(target_dict.get("max_shared_memory_per_block", HCU_DEFAULT_LDS_SIZE_BYTES))
+    if configured_lds_size == HCU_DEFAULT_LDS_SIZE_BYTES:
+        target_dict["max_shared_memory_per_block"] = HCU_LDS_SIZE_BYTES.get(arch, HCU_DEFAULT_LDS_SIZE_BYTES)
     if arch in HCU_MCPU_SET:
         target_dict["thread_warp_size"] = HCU_WARP_SIZE
     else:
@@ -68,6 +79,10 @@ def default_enable_auto_async_copy(target: Target) -> bool:
 
 def target_get_warp_size(target: Target) -> int:
     return _target_ffi_api().TargetHcuGetWarpSize(target)
+
+
+def target_get_lds_size_bytes(target: Target) -> int:
+    return int(_target_ffi_api().TargetHcuGetLdsSizeBytes(target))
 
 
 def target_has_mmac_lit_lts(target: Target) -> bool:

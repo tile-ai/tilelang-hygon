@@ -5,7 +5,8 @@
 
 namespace tl {
 
-#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx946__)
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx946__) ||                 \
+    defined(__gfx948__)
 
 TL_DEVICE void abarrier_init(int abar_id, int wave_cnt) {
 #if defined(__HIP_DEVICE_COMPILE__)
@@ -81,10 +82,11 @@ TL_DEVICE void abarrier_complete_tx(int abar_id, int tx_cnt) {
 #endif
 }
 
-#endif // !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx946__)
+#endif // !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx946__) ||
+       // defined(__gfx948__)
 
 #if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx92a__) ||                 \
-    defined(__gfx946__)
+    defined(__gfx946__) || defined(__gfx948__)
 
 TL_DEVICE void ebarrier_sync(int ebar_id) {
 #if defined(__HIP_DEVICE_COMPILE__)

@@ -21,6 +21,7 @@ enum struct hcu_target_enum
     gfx938,
     gfx92a,
     gfx946,
+    gfx948,
 };
 
 template <typename, bool>

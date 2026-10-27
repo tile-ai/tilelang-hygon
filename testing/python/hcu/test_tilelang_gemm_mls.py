@@ -1165,7 +1165,7 @@ def test_gemm_mls_ds_read_format_fp8(M, N, K, trans_A, trans_B, block_M, block_N
 
 
 @pytest.mark.skipif(
-    current_hcu_arch_string() != "gfx946",
+    current_hcu_arch_string() not in {"gfx946", "gfx948"},
     reason="partial 4K-slot K groups are specific to gfx946 matrix_load",
 )
 @pytest.mark.parametrize(
@@ -1581,7 +1581,7 @@ def run_gemm_mls_mix_f4f6f8(
     assert "ds_read_format_tensor_b" in source
     assert "__builtin_hcu_mmac_f32_16x16x32_f8f6f4" in source
     assert "__builtin_hcu_mmac_f32_16x16x64_fp4" not in source
-    if arch == "gfx946":
+    if arch in {"gfx946", "gfx948"}:
         assert "uint8_t, 4, 8" in source
         assert "__builtin_hcu_mmac_f32_16x16x32_f8f6f4_lit_lts" in source
     else:
@@ -1730,7 +1730,7 @@ def test_mls_ds_read_format_b32_copy_to_global():
 
 
 @pytest.mark.skipif(
-    current_hcu_arch_string() != "gfx946",
+    current_hcu_arch_string() not in {"gfx946", "gfx948"},
     reason="packed b4 ds_read_format copy-to-global no-pad test is only supported on gfx946",
 )
 @pytest.mark.parametrize(
@@ -1813,7 +1813,7 @@ def test_gemm_mls_b4_shared_k32_auto_expand():
 
 
 @pytest.mark.skipif(
-    current_hcu_arch_string() != "gfx946",
+    current_hcu_arch_string() not in {"gfx946", "gfx948"},
     reason="partial 4K-slot K groups are specific to gfx946 matrix_load",
 )
 def test_gemm_mls_b4_nontrans_partial_k_slot_group():
@@ -2139,7 +2139,7 @@ def test_gemm_mls_k_outer_n_inner_update_mn():
 
 
 @pytest.mark.skipif(
-    current_hcu_arch_string() != "gfx946",
+    current_hcu_arch_string() not in {"gfx946", "gfx948"},
     reason="matrix_store VGPR path is supported only on gfx946",
 )
 @pytest.mark.parametrize(
@@ -2193,7 +2193,7 @@ def test_gemm_mls_ds_read_matrix_store_b32(m, n, k, block_m, block_n, block_k, t
 
 
 @pytest.mark.skipif(
-    current_hcu_arch_string() != "gfx946",
+    current_hcu_arch_string() not in {"gfx946", "gfx948"},
     reason="matrix_store VGPR path is supported only on gfx946",
 )
 def test_gemm_wasp_mls_4p4c4c_persistent_matrix_store():
@@ -2216,7 +2216,7 @@ def test_gemm_wasp_mls_4p4c4c_persistent_matrix_store():
 
 
 @pytest.mark.skipif(
-    current_hcu_arch_string() != "gfx946",
+    current_hcu_arch_string() not in {"gfx946", "gfx948"},
     reason="matrix_store VGPR path is supported only on gfx946",
 )
 @pytest.mark.parametrize(
@@ -2280,7 +2280,7 @@ def test_gemm_mls_ds_read_matrix_store_b32_boundary(
 
 
 @pytest.mark.skipif(
-    current_hcu_arch_string() != "gfx946",
+    current_hcu_arch_string() not in {"gfx946", "gfx948"},
     reason="matrix_store VGPR path is supported only on gfx946",
 )
 @pytest.mark.parametrize(
@@ -2351,7 +2351,7 @@ def test_gemm_mls_ds_read_alt2_packed_b16_matrix_store_b32(
 
 
 @pytest.mark.skipif(
-    current_hcu_arch_string() != "gfx946",
+    current_hcu_arch_string() not in {"gfx946", "gfx948"},
     reason="matrix_store VGPR path is supported only on gfx946",
 )
 @pytest.mark.parametrize(

@@ -253,7 +253,7 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
     rocm_path = os.environ.get("ROCM_PATH", "")
     if ("dtk" in rocm_path.lower() or os.path.isdir("/opt/dtk")) and get_hcu_compiler() != "aicc":
         return []
-    if arch in ["gfx928", "gfx936", "gfx938", "gfx92a", "gfx946"]:
+    if arch in ["gfx928", "gfx936", "gfx938", "gfx92a", "gfx946", "gfx948"]:
         flags = [
             "-mllvm=-enable-latency-hack=true",
             "-mllvm=-mmac-latency=5",
@@ -263,16 +263,16 @@ def get_hcu_compile_flags(arch: str, pass_configs: dict | None = None):
             "-mllvm=-disable-cluster-lds-memops=true",
             "-mllvm=-amdgpu-disable-backoff-barrier=false",
         ]
-        if arch in ["gfx92a", "gfx946"]:
-            flags.append("-mllvm=-support-512-vgprs=true")
-        else:
+        if arch in ["gfx936", "gfx938"]:
             flags.append("-mllvm=-support-768-vgprs=true")
+        else:
+            flags.append("-mllvm=-support-512-vgprs=true")
         if _pass_config_truthy(pass_configs, PassConfigKey.TL_ENABLE_FAST_MATH):
             flags.append("-mllvm=-enable-hcu-approx-func-fp-math=true")
         if _pass_config_truthy(pass_configs, PassConfigKey.TL_ENABLE_HCU_WDRA):
             flags.append("-mllvm=-vgpr-greedy-alloc-mode=local-wave")
             # flags.append("-mllvm=-turn-off-wdra-trap-handler=true")  # just for cmodel testing
-        if arch in ["gfx938", "gfx92a", "gfx946"]:
+        if arch in ["gfx938", "gfx92a", "gfx946", "gfx948"]:
             flags.append("-mllvm=-hcu-update-wait-by-reverse-search=true")
             flags.append("-mllvm=-hcu-pre-emit-load-store-opt=false")
             # flags.append("-mllvm=-hcu-trust-special-waitcnt-for-lds-dma=true")

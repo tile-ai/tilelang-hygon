@@ -15,7 +15,7 @@ template <> struct MmacTraits<int8_t> {
   static TL_DEVICE void mmac_op(const int8_t *b, const int8_t *a, AccType *c) {
     int32x2 *a_packed = reinterpret_cast<int32x2 *>(const_cast<int8_t *>(a));
     int32x2 *b_packed = reinterpret_cast<int32x2 *>(const_cast<int8_t *>(b));
-#if defined(__gfx938__) || defined(__gfx946__)
+#if defined(__gfx938__) || defined(__gfx946__) || defined(__gfx948__)
     // default: lit en, clamp disable, lts disable
     *c = __builtin_hcu_mmac_i32_16x16x32_i8_lit_clamp_lts(*a_packed, *b_packed,
                                                           *c, 1, 0, 0);
@@ -29,7 +29,7 @@ template <> struct MmacTraits<int8_t> {
 template <> struct MmacTraits<half> {
   template <typename AccType>
   static TL_DEVICE void mmac_op(const half *b, const half *a, AccType *c) {
-#if defined(__gfx938__) || defined(__gfx946__)
+#if defined(__gfx938__) || defined(__gfx946__) || defined(__gfx948__)
     *c = __builtin_hcu_mmac_f32_16x16x16_f16_lit_lts(
         *((float16x4 *)a), *((float16x4 *)b), *c, 1, 0);
 #else
@@ -57,7 +57,7 @@ template <> struct MmacTraits<bfloat16_t> {
     }
 
     // Call the intrinsic and store the result directly to c
-#if defined(__gfx938__) || defined(__gfx946__)
+#if defined(__gfx938__) || defined(__gfx946__) || defined(__gfx948__)
     *c = __builtin_hcu_mmac_f32_16x16x16_bf16_lit_lts(a_vec, b_vec, *c, 1, 0);
 #else
     *c = __builtin_hcu_mmac_f32_16x16x16_bf16(a_vec, b_vec, *c);
@@ -72,7 +72,7 @@ template <> struct MmacTraits<float> {
 #if defined(__gfx938__)
     *c = __builtin_hcu_mmac_16x16x8_f32_lit_lts(*((float32x2 *)a),
                                                 *((float32x2 *)b), *c, 1, 0);
-#elif defined(__gfx946__)
+#elif defined(__gfx946__) || defined(__gfx948__)
     *c = __builtin_hcu_mmac_16x16x4_f32_lit_lts(*a, *b, *c, 1, 0);
 #elif defined(__gfx92a__)
     *c = __builtin_hcu_mmac_16x16x4_f32(*a, *b, *c);
@@ -87,7 +87,7 @@ template <> struct MmacTraits<float> {
 template <> struct MmacTraits<int> {
   template <typename AccType>
   static TL_DEVICE void mmac_op(const int *b, const int *a, AccType *c) {
-#if defined(__gfx938__) || defined(__gfx946__)
+#if defined(__gfx938__) || defined(__gfx946__) || defined(__gfx948__)
     // default: lit en, lts disable (aligned with tvm_mfma
     // f32_16x16x8_f32_lit_lts)
     *c = __builtin_hcu_mmac_f32_16x16x8_tf32_lit_lts(*((int32x2 *)a),
@@ -108,10 +108,11 @@ template <> struct MmacTraits<fp8_e4_t> {
     int32x2 a_val = *reinterpret_cast<const int32x2 *>(a);
     int32x2 b_val = *reinterpret_cast<const int32x2 *>(b);
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (!defined(__gfx938__) && !defined(__gfx92a__) && !defined(__gfx946__))
+    (!defined(__gfx938__) && !defined(__gfx92a__) && !defined(__gfx946__) &&   \
+     !defined(__gfx948__))
 #error                                                                         \
-    "fp8_e4_t MMAC operations are only supported on gfx938, gfx92a, and gfx946 architectures"
-#elif defined(__gfx938__) || defined(__gfx946__)
+    "fp8_e4_t MMAC operations are only supported on gfx938, gfx92a, gfx946, and gfx948 architectures"
+#elif defined(__gfx938__) || defined(__gfx946__) || defined(__gfx948__)
     *c =
         __builtin_hcu_mmac_f32_16x16x32_fp8_fp8_lit_lts(a_val, b_val, *c, 1, 0);
 #elif defined(__gfx92a__)
@@ -128,10 +129,11 @@ template <> struct MmacTraits<fp8_e5_t> {
     int32x2 a_val = *reinterpret_cast<const int32x2 *>(a);
     int32x2 b_val = *reinterpret_cast<const int32x2 *>(b);
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (!defined(__gfx938__) && !defined(__gfx92a__) && !defined(__gfx946__))
+    (!defined(__gfx938__) && !defined(__gfx92a__) && !defined(__gfx946__) &&   \
+     !defined(__gfx948__))
 #error                                                                         \
-    "fp8_e5_t MMAC operations are only supported on gfx938, gfx92a, and gfx946 architectures"
-#elif defined(__gfx938__) || defined(__gfx946__)
+    "fp8_e5_t MMAC operations are only supported on gfx938, gfx92a, gfx946, and gfx948 architectures"
+#elif defined(__gfx938__) || defined(__gfx946__) || defined(__gfx948__)
     *c =
         __builtin_hcu_mmac_f32_16x16x32_bf8_bf8_lit_lts(a_val, b_val, *c, 1, 0);
 #elif defined(__gfx92a__)

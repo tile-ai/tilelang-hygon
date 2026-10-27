@@ -342,6 +342,7 @@ struct tilelang_mls_base
             mls_res_[resource_idx], moffset,
             ::tl::bool_constant<ResourceAlongMN>{});
       } else if constexpr (HcuArch == ::tl::hcu_target_enum::gfx946 ||
+                           HcuArch == ::tl::hcu_target_enum::gfx948 ||
                            HcuArch == ::tl::hcu_target_enum::gfx92a) {
         TL_LDS_ADDR uint8_t *smem_bytes =
             reinterpret_cast<TL_LDS_ADDR uint8_t *>(smem);
@@ -395,6 +396,7 @@ struct tilelang_mls_base
             mls_res_[resource_idx], moffset,
             ::tl::bool_constant<ResourceAlongMN>{});
       } else if constexpr (HcuArch == ::tl::hcu_target_enum::gfx946 ||
+                           HcuArch == ::tl::hcu_target_enum::gfx948 ||
                            HcuArch == ::tl::hcu_target_enum::gfx92a) {
         TL_LDS_ADDR uint8_t *smem_bytes =
             reinterpret_cast<TL_LDS_ADDR uint8_t *>(smem);
@@ -591,8 +593,9 @@ mls_store_tile(void *local_src_storage, DataType *p_data,
                ::tl::index_t mls_stride, ::tl::index_t mn_length_raw,
                ::tl::index_t k_length_raw, ::tl::index_t block_mn_base,
                ::tl::index_t block_k_base, ::tl::index_t warp_id_offset = 0) {
-  static_assert(HcuArch == ::tl::hcu_target_enum::gfx946,
-                "VGPR MLS store is only supported on gfx946");
+  static_assert(HcuArch == ::tl::hcu_target_enum::gfx946 ||
+                    HcuArch == ::tl::hcu_target_enum::gfx948,
+                "VGPR MLS store is only supported on gfx946/gfx948");
   static_assert(mls_elem_bits_v<DataType> == 16 ||
                     mls_elem_bits_v<DataType> == 32,
                 "VGPR MLS store supports only b16 or b32 data");

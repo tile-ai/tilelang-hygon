@@ -30,7 +30,7 @@ tilelang.testing.set_random_seed(0)
 
 requires_blockscaled = pytest.mark.skipif(
     not target_supports_blockscaled(),
-    reason="gemm_blockscaled requires an HCU gfx946 target (auto)",
+    reason="gemm_blockscaled requires an HCU gfx946/gfx948 target (auto)",
 )
 
 

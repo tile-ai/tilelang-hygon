@@ -3,10 +3,10 @@ from tilelang.backend.target import determine_target
 from tilelang.hcu.target import get_hcu_arch_string, target_is_hcu
 
 # HCU gfx validated for FP8 ``__builtin_hcu_mmac_*`` (extend when verified on new arch).
-_FP8_MMAC_SUPPORTED_HCU_ARCHES = frozenset({"gfx938", "gfx92a", "gfx946"})
+_FP8_MMAC_SUPPORTED_HCU_ARCHES = frozenset({"gfx938", "gfx92a", "gfx946", "gfx948"})
 
 # HCU gfx validated for MLS matrix_load tests (extend when verified on new arch).
-MLS_SUPPORTED_HCU_ARCHES = frozenset({"gfx938", "gfx946", "gfx92a"})
+MLS_SUPPORTED_HCU_ARCHES = frozenset({"gfx938", "gfx946", "gfx948", "gfx92a"})
 
 
 def target_supports_fp8_mmac() -> bool:
@@ -31,7 +31,7 @@ def target_supports_mls_b4() -> bool:
     """Return whether the target supports packed FP4 as an MLS source."""
     try:
         target = tvm.target.Target(determine_target("auto"))
-        return target_is_hcu(target) and get_hcu_arch_string(target) in ("gfx92a", "gfx946")
+        return target_is_hcu(target) and get_hcu_arch_string(target) in ("gfx92a", "gfx946", "gfx948")
     except Exception:
         return False
 
@@ -40,7 +40,7 @@ def target_supports_mls_b32() -> bool:
     """Return whether the target supports b32 as an MLS source."""
     try:
         target = tvm.target.Target(determine_target("auto"))
-        return target_is_hcu(target) and get_hcu_arch_string(target) in ("gfx92a", "gfx946")
+        return target_is_hcu(target) and get_hcu_arch_string(target) in ("gfx92a", "gfx946", "gfx948")
     except Exception:
         return False
 
@@ -49,7 +49,7 @@ def target_supports_mls_fp4_pad() -> bool:
     """Return whether the active target supports fp4 MLS b8-LDS fallback tests."""
     try:
         target = tvm.target.Target(determine_target("auto"))
-        return target_is_hcu(target) and get_hcu_arch_string(target) in ("gfx92a", "gfx946")
+        return target_is_hcu(target) and get_hcu_arch_string(target) in ("gfx92a", "gfx946", "gfx948")
     except Exception:
         return False
 
@@ -64,7 +64,7 @@ def current_hcu_arch_string() -> str:
 
 
 # First-release gemm_blockscaled (FP4xFP4 + E8M0) requires lit/lts + scale builtins.
-BLOCKSCALED_SUPPORTED_HCU_ARCHES = frozenset({"gfx946"})
+BLOCKSCALED_SUPPORTED_HCU_ARCHES = frozenset({"gfx946", "gfx948"})
 
 
 def target_supports_blockscaled(target=None) -> bool:

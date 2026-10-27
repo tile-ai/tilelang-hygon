@@ -12,7 +12,7 @@ template <typename T> struct MmacMicroKDim {
 };
 
 template <> struct MmacMicroKDim<float> {
-#if defined(__gfx92a__) || defined(__gfx946__)
+#if defined(__gfx92a__) || defined(__gfx946__) || defined(__gfx948__)
   static constexpr int value = 4;
 #elif defined(__gfx938__)
   static constexpr int value = 8;

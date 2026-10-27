@@ -37,6 +37,7 @@ bool DefaultEnableAutoAsyncCopy(Target target);
 int TargetHcuGetWarpSize(Target target);
 int TargetHcuGetLdsBankCount(Target target);
 int TargetHcuGetLdsBankWidthBytes(Target target);
+int TargetHcuGetLdsSizeBytes(Target target);
 HcuLdsWrapConfig TargetHcuGetLdsWrapConfig(Target target);
 int TargetHcuGetLdsWrapFieldBits(Target target);
 int TargetHcuGetLdsWrapGranularityDwords(Target target);

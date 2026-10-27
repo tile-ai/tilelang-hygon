@@ -188,7 +188,7 @@ template <> struct mls_traits<tl::mls::gfx938_mls_16x128_trans_b8, 4> {
 };
 
 #if !defined(__HIP_DEVICE_COMPILE__) ||                                        \
-    (defined(__gfx946__) || defined(__gfx92a__))
+    (defined(__gfx946__) || defined(__gfx948__) || defined(__gfx92a__))
 #include <tl_templates/hcu/mls/tl_mls_atom_gfx946.hpp>
 
 template <::tl::index_t Alt>

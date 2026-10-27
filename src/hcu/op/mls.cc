@@ -29,6 +29,10 @@ using namespace ffi;
 
 namespace {
 
+bool UsesGfx946MlsCompat(const std::string &arch) {
+  return arch == "gfx946" || arch == "gfx948";
+}
+
 bool GetNoImplicitAsyncCommitWait(const Map<String, ObjectRef> &annotations) {
   auto value = annotations.Get(attr::kAsyncCopyNoImplicitCommitWait);
   if (!value) {
@@ -91,7 +95,8 @@ Optional<Integer> TryGetMlsDstActualSizeBytes(const Buffer &dst,
                                               int lds_physical_bits) {
   const auto hcu_arch = TargetIsHCU(target) ? GetHcuArchString(target) : "";
   if (!TargetIsHCU(target) ||
-      (hcu_arch != "gfx946" && hcu_arch != "gfx938" && hcu_arch != "gfx92a") ||
+      (hcu_arch != "gfx946" && hcu_arch != "gfx948" && hcu_arch != "gfx938" &&
+       hcu_arch != "gfx92a") ||
       dst->shape.size() < 2) {
     return std::nullopt;
   }
@@ -445,8 +450,8 @@ constexpr MlsTileConfigSet kMlsTileConfigTable[] = {
 
 const MlsTileConfigSet &GetMlsTileConfigSet(int elem_bits, Target target) {
   if (elem_bits == 4) {
-    ICHECK_EQ(GetHcuArchString(target), "gfx946")
-        << "b4 matrix_load is only supported on gfx946";
+    ICHECK(UsesGfx946MlsCompat(GetHcuArchString(target)))
+        << "b4 matrix_load is only supported on gfx946/gfx948";
   }
   for (const auto &config_set : kMlsTileConfigTable) {
     if (config_set.elem_bits == elem_bits) {
@@ -570,7 +575,7 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
         << "FP4 matrix_load requested LDS bits must be 0/4/8, got "
         << requested_lds_bits;
     const std::string arch = GetHcuArchString(target);
-    if (requested_lds_bits != 8 && arch == "gfx946") {
+    if (requested_lds_bits != 8 && UsesGfx946MlsCompat(arch)) {
       const MlsTileConfig *b4_configs =
           trans ? kMlsTileConfigsB4Trans : kMlsTileConfigsB4NonTrans;
       int b4_config_count = trans ? ArraySize(kMlsTileConfigsB4Trans)
@@ -578,10 +583,10 @@ void ComputeMlsWarpPartition(bool trans, int block_mn, int block_k,
       if (try_configs(b4_configs, b4_config_count)) {
         return;
       }
-    } else if (arch != "gfx946") {
+    } else if (!UsesGfx946MlsCompat(arch)) {
       ICHECK_EQ(arch, "gfx92a")
-          << "b4 matrix_load is only supported on gfx946; fp4 b8 LDS "
-             "fallback is supported on gfx92a/gfx946";
+          << "b4 matrix_load is only supported on gfx946/gfx948; fp4 b8 LDS "
+             "fallback is supported on gfx92a/gfx946/gfx948";
     }
     if (requested_lds_bits == 4) {
       LOG(FATAL) << "No packed-b4 MLS tile config for trans=" << trans
@@ -929,7 +934,8 @@ std::optional<std::pair<int, int>> FindMatrixStoreWarpPartition(
 LayoutMap MatrixStoreNode::InferLayout(const LayoutInferArgs &T,
                                        InferLevel level) const {
   (void)level;
-  if (!TargetIsHCU(T.target) || GetHcuArchString(T.target) != "gfx946") {
+  if (!TargetIsHCU(T.target) ||
+      !UsesGfx946MlsCompat(GetHcuArchString(T.target))) {
     return {};
   }
   if (!IsFragmentBuffer(src) || !IsGlobalBuffer(dst) || src->shape.size() < 2) {
@@ -980,8 +986,8 @@ Stmt MatrixStoreNode::Lower(const LowerArgs &T,
   if (!TargetIsHCU(T.target)) {
     LOG(FATAL) << "matrix_store is only supported on HCU target";
   }
-  ICHECK_EQ(GetHcuArchString(T.target), "gfx946")
-      << "matrix_store VGPR path is only supported on gfx946";
+  ICHECK(UsesGfx946MlsCompat(GetHcuArchString(T.target)))
+      << "matrix_store VGPR path is only supported on gfx946/gfx948";
   ICHECK(IsFragmentBuffer(src))
       << "matrix_store src must be a local.fragment MMAC result, got scope="
       << src.scope();
