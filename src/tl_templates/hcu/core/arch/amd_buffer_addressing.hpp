@@ -1807,7 +1807,7 @@ TL_DEVICE void amd_async_buffer_load_inline_asm(TL_LDS_ADDR T* smem,
 
     auto const wave_smem_ptr = __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>(smem)));
 
-#if defined(__gfx938__) || defined(__gfx946__) || defined(__gfx936__)
+#if defined(__gfx938__) || defined(__gfx946__) || defined(__gfx948__) || defined(__gfx936__)
     if constexpr(oob_conditional_check)
     {
         index_t v_offset = flag ? src_thread_addr_offset : src_wave_buffer_resource[2];

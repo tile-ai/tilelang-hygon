@@ -143,13 +143,13 @@
 #define TL_TENSOR_LOAD_FORCE_M0 0
 #endif
 
-#if defined(__gfx92a__) || defined(__gfx946__)
+#if defined(__gfx92a__) || defined(__gfx946__) || defined(__gfx948__)
 #define TL_DS_FORMAT_FORCE_M0 0
 #else
 #define TL_DS_FORMAT_FORCE_M0 1
 #endif
 
-#if defined(__gfx946__)
+#if defined(__gfx946__) || defined(__gfx948__)
 #define TL_MATRIX_LOAD_SUPPORT_BPS 1
 #else
 #define TL_MATRIX_LOAD_SUPPORT_BPS 0
@@ -161,25 +161,25 @@
 #define TL_MATRIX_LOAD_TRANS_EXTRA_CONFIG 0x00000000
 #endif
 
-#if defined(__gfx92a__) || defined(__gfx946__)
+#if defined(__gfx92a__) || defined(__gfx946__) || defined(__gfx948__)
 #define TL_DEVICE_EBARRIER_SUPPORT 1
 #else
 #define TL_DEVICE_EBARRIER_SUPPORT 0
 #endif
 
-#if defined(__gfx946__)
+#if defined(__gfx946__) || defined(__gfx948__)
 #define TL_DEVICE_EBARRIER_REDUCE_OP_SUPPORT 1
 #else
 #define TL_DEVICE_EBARRIER_REDUCE_OP_SUPPORT 0
 #endif
 
-#if defined(__gfx946__)
+#if defined(__gfx946__) || defined(__gfx948__)
 #define TL_DEVICE_ABARRIER_SUPPORT 1
 #else
 #define TL_DEVICE_ABARRIER_SUPPORT 0
 #endif
 
-#if defined(__gfx946__)
+#if defined(__gfx946__) || defined(__gfx948__)
 #define TL_BLOCK_MAX_LDS_SIZE 131072
 #else
 #define TL_BLOCK_MAX_LDS_SIZE 65536
@@ -220,7 +220,7 @@
 #define TL_BUFFER_RESOURCE_3RD_DWORD 0xffffffff
 #elif defined(__gfx9__) || defined(__gfx916__) || defined(__gfx926__) || defined(__gfx928__) || \
     defined(__gfx936__) || defined(__gfx938__) || defined(__gfx92a__) ||                        \
-    defined(__gfx946__) // for GPU code
+    defined(__gfx946__) || defined(__gfx948__) // for GPU code
 #define TL_BUFFER_RESOURCE_3RD_DWORD 0x00020000
 #endif
 

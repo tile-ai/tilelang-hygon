@@ -46,7 +46,7 @@ CUTEDSL_KNOWN_FAILURES = {
 }
 
 # HCU gfx validated for examples that rely on FP8/MMAC lowering.
-_FP8_MMAC_SUPPORTED_HCU_ARCHES = frozenset({"gfx938", "gfx92a", "gfx946"})
+_FP8_MMAC_SUPPORTED_HCU_ARCHES = frozenset({"gfx938", "gfx92a", "gfx946", "gfx948"})
 
 FP8_MMAC_HCU_SKIP_PATTERNS = {
     "cast/test_example_cast.py",

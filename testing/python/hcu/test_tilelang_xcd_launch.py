@@ -12,7 +12,7 @@ from hcu_test_utils import current_hcu_arch_string
 
 
 pytestmark = pytest.mark.skipif(
-    current_hcu_arch_string() != "gfx946",
+    current_hcu_arch_string() not in {"gfx946", "gfx948"},
     reason="HCU MultiDie launch is only validated on gfx946",
 )
 
