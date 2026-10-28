@@ -485,8 +485,10 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
     return std::nullopt;
   }
   params.copy_bytes_per_lane = static_cast<int>(tile_bytes / block_threads);
-  params.copy_transaction_bytes = SelectHcuGemmLdsCopyTransactionBytes(
-      row_bytes, params.copy_bytes_per_lane, params.element_bytes);
+  params.copy_transaction_bytes =
+      std::min(SelectHcuGemmLdsCopyTransactionBytes(
+                   row_bytes, params.copy_bytes_per_lane, params.element_bytes),
+               GetHcuGemmLdsCopyVectorBytes(copy, target));
   if (params.copy_transaction_bytes < 4 ||
       params.copy_bytes_per_lane < params.copy_transaction_bytes ||
       params.copy_bytes_per_lane % params.copy_transaction_bytes != 0 ||

@@ -20,6 +20,8 @@
 namespace tvm {
 namespace tl {
 
+class CopyNode;
+
 namespace attr {
 static constexpr const char *kHcuGemmLdsCopyStrategy =
     "tl.hcu_gemm_lds_copy_strategy";
@@ -107,6 +109,10 @@ DeriveHcuGemmLdsCopyGeometry(int bytes_per_row, int copy_transaction_bytes,
 int SelectHcuGemmLdsCopyTransactionBytes(int bytes_per_row,
                                          int copy_bytes_per_lane,
                                          int element_bytes);
+
+// Determine the copy access width before constructing its thread/LDS layouts.
+// Include the global source alignment and boundary predicates.
+int GetHcuGemmLdsCopyVectorBytes(const CopyNode &copy, Target target);
 
 int GetHcuGemmLdsWrapOffsetDwords(int wrap_step_bytes);
 

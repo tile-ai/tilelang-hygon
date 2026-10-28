@@ -9,6 +9,8 @@
 #include "gemm_lds_strategy_utils.h"
 
 #include "hcu/target_utils.h"
+#include "op/copy.h"
+#include "transform/loop_vectorize.h"
 
 #include <climits>
 #include <numeric>
@@ -171,6 +173,13 @@ int SelectHcuGemmLdsCopyTransactionBytes(int bytes_per_row,
     }
   }
   return 0;
+}
+
+int GetHcuGemmLdsCopyVectorBytes(const CopyNode &copy, Target target) {
+  With<Target> target_scope(target);
+  arith::Analyzer analyzer;
+  For loop = copy.MakeSIMTLoop(&analyzer);
+  return GetVectorizeSize(loop, &analyzer) * copy.src->dtype.bytes();
 }
 
 int GetHcuGemmLdsWrapOffsetDwords(int wrap_step_bytes) {

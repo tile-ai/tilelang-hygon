@@ -93,5 +93,47 @@ def test_hcu_gemm_plain_copy_shared_at_bn_multiple_consumers():
     )
 
 
+@pytest.mark.parametrize(
+    "n,k,trans_b,copy_bytes",
+    [(300, 128, False, 8), (302, 128, False, 4), (304, 128, False, 16), (128, 132, True, 8)],
+)
+def test_hcu_gemm_async_copy_source_alignment(n, k, trans_b, copy_bytes):
+    """Select a complete LDS strategy compatible with the global row stride."""
+    batch, m, block = 4, 200, 64
+    b_shape = (batch, n, k) if trans_b else (batch, k, n)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((batch, m, k), T.float16),
+        B: T.Tensor(b_shape, T.float16),
+        C: T.Tensor((batch, m, n), T.float16),
+    ):
+        with T.Kernel(T.ceildiv(n, block), T.ceildiv(m, block), batch, threads=128) as (bx, by, bz):
+            A_shared = T.alloc_shared((block, block), T.float16)
+            B_shared = T.alloc_shared((block, block), T.float16)
+            C_local = T.alloc_fragment((block, block), T.float32)
+            T.clear(C_local)
+            for ko in T.Pipelined(T.ceildiv(k, block), num_stages=2):
+                T.copy(A[bz, by * block, ko * block], A_shared)
+                if trans_b:
+                    T.copy(B[bz, bx * block, ko * block], B_shared)
+                else:
+                    T.copy(B[bz, ko * block, bx * block], B_shared)
+                T.gemm(A_shared, B_shared, C_local, transpose_B=trans_b)
+            T.copy(C_local, C[bz, by * block, bx * block])
+
+    kernel = tl.compile(main, out_idx=[2])
+    source = kernel.get_kernel_source()
+    assert any(
+        re.search(rf"tl::cp_async_gs(?:_idxen)?(?:_conditional)?<{copy_bytes}(?:,|>)", line) and "B_cp_async" in line
+        for line in source.splitlines()
+    ), source
+    kernel.get_profiler().assert_allclose(
+        lambda a, b: a @ (b.transpose(-1, -2) if trans_b else b),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
 if __name__ == "__main__":
     tilelang.testing.main()
