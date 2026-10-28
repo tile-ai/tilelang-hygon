@@ -257,22 +257,25 @@ bool IsAnBtLinearDsReadCopyCandidate(const CopyNode *copy,
       copy->dst.scope() != "local.fragment")
     return false;
   const GemmNode *gemm = consumer.gemm.get();
-  if (!gemm || gemm->k_ % 16 != 0 || gemm->kPack_ != 1)
+  const int read_tile_k = copy->src->dtype.bits() == 8 ? 32 : 16;
+  if (!gemm || gemm->k_ % read_tile_k != 0 || gemm->kPack_ != 1)
     return false;
   const bool feeds_a = consumer.input.same_as(gemm->a_);
   if (!(feeds_a || consumer.input.same_as(gemm->b_)) ||
       (feeds_a ? !gemm->transA_ : gemm->transB_))
     return false;
-  if (!(copy->src->dtype.is_float16() || copy->src->dtype.is_bfloat16()) ||
+  if (!(copy->src->dtype.is_float16() || copy->src->dtype.is_bfloat16() ||
+        copy->src->dtype.is_float8_e4m3fn() ||
+        copy->src->dtype.is_float8_e5m2()) ||
       copy->src->dtype != copy->dst->dtype)
     return false;
   if (copy->src_range.size() < 2 || copy->dst_range.size() < 2)
     return false;
   size_t sr = copy->src_range.size();
   size_t dr = copy->dst_range.size();
-  return IsStaticMultipleOf(copy->src_range[sr - 2]->extent, 16) &&
+  return IsStaticMultipleOf(copy->src_range[sr - 2]->extent, read_tile_k) &&
          IsStaticMultipleOf(copy->src_range[sr - 1]->extent, 32) &&
-         IsStaticMultipleOf(copy->dst_range[dr - 2]->extent, 16) &&
+         IsStaticMultipleOf(copy->dst_range[dr - 2]->extent, read_tile_k) &&
          IsStaticMultipleOf(copy->dst_range[dr - 1]->extent, 32);
 }
 
@@ -653,7 +656,8 @@ private:
         !IsSharedBuffer(buffer) || HasAnnotatedLayout(buffer) ||
         blocked_plain_buffers_.count(buffer) ||
         blocked_plain_data_.count(buffer->data) ||
-        !(buffer->dtype.is_float16() || buffer->dtype.is_bfloat16()) ||
+        !(buffer->dtype.is_float16() || buffer->dtype.is_bfloat16() ||
+          buffer->dtype.is_float8_e4m3fn() || buffer->dtype.is_float8_e5m2()) ||
         buffer->dtype.lanes() != 1 || !buffer->strides.empty() ||
         buffer->shape.size() != 2 || !is_zero(buffer->elem_offset))
       return std::nullopt;
@@ -692,12 +696,14 @@ private:
     auto consumers = GetExclusiveGemmConsumersAfterCall(buffer, nullptr);
     if (!consumers || consumers->empty())
       return std::nullopt;
+    const int element_bits = buffer->dtype.bits();
+    const int read_tile_k = element_bits == 8 ? 32 : 16;
     std::vector<HcuGemmLdsReadPattern> reads;
     for (const GemmWithInput &consumer : *consumers) {
       const Gemm &gemm = consumer.gemm;
       if (gemm->a_.same_as(gemm->b_) ||
           gemm->IsInstance<GemmBlockScaledNode>() ||
-          gemm->k_ % (16 * gemm->kPack_) != 0 ||
+          gemm->k_ % (read_tile_k * gemm->kPack_) != 0 ||
           gemm->a_->dtype != buffer->dtype || gemm->b_->dtype != buffer->dtype)
         return std::nullopt;
       bool feeds_a = consumer.input.same_as(gemm->a_);
@@ -742,7 +748,8 @@ private:
         if (policy->k_warp != 1 || mn % warp_mn || (mn / warp_mn) % 32)
           return std::nullopt;
       }
-      reads.push_back({16, 16, 32, 8, 16, kind, gemm->kPack_});
+      reads.push_back({element_bits, read_tile_k, 32, 128 / element_bits, 16,
+                       kind, gemm->kPack_});
     }
     return MakeHcuPlainGemmLdsLayout(
         buffer->shape, TargetHcuGetLdsBankCount(target_),
@@ -1392,7 +1399,7 @@ private:
                                 auto_an_bt_strategies_.count(copy->src->data);
         // The fallback template is B-specific. AN must have an explicit
         // logical-to-physical map before it can use the generic vector read.
-        if (feeds_a && !has_layout) {
+        if ((feeds_a || copy->src->dtype.bits() == 8) && !has_layout) {
           return IRMutatorWithAnalyzer::VisitStmt_(op);
         }
         auto annotations = call->annotations;
@@ -1456,6 +1463,28 @@ private:
 
     if (tir_op.same_as(Gemm::Get()) || tir_op.same_as(GemmBlockScaled::Get())) {
       auto gemm = Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
+      if (mode_ == Mode::kMaterialize) {
+        for (const Buffer &input : {gemm->a_, gemm->b_}) {
+          if (!IsSharedBuffer(input) || !input->dtype.is_float8() ||
+              IsAtBnAccess({gemm, input}) || plain_layouts_.count(input->data))
+            continue;
+          if (Optional<Layout> layout = FindAnnotatedLayout(input)) {
+            arith::Analyzer layout_analyzer;
+            Array<PrimExpr> vars = layout.value()->GetForwardVars();
+            for (size_t axis = 0; axis < vars.size(); ++axis) {
+              layout_analyzer.Bind(Downcast<Var>(vars[axis]),
+                                   Range(make_zero(vars[axis].dtype()),
+                                         layout.value()->InputShape()[axis]));
+            }
+            ICHECK(layout_analyzer.CanProveEqual(
+                layout.value()->GetLinearizedForwardIndex(),
+                MakeLinearLayout(input->shape)->GetLinearizedForwardIndex()))
+                << "fp8 AN/BT buffer " << input->name
+                << " requires row-major storage during materialize; "
+                   "no layout-aware AN/BT read was selected for this buffer";
+          }
+        }
+      }
       auto annotations =
           AnnotateGemmHcuMlsFlags(call->annotations, gemm.get(), collector_);
       const int b_ds_read_alt = GetDsReadAlt(gemm->b_);

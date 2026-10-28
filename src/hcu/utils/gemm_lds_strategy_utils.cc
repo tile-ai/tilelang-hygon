@@ -45,10 +45,17 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
   }
   bool has_an_bt = false;
   bool has_at_bn = false;
+  const int element_bits = consumers.front().element_bits;
+  if (element_bits != 8 && element_bits != 16)
+    return std::nullopt;
+  const int elements_per_read = 128 / element_bits;
+  const int read_tile_k = element_bits == 8 ? 32 : 16;
+  if (rows < read_tile_k)
+    return std::nullopt;
   for (const auto &read : consumers) {
-    // Only the b16 contract is enabled in this stage.
-    if (read.element_bits != 16 || read.read_tile_k != 16 ||
-        read.read_tile_mn != 32 || read.elements_per_read != 8 ||
+    if (read.element_bits != element_bits || read.read_tile_k != read_tile_k ||
+        read.read_tile_mn != 32 ||
+        read.elements_per_read != elements_per_read ||
         read.read_bytes_per_lane != 16)
       return std::nullopt;
     if (read.consumer_kind == HcuGemmLdsAccessKind::kAnBt) {
@@ -61,12 +68,49 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
       has_at_bn = true;
     }
   }
+  // Pure AT/BN keeps the existing makeHCUSwizzledLayout path. This
+  // common layout is only needed by AN/BT and its mixed consumers.
   if (!has_an_bt)
     return std::nullopt;
   PrimExpr row = InputPlaceholder(0);
   PrimExpr col = InputPlaceholder(1);
   PrimExpr shift = Integer(0);
-  if (!has_at_bn) {
+  if (element_bits == 8) {
+    // b8 preserves a 16-element suffix. Its K32/N32 requests need a
+    // distinct row-bit mapping from the b16 K16/N32 contract.
+    if (bank_count == 32) {
+      if (width == 64)
+        shift = (row & 2) << 4;
+      if (width >= 128)
+        shift = (row & 3) << 5;
+      // NMZ b128 phases pair lanes 0..3 with 20..23. At width 128,
+      // injecting r1 into column bit 6 cancels the producer's lane bit 2.
+      // Use r1 for column bit 4 and r3 for bit 6 instead; the b8 matrix
+      // phase's r3/c relation preserves its three independent bank bits.
+      if (width == 128 || (has_at_bn && width >= 128))
+        shift = ((row & 1) << 5) ^ ((row & 10) << 3);
+      if (has_at_bn) {
+        // Cover the full b128 phase for AT/BN kp2 as well as the matrix
+        // phase. At width 64, r3 is broadcast into both N16-group bits.
+        if (width == 32)
+          shift = (row & 4) << 2;
+        else if (width == 64)
+          shift = ((row & 6) << 3) ^ ((row & 8) * 6);
+        else
+          shift = shift ^ ((row & 4) << 4);
+      }
+    } else {
+      if (width == 128)
+        shift = (row & 2) << 5;
+      if (width >= 256)
+        shift = (row & 3) << 6;
+      if (has_at_bn) {
+        shift = shift ^ ((row & 4) << 2);
+        if (width >= 64)
+          shift = shift ^ ((row & 8) << 2);
+      }
+    }
+  } else if (!has_at_bn) {
     const int row_period = bank_count / std::gcd(bank_count, int(width / 2));
     if (row_period == 1)
       shift = (row & 1) << 5;
@@ -85,9 +129,11 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
               ((row & 8) << 1);
   }
   // Express the preserved vector bits explicitly so vectorization and the
-  // symbolic ds-read contiguity check can see the N8 affine suffix.
+  // symbolic ds-read contiguity check can see the affine vector suffix.
   PrimExpr physical_col =
-      ((floordiv(col, 8) ^ floordiv(shift, 8)) * 8) + floormod(col, 8);
+      ((floordiv(col, elements_per_read) ^ floordiv(shift, elements_per_read)) *
+       elements_per_read) +
+      floormod(col, elements_per_read);
   Layout layout(Array<PrimExpr>{Integer(rows), Integer(width)},
                 {row, physical_col});
   Array<PrimExpr> leading;

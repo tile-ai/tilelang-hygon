@@ -3035,11 +3035,14 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     const auto *load = op->args[2].as<BufferLoadNode>();
     ICHECK(load) << "HCU ds_read_vector requires a shared BufferLoad source";
     DataType shared_dtype = load->buffer->dtype.element_of();
-    ICHECK(shared_dtype.is_float16() || shared_dtype.is_bfloat16())
-        << "HCU ds_read_vector only supports fp16/bf16 shared sources, got "
+    ICHECK(shared_dtype.is_float16() || shared_dtype.is_bfloat16() ||
+           shared_dtype.is_float8_e4m3fn() || shared_dtype.is_float8_e5m2())
+        << "HCU ds_read_vector requires fp16/bf16 or E4M3/E5M2 shared sources, "
+           "got "
         << shared_dtype;
-    const char *shared_elem_type =
-        shared_dtype.is_bfloat16() ? "bfloat16_t" : "half_t";
+    const char *shared_elem_type = shared_dtype.bits() == 8     ? "int"
+                                   : shared_dtype.is_bfloat16() ? "bfloat16_t"
+                                                                : "half_t";
     std::ostringstream load_expr;
     PrintExpr(op->args[2], load_expr);
     PrintIndent();
