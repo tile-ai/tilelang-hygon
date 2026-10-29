@@ -474,6 +474,10 @@ class GemmHCUMMAC(GemmBase):
         B_buf = B_region.buffer
         C_buf = C_region.buffer
         clear_accum = self.clear_accum
+        # Preserve dynamic clears before operand loads. Only constant clears
+        # are folded into the first MMAC through a template specialization.
+        dynamic_clear_accum = not isinstance(clear_accum, (bool, int, tirx.IntImm))
+        static_clear_accum = not dynamic_clear_accum and bool(clear_accum)
         a_dtype = self.a_dtype
         b_dtype = self.b_dtype
         a_local_dtype = _mls_local_dtype(a_dtype, fp4_mmac_mode=fp4_mmac_mode)
@@ -500,7 +504,7 @@ class GemmHCUMMAC(GemmBase):
             def _gemm_bs_mls_mls() -> None:
                 A_local = T.alloc_local(emitter.local_elems_a(full_k=True), a_local_dtype)
                 B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_local_dtype)
-                if clear_accum:
+                if dynamic_clear_accum and clear_accum:
                     T.clear(C_buf)
                 emitter.ldmatrix_mls_a(A_local, A_region)
                 emitter.ldmatrix_mls_b(B_local, B_region)
@@ -519,6 +523,7 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_b=scale_format_b,
                     real_ab_type=meta.real_ab_type,
+                    clear_accum=static_clear_accum,
                 )
 
             return _Simplify(_gemm_bs_mls_mls, inline_let=True)
@@ -529,7 +534,7 @@ class GemmHCUMMAC(GemmBase):
             @T.prim_func
             def _gemm_bs_r_mls() -> None:
                 B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_local_dtype)
-                if clear_accum:
+                if dynamic_clear_accum and clear_accum:
                     T.clear(C_buf)
                 emitter.ldmatrix_mls_b(B_local, B_region)
                 emitter.mmac_scale_fp4(
@@ -547,6 +552,7 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_b=scale_format_b,
                     real_ab_type=meta.real_ab_type,
+                    clear_accum=static_clear_accum,
                 )
 
             return _Simplify(_gemm_bs_r_mls, inline_let=True)
@@ -557,7 +563,7 @@ class GemmHCUMMAC(GemmBase):
             @T.prim_func
             def _gemm_bs_mls_r() -> None:
                 A_local = T.alloc_local(emitter.local_elems_a(full_k=True), a_local_dtype)
-                if clear_accum:
+                if dynamic_clear_accum and clear_accum:
                     T.clear(C_buf)
                 emitter.ldmatrix_mls_a(A_local, A_region)
                 emitter.mmac_scale_fp4(
@@ -575,6 +581,7 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_b=scale_format_b,
                     real_ab_type=meta.real_ab_type,
+                    clear_accum=static_clear_accum,
                 )
 
             return _Simplify(_gemm_bs_mls_r, inline_let=True)
@@ -586,7 +593,7 @@ class GemmHCUMMAC(GemmBase):
             def _gemm_bs_s_mls() -> None:
                 A_local = T.alloc_local(emitter.local_elems_a(full_k=True), a_local_dtype)
                 B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_local_dtype)
-                if clear_accum:
+                if dynamic_clear_accum and clear_accum:
                     T.clear(C_buf)
                 emitter.ldmatrix_mls_b(B_local, B_region)
                 for ki in T.serial(0, inner_k):
@@ -606,6 +613,7 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_b=scale_format_b,
                     real_ab_type=meta.real_ab_type,
+                    clear_accum=static_clear_accum,
                 )
 
             return _Simplify(_gemm_bs_s_mls, inline_let=True)
@@ -617,7 +625,7 @@ class GemmHCUMMAC(GemmBase):
             def _gemm_bs_ss() -> None:
                 A_local = T.alloc_local(emitter.local_elems_a(full_k=True), a_local_dtype)
                 B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_local_dtype)
-                if clear_accum:
+                if dynamic_clear_accum and clear_accum:
                     T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_a_fullk(A_local, A_region, ki)
@@ -637,6 +645,7 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_b=scale_format_b,
                     real_ab_type=meta.real_ab_type,
+                    clear_accum=static_clear_accum,
                 )
 
             return _Simplify(_gemm_bs_ss, inline_let=True)
@@ -648,7 +657,7 @@ class GemmHCUMMAC(GemmBase):
             @T.prim_func
             def _gemm_bs_sr() -> None:
                 A_local = T.alloc_local(emitter.local_elems_a(full_k=True), a_local_dtype)
-                if clear_accum:
+                if dynamic_clear_accum and clear_accum:
                     T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_a_fullk(A_local, A_region, ki)
@@ -667,6 +676,7 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_b=scale_format_b,
                     real_ab_type=meta.real_ab_type,
+                    clear_accum=static_clear_accum,
                 )
 
             return _Simplify(_gemm_bs_sr, inline_let=True)
@@ -678,7 +688,7 @@ class GemmHCUMMAC(GemmBase):
             @T.prim_func
             def _gemm_bs_rs() -> None:
                 B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_local_dtype)
-                if clear_accum:
+                if dynamic_clear_accum and clear_accum:
                     T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_b_fullk(B_local, B_region, ki)
@@ -697,6 +707,7 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_b=scale_format_b,
                     real_ab_type=meta.real_ab_type,
+                    clear_accum=static_clear_accum,
                 )
 
             return _Simplify(_gemm_bs_rs, inline_let=True)
@@ -707,7 +718,7 @@ class GemmHCUMMAC(GemmBase):
 
             @T.prim_func
             def _gemm_bs_rr() -> None:
-                if clear_accum:
+                if dynamic_clear_accum and clear_accum:
                     T.clear(C_buf)
                 emitter.mmac_scale_fp4(
                     A_buf,
@@ -724,6 +735,7 @@ class GemmHCUMMAC(GemmBase):
                     scale_shape_kb=scale_kb,
                     scale_format_b=scale_format_b,
                     real_ab_type=meta.real_ab_type,
+                    clear_accum=static_clear_accum,
                 )
 
             return _Simplify(_gemm_bs_rr, inline_let=True)
@@ -819,12 +831,10 @@ class GemmHCUMMAC(GemmBase):
             def _gemm_mls_mls() -> None:
                 A_local = T.alloc_local(emitter.local_elems_a(full_k=True), a_mls_local_dtype)
                 B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_mls_local_dtype)
-                if clear_accum:
-                    T.clear(C_buf)
                 emitter.ldmatrix_mls_a(A_local, A_region)
                 emitter.ldmatrix_mls_b(B_local, B_region)
                 for ki in T.serial(0, inner_k):
-                    emitter.mmac(A_local, B_local, C_buf, ki, trans_c=mmac_trans_c)
+                    emitter.mmac(A_local, B_local, C_buf, ki, trans_c=mmac_trans_c, clear_accum=clear_accum)
 
             return _Simplify(_gemm_mls_mls, inline_let=True)
 
@@ -838,11 +848,9 @@ class GemmHCUMMAC(GemmBase):
                 @T.prim_func
                 def _gemm_r_mls() -> None:
                     B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_mls_local_dtype)
-                    if clear_accum:
-                        T.clear(C_buf)
                     emitter.ldmatrix_mls_b(B_local, B_region)
                     for ki in T.serial(0, inner_k):
-                        emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c)
+                        emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, clear_accum=clear_accum)
 
                 return _Simplify(_gemm_r_mls, inline_let=True)
 
@@ -852,12 +860,10 @@ class GemmHCUMMAC(GemmBase):
                 def _gemm_s_mls() -> None:
                     A_local = T.alloc_local(emitter.local_elems_a(), a_dtype)
                     B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_mls_local_dtype)
-                    if clear_accum:
-                        T.clear(C_buf)
                     emitter.ldmatrix_mls_b(B_local, B_region)
                     for ki in T.serial(0, inner_k):
                         emitter.ldmatrix_a(A_local, A_region, ki)
-                        emitter.mmac(A_local, B_local, C_buf, ki, trans_c=mmac_trans_c)
+                        emitter.mmac(A_local, B_local, C_buf, ki, trans_c=mmac_trans_c, clear_accum=clear_accum)
 
                 return _Simplify(_gemm_s_mls, inline_let=True)
 
@@ -870,11 +876,9 @@ class GemmHCUMMAC(GemmBase):
                 @T.prim_func
                 def _gemm_r_b_linear() -> None:
                     B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_dtype)
-                    if clear_accum:
-                        T.clear(C_buf)
                     emitter.ldmatrix_b_linear(B_local, B_region)
                     for ki in T.serial(0, inner_k):
-                        emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c)
+                        emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, clear_accum=clear_accum)
 
                 return _Simplify(_gemm_r_b_linear, inline_let=True)
 
@@ -884,12 +888,10 @@ class GemmHCUMMAC(GemmBase):
                 def _gemm_s_b_linear() -> None:
                     A_local = T.alloc_local(emitter.local_elems_a(), a_dtype)
                     B_local = T.alloc_local(emitter.local_elems_b(full_k=True), b_dtype)
-                    if clear_accum:
-                        T.clear(C_buf)
                     emitter.ldmatrix_b_linear(B_local, B_region)
                     for ki in T.serial(0, inner_k):
                         emitter.ldmatrix_a(A_local, A_region, ki)
-                        emitter.mmac(A_local, B_local, C_buf, ki, trans_c=mmac_trans_c)
+                        emitter.mmac(A_local, B_local, C_buf, ki, trans_c=mmac_trans_c, clear_accum=clear_accum)
 
                 return _Simplify(_gemm_s_b_linear, inline_let=True)
 
@@ -901,12 +903,10 @@ class GemmHCUMMAC(GemmBase):
             def _gemm_ss() -> None:
                 A_local = T.alloc_local(emitter.warp_rows * local_size_a * k_pack, a_dtype)
                 B_local = T.alloc_local(emitter.warp_cols * local_size_b * k_pack, b_dtype)
-                if clear_accum:
-                    T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_a(A_local, A_region, ki)
                     emitter.ldmatrix_b(B_local, B_region, ki)
-                    emitter.mmac(A_local, B_local, C_buf, ki, trans_c=mmac_trans_c)
+                    emitter.mmac(A_local, B_local, C_buf, ki, trans_c=mmac_trans_c, clear_accum=clear_accum)
 
             return _Simplify(_gemm_ss, inline_let=True)
 
@@ -916,11 +916,9 @@ class GemmHCUMMAC(GemmBase):
             @T.prim_func
             def _gemm_sr() -> None:
                 A_local = T.alloc_local(emitter.warp_rows * local_size_a * k_pack, a_dtype)
-                if clear_accum:
-                    T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_a(A_local, A_region, ki)
-                    emitter.mmac(A_local, B_buf, C_buf, ki, trans_c=mmac_trans_c)
+                    emitter.mmac(A_local, B_buf, C_buf, ki, trans_c=mmac_trans_c, clear_accum=clear_accum)
 
             return _Simplify(_gemm_sr, inline_let=True)
 
@@ -930,11 +928,9 @@ class GemmHCUMMAC(GemmBase):
             @T.prim_func
             def _gemm_rs() -> None:
                 B_local = T.alloc_local(emitter.warp_cols * local_size_b * k_pack, b_dtype)
-                if clear_accum:
-                    T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
                     emitter.ldmatrix_b(B_local, B_region, ki)
-                    emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c)
+                    emitter.mmac(A_buf, B_local, C_buf, ki, trans_c=mmac_trans_c, clear_accum=clear_accum)
 
             return _Simplify(_gemm_rs, inline_let=True)
 
@@ -944,10 +940,8 @@ class GemmHCUMMAC(GemmBase):
 
             @T.prim_func
             def _gemm_rr() -> None:
-                if clear_accum:
-                    T.clear(C_buf)
                 for ki in T.serial(0, inner_k):
-                    emitter.mmac(A_buf, B_buf, C_buf, ki, trans_c=mmac_trans_c)
+                    emitter.mmac(A_buf, B_buf, C_buf, ki, trans_c=mmac_trans_c, clear_accum=clear_accum)
 
             return _Simplify(_gemm_rr, inline_let=True)
 

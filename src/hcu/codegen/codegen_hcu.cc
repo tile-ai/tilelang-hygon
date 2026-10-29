@@ -3373,9 +3373,10 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     // arg 9: B multiplicand index
     // arg 10: C accumulator
     // arg 11: C accumulator index
+    // arg 12 (optional): use a zero input accumulator, keeping C as output
 
-    ICHECK(op->args.size() == 12U)
-        << "Invalid number of arguments for tvm_mfma";
+    ICHECK(op->args.size() == 12U || op->args.size() == 13U)
+        << "Invalid number of arguments for hcu_mmac";
     std::string prefix = Downcast<StringImm>(op->args[0])->value;
     std::string A_layout = Downcast<StringImm>(op->args[1])->value;
     std::string B_layout = Downcast<StringImm>(op->args[2])->value;
@@ -3508,16 +3509,29 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       lts = prefix.find("_lit_lts") != std::string::npos ? ", 1, 0" : "";
     }
 
+    std::string accumulator =
+        "*((" + dtype_map.at(C_dtype) + "*)" + c_ref + " + " + c_bias + ")";
+    if (op->args.size() == 13U && !is_zero(op->args[12])) {
+      // Value-initialize the actual MMAC accumulator type, including all vector
+      // lanes. Do not clear the destination or assume float32x4 accumulators.
+      const std::string zero = dtype_map.at(C_dtype) + "{}";
+      if (is_one(op->args[12])) {
+        accumulator = zero;
+      } else {
+        accumulator = "(" + PrintExpr(op->args[12]) + " ? " + zero + " : " +
+                      accumulator + ")";
+      }
+    }
     std::string call_mfma_code =
         "*((({C_dtype}*){c_ref}) + {c_bias}) = {mfma_buildin}("
         "*((({A_dtype}*){a_ref_cast}) + {a_bias}), "
         "*((({B_dtype}*){b_ref_cast}) + {b_bias}), "
-        "*((({C_dtype}*){c_ref}) + "
-        "{c_bias}){lit_suffix}{clamp_suffix}{lts_suffix})";
+        "{accumulator}{lit_suffix}{clamp_suffix}{lts_suffix})";
     std::string mfma_buildin = "__builtin_hcu_mmac_" + prefix;
     Replacer replacer;
 
     replacer.register_rule("{mfma_buildin}", mfma_buildin);
+    replacer.register_rule("{accumulator}", accumulator);
     replacer.register_rule("{A_dtype}", dtype_map[A_dtype]);
     replacer.register_rule("{B_dtype}", dtype_map[B_dtype]);
     replacer.register_rule("{C_dtype}", dtype_map[C_dtype]);

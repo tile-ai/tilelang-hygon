@@ -653,7 +653,8 @@ TL_DEVICE CVec mmac_scale_f8f6f4(AVec a, BVec b, CVec c, int off_a, int off_b) {
 template <int WarpRows, int WarpCols, int NumKAtoms, int GranularityM,
           int GranularityK_A, int GranularityN, int GranularityK_B,
           int ScaleShapeKA, int ScaleShapeKB, int KPack, int MmacK,
-          int RealABType, typename RowLayoutA, typename RowLayoutB>
+          int RealABType, typename RowLayoutA, typename RowLayoutB,
+          bool ClearAccum = false>
 TL_DEVICE void mmac_scale_fp4_body(const void *a, const void *b, float *c,
                                    int m0_wave_base) {
   constexpr int MMAC_MN = 16;
@@ -773,16 +774,24 @@ TL_DEVICE void mmac_scale_fp4_body(const void *a, const void *b, float *c,
             constexpr int off_b = (offsets >> 16) & 31;
             a_vec_t a_vec = a_v[(kii * WarpRows + ii) * KPack + kpp];
             b_vec_t b_vec = b_v[(kii * WarpCols + jj) * KPack + kpp];
+            // Each output atom starts from zero only on its first K issue,
+            // including when scale pages reorder independent M/N atoms.
+            c_vec_t accumulator;
+            if constexpr (ClearAccum && k_atom == 0) {
+              accumulator = c_vec_t{};
+            } else {
+              accumulator = c_v[ii * WarpCols + jj];
+            }
             if constexpr (MMAC_K == 64) {
               static_assert(off_a % 2 == 0 && off_b % 2 == 0,
                             "mmac_k=64 scale offsets must be 2-row aligned");
               c_v[ii * WarpCols + jj] =
                   __builtin_hcu_mmac_scale_f32_16x16x64_fp4_lit_lts(
-                      a_vec, b_vec, c_v[ii * WarpCols + jj], /*lit=*/true,
+                      a_vec, b_vec, accumulator, /*lit=*/true,
                       /*lts=*/false, off_a, off_b);
             } else {
               c_v[ii * WarpCols + jj] = mmac_scale_f8f6f4<RealABType>(
-                  a_vec, b_vec, c_v[ii * WarpCols + jj], off_a, off_b);
+                  a_vec, b_vec, accumulator, off_a, off_b);
             }
           };
           if constexpr (pages_stable_across_k) {
