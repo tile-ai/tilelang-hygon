@@ -5,6 +5,7 @@
  */
 
 #include "support/check.h"
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/op.h>
@@ -1286,7 +1287,16 @@ Layout makeHCUSwizzledLayout(const Buffer &buffer, int kPack) {
   auto base = MakeGemmABLayoutCDNA(static_cast<int>(info.stride),
                                    static_cast<int>(info.continuous),
                                    info.element_size, kPack);
-  return ExpandLayout2D(base, buffer);
+  Layout layout = ExpandLayout2D(base, buffer);
+  arith::Analyzer analyzer;
+  Array<PrimExpr> output_shape = layout->OutputShape();
+  for (size_t i = 0; i < layout->InputDim(); ++i) {
+    if (!analyzer.CanProveEqual(layout->InputShape()[i], output_shape[i]))
+      return layout;
+  }
+  // The compact XOR map is self-inverse. Preserve its forward map and
+  // expose the inverse wherever this shared layout is used.
+  return layout->WithInverse(layout);
 }
 
 Layout MakeVoltaSwizzledLayout(const Buffer &buffer, bool is_a, bool k_inner) {

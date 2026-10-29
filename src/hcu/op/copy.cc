@@ -320,6 +320,70 @@ Map<String, ObjectRef> GetHCUAsyncCopyAnnotations(const CopyNode &op) {
   return result;
 }
 
+Fragment RemapAsyncCopyOwnership(const CopyNode &op, const LowerArgs &args,
+                                 const Fragment &physical,
+                                 arith::Analyzer *analyzer) {
+  if (op.annotations.count(attr::kHcuGemmLdsCopyStrategy) ||
+      op.annotations.count(attr::kParallelLoopLayout))
+    return physical;
+  auto entry = args.layout_map.find(op.dst);
+  if (entry == args.layout_map.end())
+    return physical;
+  const Layout &storage = (*entry).second;
+  if (storage->IsEqual(MakeLinearLayout(op.dst->shape).get()))
+    return physical;
+
+  // Generic HCU async writes use implicit lane-ordered LDS destinations.
+  // Assign logical copy elements through the selected storage map, without
+  // imposing a GEMM read mode or choosing another shared-memory swizzle.
+  const size_t rank = op.dst_range.size();
+  ICHECK_GE(rank, 2U);
+  ICHECK_EQ(storage->InputDim(), rank);
+  ICHECK_EQ(physical->InputDim(), 1U);
+  Array<PrimExpr> output_shape = storage->OutputShape();
+  for (size_t i = 0; i < rank; ++i) {
+    ICHECK(analyzer->CanProveEqual(storage->InputShape()[i], output_shape[i]))
+        << "HCU async copy requires a compact shared layout";
+    if (i + 2 < rank) {
+      ICHECK(is_one(op.dst_range[i]->extent))
+          << "HCU async copy into a swizzled layout requires a matrix slice";
+    } else {
+      ICHECK(is_zero(op.dst_range[i]->min) &&
+             analyzer->CanProveEqual(op.dst_range[i]->extent,
+                                     storage->InputShape()[i]))
+          << "HCU async copy into a swizzled layout requires a full matrix";
+    }
+  }
+  PrimExpr columns = storage->InputShape().back();
+  PrimExpr total = storage->InputShape()[rank - 2] * columns;
+  ICHECK(analyzer->CanProveEqual(physical->InputShape()[0], total));
+  Array<PrimExpr> indices;
+  for (size_t i = 0; i + 2 < rank; ++i)
+    indices.push_back(op.dst_range[i]->min);
+  indices.push_back(floordiv(InputPlaceholder(0), columns));
+  indices.push_back(floormod(InputPlaceholder(0), columns));
+  Array<PrimExpr> mapped = storage->Forward(indices);
+  for (size_t i = 0; i + 2 < rank; ++i) {
+    ICHECK(analyzer->CanProveEqual(mapped[i], indices[i]))
+        << "HCU async copy requires storage to preserve matrix-slice indices";
+  }
+  PrimExpr physical_index = mapped[rank - 2] * columns + mapped.back();
+  Fragment logical(physical->InputShape(), physical->Forward({physical_index}),
+                   physical->ForwardThread({physical_index}, std::nullopt),
+                   physical->ReplicateExtent(), std::nullopt);
+  Array<PrimExpr> backward = storage->Inverse()->Forward(indices);
+  PrimExpr logical_index = backward[rank - 2] * columns + backward.back();
+  Layout physical_inverse = physical->Inverse();
+  PrimExpr inverse_index = Substitute(
+      logical_index,
+      {{InputPlaceholder(0), physical_inverse->GetForwardIndex()[0]}});
+  return Downcast<Fragment>(
+             logical->WithInverse(Layout(
+                 physical_inverse->InputShape(),
+                 {inverse_index, physical_inverse->GetForwardIndex().back()})))
+      ->BindThreadRange(physical->ThreadRange());
+}
+
 } // namespace
 
 enum class CopyInst : uint8_t {
@@ -419,6 +483,8 @@ private:
                           level);
     }
     auto loop_layout = par_op->GetLoopLayout();
+    loop_layout =
+        RemapAsyncCopyOwnership(op, lower_args, loop_layout, analyzer);
     Var thread_var = RequireHcuThreadVar(lower_args);
     Stmt lowered_loop = LowerParallelLoop(
         par_op->GetRoot(), loop_layout, thread_var, analyzer,
