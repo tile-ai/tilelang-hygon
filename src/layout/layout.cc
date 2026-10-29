@@ -547,6 +547,11 @@ bool CanProveInverseRoundTrip(const Array<PrimExpr> &input_shape,
   }
   Array<PrimExpr> physical_from_logical =
       Substitute(forward_indices, logical_substitution);
+  for (size_t i = 0; i < physical_from_logical.size(); ++i) {
+    if (!analyzer.CanProve(physical_from_logical[i] >= 0) ||
+        !analyzer.CanProve(physical_from_logical[i] < output_shape[i]))
+      return false;
+  }
   Map<Var, PrimExpr> inverse_substitution;
   for (size_t i = 0; i < physical_from_logical.size(); ++i) {
     inverse_substitution.Set(InputPlaceholder(i), physical_from_logical[i]);
@@ -569,6 +574,11 @@ bool CanProveInverseRoundTrip(const Array<PrimExpr> &input_shape,
   }
   Array<PrimExpr> logical_from_physical =
       Substitute(backward_indices, physical_substitution);
+  for (size_t i = 0; i < logical_from_physical.size(); ++i) {
+    if (!analyzer.CanProve(logical_from_physical[i] >= 0) ||
+        !analyzer.CanProve(logical_from_physical[i] < input_shape[i]))
+      return false;
+  }
   Map<Var, PrimExpr> forward_substitution;
   for (size_t i = 0; i < logical_from_physical.size(); ++i) {
     forward_substitution.Set(InputPlaceholder(i), logical_from_physical[i]);
@@ -616,6 +626,11 @@ CheckStaticInverseRoundTrip(const Array<PrimExpr> &input_shape,
               "coordinate " +
                   FormatIntTuple(logical)};
     }
+    for (size_t i = 0; i < physical->size(); ++i) {
+      if ((*physical)[i] < 0 || (*physical)[i] >= output_extents[i])
+        return {InverseRoundTripStatus::kInvalid,
+                "forward map leaves its declared output domain"};
+    }
     auto recovered = EvaluateStaticMap(backward_indices, *physical);
     if (!recovered) {
       return {InverseRoundTripStatus::kUnknown,
@@ -640,6 +655,11 @@ CheckStaticInverseRoundTrip(const Array<PrimExpr> &input_shape,
               "the inverse map could not be evaluated exactly at physical "
               "coordinate " +
                   FormatIntTuple(physical)};
+    }
+    for (size_t i = 0; i < logical->size(); ++i) {
+      if ((*logical)[i] < 0 || (*logical)[i] >= input_extents[i])
+        return {InverseRoundTripStatus::kInvalid,
+                "inverse map leaves its declared logical domain"};
     }
     auto recovered = EvaluateStaticMap(forward_indices, *logical);
     if (!recovered) {
@@ -798,6 +818,7 @@ void LayoutNode::RegisterReflection() {
   refl::ObjectDef<LayoutNode>()
       .def_ro("input_size", &LayoutNode::input_size_)
       .def_ro("forward_index", &LayoutNode::forward_index_)
+      .def_ro("inverse_index", &LayoutNode::inverse_index_)
       .def("_DebugOutput", &LayoutNode::DebugOutput);
 }
 
@@ -1097,8 +1118,52 @@ Fragment FragmentNode::BindThreadRange(Range thread_range) const {
   return Fragment(n);
 }
 
+Layout LayoutNode::ExplicitInverse() const {
+  ICHECK(inverse_index_.defined());
+  Array<PrimExpr> output_shape = OutputShape();
+  size_t logical_rank = InputDim();
+  if (const auto *fragment = GetRef<Layout>(this).as<FragmentNode>()) {
+    output_shape.push_back(fragment->ThreadExtent());
+    ++logical_rank;
+  }
+  ICHECK_EQ(inverse_index_.value().size(), logical_rank);
+  return Layout(output_shape, inverse_index_.value());
+}
+
+Layout LayoutNode::WithInverse(const Layout &inverse) const {
+  ffi::ObjectPtr<LayoutNode> node;
+  if (const auto *partial = GetRef<Layout>(this).as<PartialFragmentNode>()) {
+    node = make_object<PartialFragmentNode>(*partial);
+  } else if (const auto *fragment = GetRef<Layout>(this).as<FragmentNode>()) {
+    node = make_object<FragmentNode>(*fragment);
+  } else {
+    node = make_object<LayoutNode>(*this);
+  }
+  Layout result(node);
+  Array<PrimExpr> expected_shape = OutputShape();
+  if (const auto *fragment = result.as<FragmentNode>())
+    expected_shape.push_back(fragment->ThreadExtent());
+  ICHECK_EQ(expected_shape.size(), inverse->InputDim())
+      << "Supplied inverse input shape must match layout output coordinates";
+  arith::Analyzer analyzer;
+  for (size_t i = 0; i < expected_shape.size(); ++i) {
+    ICHECK(analyzer.CanProveEqual(expected_shape[i], inverse->InputShape()[i]))
+        << "Supplied inverse input shape must match layout output coordinates: "
+        << "expected=" << expected_shape << ", actual=" << inverse->InputShape()
+        << ", layout=" << DebugOutput();
+  }
+  const size_t logical_rank =
+      InputDim() + (result.as<FragmentNode>() ? 1U : 0U);
+  ICHECK_EQ(inverse->OutputDim(), logical_rank)
+      << "Supplied inverse output rank must match layout input coordinates";
+  node->inverse_index_ = inverse->GetForwardIndex();
+  return result;
+}
+
 std::pair<Layout, arith::IterMapLevel>
 LayoutNode::InverseWithLevel(bool require_padding_guard) const {
+  if (inverse_index_.defined())
+    return {ExplicitInverse(), arith::IterMapLevel::Bijective};
   arith::Analyzer analyzer;
   auto collect_symbolic = [&](const Array<PrimExpr> &shape) {
     Array<PrimExpr> symbolic_dims;
@@ -1273,6 +1338,19 @@ Layout FragmentNode::Reshape(const Array<PrimExpr> &shape,
   new_forward_thread = RestoreInputPlaceholders(new_forward_thread, new_vars);
   Fragment reshaped(shape, new_forward_index, new_forward_thread,
                     ReplicateExtent(), std::nullopt);
+  if (inverse_index_.defined() && az->CanProveEqual(rescale_num, rescale_den)) {
+    Layout inverse = ExplicitInverse();
+    Array<PrimExpr> old_logical;
+    for (size_t i = 0; i < InputDim(); ++i)
+      old_logical.push_back(inverse->GetForwardIndex()[i]);
+    PrimExpr flat = Integer(0);
+    for (size_t i = 0; i < InputDim(); ++i)
+      flat = flat * InputShape()[i] + old_logical[i];
+    Array<PrimExpr> backward = RecoverOriginalIndices(shape, flat);
+    backward.push_back(inverse->GetForwardIndex().back());
+    reshaped = Downcast<Fragment>(
+        reshaped->WithInverse(Layout(inverse->InputShape(), backward)));
+  }
   if (thread_range_.defined()) {
     reshaped = reshaped->BindThreadRange(thread_range_);
   }
@@ -1533,6 +1611,9 @@ bool FragmentNode::IsCompletedReplicated() const {
 
 arith::IterMapResult
 LayoutNode::DetectInjective(bool require_padding_guard) const {
+  // A supplied two-sided inverse establishes injectivity by contract.
+  if (inverse_index_.defined())
+    return arith::IterMapResult();
   return DetectInjectiveMapping(forward_index_, GetVarMap(),
                                 require_padding_guard);
 }
@@ -1541,16 +1622,27 @@ arith::IterMapResult
 FragmentNode::DetectInjective(bool require_padding_guard) const {
   // A fragment's physical identity includes its owning thread as well as its
   // per-thread indices. The replication coordinate is part of GetVarMap().
+  // A supplied two-sided inverse establishes injectivity by contract.
+  if (inverse_index_.defined())
+    return arith::IterMapResult();
   Array<PrimExpr> indices{forward_thread_};
   indices.insert(indices.end(), forward_index_.begin(), forward_index_.end());
   return DetectInjectiveMapping(indices, GetVarMap(), require_padding_guard);
 }
 
 PrimExpr FragmentNode::ThreadExtent() const {
-  Array<PrimExpr> ret(OutputDim(), 1);
   arith::Analyzer analyzer;
   UpdateAnalyzer(&analyzer);
   auto ist = analyzer.int_set(forward_thread_ + 1);
+  if (arith::is_pos_inf(ist.max())) {
+    // IntervalSet does not handle bitwise thread permutations. Preserve their
+    // finite thread domain when ConstIntBound can establish an upper bound.
+    auto bound = analyzer.const_int_bound(forward_thread_);
+    if (bound->min_value >= 0 &&
+        bound->max_value != arith::ConstIntBound::kPosInf) {
+      return Integer(bound->max_value + 1);
+    }
+  }
   return ist.max();
 }
 
@@ -1585,6 +1677,8 @@ Layout FragmentNode::Inverse() const {
 
 std::pair<Layout, arith::IterMapLevel>
 FragmentNode::InverseWithLevel(bool require_padding_guard) const {
+  if (inverse_index_.defined())
+    return {ExplicitInverse(), arith::IterMapLevel::Bijective};
   auto input_size_copy = input_size_;
   input_size_copy.push_back(ReplicateExtent());
   auto forward_index_copy = forward_index_;
@@ -1790,6 +1884,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def("tl.Layout_output_shape",
            [](Layout layout) { return layout->OutputShape(); })
       .def("tl.Layout_inverse", [](Layout layout) { return layout->Inverse(); })
+      .def("tl.Layout_with_inverse",
+           [](Layout layout, Layout inverse) {
+             return layout->WithInverse(inverse);
+           })
       .def("tl.Layout_reshape",
            [](Layout layout, Array<PrimExpr> shape, PrimExpr rescale_num,
               PrimExpr rescale_den) {

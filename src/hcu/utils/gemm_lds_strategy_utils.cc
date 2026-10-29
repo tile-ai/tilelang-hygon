@@ -24,6 +24,46 @@ bool IsPowerOfTwo(int value) { return value > 0 && (value & (value - 1)) == 0; }
 
 } // namespace
 
+Optional<Layout> MakeHcuNativeAnBtLdsLayout(
+    const Array<PrimExpr> &shape,
+    const std::vector<HcuGemmLdsReadPattern> &consumers) {
+  if (shape.size() != 2 || consumers.empty())
+    return std::nullopt;
+  const int64_t *rows = as_const_int(shape[0]);
+  const int64_t *width = as_const_int(shape[1]);
+  if (!rows || !width || *rows <= 0 || *width <= 0 || *rows > INT_MAX ||
+      *width > INT_MAX)
+    return std::nullopt;
+  const int bits = consumers.front().element_bits;
+  if (bits != 8 && bits != 16)
+    return std::nullopt;
+  const int mmac_k = 256 / bits;
+  const int atom_mn = 16;
+  if (*rows % mmac_k != 0 || *width % atom_mn != 0)
+    return std::nullopt;
+  for (const auto &read : consumers) {
+    if (read.read_kind != HcuGemmLdsReadKind::kNative ||
+        read.consumer_kind != HcuGemmLdsAccessKind::kAnBt ||
+        read.consumer_k_pack != 1 || read.element_bits != bits ||
+        read.read_tile_k != mmac_k || read.read_tile_mn != 16 ||
+        read.elements_per_read != mmac_k / 4 ||
+        read.read_bytes_per_lane != bits * mmac_k / 32)
+      return std::nullopt;
+  }
+  PrimExpr k = InputPlaceholder(0);
+  PrimExpr n = InputPlaceholder(1);
+  // XOR only the low group bits shared by the row width and the four K
+  // groups in a native fragment. This remains a permutation for non-power-
+  // of-two widths: e.g. six MN groups use two phases, not four.
+  const int phases = std::gcd(int(*width / atom_mn), 4);
+  PrimExpr phase = floormod(floordiv(k, mmac_k / 4), phases);
+  PrimExpr group = floormod(floordiv(n, atom_mn), phases);
+  PrimExpr block = floordiv(n, atom_mn * phases);
+  Layout layout(shape, {k, (block * phases + (group ^ phase)) * atom_mn +
+                               floormod(n, atom_mn)});
+  return layout->WithInverse(layout);
+}
+
 Optional<Layout>
 MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
                           int bank_width_bytes,
@@ -43,8 +83,14 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
       !IsPowerOfTwo(rows) || !IsPowerOfTwo(width)) {
     return std::nullopt;
   }
+  for (const auto &read : consumers) {
+    if (read.read_kind != HcuGemmLdsReadKind::kMatrix &&
+        read.consumer_kind == HcuGemmLdsAccessKind::kAnBt)
+      return std::nullopt;
+  }
   bool has_an_bt = false;
   bool has_at_bn = false;
+  bool has_at_bn_pack2 = false;
   const int element_bits = consumers.front().element_bits;
   if (element_bits != 8 && element_bits != 16)
     return std::nullopt;
@@ -66,6 +112,7 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
       if (read.consumer_k_pack != 1 && read.consumer_k_pack != 2)
         return std::nullopt;
       has_at_bn = true;
+      has_at_bn_pack2 |= read.consumer_k_pack == 2;
     }
   }
   // Pure AT/BN keeps the existing makeHCUSwizzledLayout path. This
@@ -109,6 +156,14 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
         if (width >= 64)
           shift = shift ^ ((row & 8) << 2);
       }
+      if (width == 64 && (!has_at_bn || has_at_bn_pack2)) {
+        // SB's 16-lane matrix and b128-read phases need independent row
+        // bits in both N16 selectors. Keep r2 off the low selector: the
+        // ordinary-read phase already pairs that bit with its N16 column.
+        // A pack1-only mixed consumer already has zero conflicts; retain
+        // its existing mapping rather than changing its producer addresses.
+        shift = ((row & 4) << 3) ^ ((row & 8) << 1);
+      }
     }
   } else if (!has_at_bn) {
     const int row_period = bank_count / std::gcd(bank_count, int(width / 2));
@@ -139,7 +194,8 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
   Array<PrimExpr> leading;
   for (size_t i = 0; i + 2 < shape.size(); ++i)
     leading.push_back(shape[i]);
-  return layout->Expand(leading);
+  Layout expanded = layout->Expand(leading);
+  return expanded->WithInverse(expanded);
 }
 
 void HcuGemmLdsCopyStrategyNode::RegisterReflection() {
@@ -224,7 +280,8 @@ int SelectHcuGemmLdsCopyTransactionBytes(int bytes_per_row,
 int GetHcuGemmLdsCopyVectorBytes(const CopyNode &copy, Target target) {
   With<Target> target_scope(target);
   arith::Analyzer analyzer;
-  For loop = copy.MakeSIMTLoop(&analyzer);
+  For loop = copy.par_op_.defined() ? copy.par_op_->GetRoot()
+                                    : copy.MakeSIMTLoop(&analyzer);
   return GetVectorizeSize(loop, &analyzer) * copy.src->dtype.bytes();
 }
 

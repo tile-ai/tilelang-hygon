@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from types import SimpleNamespace
 
 from tilelang import _ffi_api
@@ -24,7 +23,6 @@ from tilelang.tileop.gemm_blockscaled.gemm_blockscaled_base import GemmBlockScal
 
 GEMM_INST_HCU_MMAC = "hcu.mmac"
 GEMM_INST_HCU_MMAC_BLOCKSCALED = "hcu.mmac.blockscaled"
-logger = logging.getLogger(__name__)
 
 
 def _int_annotation(annotations, key: str, default: int = 0) -> int:
@@ -329,13 +327,8 @@ class GemmHCUMMAC(GemmBase):
         )
         out = {self.C: frag_c}
         if _is_shared_like(self.A):
-            if meta.a_at_bn_auto_lds_strategy:
+            if meta.a_at_bn_auto_lds_strategy or meta.a_respect_layout_map:
                 pass
-            elif meta.a_respect_layout_map:
-                logger.warning(
-                    "HCU MMAC GEMM A uses custom annotate_layout; TileLang will not inject the default A shared swizzle. "
-                    "The annotated layout must match GEMM-A matrix-core load semantics."
-                )
             elif meta.a_from_async_copy_linear:
                 out[self.A] = make_linear_layout(self.A)
             else:
@@ -357,10 +350,7 @@ class GemmHCUMMAC(GemmBase):
             raise ValueError(f"Unsupported A scope for HCU gemm: {self.A.scope()}")
         if _is_shared_like(self.B):
             if meta.b_respect_layout_map:
-                logger.warning(
-                    "HCU MMAC GEMM B uses custom annotate_layout; TileLang will not inject the default B shared swizzle. "
-                    "The annotated layout must match GEMM-B matrix-core load semantics."
-                )
+                pass
             elif meta.b_from_async_copy_linear:
                 out[self.B] = make_linear_layout(self.B)
             else:

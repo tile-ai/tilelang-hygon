@@ -8,9 +8,12 @@
 #ifndef TVM_TL_HCU_UTILS_GEMM_AN_BT_LDS_STRATEGY_H_
 #define TVM_TL_HCU_UTILS_GEMM_AN_BT_LDS_STRATEGY_H_
 
+#include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "layout/layout.h"
 #include "op/copy.h"
 #include "op/gemm.h"
+
+#include <optional>
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/target/target.h>
@@ -26,6 +29,8 @@ static constexpr const char *kHcuGemmAnBtLdsStrategy =
 class HcuGemmAnBtLdsStrategyNode : public Object {
 public:
   int strategy_version{1};
+  // Reflected integer encoding of HcuGemmLdsReadKind.
+  int read_kind{static_cast<int>(HcuGemmLdsReadKind::kNative)};
   int block_k{0};
   int block_mn{0};
   int block_threads{0};
@@ -62,9 +67,11 @@ public:
                                                 HcuGemmAnBtLdsStrategyNode);
 };
 
-Optional<HcuGemmAnBtLdsStrategy>
-DeriveHcuGemmAnBtLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
-                             bool feeds_a, Range thread_bounds, Target target);
+Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategy(
+    const CopyNode &copy, const GemmNode &gemm, bool feeds_a,
+    Range thread_bounds, Target target,
+    Optional<Layout> storage_layout = std::nullopt,
+    HcuGemmLdsReadKind read_kind = HcuGemmLdsReadKind::kMatrix);
 
 Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
     const CopyNode &copy, const GemmNode &gemm, bool feeds_a,

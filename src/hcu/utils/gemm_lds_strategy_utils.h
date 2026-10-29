@@ -48,6 +48,7 @@ public:
   int wrap_idx_mask{0};
   bool wrap_uses_copy_transaction{false};
   Layout storage_layout;
+  // Logical copy coordinates -> (thread, local slots), for every producer.
   Fragment copy_loop_layout;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.HcuGemmLdsCopyStrategy",
@@ -67,6 +68,8 @@ public:
                                                 HcuGemmLdsCopyStrategyNode);
 };
 
+enum class HcuGemmLdsReadKind { kNative = 0, kMatrix = 1 };
+
 /*! \brief Per-consumer read contract, independent of async copy geometry. */
 struct HcuGemmLdsReadPattern {
   int element_bits;
@@ -76,6 +79,7 @@ struct HcuGemmLdsReadPattern {
   int read_bytes_per_lane;
   HcuGemmLdsAccessKind consumer_kind;
   int consumer_k_pack;
+  HcuGemmLdsReadKind read_kind{HcuGemmLdsReadKind::kMatrix};
 };
 
 /*! \brief Closed-form ordinary-copy layout; leading dimensions are unchanged.
@@ -84,6 +88,11 @@ Optional<Layout>
 MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
                           int bank_width_bytes,
                           const std::vector<HcuGemmLdsReadPattern> &consumers);
+
+/*! \brief Native AN/BT storage for a complete single-wave K-leading tile. */
+Optional<Layout>
+MakeHcuNativeAnBtLdsLayout(const Array<PrimExpr> &shape,
+                           const std::vector<HcuGemmLdsReadPattern> &consumers);
 
 struct HcuGemmLdsCopyGeometry {
   int bank_count{0};
