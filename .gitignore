@@ -33,6 +33,8 @@ dist*/
 !src/tl_templates/hcu/distributed/**
 !testing/python/hcu/distributed/
 !testing/python/hcu/distributed/**
+!examples/distributed/
+!examples/distributed/**
 wheelhouse/
 __pycache__
 nnfusion.tar.gz
