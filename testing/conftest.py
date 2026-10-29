@@ -31,8 +31,7 @@ def pytest_configure(config):
 
     distributed = Path(REPO_ROOT) / "testing/python/hcu/distributed"
     skip_seed = any(
-        (Path(config.invocation_params.dir) / str(arg).split("::", 1)[0]).resolve().is_relative_to(distributed)
-        for arg in config.args
+        (Path(config.invocation_params.dir) / str(arg).split("::", 1)[0]).resolve().is_relative_to(distributed) for arg in config.args
     )
     if not skip_seed:
         try:

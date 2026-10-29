@@ -20,8 +20,12 @@ class _StorageOwner:
         # Live storage must not be released early during interpreter teardown.
         self._finalizer.atexit = False
         self.__cuda_array_interface__ = {
-            "shape": (nbytes,), "typestr": "|u1", "data": (allocation.ptr, False),
-            "strides": None, "version": 3, "stream": 1,
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (allocation.ptr, False),
+            "strides": None,
+            "version": 3,
+            "stream": 1,
         }
 
 

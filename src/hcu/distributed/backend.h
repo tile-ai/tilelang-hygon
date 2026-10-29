@@ -55,12 +55,12 @@ public:
     return "#include <tl_templates/hcu/distributed/metadata_runtime.h>\n";
   }
   virtual DistributedInitSpec InitSpec() const;
-
 };
 
 /*! \brief Stable diagnostic wording for a distributed capability. */
 const char *DistributedCapabilityName(DistributedCapability capability);
-/*! \brief Require a capability without extending the backend virtual interface. */
+/*! \brief Require a capability without extending the backend virtual interface.
+ */
 void RequireDistributedCapability(const HcuDistributedBackend &backend,
                                   DistributedCapability capability);
 
@@ -73,17 +73,18 @@ void RequireDistributedCapability(const HcuDistributedBackend &backend,
  */
 using HcuDistributedBackendFactory =
     std::function<const HcuDistributedBackend &()>;
-TVM_DLL void RegisterHcuDistributedBackend(
-    const std::string &name, uint32_t backend_id,
-    HcuDistributedBackendFactory factory,
-    std::vector<DistributedCapability> capabilities);
+TVM_DLL void
+RegisterHcuDistributedBackend(const std::string &name, uint32_t backend_id,
+                              HcuDistributedBackendFactory factory,
+                              std::vector<DistributedCapability> capabilities);
 TVM_DLL uint32_t GetHcuDistributedBackendId(const std::string &name);
 TVM_DLL std::vector<std::string> ListHcuDistributedBackends();
 
 /*! \brief Common globals/entry points around a backend-private validator. */
-TVM_DLL std::string EmitDistributedModulePreamble(
-    const std::string &backend, const std::string &validator,
-    const std::string &private_declarations = "");
+TVM_DLL std::string
+EmitDistributedModulePreamble(const std::string &backend,
+                              const std::string &validator,
+                              const std::string &private_declarations = "");
 TVM_DLL ffi::String GetHcuDistributedRequirements(const std::string &backend);
 
 /*! \brief Returns true when an HCU target explicitly selects a backend. */

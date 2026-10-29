@@ -1,4 +1,5 @@
 """Versioned distributed envelope and artifact compatibility checks."""
+
 from functools import cache
 import json
 import re
@@ -60,10 +61,14 @@ def _source_text(source):
 def source_uses_distributed_metadata(source):
     """Detect runtime use, including markers from legacy artifacts."""
     # Legacy remote-source markers still require strict artifact validation.
-    return re.search(
-        r"^// (?:tilelang_distributed_metadata|tilelang_distributed_abi|tilelang_ipc_remote_source):",
-        _source_text(source), re.MULTILINE,
-    ) is not None
+    return (
+        re.search(
+            r"^// (?:tilelang_distributed_metadata|tilelang_distributed_abi|tilelang_ipc_remote_source):",
+            _source_text(source),
+            re.MULTILINE,
+        )
+        is not None
+    )
 
 
 class UnsupportedDistributedExecutionError(DistributedABIError):
@@ -109,9 +114,7 @@ def validate_artifact_source(source, target):
     expected_version = metadata_layout()["abi_version"]
     expected_backend = int(tvm.ffi.get_global_func("tl.GetHcuDistributedBackendId")(str(target.attrs["dist_backend"])))
     if (version, backend_id) != (expected_version, expected_backend):
-        raise incompatible(
-            f"cached/exported version/backend {version}/{backend_id}; expected {expected_version}/{expected_backend}"
-        )
+        raise incompatible(f"cached/exported version/backend {version}/{backend_id}; expected {expected_version}/{expected_backend}")
 
 
 def requirements_for_backend(name):

@@ -13,8 +13,12 @@ from pathlib import Path
 from typing import Literal
 
 _EXPORTED_ENV = (
-    "PYTHONPATH", "LD_LIBRARY_PATH",
-    "MASTER_ADDR", "MASTER_PORT", "TILELANG_CACHE_DIR", "HIP_VISIBLE_DEVICES",
+    "PYTHONPATH",
+    "LD_LIBRARY_PATH",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "TILELANG_CACHE_DIR",
+    "HIP_VISIBLE_DEVICES",
 )
 _DEVICE_WAIT_SECONDS = 60.0
 _DEVICE_POLL_SECONDS = 5.0
@@ -34,9 +38,7 @@ def _terminate_process_group(pid):
 
 def _run(command, env, timeout, output=None):
     """Spawn without forking a HIP-initialized parent; bound timeout cleanup."""
-    actions = [] if output is None else [
-        (os.POSIX_SPAWN_DUP2, output.fileno(), fd) for fd in (1, 2)
-    ]
+    actions = [] if output is None else [(os.POSIX_SPAWN_DUP2, output.fileno(), fd) for fd in (1, 2)]
     pid = os.posix_spawnp(command[0], command, env, file_actions=actions, setpgroup=0)
     deadline = time.monotonic() + timeout
     while True:
@@ -69,6 +71,7 @@ def _check_hcu(world_size):
     if "hcu" not in tvm.target.Target.list_kinds():
         return "HCU preflight: HCU target is not available in this build"
     from tilelang.hcu.target import HCU_MCPU_SET, normalize_hcu_arch
+
     for device in range(world_size):
         arch = normalize_hcu_arch(getattr(torch.cuda.get_device_properties(device), "gcnArchName", None))
         if arch not in HCU_MCPU_SET:
@@ -100,19 +103,18 @@ def _select_devices(world_size, env):
             pytest.skip(f"HCU preflight: cannot query idle devices with hy-smi: {error}")
         lines = result.stdout.splitlines()
         try:
-            header = next(i for i, line in enumerate(lines)
-                          if line.strip().startswith("HCU") and "VRAM%" in line.split())
+            header = next(i for i, line in enumerate(lines) if line.strip().startswith("HCU") and "VRAM%" in line.split())
             column = lines[header].split().index("VRAM%")
-            usage = {int(row[0]): float(row[column].rstrip("%"))
-                     for row in (line.split() for line in lines[header + 1:])
-                     if row and row[0].isdigit()}
+            usage = {
+                int(row[0]): float(row[column].rstrip("%"))
+                for row in (line.split() for line in lines[header + 1 :])
+                if row and row[0].isdigit()
+            }
         except (StopIteration, ValueError, IndexError):
             pytest.skip("HCU preflight: cannot parse the hy-smi HCU/VRAM% table")
         mask = env.get("HIP_VISIBLE_DEVICES")
         try:
-            visible = sorted(usage) if mask is None else (
-                [] if mask.strip() in ("", "-1") else [int(i) for i in mask.split(",")]
-            )
+            visible = sorted(usage) if mask is None else ([] if mask.strip() in ("", "-1") else [int(i) for i in mask.split(",")])
             if len(set(visible)) != len(visible) or any(i not in usage for i in visible):
                 raise ValueError
         except ValueError:
@@ -133,8 +135,12 @@ def _select_devices(world_size, env):
 
 
 def run_hcu_script(
-    script: Path, *, world_size: int, port: int,
-    launcher: Literal["mpi", "torchrun"] = "mpi", timeout: float = 240,
+    script: Path,
+    *,
+    world_size: int,
+    port: int,
+    launcher: Literal["mpi", "torchrun"] = "mpi",
+    timeout: float = 240,
 ) -> None:
     """Run an IPC test with a fresh cache for every rank."""
     import pytest
@@ -152,8 +158,7 @@ def run_hcu_script(
             output.seek(0)
             message = output.read()
             if status == 77:
-                reason = next((line for line in reversed(message.splitlines())
-                               if line.startswith("HCU preflight:")), message.strip())
+                reason = next((line for line in reversed(message.splitlines()) if line.startswith("HCU preflight:")), message.strip())
                 pytest.skip(reason)
             raise RuntimeError(f"HCU preflight failed (exit {status}): {message}")
     env["TILELANG_CACHE_DIR"] = tempfile.mkdtemp(prefix=f"tilelang-hcu-{script.stem}-w{world_size}-")
@@ -165,8 +170,14 @@ def run_hcu_script(
                 command.extend(["-x", name])
         command.extend(entry)
     else:
-        command = ["torchrun", "--nnodes=1", f"--nproc_per_node={world_size}",
-                   f"--master_addr={env['MASTER_ADDR']}", f"--master_port={port}", *entry[1:]]
+        command = [
+            "torchrun",
+            "--nnodes=1",
+            f"--nproc_per_node={world_size}",
+            f"--master_addr={env['MASTER_ADDR']}",
+            f"--master_port={port}",
+            *entry[1:],
+        ]
     status = _run(command, env, timeout)
     if status:
         raise RuntimeError(f"{launcher} HCU test exited with status {status}: {script}")
@@ -183,8 +194,7 @@ if __name__ == "__main__":
 
         launcher, script = sys.argv[2], Path(sys.argv[3]).resolve()
         if launcher == "mpi":
-            for name, mpi_name in (("RANK", "RANK"), ("LOCAL_RANK", "LOCAL_RANK"),
-                                   ("WORLD_SIZE", "SIZE")):
+            for name, mpi_name in (("RANK", "RANK"), ("LOCAL_RANK", "LOCAL_RANK"), ("WORLD_SIZE", "SIZE")):
                 os.environ[name] = os.environ[f"OMPI_COMM_WORLD_{mpi_name}"]
         cache = Path(os.environ["TILELANG_CACHE_DIR"]) / f"rank-{os.environ['RANK']}"
         cache.mkdir(parents=True, exist_ok=True)

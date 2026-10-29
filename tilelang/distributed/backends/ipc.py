@@ -8,8 +8,9 @@ from typing import Any, Protocol
 from collections.abc import Callable
 
 from ..allocator import (
-    Allocation, DistributedAllocator,
-    get_distributed_backend_registration, register_distributed_backend,
+    Allocation,
+    DistributedAllocator,
+    register_distributed_backend,
 )
 
 
@@ -42,8 +43,6 @@ class _IpcRuntime(Protocol):
     def open_handle(self, handle: bytes) -> int: ...
     def close_handle(self, ptr: int) -> None: ...
     def can_access_peer(self, device: int, peer_device: int) -> bool: ...
-
-
 
 
 class _FfiIpcRuntime:
@@ -131,7 +130,7 @@ class IpcAllocator(DistributedAllocator):
 
     @property
     def metadata(self) -> tuple[int, ...]:
-        """Native ABI header/status slots followed by process-local peer VAs."""
+        """Native ABI header/status slots followed by process-local peer virtual addresses."""
         self._require_open()
         layout = ipc_metadata_layout()
         payload = [0] * layout["peer_base"]
@@ -371,5 +370,7 @@ class IpcAllocator(DistributedAllocator):
 
 # Runtime implementations own their registration; the factory has no IPC branch.
 IPC_BACKEND = register_distributed_backend(
-    "ipc", 1, IpcAllocator,
+    "ipc",
+    1,
+    IpcAllocator,
 )

@@ -4,7 +4,8 @@
  *
  * Callers complete producer writes on their producing streams, then rendezvous
  * across ranks before peer reads. Open IPC mappings and supported peer access
- * are prerequisites for visibility; compilation/initialization are not barriers.
+ * are prerequisites for visibility; compilation/initialization are not
+ barriers.
  * get_block has no implicit collective or block barrier. Synchronize block
  * threads before consuming or reusing an LDS/shared destination. Keep sources
  * alive and unchanged until all remote consumers complete, then rendezvous
@@ -14,13 +15,14 @@
 #ifndef TILELANG_TEMPLATES_HCU_DISTRIBUTED_DISTRIBUTED_H_
 #define TILELANG_TEMPLATES_HCU_DISTRIBUTED_DISTRIBUTED_H_
 
-#include <stdint.h>
-#include "metadata_runtime.h"
 #include "ipc_payload.h"
+#include "metadata_runtime.h"
+#include <stdint.h>
 
 namespace tl {
 
-__device__ __forceinline__ int ipc_validate_payload(const uint64_t *source, int64_t count) {
+__device__ __forceinline__ int ipc_validate_payload(const uint64_t *source,
+                                                    int64_t count) {
   using namespace distributed_metadata;
   using namespace ipc_payload;
   const uint64_t world_size = source[kWorldSize];
@@ -32,10 +34,9 @@ __device__ __forceinline__ int ipc_validate_payload(const uint64_t *source, int6
   return kSuccess;
 }
 
-
 __device__ __forceinline__ uint64_t ipc_get_peer_base(int32_t peer) {
   return __tilelang_distributed_metadata[distributed_metadata::kPayload +
-                                        ipc_payload::kPeerBases + peer];
+                                         ipc_payload::kPeerBases + peer];
 }
 
 template <typename SrcT, typename DstT>
@@ -59,7 +60,6 @@ __device__ __forceinline__ void ipc_get_block(const SrcT *local_src, DstT *dst,
     dst[index] = static_cast<DstT>(remote_src[index]);
   }
 }
-
 
 } // namespace tl
 

@@ -326,7 +326,8 @@ struct SafeMemChecker : public StmtExprVisitor {
       indices.push_back(cast(DataType::Int(64), index));
     const auto offsets = load->buffer.OffsetOf(indices);
     ICHECK_EQ(offsets.size(), 1U) << "get_block requires a contiguous source";
-    PrimExpr offset = offsets[0] - cast(DataType::Int(64), load->buffer->elem_offset);
+    PrimExpr offset =
+        offsets[0] - cast(DataType::Int(64), load->buffer->elem_offset);
     PrimExpr extent = IntImm(DataType::Int(64), 1);
     for (const PrimExpr &dim : load->buffer->shape)
       extent = extent * cast(DataType::Int(64), dim);
@@ -805,7 +806,8 @@ private:
     if (const CallNode *call_node = op->value.as<CallNode>()) {
       Call call = Downcast<Call>(op->value);
       if (call->op.same_as(tl::get_block()))
-        return WrapEvaluateWithConditions(evaluate, CollectDistributedGetConditions(call));
+        return WrapEvaluateWithConditions(
+            evaluate, CollectDistributedGetConditions(call));
       if (call->op.as<OpNode>() && IsCPAsyncOp(Downcast<Op>(call->op))) {
         Array<PrimExpr> conditions = CollectCPAsyncConditions(call);
         if (conditions.empty()) {

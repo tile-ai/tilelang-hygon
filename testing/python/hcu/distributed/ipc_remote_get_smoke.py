@@ -49,8 +49,6 @@ def remote_get_kernel():
     return main
 
 
-
-
 def gemm_kernel():
     """Local GEMM writing directly into an IPC-arena partial-C buffer."""
 

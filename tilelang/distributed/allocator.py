@@ -33,9 +33,7 @@ _backend_registry: dict[str, _BackendRegistration] = {}
 _backend_registry_lock = RLock()
 
 
-def register_distributed_backend(
-    name: str, backend_id: int, factory: Callable[..., DistributedAllocator]
-) -> _BackendRegistration:
+def register_distributed_backend(name: str, backend_id: int, factory: Callable[..., DistributedAllocator]) -> _BackendRegistration:
     """Register once; duplicate names/IDs and replacement are rejected.
 
     Native and Python plugins choose the same stable, nonzero uint32 ID. IPC
@@ -70,9 +68,7 @@ def get_distributed_backend_registration(name: str) -> _BackendRegistration:
             return _backend_registry[name]
         except KeyError:
             supported = ", ".join(sorted(_backend_registry))
-            raise ValueError(
-                f"Unsupported distributed allocator backend: {name}; supported backends: {supported}"
-            ) from None
+            raise ValueError(f"Unsupported distributed allocator backend: {name}; supported backends: {supported}") from None
 
 
 class DistributedAllocator(ABC):

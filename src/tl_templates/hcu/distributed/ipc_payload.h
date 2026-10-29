@@ -10,8 +10,8 @@ constexpr int kBackendId = 1;
 constexpr int kArenaSize = 0;
 constexpr int kPeerBases = 1;
 constexpr int kHeaderSize = kPeerBases;
-constexpr int kMaxWorldSize =
-    distributed_metadata::kCapacity - distributed_metadata::kPayload - kHeaderSize;
+constexpr int kMaxWorldSize = distributed_metadata::kCapacity -
+                              distributed_metadata::kPayload - kHeaderSize;
 // Reserved legacy span-status values; new code uses ordinary predication.
 constexpr int kInvalidSourceCount = 256;
 constexpr int kInvalidSourceSpan = 257;

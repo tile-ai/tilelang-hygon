@@ -1,4 +1,5 @@
 """IPC device integration entry points; unit coverage stays in domain-specific files."""
+
 import os
 from pathlib import Path
 

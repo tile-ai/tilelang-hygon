@@ -15,7 +15,8 @@ namespace codegen {
 using namespace ffi;
 
 static Map<String, runtime::FunctionInfo>
-ExtractFuncInfo(const IRModule &mod, bool uses_distributed_metadata, const Target &target) {
+ExtractFuncInfo(const IRModule &mod, bool uses_distributed_metadata,
+                const Target &target) {
   Map<String, runtime::FunctionInfo> fmap;
 
   for (auto kv : mod->functions) {
@@ -55,9 +56,11 @@ ExtractFuncInfo(const IRModule &mod, bool uses_distributed_metadata, const Targe
     const auto spec = tl::hcu::GetHcuDistributedBackend(target).InitSpec();
     for (const auto &helper : {spec.initialize}) {
       Array<DLDataType> arguments;
-      for (auto dtype : helper.argument_types) arguments.push_back(dtype);
+      for (auto dtype : helper.argument_types)
+        arguments.push_back(dtype);
       // Empty launch tags select one thread/block for the common helper ABI.
-      fmap.Set(helper.name, runtime::FunctionInfo(helper.name, arguments, {}, {}));
+      fmap.Set(helper.name,
+               runtime::FunctionInfo(helper.name, arguments, {}, {}));
     }
   }
   return fmap;

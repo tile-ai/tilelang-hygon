@@ -34,6 +34,8 @@ void SetTvmStream(int device_id, int64_t stream) {
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
-      .def("tl.hcu.distributed.get_tvm_stream", tvm::tl::hcu::stream_bridge::GetTvmStream)
-      .def("tl.hcu.distributed.set_tvm_stream", tvm::tl::hcu::stream_bridge::SetTvmStream);
+      .def("tl.hcu.distributed.get_tvm_stream",
+           tvm::tl::hcu::stream_bridge::GetTvmStream)
+      .def("tl.hcu.distributed.set_tvm_stream",
+           tvm::tl::hcu::stream_bridge::SetTvmStream);
 }

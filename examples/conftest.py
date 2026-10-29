@@ -1,6 +1,5 @@
 import os
 import random
-import sys
 import pytest
 
 os.environ["PYTHONHASHSEED"] = "0"
@@ -24,10 +23,7 @@ def pytest_configure(config):
     from pathlib import Path
 
     distributed = Path(__file__).parent / "distributed"
-    if any(
-        (Path(config.invocation_params.dir) / str(arg).split("::", 1)[0]).resolve().is_relative_to(distributed)
-        for arg in config.args
-    ):
+    if any((Path(config.invocation_params.dir) / str(arg).split("::", 1)[0]).resolve().is_relative_to(distributed) for arg in config.args):
         return
     try:
         import torch
@@ -133,10 +129,13 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         "error",
     }
     skipped = terminalreporter.stats.get("skipped", [])
-    if skipped and all("HCU preflight:" in str(report.longrepr) for report in skipped):
-        if not any(terminalreporter.stats.get(kind) for kind in known_types.difference({"skipped", "deselected"})):
-            terminalreporter.write_sep("-", "HCU tests skipped: environment preflight requirements were not met.")
-            return
+    if (
+        skipped
+        and all("HCU preflight:" in str(report.longrepr) for report in skipped)
+        and not any(terminalreporter.stats.get(kind) for kind in known_types.difference({"skipped", "deselected"}))
+    ):
+        terminalreporter.write_sep("-", "HCU tests skipped: environment preflight requirements were not met.")
+        return
     if sum(len(terminalreporter.stats.get(k, [])) for k in known_types.difference({"skipped", "deselected"})) == 0:
         terminalreporter.write_sep(
             "!",

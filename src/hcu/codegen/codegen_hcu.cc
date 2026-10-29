@@ -814,7 +814,7 @@ void CodeGenTileLangHCU::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
 }
 
 bool CodeGenTileLangHCU::TryEmitDistributedCall(const Call &call,
-                                             std::ostream &os) {
+                                                std::ostream &os) {
   enum class DistributedCallKind { kRank, kNumRanks, kBlockGet };
   const auto *op = call.get();
   DistributedCallKind kind;
@@ -829,9 +829,10 @@ bool CodeGenTileLangHCU::TryEmitDistributedCall(const Call &call,
   }
 
   const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
-  const auto capability = kind == DistributedCallKind::kBlockGet
-      ? tl::hcu::DistributedCapability::kBlockRemoteGet
-      : tl::hcu::DistributedCapability::kRankAndWorldSize;
+  const auto capability =
+      kind == DistributedCallKind::kBlockGet
+          ? tl::hcu::DistributedCapability::kBlockRemoteGet
+          : tl::hcu::DistributedCapability::kRankAndWorldSize;
   tl::hcu::RequireDistributedCapability(backend, capability);
   switch (kind) {
   case DistributedCallKind::kRank:

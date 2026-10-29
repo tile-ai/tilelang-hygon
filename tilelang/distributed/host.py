@@ -1,4 +1,5 @@
 """Backend-neutral module binding and initialization/launch stream ordering."""
+
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Lock, RLock
@@ -7,6 +8,7 @@ from collections.abc import Callable
 from weakref import WeakValueDictionary
 from .allocator import get_distributed_backend_registration
 from .metadata import metadata_layout
+
 
 @contextmanager
 def tvm_hcu_stream(device: int, stream: int):
@@ -102,8 +104,11 @@ class DistributedMetadataInitializer:
 
         native_id = int(tvm.ffi.get_global_func("tl.GetHcuDistributedBackendId")(backend))
         if native_id != registration.backend_id:
-            raise RuntimeError(f"Distributed backend registry ID mismatch for {backend}: native={native_id}, Python={registration.backend_id}")
+            raise RuntimeError(
+                f"Distributed backend registry ID mismatch for {backend}: native={native_id}, Python={registration.backend_id}"
+            )
         from .metadata import validate_envelope, incompatible, requirements_for_backend
+
         requirements = self.requirements or requirements_for_backend(backend)
         spec = requirements["init_spec"]
         try:
@@ -137,7 +142,13 @@ class DistributedMetadataInitializer:
             raise incompatible(f"device initializer rejected metadata: status={error}, observed version={detail}")
         if binding is None:
             binding = _DistributedMetadataBinding(
-                module, allocator, allocator.group, allocator.device, backend, allocator.generation, metadata_tensor,
+                module,
+                allocator,
+                allocator.group,
+                allocator.device,
+                backend,
+                allocator.generation,
+                metadata_tensor,
                 registration=registration,
             )
         else:

@@ -11,8 +11,8 @@
 #include <tvm/ffi/error.h>
 #include <tvm/ffi/reflection/registry.h>
 
-#include <map>
 #include <iomanip>
+#include <map>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -55,9 +55,8 @@ const BackendRegistration &Lookup(const std::string &name) {
     }
     supported << entry.first;
   }
-  TVM_FFI_THROW(ValueError)
-      << "Unsupported HCU distributed backend: " << name
-      << "; supported backends: " << supported.str();
+  TVM_FFI_THROW(ValueError) << "Unsupported HCU distributed backend: " << name
+                            << "; supported backends: " << supported.str();
 }
 
 } // namespace
@@ -67,29 +66,32 @@ void RegisterHcuDistributedBackend(
     HcuDistributedBackendFactory factory,
     std::vector<DistributedCapability> capabilities) {
   if (name.empty() || backend_id == 0 || !factory) {
-    TVM_FFI_THROW(ValueError)
-        << "Distributed backend registration requires a name, nonzero ID and factory";
+    TVM_FFI_THROW(ValueError) << "Distributed backend registration requires a "
+                                 "name, nonzero ID and factory";
   }
-  std::set<DistributedCapability> declared(capabilities.begin(), capabilities.end());
+  std::set<DistributedCapability> declared(capabilities.begin(),
+                                           capabilities.end());
   const HcuDistributedBackend &backend = factory();
   if (std::string(backend.name()) != name) {
-    TVM_FFI_THROW(ValueError) << "Distributed backend factory name mismatch: " << name;
+    TVM_FFI_THROW(ValueError)
+        << "Distributed backend factory name mismatch: " << name;
   }
   auto &registry = Registry();
   std::lock_guard<std::mutex> lock(registry.mutex);
   if (registry.entries.count(name)) {
     TVM_FFI_THROW(ValueError)
-        << "Distributed backend is already registered and cannot be replaced: " << name;
+        << "Distributed backend is already registered and cannot be replaced: "
+        << name;
   }
   for (const auto &entry : registry.entries) {
     if (entry.second.backend_id == backend_id) {
-      TVM_FFI_THROW(ValueError)
-          << "Distributed backend ID " << backend_id << " is already registered to "
-          << entry.first;
+      TVM_FFI_THROW(ValueError) << "Distributed backend ID " << backend_id
+                                << " is already registered to " << entry.first;
     }
   }
   registry.entries.emplace(
-      name, BackendRegistration{backend_id, std::move(factory), std::move(declared)});
+      name,
+      BackendRegistration{backend_id, std::move(factory), std::move(declared)});
 }
 
 uint32_t GetHcuDistributedBackendId(const std::string &name) {
@@ -116,23 +118,27 @@ ffi::String GetHcuDistributedRequirements(const std::string &name) {
   const auto &backend = entry.factory();
   const auto spec = backend.InitSpec();
   std::ostringstream json;
-  json << "{\"schema_version\":" << ::tl::distributed_metadata::kRequirementsVersion
+  json << "{\"schema_version\":"
+       << ::tl::distributed_metadata::kRequirementsVersion
        << ",\"backend\":" << std::quoted(name)
        << ",\"backend_id\":" << entry.backend_id
        << ",\"abi_version\":" << ::tl::distributed_metadata::kAbiVersion
        << ",\"capabilities\":[";
   bool first = true;
   for (auto capability : entry.capabilities) {
-    if (!first) json << ",";
+    if (!first)
+      json << ",";
     first = false;
     json << std::quoted(capability == DistributedCapability::kRankAndWorldSize
-                            ? "rank_world_size" : "block_remote_get");
+                            ? "rank_world_size"
+                            : "block_remote_get");
   }
   json << "],\"init_spec\":{\"initialize\":{\"name\":"
        << std::quoted(spec.initialize.name) << ",\"argument_types\":[";
   bool first_type = true;
   for (auto type : spec.initialize.argument_types) {
-    if (!first_type) json << ",";
+    if (!first_type)
+      json << ",";
     first_type = false;
     std::ostringstream dtype;
     dtype << DataType(type);
@@ -142,14 +148,16 @@ ffi::String GetHcuDistributedRequirements(const std::string &name) {
   return ffi::String(json.str());
 }
 
-std::string EmitDistributedModulePreamble(
-    const std::string &name, const std::string &validator,
-    const std::string &private_declarations) {
+std::string
+EmitDistributedModulePreamble(const std::string &name,
+                              const std::string &validator,
+                              const std::string &private_declarations) {
   const auto &entry = Lookup(name);
   const auto spec = entry.factory().InitSpec();
   std::ostringstream code;
-  code << "// tilelang_distributed_abi: " << ::tl::distributed_metadata::kAbiVersion
-       << ":" << entry.backend_id << "\n";
+  code << "// tilelang_distributed_abi: "
+       << ::tl::distributed_metadata::kAbiVersion << ":" << entry.backend_id
+       << "\n";
   code << R"(
 extern "C" __device__ volatile uint64_t __tilelang_distributed_metadata[tl::distributed_metadata::kCapacity] = {};
 )" << private_declarations;
@@ -158,10 +166,12 @@ extern "C" __device__ volatile uint64_t __tilelang_distributed_metadata[tl::dist
   if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
       threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
     using namespace tl::distributed_metadata;
-    result[0] = tl::distributed_validate_envelope(source, count, )" << entry.backend_id << R"();
+    result[0] = tl::distributed_validate_envelope(source, count, )"
+       << entry.backend_id << R"();
     result[1] = count >= kPayload && source != nullptr ? source[kVersion] : 0;
     if (result[0] != kSuccess) return;
-    result[0] = )" << validator << R"((source, count);
+    result[0] = )"
+       << validator << R"((source, count);
     if (result[0] != kSuccess) return;
     for (int64_t i = 0; i < count; ++i) {
       __tilelang_distributed_metadata[i] = source[i];
@@ -220,41 +230,49 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace hcu = tvm::tl::hcu;
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
-      .def("tl.GetHcuDistributedRequirements", [](tvm::ffi::String name) {
-        return hcu::GetHcuDistributedRequirements(std::string(name));
-      })
-      .def("tl.hcu.distributed.metadata_layout", []() {
-        using namespace ::tl::distributed_metadata;
-        return tvm::ffi::String(
-        "{\"abi_version\":" + std::to_string(kAbiVersion) +
-        ",\"requirements_version\":" + std::to_string(kRequirementsVersion) +
-        ",\"capacity\":" + std::to_string(kCapacity) +
-        ",\"version\":" + std::to_string(kVersion) +
-        ",\"backend\":" + std::to_string(kBackend) +
-        ",\"rank\":" + std::to_string(kRank) +
-        ",\"world_size\":" + std::to_string(kWorldSize) +
-        ",\"payload_size\":" + std::to_string(kPayloadSize) +
-        ",\"status\":" + std::to_string(kStatus) +
-        ",\"status_detail\":" + std::to_string(kStatusDetail) +
-        ",\"payload\":" + std::to_string(kPayload) +
-        ",\"status_words\":" + std::to_string(kStatusWords) +
-        ",\"success\":" + std::to_string(kSuccess) +
-        ",\"invalid_peer_error\":" + std::to_string(kInvalidPeer) +
-        ",\"incompatible_version\":" + std::to_string(kIncompatibleVersion) +
-        ",\"invalid_envelope\":" + std::to_string(kInvalidEnvelope) +
-        ",\"backend_mismatch\":" + std::to_string(kBackendMismatch) +
-        ",\"invalid_payload\":" + std::to_string(kInvalidPayload) + "}");
-      })
-      .def("tl.GetHcuDistributedBackendId", [](tvm::ffi::String name) {
-        return static_cast<int64_t>(hcu::GetHcuDistributedBackendId(std::string(name)));
-      })
-      .def("tl.ListHcuDistributedBackends", []() {
-        tvm::ffi::Array<tvm::ffi::String> names;
-        for (const auto &name : hcu::ListHcuDistributedBackends()) {
-          names.push_back(tvm::ffi::String(name));
-        }
-        return names;
-      })
+      .def("tl.GetHcuDistributedRequirements",
+           [](tvm::ffi::String name) {
+             return hcu::GetHcuDistributedRequirements(std::string(name));
+           })
+      .def("tl.hcu.distributed.metadata_layout",
+           []() {
+             using namespace ::tl::distributed_metadata;
+             return tvm::ffi::String(
+                 "{\"abi_version\":" + std::to_string(kAbiVersion) +
+                 ",\"requirements_version\":" +
+                 std::to_string(kRequirementsVersion) +
+                 ",\"capacity\":" + std::to_string(kCapacity) +
+                 ",\"version\":" + std::to_string(kVersion) +
+                 ",\"backend\":" + std::to_string(kBackend) +
+                 ",\"rank\":" + std::to_string(kRank) +
+                 ",\"world_size\":" + std::to_string(kWorldSize) +
+                 ",\"payload_size\":" + std::to_string(kPayloadSize) +
+                 ",\"status\":" + std::to_string(kStatus) +
+                 ",\"status_detail\":" + std::to_string(kStatusDetail) +
+                 ",\"payload\":" + std::to_string(kPayload) +
+                 ",\"status_words\":" + std::to_string(kStatusWords) +
+                 ",\"success\":" + std::to_string(kSuccess) +
+                 ",\"invalid_peer_error\":" + std::to_string(kInvalidPeer) +
+                 ",\"incompatible_version\":" +
+                 std::to_string(kIncompatibleVersion) +
+                 ",\"invalid_envelope\":" + std::to_string(kInvalidEnvelope) +
+                 ",\"backend_mismatch\":" + std::to_string(kBackendMismatch) +
+                 ",\"invalid_payload\":" + std::to_string(kInvalidPayload) +
+                 "}");
+           })
+      .def("tl.GetHcuDistributedBackendId",
+           [](tvm::ffi::String name) {
+             return static_cast<int64_t>(
+                 hcu::GetHcuDistributedBackendId(std::string(name)));
+           })
+      .def("tl.ListHcuDistributedBackends",
+           []() {
+             tvm::ffi::Array<tvm::ffi::String> names;
+             for (const auto &name : hcu::ListHcuDistributedBackends()) {
+               names.push_back(tvm::ffi::String(name));
+             }
+             return names;
+           })
       .def("tl.TargetHasHcuDistributedBackend",
            hcu::TargetHasHcuDistributedBackend)
       .def("tl.GetHcuDistributedBackendName",

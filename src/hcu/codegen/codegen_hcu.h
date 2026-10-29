@@ -11,8 +11,8 @@
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/op.h>
 
-#include <optional>
 #include <map>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>

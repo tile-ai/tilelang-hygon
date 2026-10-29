@@ -16,7 +16,9 @@ class IpcDistributedBackend final : public HcuDistributedBackend {
 public:
   ffi::String name() const final { return "ipc"; }
 
-  std::string EmitRankExpr() const final { return "tl::distributed_get_rank()"; }
+  std::string EmitRankExpr() const final {
+    return "tl::distributed_get_rank()";
+  }
 
   std::string EmitNumRanksExpr() const final {
     return "tl::distributed_get_num_ranks()";
@@ -34,7 +36,6 @@ public:
   std::string ModulePreamble() const final {
     return EmitDistributedModulePreamble("ipc", "tl::ipc_validate_payload");
   }
-
 };
 
 } // namespace

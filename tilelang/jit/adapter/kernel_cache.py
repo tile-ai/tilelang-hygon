@@ -30,4 +30,5 @@ class TVMFFIKernelCache(KernelCache):
         KernelCache._safe_write_executable(executable, kernel_lib_path, export_kwargs=self._get_export_kwargs(kernel))
 
         from tilelang.distributed.metadata import save_library_requirements
+
         save_library_requirements(kernel_lib_path, getattr(kernel.adapter, "distributed_requirements", None))

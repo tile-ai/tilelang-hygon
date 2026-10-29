@@ -343,7 +343,8 @@ class JITKernel(Generic[_P, _T]):
         from tilelang.distributed.metadata import reject_unsupported_execution_backend
 
         reject_unsupported_execution_backend(
-            artifact.kernel_source, self.execution_backend,
+            artifact.kernel_source,
+            self.execution_backend,
             supported=self.execution_backend_spec.supports_distributed_runtime,
         )
 
@@ -458,7 +459,8 @@ class JITKernel(Generic[_P, _T]):
         from tilelang.distributed.metadata import reject_unsupported_execution_backend
 
         reject_unsupported_execution_backend(
-            device_kernel_source, execution_backend,
+            device_kernel_source,
+            execution_backend,
             supported=self.execution_backend_spec.supports_distributed_runtime,
         )
 
@@ -812,6 +814,7 @@ class JITKernel(Generic[_P, _T]):
         elif not (os.path.exists(kernel_file) and os.path.samefile(cached_library, kernel_file)):
             shutil.copyfile(cached_library, kernel_file)
         from tilelang.distributed.metadata import save_library_requirements
+
         save_library_requirements(kernel_file, getattr(self.adapter, "distributed_requirements", None))
         logger.info(f"Kernel library exported to {os.path.abspath(kernel_file)}")
 

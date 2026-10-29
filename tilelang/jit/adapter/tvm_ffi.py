@@ -117,8 +117,10 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
         self.target = Target(determine_target(target))
         from tilelang.distributed.metadata import validate_artifact_source
+
         validate_artifact_source(device_kernel_source, self.target)
         from tilelang.distributed.metadata import requirements_for_target
+
         self.distributed_requirements = requirements_for_target(self.target)
 
         self.host_mod = host_mod
@@ -142,6 +144,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         if cached is not None:
             return cached
         from tilelang.distributed.metadata import source_uses_distributed_metadata
+
         required = source_uses_distributed_metadata(getattr(self, "device_kernel_source", None))
         if not required:
             # Fresh adapters own rt_mod; disk-cache adapters own the executable
@@ -499,8 +502,10 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
         adapter.verbose = verbose
         from tilelang.distributed.metadata import validate_artifact_source
+
         validate_artifact_source(device_kernel_source, adapter.target)
         from tilelang.distributed.metadata import load_library_requirements
+
         adapter.distributed_requirements = load_library_requirements(kernel_lib_path, adapter.target)
         adapter.libpath = kernel_lib_path
         adapter.kernel_global_source = device_kernel_source.text

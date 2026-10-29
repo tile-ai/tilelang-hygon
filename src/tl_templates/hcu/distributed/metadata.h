@@ -1,5 +1,6 @@
-// Distributed wire ABI. This header is the sole source of host/device constants.
-// Bump kAbiVersion for incompatible layout, field semantics or helper signatures.
+// Distributed wire ABI. This header is the sole source of host/device
+// constants. Bump kAbiVersion for incompatible layout, field semantics or
+// helper signatures.
 #ifndef TILELANG_HCU_DISTRIBUTED_METADATA_H_
 #define TILELANG_HCU_DISTRIBUTED_METADATA_H_
 namespace tl {
