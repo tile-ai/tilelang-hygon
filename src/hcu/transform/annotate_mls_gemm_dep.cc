@@ -924,11 +924,8 @@ private:
         wrap_count);
   }
 
-  std::pair<Optional<HcuGemmAtBnLdsStrategy>, Optional<HcuGemmAnBtLdsStrategy>>
-  SelectAutoStrategy(const CopyNode &copy,
-                     const std::vector<GemmWithInput> &consumers) const {
-    // Try the ordinary-copy storage map for every AN/BT dtype first.
-    // Pure AT/BN and unsuccessful common plans use the existing strategies.
+  Optional<HcuGemmAnBtLdsStrategy> TrySelectCommonAnBtStrategy(
+      const CopyNode &copy, const std::vector<GemmWithInput> &consumers) const {
     if (IsFullPlainRegion(BufferRegion(copy.dst, copy.dst_range))) {
       if (Optional<Layout> layout =
               TryMakeCommonGemmLayout(copy.dst, consumers)) {
@@ -936,12 +933,18 @@ private:
           if (!IsAtBnAccess(consumer)) {
             if (auto strategy =
                     TryDeriveAnBtStrategy(copy, consumer, layout.value())) {
-              return {std::nullopt, strategy};
+              return strategy;
             }
           }
         }
       }
     }
+    return std::nullopt;
+  }
+
+  std::pair<Optional<HcuGemmAtBnLdsStrategy>, Optional<HcuGemmAnBtLdsStrategy>>
+  SelectWrapStrategy(const CopyNode &copy,
+                     const std::vector<GemmWithInput> &consumers) const {
     Optional<HcuGemmAtBnLdsStrategy> at_bn_strategy;
     Optional<HcuGemmAnBtLdsStrategy> an_bt_strategy;
     std::optional<GemmWithInput> an_bt_consumer;
@@ -1143,16 +1146,28 @@ private:
   Optional<Map<String, ObjectRef>> TryBuildPendingGemmCopyAnnotations(
       const CopyNode &copy, const Map<String, ObjectRef> &base_annotations,
       const std::vector<GemmWithInput> &consumers) {
-    auto [at_bn_strategy, an_bt_strategy] = SelectAutoStrategy(copy, consumers);
-    if (!at_bn_strategy.defined() && !an_bt_strategy.defined()) {
-      return std::nullopt;
+    // Prefer native wrap for async producers at the derived vector width.
+    // Ordinary copies still materialize their common layout independently.
+    auto [at_bn_strategy, an_bt_strategy] = SelectWrapStrategy(copy, consumers);
+    Optional<HcuGemmLdsCopyStrategy> copy_strategy;
+    if (at_bn_strategy.defined() || an_bt_strategy.defined()) {
+      copy_strategy =
+          TrySelectCopyStrategy(copy, at_bn_strategy, an_bt_strategy);
+    }
+    if (!copy_strategy.defined()) {
+      // Also fall back when the consumers cannot share one wrap copy plan.
+      at_bn_strategy = std::nullopt;
+      an_bt_strategy = TrySelectCommonAnBtStrategy(copy, consumers);
+      if (!an_bt_strategy.defined()) {
+        return std::nullopt;
+      }
+      copy_strategy =
+          TrySelectCopyStrategy(copy, at_bn_strategy, an_bt_strategy);
+      if (!copy_strategy.defined()) {
+        return std::nullopt;
+      }
     }
     auto annotations = base_annotations;
-    Optional<HcuGemmLdsCopyStrategy> copy_strategy =
-        TrySelectCopyStrategy(copy, at_bn_strategy, an_bt_strategy);
-    if (!copy_strategy.defined()) {
-      return std::nullopt;
-    }
     if (at_bn_strategy.defined()) {
       annotations.Set(kPendingGemmAtBnLdsStrategy, at_bn_strategy.value());
     }

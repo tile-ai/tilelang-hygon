@@ -287,6 +287,8 @@ def single_program(dtype, trans_a, trans_b, explicit_async=False, pack=1):
             if explicit_async:
                 T.async_copy(A, a)
                 T.async_copy(B, b)
+                T.ptx_wait_group(0)
+                T.sync_threads()
             else:
                 T.copy(A, a)
                 T.copy(B, b)
@@ -322,6 +324,47 @@ def test_explicit_async_path_numerical(runtime_arch):
     a = torch.randn((64, 32), dtype=torch.float16)
     b = torch.randn((32, 32), dtype=torch.float16)
     torch.testing.assert_close(kernel(a.cuda(), b.cuda()).cpu(), a.float() @ b.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("n,threads,copy_bytes", [(128, 128, 16), (132, 128, 8), (130, 128, 4), (128, 64, 16)])
+def test_async_wrap_preference_and_common_fallback(runtime_arch, n, threads, copy_bytes):
+    """Preserve vector width, preferring wrap only when its wave phases fit."""
+    m = 32 if threads == 64 else 64
+
+    @T.prim_func
+    def main(A: T.Tensor((m, 16), T.float16), B: T.Tensor((16, n), T.float16), C: T.Tensor((m, n), T.float32)):
+        with T.Kernel(T.ceildiv(n, 128), threads=threads) as bx:
+            a = T.alloc_shared((m, 16), T.float16)
+            b = T.alloc_shared((16, 128), T.float16)
+            c = T.alloc_fragment((m, 128), T.float32)
+            T.async_copy(A, a)
+            T.async_copy(B[0:16, bx * 128 : (bx + 1) * 128], b)
+            T.ptx_wait_group(0)
+            T.sync_threads()
+            T.clear(c)
+            T.gemm(a, b, c)
+            T.copy(c, C[0:m, bx * 128 : (bx + 1) * 128])
+
+    captures, _ = lower_with_captures(main, arch=runtime_arch, enable_async=True)
+    strategies = []
+
+    def visit(node):
+        key = "tl.hcu_gemm_lds_copy_strategy"
+        if isinstance(node, tvm.tirx.Call) and key in node.annotations and node.args[1].args[0].buffer.name == "b":
+            strategies.append(node.annotations[key])
+
+    for func in captures["tl.MaterializeHcuGemmLdsStrategy"].functions.values():
+        tvm.tirx.stmt_functor.post_order_visit(func.body, visit)
+    assert strategies
+    for strategy in strategies:
+        assert int(strategy.copy_transaction_bytes) == copy_bytes
+        assert int(strategy.wrap_offset) == (16 if threads == 128 else 0)
+        assert int(strategy.wrap_idx_mask) == (1 if threads == 128 else 0)
+
+    kernel = tl.compile(main, target={"kind": "hcu", "mcpu": runtime_arch}, out_idx=[2])
+    source = kernel.get_kernel_source()
+    assert "tl::ds_read_vector" in source
+    kernel.get_profiler().assert_allclose(lambda a, b: a.float() @ b.float(), atol=1e-2, rtol=1e-2)
 
 
 def test_unsupported_consumer_abandons_entire_buffer():
