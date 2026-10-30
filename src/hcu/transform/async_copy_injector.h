@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 #include <tvm/ir/expr.h>
 #include <tvm/tirx/stmt.h>
 
@@ -9,6 +11,7 @@ namespace tl {
 struct HCUAsyncCopyInjectResult {
   tvm::tirx::Stmt stmt;
   bool injected_hcu_async_copy{false};
+  std::string rejection_reason;
 };
 
 /*! \brief Inject HCU async-copy lowering patterns into a statement. */

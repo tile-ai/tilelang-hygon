@@ -49,7 +49,7 @@ ASYNC_COPY_K_MAJOR_SWIZZLE_CONFIG: dict[int, dict[str, Any]] = {
     },
     5120: {
         "swizzle_panel_size": 10,
-        "swizzle_order": "col",
+        "swizzle_order": "column",
         "swizzle_enable": True,
     },
     8192: {

@@ -518,9 +518,21 @@ private:
         return lowered_loop;
       }
       if (explicit_async_semantics) {
-        LOG(FATAL) << "Explicit async copy semantics require HCU async-copy "
-                      "lowering, "
-                      "but no eligible global->shared store was rewritten.";
+        LOG(FATAL)
+            << "HCU async-copy lowering failed for source buffer `"
+            << op.src->name << "` (scope=" << op.src.scope()
+            << ", dtype=" << op.src->dtype << ", shape=" << op.src->shape
+            << ", strides=" << op.src->strides << ") -> destination buffer `"
+            << op.dst->name << "` (scope=" << op.dst.scope()
+            << ", dtype=" << op.dst->dtype << ", shape=" << op.dst->shape
+            << "). "
+            << (inject_result.rejection_reason.empty()
+                    ? "No supported contiguous global-to-shared load/store "
+                      "pattern was found."
+                    : inject_result.rejection_reason)
+            << " Explicit async-copy semantics require an eligible transfer. "
+               "Use T.copy instead of T.async_copy (or remove force_cp_async) "
+               "to allow synchronous fallback.";
       }
       DLOG(WARNING) << "Fallback to normal copy because HCU async-copy rewrite "
                        "found no eligible global->shared store.";
