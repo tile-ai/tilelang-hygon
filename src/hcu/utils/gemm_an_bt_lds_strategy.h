@@ -12,6 +12,8 @@
 #include "op/copy.h"
 #include "op/gemm.h"
 
+#include <optional>
+
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/target/target.h>
 
@@ -64,7 +66,8 @@ public:
 
 Optional<HcuGemmAnBtLdsStrategy>
 DeriveHcuGemmAnBtLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
-                             bool feeds_a, Range thread_bounds, Target target);
+                             bool feeds_a, Range thread_bounds, Target target,
+                             Optional<Layout> storage_layout = std::nullopt);
 
 Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
     const CopyNode &copy, const GemmNode &gemm, bool feeds_a,

@@ -214,6 +214,15 @@ class Layout(Node):
 
         return _ffi_api.Layout_expand(self, leading_shape)
 
+    def with_inverse(self, inverse: "Layout") -> "Layout":
+        """Return a layout with a caller-supplied two-sided inverse.
+
+        Only coordinate shapes are checked; the caller is responsible for
+        inverse correctness. This supports non-affine maps which automatic
+        inference cannot recover. Fragment coordinates follow ``Fragment.inverse()``.
+        """
+        return _ffi_api.Layout_with_inverse(self, inverse)
+
     def inverse(self) -> "Layout":
         """
         Compute the inverse of the current layout transformation.

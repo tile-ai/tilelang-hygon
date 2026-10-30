@@ -109,6 +109,14 @@ public:
 
   virtual Layout Inverse() const;
 
+  /*! \brief Attach an explicit inverse for maps outside affine inference.
+   * Only coordinate shapes are checked; the caller must supply a correct
+   * two-sided inverse.
+   * Fragment inverses use (local slots..., normalized thread) as input and
+   * (logical coordinates..., replica) as output, just like Inverse().
+   */
+  Layout WithInverse(const Layout &inverse) const;
+
   // Reshape the layout to a new logical shape. When aliasing buffers of
   // different dtypes, the element count may change while the underlying
   // storage footprint stays equal. Use rescale_num/rescale_den to represent
@@ -152,6 +160,8 @@ protected:
   void UpdateAnalyzer(arith::Analyzer *analyzer) const;
   ffi::Array<PrimExpr> forward_index_;
   ffi::Array<PrimExpr> input_size_;
+  ffi::Optional<ffi::Array<PrimExpr>> inverse_index_;
+  Layout ExplicitInverse() const;
 };
 
 /*!

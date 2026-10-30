@@ -379,8 +379,15 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     ICHECK(feeds_a || meta->feeds_slot == 1);
     ICHECK(!ds_trans && (feeds_a ? meta->gemm_trans_a : !meta->gemm_trans_b))
         << "linear ds_read only supports GEMM AN or BT access";
-    ICHECK(src->dtype.is_float16() || src->dtype.is_bfloat16());
-    ICHECK_EQ(read_k % 16, 0);
+    const bool b8 =
+        src->dtype.is_float8_e4m3fn() || src->dtype.is_float8_e5m2();
+    ICHECK(src->dtype.is_float16() || src->dtype.is_bfloat16() ||
+           (hcu_layout_ds_read_ && b8))
+        << "fp8 AN/BT ds_read requires the layout-aware path";
+    const int read_tile_k = b8 ? 32 : 16;
+    const int elements_per_lane = b8 ? 16 : 8;
+    const int lanes_per_row = 32 / elements_per_lane;
+    ICHECK_EQ(read_k % read_tile_k, 0);
     ICHECK_EQ(read_mn % 32, 0);
 
     GemmWarpPolicy policy(meta->gemm_policy);
@@ -388,8 +395,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
         *policy.get(), meta->gemm_m, meta->gemm_n, meta->gemm_k,
         meta->gemm_k_pack, dst->dtype.bits(), block_size, T.target,
         meta->a_from_mls, meta->b_from_mls, !meta->gemm_trans_a,
-        meta->gemm_trans_b, meta->min_m_per_warp,
-        feeds_a ? meta->min_n_per_warp : std::max(meta->min_n_per_warp, 32),
+        meta->gemm_trans_b, meta->min_m_per_warp, meta->min_n_per_warp,
         meta->gemm_mmac_k);
     int warp_mn = feeds_a ? policy->m_warp : policy->n_warp;
     int warp_k = policy->k_warp;
@@ -453,41 +459,54 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
 
       Array<Stmt> reads;
       for (int mn_panel = 0; mn_panel < per_warp_mn / 32; ++mn_panel) {
-        for (int k_tile = 0; k_tile < read_k / 16; ++k_tile) {
+        for (int k_tile = 0; k_tile < read_k / read_tile_k; ++k_tile) {
           PrimExpr panel = analyzer->Simplify(
               warp_mn_idx * make_const(warp_mn_idx.dtype(), per_warp_mn / 32) +
               make_const(warp_mn_idx.dtype(), mn_panel));
           PrimExpr logical_k = analyzer->Simplify(
-              origin_dim0 + make_const(lane.dtype(), k_tile * 16) +
-              FloorDiv(lane, make_const(lane.dtype(), 4)));
+              origin_dim0 + make_const(lane.dtype(), k_tile * read_tile_k) +
+              FloorDiv(lane, make_const(lane.dtype(), lanes_per_row)));
           PrimExpr logical_n = analyzer->Simplify(
               origin_dim1 + panel * make_const(panel.dtype(), 32) +
-              FloorMod(lane, make_const(lane.dtype(), 4)) *
-                  make_const(lane.dtype(), 8));
+              FloorMod(lane, make_const(lane.dtype(), lanes_per_row)) *
+                  make_const(lane.dtype(), elements_per_lane));
           Array<PrimExpr> logical;
           for (size_t i = 0; i + 2 < sr; ++i) {
             logical.push_back(src_ranges[i]->min);
           }
           logical.push_back(logical_k);
           logical.push_back(logical_n);
-          Array<PrimExpr> logical_last = logical;
-          logical_last.Set(logical_last.size() - 1,
-                           logical_n + make_const(logical_n.dtype(), 7));
           Array<PrimExpr> physical = layout->Forward(logical);
-          Array<PrimExpr> physical_last = layout->Forward(logical_last);
-          ICHECK_EQ(physical.size(), physical_last.size());
-          for (size_t i = 0; i + 1 < physical.size(); ++i) {
-            ICHECK(analyzer->CanProveEqual(physical[i], physical_last[i]))
-                << "each AN/BT ds_read 8-half segment must remain in one "
-                   "physical row";
+          // The instruction fetches one contiguous 16-byte segment per lane.
+          // Prove every element, not just the endpoints: an interior bit
+          // permutation can preserve both endpoints while corrupting the read.
+          for (int element = 1; element < elements_per_lane; ++element) {
+            Array<PrimExpr> logical_element = logical;
+            logical_element.Set(logical_element.size() - 1,
+                                logical_n +
+                                    make_const(logical_n.dtype(), element));
+            Array<PrimExpr> physical_element = layout->Forward(logical_element);
+            ICHECK_EQ(physical.size(), physical_element.size());
+            for (size_t i = 0; i + 1 < physical.size(); ++i) {
+              ICHECK(analyzer->CanProveEqual(physical[i], physical_element[i]))
+                  << "layout-aware AN/BT ds_read of buffer " << src->name
+                  << " requires each 16-byte segment to remain in one physical "
+                     "row";
+            }
+            ICHECK(analyzer->CanProveEqual(physical.back() + element,
+                                           physical_element.back()))
+                << "layout-aware AN/BT ds_read of buffer " << src->name
+                << " requires each 16-byte segment to remain contiguous";
           }
-          ICHECK(analyzer->CanProveEqual(physical.back() + 7,
-                                         physical_last.back()))
-              << "each AN/BT ds_read 8-half segment must remain contiguous";
+          ICHECK(analyzer->CanProveEqual(
+              floormod(src_buf.OffsetOf(physical)[0], elements_per_lane), 0))
+              << "layout-aware AN/BT ds_read of buffer " << src->name
+              << " requires a 16-byte aligned source segment";
           PrimExpr local_offset = analyzer->Simplify(
               dst_leading_offset +
               make_const(dst_leading_offset.dtype(),
-                         (k_tile * per_warp_mn / 16 + mn_panel * 2) * 4));
+                         (k_tile * per_warp_mn / 16 + mn_panel * 2) *
+                             (read_tile_k / 4)));
           reads.push_back(Evaluate(Call(
               DataType::Handle(), tl::ds_read_vector(),
               {dst_buf->data, local_offset, BufferLoad(src_buf, physical)})));
@@ -500,6 +519,26 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     ICHECK(!feeds_a)
         << "GEMM AN linear ds_read requires a compiler-derived or explicit "
            "LDS layout";
+    // Unmapped pointer arithmetic in the external template is legal only
+    // for a final row-major layout. Selection precedes LayoutInference.
+    if (T.layout_map.count(src)) {
+      Layout source_layout = T.layout_map.at(src);
+      Layout linear_layout = MakeLinearLayout(src->shape);
+      arith::Analyzer layout_analyzer;
+      Array<PrimExpr> input_vars = source_layout->GetForwardVars();
+      ICHECK_EQ(input_vars.size(), src->shape.size());
+      for (size_t axis = 0; axis < input_vars.size(); ++axis) {
+        layout_analyzer.Bind(Downcast<Var>(input_vars[axis]),
+                             Range(make_zero(input_vars[axis].dtype()),
+                                   source_layout->InputShape()[axis]));
+      }
+      ICHECK(layout_analyzer.CanProveEqual(
+          source_layout->GetLinearizedForwardIndex(),
+          linear_layout->GetLinearizedForwardIndex()))
+          << "Unmapped linear ds_read of buffer " << src->name
+          << " requires a final row-major source layout; use a compatible "
+             "N8 layout and layout-aware ds_read_vector for swizzled LDS";
+    }
     std::string dtype_str = DsReadFormatDTypeString(src->dtype);
     int total_warp = block_size / TargetHcuGetWarpSize(T.target);
     std::stringstream ss;

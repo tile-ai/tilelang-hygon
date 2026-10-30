@@ -48,6 +48,8 @@ public:
 
   bool InjectedHCUAsyncCopy() const { return injected_hcu_async_copy_; }
 
+  const std::string &RejectionReason() const { return rejection_reason_; }
+
   Stmt Finalize(Stmt body) {
     if (!pending_sync_copies_ || UseExplicitAsyncSemantics()) {
       pending_sync_copies_ = false;
@@ -413,13 +415,11 @@ private:
       ICHECK(thread_var_.defined());
       for (int local_thread = 0; local_thread < block_threads; ++local_thread) {
         const int thread = thread_offset + local_thread;
-        PrimExpr reference = analyzer_.Simplify(Substitute(
+        PrimExpr thread_expr = analyzer_.Simplify(Substitute(
             expr, {{thread_var_, IntImm(thread_var_->dtype, thread)}}));
-        reference = EvaluateSymbolicVectorLane(reference, 0);
+        PrimExpr reference = EvaluateSymbolicVectorLane(thread_expr, 0);
         for (int lane = 1; lane < current_vectorized_lanes_; ++lane) {
-          PrimExpr current = analyzer_.Simplify(Substitute(
-              expr, {{thread_var_, IntImm(thread_var_->dtype, thread)}}));
-          current = EvaluateSymbolicVectorLane(current, lane);
+          PrimExpr current = EvaluateSymbolicVectorLane(thread_expr, lane);
           if (!analyzer_.CanProveEqual(current, reference)) {
             return false;
           }
@@ -547,6 +547,14 @@ private:
     }
     const int total_bytes = total_bits / 8;
     if (!IsValidCPAsyncTransferBytes(total_bytes)) {
+      if (rejection_reason_.empty()) {
+        rejection_reason_ =
+            "The lowered global-to-shared access width is " +
+            std::to_string(total_bytes) +
+            " bytes; supported HCU async-copy transaction widths are 4, 8, "
+            "and 16 bytes. Source strides and boundary predicates must "
+            "permit one of these widths under the current lowering.";
+      }
       return std::nullopt;
     }
 
@@ -1018,6 +1026,7 @@ private:
   std::vector<std::pair<Var, PrimExpr>> active_bindings_;
   arith::Analyzer analyzer_;
   bool injected_hcu_async_copy_{false};
+  std::string rejection_reason_;
   bool pending_sync_copies_{false};
   bool uncommitted_sync_copies_{false};
 };
@@ -1030,7 +1039,8 @@ InjectHCUAsyncCopy(const Stmt &body, bool async_without_async_commit_wait,
                                 std::move(call_annotations),
                                 std::move(thread_var), std::move(buffer_remap));
   Stmt injected = injector(body);
-  return {injector.Finalize(injected), injector.InjectedHCUAsyncCopy()};
+  return {injector.Finalize(injected), injector.InjectedHCUAsyncCopy(),
+          injector.RejectionReason()};
 }
 
 namespace {

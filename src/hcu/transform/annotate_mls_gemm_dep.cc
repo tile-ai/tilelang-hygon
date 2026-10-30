@@ -97,10 +97,11 @@ bool ContainsMlsTileOps(const Stmt &body) {
   return checker.found();
 }
 
-class PendingCopyCallCollector : public StmtExprVisitor {
+class PipelineCopyCallCollector : public StmtExprVisitor {
 public:
   void VisitExpr_(const CallNode *op) final {
-    if (op->annotations.count(kPendingGemmLdsCopyStrategy)) {
+    if (op->op.same_as(Copy::Get()) ||
+        op->op.same_as(Op::Get("tl.tileop.async_copy"))) {
       calls.insert(GetRef<Call>(op));
     }
     StmtExprVisitor::VisitExpr_(op);
@@ -150,7 +151,7 @@ private:
       }
       ICHECK_LT(flag_index, flags.size());
       if (!is_zero(flags[flag_index])) {
-        PendingCopyCallCollector calls;
+        PipelineCopyCallCollector calls;
         calls(stmt);
         selected_calls_.insert(calls.calls.begin(), calls.calls.end());
       }
@@ -167,6 +168,84 @@ private:
   std::unordered_set<Call, ObjectPtrHash, ObjectPtrEqual> selected_calls_;
 };
 
+bool HasAsyncCopySemantics(const Call &call) {
+  if (!call->op.same_as(Copy::Get()))
+    return true;
+  for (const char *key : {"is_async_copy", "force_cp_async",
+                          attr::kAsyncCopyNoImplicitCommitWait}) {
+    if (auto value = call->annotations.Get(key)) {
+      if (const auto *imm = value.value().as<IntImmNode>(); !imm || imm->value)
+        return true;
+    }
+  }
+  return false;
+}
+
+class PlainCopyWriterGate : public StmtExprVisitor {
+public:
+  std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual> blocked;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> blocked_data;
+
+private:
+  void VisitStmt_(const BufferStoreNode *op) final {
+    blocked.insert(op->buffer);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    // Region bridge loads are metadata and are handled below. Scalar reads
+    // are outside the supported GEMM-only consumer set.
+    blocked.insert(op->buffer);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(region()))
+      return;
+    if (async_loop_depth_ && op->op.same_as(Copy::Get())) {
+      auto copy = Downcast<Copy>(ParseOperator(GetRef<Call>(op)));
+      blocked.insert(copy->dst);
+    }
+    for (const PrimExpr &arg : op->args) {
+      if (const auto *var = arg.as<VarNode>(); var && var->dtype.is_handle())
+        blocked_data.insert(GetRef<Var>(var));
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    bool async_loop = false;
+    for (const char *key :
+         {attr::kLoopPreferAsync, attr::kParallelAsyncWithoutAsyncCommitWait}) {
+      if (auto value = op->annotations.Get(key)) {
+        if (const auto *imm = value.value().as<IntImmNode>())
+          async_loop |= imm->value != 0;
+      }
+    }
+    async_loop_depth_ += async_loop;
+    StmtExprVisitor::VisitStmt_(op);
+    async_loop_depth_ -= async_loop;
+  }
+
+  void VisitStmt_(const SBlockNode *op) final {
+    for (const auto &match : op->match_buffers)
+      blocked.insert(match->source->buffer);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  int async_loop_depth_{0};
+};
+
+PrimExpr MakePlainFragmentRegion(const Buffer &buffer, int access_mask) {
+  Array<PrimExpr> zeros;
+  for (const PrimExpr &extent : buffer->shape)
+    zeros.push_back(make_zero(extent.dtype()));
+  Array<PrimExpr> args{BufferLoad(buffer, zeros), Integer(access_mask)};
+  for (const PrimExpr &extent : buffer->shape)
+    args.push_back(extent);
+  return Call(DataType::Handle(), region(), args);
+}
+
 bool IsStaticMultipleOf(const PrimExpr &expr, int64_t value) {
   const auto *imm = expr.as<IntImmNode>();
   return imm && value != 0 && imm->value % value == 0;
@@ -178,28 +257,26 @@ bool IsAnBtLinearDsReadCopyCandidate(const CopyNode *copy,
       copy->dst.scope() != "local.fragment")
     return false;
   const GemmNode *gemm = consumer.gemm.get();
-  if (!gemm || gemm->k_ % 16 != 0 || gemm->kPack_ != 1)
+  const int read_tile_k = copy->src->dtype.bits() == 8 ? 32 : 16;
+  if (!gemm || gemm->k_ % read_tile_k != 0 || gemm->kPack_ != 1)
     return false;
   const bool feeds_a = consumer.input.same_as(gemm->a_);
   if (!(feeds_a || consumer.input.same_as(gemm->b_)) ||
       (feeds_a ? !gemm->transA_ : gemm->transB_))
     return false;
-  if (!(copy->src->dtype.is_float16() || copy->src->dtype.is_bfloat16()) ||
+  if (!(copy->src->dtype.is_float16() || copy->src->dtype.is_bfloat16() ||
+        copy->src->dtype.is_float8_e4m3fn() ||
+        copy->src->dtype.is_float8_e5m2()) ||
       copy->src->dtype != copy->dst->dtype)
     return false;
   if (copy->src_range.size() < 2 || copy->dst_range.size() < 2)
     return false;
   size_t sr = copy->src_range.size();
   size_t dr = copy->dst_range.size();
-  return IsStaticMultipleOf(copy->src_range[sr - 2]->extent, 16) &&
+  return IsStaticMultipleOf(copy->src_range[sr - 2]->extent, read_tile_k) &&
          IsStaticMultipleOf(copy->src_range[sr - 1]->extent, 32) &&
-         IsStaticMultipleOf(copy->dst_range[dr - 2]->extent, 16) &&
+         IsStaticMultipleOf(copy->dst_range[dr - 2]->extent, read_tile_k) &&
          IsStaticMultipleOf(copy->dst_range[dr - 1]->extent, 32);
-}
-
-bool IsBLinearDirectGemmCandidate(const GemmNode *gemm) {
-  return gemm && !gemm->transB_ && gemm->k_ % 16 == 0 && gemm->kPack_ == 1 &&
-         (gemm->b_->dtype.is_float16() || gemm->b_->dtype.is_bfloat16());
 }
 
 struct ThreadExtentInfo {
@@ -269,6 +346,7 @@ bool HaveCompatibleAtBnStrategyParameters(const HcuGemmAtBnLdsStrategy &lhs,
 bool HaveCompatibleAnBtStrategyParameters(const HcuGemmAnBtLdsStrategy &lhs,
                                           const HcuGemmAnBtLdsStrategy &rhs) {
   return lhs->strategy_version == rhs->strategy_version &&
+         lhs->storage_layout->IsEqual(rhs->storage_layout.get()) &&
          lhs->block_k == rhs->block_k && lhs->block_mn == rhs->block_mn &&
          lhs->block_threads == rhs->block_threads &&
          lhs->thread_offset == rhs->thread_offset &&
@@ -415,6 +493,10 @@ public:
     AnnotateMlsGemmDepMutator mutator(
         &collector, target.value(), thread.block_threads, thread.thread_var,
         &analyzer, Mode::kMaterialize, std::move(selected_calls));
+    PlainCopyWriterGate writer_gate;
+    writer_gate(f->body);
+    mutator.blocked_plain_buffers_ = std::move(writer_gate.blocked);
+    mutator.blocked_plain_data_ = std::move(writer_gate.blocked_data);
     PrimFuncNode *fn = f.CopyOnWrite();
     fn->body = mutator(f->body);
     mutator.ValidateAutoLayoutsAttached();
@@ -514,10 +596,26 @@ private:
     copy_node->src_range = src_range;
     copy_node->dst_range = dst_range;
     copy_node->annotations = {};
+    // Gather sources remain scalar expressions in src_range. Keep the actual
+    // loop for vector-width proof instead of synthesizing a rectangular copy.
+    copy_node->par_op_ = ParallelOp(GetRef<For>(op));
     return ParallelGatherCopy{Copy(copy_node)};
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
+    if (mode_ == Mode::kMaterialize) {
+      if (auto value = op->annotations.Get(attr::kHcuGemmAnBtLdsStrategy)) {
+        HcuGemmAnBtLdsStrategy strategy =
+            Downcast<HcuGemmAnBtLdsStrategy>(value.value());
+        auto gather = MatchPreferredAsyncParallelGather(op);
+        ICHECK(gather.has_value());
+        const Var &data = gather->copy->dst->data;
+        auto_an_bt_strategies_.insert_or_assign(data, strategy);
+        auto_copy_strategies_.insert_or_assign(
+            data, Downcast<HcuGemmLdsCopyStrategy>(
+                      op->annotations.at(attr::kHcuGemmLdsCopyStrategy)));
+      }
+    }
     if (mode_ != Mode::kCollectCandidates) {
       return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
@@ -550,6 +648,133 @@ private:
     return IRMutatorWithAnalyzer::VisitStmt_(updated.get());
   }
 
+  bool IsFullPlainRegion(const BufferRegion &region) const {
+    const Buffer &buffer = region->buffer;
+    if (region->region.size() != buffer->shape.size() ||
+        !buffer->strides.empty())
+      return false;
+    for (size_t i = 0; i < buffer->shape.size(); ++i) {
+      if (!is_zero(region->region[i]->min) ||
+          !analyzer_->CanProveEqual(region->region[i]->extent,
+                                    buffer->shape[i]))
+        return false;
+    }
+    return true;
+  }
+
+  Optional<Layout> TryMakePlainLayout(const Buffer &buffer) const {
+    if (block_threads_ < TargetHcuGetWarpSize(target_) ||
+        block_threads_ % TargetHcuGetWarpSize(target_) != 0 ||
+        !IsSharedBuffer(buffer) || HasAnnotatedLayout(buffer) ||
+        blocked_plain_buffers_.count(buffer) ||
+        blocked_plain_data_.count(buffer->data) ||
+        !(buffer->dtype.is_float16() || buffer->dtype.is_bfloat16() ||
+          buffer->dtype.is_float8_e4m3fn() || buffer->dtype.is_float8_e5m2()) ||
+        buffer->dtype.lanes() != 1 || !buffer->strides.empty() ||
+        buffer->shape.size() != 2 || !is_zero(buffer->elem_offset))
+      return std::nullopt;
+    auto writers = collector_->GetProducerRecords(buffer);
+    if (writers.empty())
+      return std::nullopt;
+    bool has_fragment_writer = false;
+    for (const auto &writer : writers) {
+      if (!writer.call)
+        return std::nullopt;
+      Call call = GetRef<Call>(writer.call);
+      if (HasAsyncCopySemantics(call) || selected_calls_.count(call))
+        return std::nullopt;
+      auto parsed = ParseOperator(call);
+      const auto *copy = parsed.as<CopyNode>();
+      if (!copy || IsMatrixLoadPreferredCopy(*copy) ||
+          copy->src->dtype != buffer->dtype ||
+          !IsFullPlainRegion(BufferRegion(buffer, copy->dst_range)))
+        return std::nullopt;
+      if (IsGlobalLikeBuffer(copy->src)) {
+        if (copy->src_range.size() < 2 ||
+            !analyzer_->CanProveEqual(floormod(copy->src_range.back()->min, 8),
+                                      0))
+          return std::nullopt;
+      } else if (copy->src.scope() == "local.fragment") {
+        if (!copy->dst.same_as(buffer) || !copy->src->strides.empty() ||
+            !is_zero(copy->src->elem_offset) ||
+            !StructuralEqual()(copy->src->shape, buffer->shape) ||
+            !IsFullPlainRegion(BufferRegion(copy->src, copy->src_range)))
+          return std::nullopt;
+        has_fragment_writer = true;
+      } else {
+        return std::nullopt;
+      }
+    }
+    auto consumers = GetExclusiveGemmConsumersAfterCall(buffer, nullptr);
+    if (!consumers || consumers->empty())
+      return std::nullopt;
+    return TryMakeCommonGemmLayout(buffer, *consumers, has_fragment_writer);
+  }
+
+  Optional<Layout>
+  TryMakeCommonGemmLayout(const Buffer &buffer,
+                          const std::vector<GemmWithInput> &consumers,
+                          bool has_fragment_writer = false) const {
+    const int element_bits = buffer->dtype.bits();
+    const int read_tile_k = element_bits == 8 ? 32 : 16;
+    std::vector<HcuGemmLdsReadPattern> reads;
+    for (const GemmWithInput &consumer : consumers) {
+      const Gemm &gemm = consumer.gemm;
+      if (gemm->a_.same_as(gemm->b_) ||
+          gemm->IsInstance<GemmBlockScaledNode>() ||
+          gemm->k_ % (read_tile_k * gemm->kPack_) != 0 ||
+          gemm->a_->dtype != buffer->dtype || gemm->b_->dtype != buffer->dtype)
+        return std::nullopt;
+      bool feeds_a = consumer.input.same_as(gemm->a_);
+      HcuGemmLdsAccessKind kind = GetHcuGemmLdsAccessKind(*gemm.get(), feeds_a);
+      const BufferRegion &input = feeds_a ? gemm->aRegion_ : gemm->bRegion_;
+      // First-stage scope is full compact tiles, including identity relays.
+      if (!IsFullPlainRegion(input))
+        return std::nullopt;
+      if (!consumer.input.same_as(buffer)) {
+        for (const auto &relay : collector_->GetReaderCalls(buffer)) {
+          if (relay.call && GemmWithInputFromReaderCall(relay.call, buffer))
+            continue;
+          if (!relay.call || !relay.call->op.same_as(Copy::Get()))
+            return std::nullopt;
+          auto copy = Downcast<Copy>(ParseOperator(GetRef<Call>(relay.call)));
+          if (has_fragment_writer &&
+              (HasAsyncCopySemantics(GetRef<Call>(relay.call)) ||
+               selected_calls_.count(GetRef<Call>(relay.call)) ||
+               !copy->src.same_as(buffer) ||
+               copy->dst->dtype != buffer->dtype ||
+               !copy->dst->strides.empty() || !is_zero(copy->dst->elem_offset)))
+            return std::nullopt;
+          if (!IsFullPlainRegion(BufferRegion(copy->src, copy->src_range)) ||
+              !IsFullPlainRegion(BufferRegion(copy->dst, copy->dst_range)) ||
+              !StructuralEqual()(copy->src->shape, copy->dst->shape) ||
+              copy->dst.scope() != "local.fragment")
+            return std::nullopt;
+        }
+      }
+      if (kind == HcuGemmLdsAccessKind::kAnBt) {
+        if (gemm->kPack_ != 1 ||
+            GetHcuGemmLdsMnExtent(*gemm.get(), feeds_a) % 32)
+          return std::nullopt;
+        GemmWarpPolicy policy(gemm->policy_->policy_type);
+        hcu::ComputeWarpPartitionHCU(
+            *policy.get(), gemm->m_, gemm->n_, gemm->k_, gemm->kPack_,
+            buffer->dtype.bits(), block_threads_, target_,
+            IsFromMls(gemm->a_, collector_), IsFromMls(gemm->b_, collector_),
+            !gemm->transA_, gemm->transB_);
+        int warp_mn = feeds_a ? policy->m_warp : policy->n_warp;
+        int mn = GetHcuGemmLdsMnExtent(*gemm.get(), feeds_a);
+        if (policy->k_warp != 1 || mn % warp_mn || (mn / warp_mn) % 32)
+          return std::nullopt;
+      }
+      reads.push_back({element_bits, read_tile_k, 32, 128 / element_bits, 16,
+                       kind, gemm->kPack_});
+    }
+    return MakeHcuPlainGemmLdsLayout(
+        buffer->shape, TargetHcuGetLdsBankCount(target_),
+        TargetHcuGetLdsBankWidthBytes(target_), reads);
+  }
+
   Range CurrentStrategyThreadBounds() const {
     if (thread_var_.defined()) {
       Range bounds = ComputeThreadBounds(thread_var_, *analyzer_);
@@ -579,10 +804,23 @@ private:
         block_layout_map = layout_map.value();
       }
     }
+    bool plain_layout_map_changed = false;
     annotated_layout_maps_stack_.push_back(block_layout_map);
+    if (mode_ == Mode::kMaterialize) {
+      for (const Buffer &buffer : op->alloc_buffers) {
+        if (Optional<Layout> layout = TryMakePlainLayout(buffer)) {
+          // Ordinary global and fragment producers share the same storage
+          // map and layout-aware GEMM reads. Their copies remain synchronous.
+          plain_layouts_.emplace(buffer->data, layout.value());
+          block_layout_map.Set(buffer->data, layout.value());
+          annotated_layout_maps_stack_.back().Set(buffer->data, layout.value());
+          plain_layout_map_changed = true;
+        }
+      }
+    }
 
     SBlock block = Downcast<SBlock>(IRMutatorWithAnalyzer::VisitStmt_(op));
-    bool layout_map_changed = false;
+    bool layout_map_changed = plain_layout_map_changed;
     // Materialize auto layouts at the shared buffer's allocation scope, just
     // like an explicit T.annotate_layout entry.
     for (const Buffer &buffer : block->alloc_buffers) {
@@ -658,8 +896,8 @@ private:
   }
 
   Optional<HcuGemmAnBtLdsStrategy>
-  TryDeriveAnBtStrategy(const CopyNode &copy,
-                        const GemmWithInput &consumer) const {
+  TryDeriveAnBtStrategy(const CopyNode &copy, const GemmWithInput &consumer,
+                        Optional<Layout> storage_layout = std::nullopt) const {
     const GemmNode *gemm = consumer.gemm.get();
     if (gemm == nullptr) {
       return std::nullopt;
@@ -667,7 +905,8 @@ private:
     const bool feeds_a = consumer.input.same_as(gemm->a_);
     ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
     return DeriveHcuGemmAnBtLdsStrategy(copy, *gemm, feeds_a,
-                                        CurrentStrategyThreadBounds(), target_);
+                                        CurrentStrategyThreadBounds(), target_,
+                                        std::move(storage_layout));
   }
 
   Optional<HcuGemmAnBtLdsStrategy>
@@ -685,8 +924,26 @@ private:
         wrap_count);
   }
 
+  Optional<HcuGemmAnBtLdsStrategy> TrySelectCommonAnBtStrategy(
+      const CopyNode &copy, const std::vector<GemmWithInput> &consumers) const {
+    if (IsFullPlainRegion(BufferRegion(copy.dst, copy.dst_range))) {
+      if (Optional<Layout> layout =
+              TryMakeCommonGemmLayout(copy.dst, consumers)) {
+        for (const GemmWithInput &consumer : consumers) {
+          if (!IsAtBnAccess(consumer)) {
+            if (auto strategy =
+                    TryDeriveAnBtStrategy(copy, consumer, layout.value())) {
+              return strategy;
+            }
+          }
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
   std::pair<Optional<HcuGemmAtBnLdsStrategy>, Optional<HcuGemmAnBtLdsStrategy>>
-  SelectAutoStrategy(const CopyNode &copy,
+  SelectWrapStrategy(const CopyNode &copy,
                      const std::vector<GemmWithInput> &consumers) const {
     Optional<HcuGemmAtBnLdsStrategy> at_bn_strategy;
     Optional<HcuGemmAnBtLdsStrategy> an_bt_strategy;
@@ -795,26 +1052,6 @@ private:
         at_bn->storage_layout, at_bn->copy_loop_layout);
   }
 
-  bool IsLinearDsReadGemmInput(const Gemm &gemm, const Buffer &input) const {
-    GemmWithInput consumer{gemm, input};
-    for (const ProducerRecord &record : collector_->GetProducerRecords(input)) {
-      if (record.call == nullptr) {
-        continue;
-      }
-      Optional<TileOperator> producer =
-          ParseOperator(ffi::GetRef<Call>(record.call));
-      if (!producer.defined()) {
-        continue;
-      }
-      if (const auto *copy = producer.as<CopyNode>()) {
-        if (IsAnBtLinearDsReadCopyCandidate(copy, consumer)) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
   int GetDsReadAlt(const Buffer &input) const {
     int alt = 1;
     bool found = false;
@@ -909,16 +1146,28 @@ private:
   Optional<Map<String, ObjectRef>> TryBuildPendingGemmCopyAnnotations(
       const CopyNode &copy, const Map<String, ObjectRef> &base_annotations,
       const std::vector<GemmWithInput> &consumers) {
-    auto [at_bn_strategy, an_bt_strategy] = SelectAutoStrategy(copy, consumers);
-    if (!at_bn_strategy.defined() && !an_bt_strategy.defined()) {
-      return std::nullopt;
+    // Prefer native wrap for async producers at the derived vector width.
+    // Ordinary copies still materialize their common layout independently.
+    auto [at_bn_strategy, an_bt_strategy] = SelectWrapStrategy(copy, consumers);
+    Optional<HcuGemmLdsCopyStrategy> copy_strategy;
+    if (at_bn_strategy.defined() || an_bt_strategy.defined()) {
+      copy_strategy =
+          TrySelectCopyStrategy(copy, at_bn_strategy, an_bt_strategy);
+    }
+    if (!copy_strategy.defined()) {
+      // Also fall back when the consumers cannot share one wrap copy plan.
+      at_bn_strategy = std::nullopt;
+      an_bt_strategy = TrySelectCommonAnBtStrategy(copy, consumers);
+      if (!an_bt_strategy.defined()) {
+        return std::nullopt;
+      }
+      copy_strategy =
+          TrySelectCopyStrategy(copy, at_bn_strategy, an_bt_strategy);
+      if (!copy_strategy.defined()) {
+        return std::nullopt;
+      }
     }
     auto annotations = base_annotations;
-    Optional<HcuGemmLdsCopyStrategy> copy_strategy =
-        TrySelectCopyStrategy(copy, at_bn_strategy, an_bt_strategy);
-    if (!copy_strategy.defined()) {
-      return std::nullopt;
-    }
     if (at_bn_strategy.defined()) {
       annotations.Set(kPendingGemmAtBnLdsStrategy, at_bn_strategy.value());
     }
@@ -993,6 +1242,63 @@ private:
     annotations.erase(kPendingGemmAtBnLdsStrategy);
     annotations.erase(kPendingGemmAnBtLdsStrategy);
     return annotations;
+  }
+
+  bool HasLayoutAwareGemmInput(const Buffer &buffer) const {
+    return plain_layouts_.count(buffer->data) ||
+           auto_an_bt_strategies_.count(buffer->data);
+  }
+
+  Stmt MaterializeLayoutAwareGemm(const Call &call, const Gemm &gemm,
+                                  Map<String, ObjectRef> annotations) {
+    Array<PrimExpr> args = call->args;
+    Array<Buffer> fragments;
+    Array<Stmt> statements;
+    bool convert_a =
+        HasLayoutAwareGemmInput(gemm->a_) && !IsAtBnAccess({gemm, gemm->a_});
+    bool convert_b =
+        HasLayoutAwareGemmInput(gemm->b_) && !IsAtBnAccess({gemm, gemm->b_});
+    for (int slot = 0; slot < 2; ++slot) {
+      const Buffer &input = slot == 0 ? gemm->a_ : gemm->b_;
+      if (!HasLayoutAwareGemmInput(input))
+        continue;
+      annotations.Set(slot == 0 ? attr::kHcuARespectLayoutMap
+                                : attr::kHcuBRespectLayoutMap,
+                      Integer(1));
+      if (!(slot == 0 ? convert_a : convert_b))
+        continue;
+      const Array<Range> &read_region =
+          slot == 0 ? gemm->aRegion_->region : gemm->bRegion_->region;
+      Array<PrimExpr> fragment_shape = {
+          read_region[read_region.size() - 2]->extent,
+          read_region.back()->extent};
+      Buffer fragment =
+          decl_buffer(fragment_shape, input->dtype,
+                      input->name + "_plain_fragment", "local.fragment");
+      fragments.push_back(fragment);
+      Map<String, ObjectRef> read_annotations;
+      read_annotations.Set(attr::kHcuLinearDsRead, Integer(1));
+      read_annotations.Set(attr::kHcuLayoutDsRead, Integer(1));
+      read_annotations.Set(attr::kMlsGemmDep,
+                           BuildCopyToGemmLinearMeta(
+                               {gemm, input}, IsFromMls(gemm->a_, collector_),
+                               IsFromMls(gemm->b_, collector_), target_));
+      statements.push_back(Evaluate(
+          Call(call->dtype, DsReadFormat::Get(),
+               {args[slot], MakePlainFragmentRegion(fragment, kAccessWrite)},
+               read_annotations)));
+      args.Set(slot, MakePlainFragmentRegion(fragment, kAccessRead));
+    }
+    statements.push_back(
+        Evaluate(Call(call->dtype, call->op, args, annotations, call->span)));
+    if (fragments.empty())
+      return statements[0];
+    // Preserve a single planner statement while giving temporary fragments a
+    // lexical allocation scope; pipeline rewriting sees all source accesses.
+    SBlock block({}, {gemm->aRegion_, gemm->bRegion_}, {gemm->cRegion_},
+                 "layout_aware_gemm_read", SeqStmt(statements), std::nullopt,
+                 fragments);
+    return SBlockRealize({}, const_true(), block);
   }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
@@ -1090,6 +1396,33 @@ private:
 
     if (IsCopyLikeOp(tir_op)) {
       auto copy = Downcast<Copy>(ParseOperator(ffi::GetRef<Call>(call)));
+      // Explicit async strategies can already be materialized by collection.
+      // Restore their per-buffer state before dispatching GEMM reads.
+      if (mode_ == Mode::kMaterialize) {
+        if (auto strategy =
+                call->annotations.Get(attr::kHcuGemmAnBtLdsStrategy)) {
+          auto_an_bt_strategies_.insert_or_assign(
+              copy->dst->data,
+              Downcast<HcuGemmAnBtLdsStrategy>(strategy.value()));
+          auto copy_strategy =
+              call->annotations.Get(attr::kHcuGemmLdsCopyStrategy);
+          ICHECK(copy_strategy);
+          auto_copy_strategies_.insert_or_assign(
+              copy->dst->data,
+              Downcast<HcuGemmLdsCopyStrategy>(copy_strategy.value()));
+        }
+      }
+      if (mode_ == Mode::kMaterialize &&
+          plain_layouts_.count(copy->dst->data)) {
+        auto annotations = call->annotations;
+        annotations.erase(kPendingGemmLdsCopyStrategy);
+        annotations.erase(kPendingGemmAtBnLdsStrategy);
+        annotations.erase(kPendingGemmAnBtLdsStrategy);
+        annotations.erase(attr::kHcuCopyAsyncPromotable);
+        annotations.Set(attr::kHcuPlainGemmLdsCopy, Integer(1));
+        return Evaluate(
+            Call(call->dtype, call->op, call->args, annotations, call->span));
+      }
       if (mode_ == Mode::kMaterialize &&
           call->annotations.count(kPendingGemmLdsCopyStrategy)) {
         const bool selected =
@@ -1142,23 +1475,30 @@ private:
                                 auto_an_bt_strategies_.count(copy->src->data);
         // The fallback template is B-specific. AN must have an explicit
         // logical-to-physical map before it can use the generic vector read.
-        if (feeds_a && !has_layout) {
+        if ((feeds_a || copy->src->dtype.bits() == 8) && !has_layout) {
           return IRMutatorWithAnalyzer::VisitStmt_(op);
         }
         auto annotations = call->annotations;
         const Gemm &gemm = consumer->gemm;
-        const bool a_from_mls = IsFromMls(gemm->a_, collector_) ||
-                                IsLinearDsReadGemmInput(gemm, gemm->a_);
-        const bool b_from_mls = IsFromMls(gemm->b_, collector_) ||
-                                IsLinearDsReadGemmInput(gemm, gemm->b_);
-        annotations.Set(attr::kMlsGemmDep,
-                        BuildCopyToGemmLinearMeta(consumer.value(), a_from_mls,
-                                                  b_from_mls, target_));
+        const bool a_from_mls = IsFromMls(gemm->a_, collector_);
+        const bool b_from_mls = IsFromMls(gemm->b_, collector_);
+        MlsGemmDepMeta meta = BuildCopyToGemmLinearMeta(
+            consumer.value(), a_from_mls, b_from_mls, target_);
+        GemmWarpPolicy policy(meta->gemm_policy);
+        hcu::ComputeWarpPartitionHCU(
+            *policy.get(), meta->gemm_m, meta->gemm_n, meta->gemm_k,
+            meta->gemm_k_pack, copy->dst->dtype.bits(), block_threads_, target_,
+            a_from_mls, b_from_mls, !meta->gemm_trans_a, meta->gemm_trans_b,
+            meta->min_m_per_warp, meta->min_n_per_warp, meta->gemm_mmac_k);
+        const int warp_mn = feeds_a ? policy->m_warp : policy->n_warp;
+        const int mn = GetHcuGemmLdsMnExtent(*gemm.get(), feeds_a);
+        if (policy->k_warp != 1 || mn % warp_mn || (mn / warp_mn) % 32)
+          return IRMutatorWithAnalyzer::VisitStmt_(op);
+        annotations.Set(attr::kMlsGemmDep, meta);
         annotations.Set(attr::kHcuLinearDsRead, IntImm(DataType::Int(32), 1));
         if (has_layout) {
           annotations.Set(attr::kHcuLayoutDsRead, IntImm(DataType::Int(32), 1));
         }
-        copy_ds_read_outputs_.insert(copy->dst);
         return Evaluate(Call(call->dtype, DsReadFormat::Get(), call->args,
                              annotations, call->span));
       }
@@ -1206,12 +1546,6 @@ private:
         annotations.Set(attr::kHcuBDsReadAlt,
                         IntImm(DataType::Int(32), b_ds_read_alt));
       }
-      if (copy_ds_read_outputs_.count(gemm->a_)) {
-        annotations.Set(attr::kHcuAFromMls, IntImm(DataType::Int(32), 1));
-      }
-      if (copy_ds_read_outputs_.count(gemm->b_)) {
-        annotations.Set(attr::kHcuBFromMls, IntImm(DataType::Int(32), 1));
-      }
       auto a_at_bn_strategy = auto_at_bn_strategies_.find(gemm->a_->data);
       auto a_an_bt_strategy = auto_an_bt_strategies_.find(gemm->a_->data);
       const bool a_uses_at_bn = IsAtBnAccess({gemm, gemm->a_});
@@ -1225,10 +1559,6 @@ private:
                         IntImm(DataType::Int(32), 1));
       } else if (IsSharedBuffer(gemm->a_) && HasAnnotatedLayout(gemm->a_)) {
         annotations.Set(attr::kHcuARespectLayoutMap,
-                        IntImm(DataType::Int(32), 1));
-      } else if (IsSharedBuffer(gemm->a_) &&
-                 async_copy_linear_outputs_.count(gemm->a_->data)) {
-        annotations.Set(attr::kHcuAFromAsyncCopyLinear,
                         IntImm(DataType::Int(32), 1));
       }
       auto b_an_bt_strategy = auto_an_bt_strategies_.find(gemm->b_->data);
@@ -1247,11 +1577,11 @@ private:
       } else if (IsSharedBuffer(gemm->b_) && HasAnnotatedLayout(gemm->b_)) {
         annotations.Set(attr::kHcuBRespectLayoutMap,
                         IntImm(DataType::Int(32), 1));
-      } else if (IsSharedBuffer(gemm->b_) &&
-                 async_copy_linear_outputs_.count(gemm->b_->data) &&
-                 IsBLinearDirectGemmCandidate(gemm.get())) {
-        annotations.Set(attr::kHcuBFromAsyncCopyLinear,
-                        IntImm(DataType::Int(32), 1));
+      }
+      if (mode_ == Mode::kMaterialize && (HasLayoutAwareGemmInput(gemm->a_) ||
+                                          HasLayoutAwareGemmInput(gemm->b_))) {
+        return MaterializeLayoutAwareGemm(GetRef<Call>(call), gemm,
+                                          annotations);
       }
       Call new_call(call->dtype, call->op, call->args, annotations, call->span);
       return Evaluate(new_call);
@@ -1260,6 +1590,10 @@ private:
     return IRMutatorWithAnalyzer::VisitStmt_(op);
   }
 
+  std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
+      blocked_plain_buffers_;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> blocked_plain_data_;
+  std::unordered_map<Var, Layout, ObjectPtrHash, ObjectPtrEqual> plain_layouts_;
   PropagationTirCollector *collector_;
   Target target_;
   int block_threads_{-1};
@@ -1269,8 +1603,6 @@ private:
   std::unordered_map<Buffer, bool, ObjectPtrHash, ObjectPtrEqual>
       shared_mls_trans_;
   std::vector<Map<Var, Layout>> annotated_layout_maps_stack_;
-  std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
-      copy_ds_read_outputs_;
   std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>
       async_copy_linear_outputs_;
   std::unordered_map<Var, HcuGemmAtBnLdsStrategy, ObjectPtrHash, ObjectPtrEqual>

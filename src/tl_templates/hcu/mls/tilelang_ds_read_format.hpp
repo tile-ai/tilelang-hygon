@@ -34,6 +34,11 @@ TL_DEVICE void ds_read_vector(float32x4 &dst, TL_LDS_ADDR bfloat16_t *ptr) {
   dst = mls::ds_read_m32x16_b16_builtin(ptr, 0);
 }
 
+// The b8 instruction transfers raw bits, independently of the fp8 encoding.
+TL_DEVICE void ds_read_vector(float32x4 &dst, TL_LDS_ADDR int *ptr) {
+  dst = __builtin_hcu_ds_read_m32x32_i8(ptr, 0);
+}
+
 namespace mls {
 
 /*
