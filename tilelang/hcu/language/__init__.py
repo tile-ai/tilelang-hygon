@@ -17,6 +17,8 @@ from .kernel import *  # noqa: F401,F403
 from .kernel import __all__ as _KERNEL_ALL
 from .loop import *  # noqa: F401,F403
 from .loop import __all__ as _LOOP_ALL
+from .random import *  # noqa: F401,F403
+from .random import __all__ as _RANDOM_ALL
 from .reduce_op import *  # noqa: F401,F403
 from .reduce_op import __all__ as _REDUCE_ALL
 
@@ -60,10 +62,23 @@ __all__ = tuple(
             *_INTRINSIC_ALL,
             *_KERNEL_ALL,
             *_LOOP_ALL,
+            *_RANDOM_ALL,
             *_REDUCE_ALL,
             *_SCALE_ALL,
         )
     )
 )
 
-del _COMMON_ALL, _ALLOCATE_ALL, _ANNOTATION_ALL, _COPY_ALL, _GEMM_ALL, _INTRINSIC_ALL, _KERNEL_ALL, _LOOP_ALL, _REDUCE_ALL, _SCALE_ALL
+del (
+    _COMMON_ALL,
+    _ALLOCATE_ALL,
+    _ANNOTATION_ALL,
+    _COPY_ALL,
+    _GEMM_ALL,
+    _INTRINSIC_ALL,
+    _KERNEL_ALL,
+    _LOOP_ALL,
+    _RANDOM_ALL,
+    _REDUCE_ALL,
+    _SCALE_ALL,
+)
