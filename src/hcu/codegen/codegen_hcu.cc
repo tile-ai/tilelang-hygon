@@ -2398,10 +2398,8 @@ std::string CodeGenTileLangHCU::GetVecLoadWithPredicate(
     DataType t, const BufferNode *buffer, PrimExpr base,
     const std::string &pred) {
   if (CanUseVMBufferOps(buffer, t.lanes())) {
-    // Address-rebase annotations are store-only until ordinary VM loads have
-    // been validated independently.  Async/direct-to-LDS loads likewise pass
-    // false at their call sites.
-    auto desc = GetBufferDesc(t, buffer, base, false);
+    // Async/direct-to-LDS loads likewise pass false at their call sites.
+    auto desc = GetBufferDesc(t, buffer, base);
     std::string data_type = HcuCkTemplateElemType(t);
     std::ostringstream os;
     os << "*(";
