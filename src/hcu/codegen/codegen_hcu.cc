@@ -814,6 +814,10 @@ std::string CodeGenTileLangHCU::Finish() {
     decl_stream << "#include <tl_templates/hcu/hcu_fp8.h>\n";
   }
 
+  if (need_hiprand_kernel_h_) {
+    decl_stream << "#include <hiprand/hiprand_kernel.h>\n";
+  }
+
   decl_stream << "#include <tl_templates/hcu/atomic.h>\n";
   if (enable_gemm_mls_) {
     decl_stream << "#include <tl_templates/hcu/mls/tilelang_mls_base.hpp>\n";
@@ -3711,6 +3715,31 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     this->stream << ");\n";
     return;
+  } else if (op->op.same_as(tl::rng_init())) {
+    this->need_hiprand_kernel_h_ = true;
+    auto it = rng_state_name_map_.find(op);
+    ICHECK(it != rng_state_name_map_.end())
+        << "tl.rng_init call was not registered by the AddFunction pre-scan";
+    this->hiprand_random_generator_state = it->second;
+    this->hiprand_random_generator_state_type =
+        op->args[3].as<StringImmNode>()->value;
+    this->PrintIndent();
+    this->stream << "hiprand_init(" << PrintExpr(op->args[0]) << ", "
+                 << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2])
+                 << ", &" << this->hiprand_random_generator_state << ");\n";
+    return;
+  } else if (op->op.same_as(tl::rng_rand())) {
+    this->need_hiprand_kernel_h_ = true;
+    os << "hiprand(&" << this->hiprand_random_generator_state << ")";
+    return;
+  } else if (op->op.same_as(tl::rng_rand_float())) {
+    this->need_hiprand_kernel_h_ = true;
+    os << "hiprand_" << op->args[0].as<StringImmNode>()->value;
+    if (op->dtype.bits() == 64) {
+      os << "_double";
+    }
+    os << "(&" << this->hiprand_random_generator_state << ")";
+    return;
   } else if (op->op.same_as(tl::hcu_set_max_nreg())) {
     this->PrintIndent();
     int nreg = Downcast<IntImm>(op->args[0])->value;
@@ -3936,6 +3965,7 @@ void CodeGenTileLangHCU::VisitExpr_(const ShuffleNode *op,
 void CodeGenTileLangHCU::VisitExpr_(const BroadcastNode *op,
                                     std::ostream &os) { // NOLINT(*)
   int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
+
   if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8) {
     const int64_t *p = as_const_int(op->value);
     if (p && lanes == 4) {
@@ -4014,6 +4044,27 @@ void CodeGenTileLangHCU::VisitExpr_(const BroadcastNode *op,
     return;
   }
 
+  // 32-bit int/uint broadcast with lanes > 4 lowers to (u)longlong{lanes/2}
+  // (each ulonglong holds two consecutive 32-bit lanes).
+  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 32 &&
+      op->dtype.lanes() > 4 && op->dtype.lanes() % 2 == 0) {
+    int lanes = op->dtype.lanes();
+    std::string v = PrintExpr(op->value);
+    const char *u64 = op->dtype.is_uint() ? "unsigned long long" : "long long";
+    os << "make_";
+    PrintType(op->dtype, os);
+    os << '(';
+    for (int i = 0; i < lanes / 2; ++i) {
+      if (i != 0)
+        os << ", ";
+      // Widen through `unsigned int` so both lanes are zero-extended.
+      os << "(" << u64 << ")(((unsigned long long)(unsigned int)(" << v
+         << ")) | ((unsigned long long)(unsigned int)(" << v << ") << 32))";
+    }
+    os << ')';
+    return;
+  }
+
   if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 4) {
     bool fail = false;
     const int64_t *p = as_const_int(op->value);
@@ -4057,6 +4108,59 @@ void CodeGenTileLangHCU::VisitExpr_(const BroadcastNode *op,
 
     if (!fail) {
       return;
+    }
+  }
+
+  if (auto call = op->value.as<CallNode>()) {
+    if (this->hiprand_random_generator_state_type ==
+        "hiprandStatePhilox4_32_10_t") {
+      if (call->op.same_as(tl::rng_rand()) && lanes == 4) {
+        os << "hiprand4(&" << this->hiprand_random_generator_state << ")";
+        return;
+      }
+      if (call->op.same_as(tl::rng_rand_float())) {
+        int bits = call->dtype.bits();
+        std::string dist = call->args[0].as<StringImmNode>()->value;
+        if (bits == 32) {
+          if (lanes == 4) {
+            os << "hiprand_" << dist << "4(&"
+               << this->hiprand_random_generator_state << ")";
+            return;
+          } else if (lanes == 2 && dist == "normal") {
+            os << "hiprand_normal2(&" << this->hiprand_random_generator_state
+               << ")";
+            return;
+          }
+
+        } else {
+          if (lanes == 2) {
+            os << "hiprand_" << dist << "2_double(&"
+               << this->hiprand_random_generator_state << ")";
+            return;
+          }
+        }
+      }
+    } else if (this->hiprand_random_generator_state_type ==
+                   "hiprandStateMRG32k3a_t" ||
+               this->hiprand_random_generator_state_type ==
+                   "hiprandStateXORWOW_t") {
+      if (call->op.same_as(tl::rng_rand_float())) {
+        int bits = call->dtype.bits();
+        std::string dist = call->args[0].as<StringImmNode>()->value;
+        if (bits == 32) {
+          if (lanes == 2 && dist == "normal") {
+            os << "hiprand_normal2(&" << this->hiprand_random_generator_state
+               << ")";
+            return;
+          }
+        } else {
+          if (lanes == 2 && dist == "normal") {
+            os << "hiprand_normal2_double(&"
+               << this->hiprand_random_generator_state << ")";
+            return;
+          }
+        }
+      }
     }
   }
 
@@ -4346,6 +4450,22 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   int func_scope = this->BeginScope();
   EmitHoistedCPAsyncResources(f);
   this->PreFunctionBody(f);
+  // Declare hiprand states for all tl.rng_init calls at function scope.
+  // Sync-insertion passes may split the block containing rng_init across
+  // __syncthreads(), so a declaration emitted at the call site can go out
+  // of scope before later rng_rand / rng_rand_float uses.
+  rng_state_name_map_.clear();
+  tirx::PostOrderVisit(f->body, [this](const ObjectRef &n) {
+    const auto *call = n.as<CallNode>();
+    if (call == nullptr || !call->op.same_as(tl::rng_init())) {
+      return;
+    }
+    this->need_hiprand_kernel_h_ = true;
+    std::string name = name_supply_->FreshName("__random_generator_state");
+    this->stream << "  " << call->args[3].as<StringImmNode>()->value << " "
+                 << name << ";\n";
+    rng_state_name_map_.emplace(call, std::move(name));
+  });
   this->PrintStmt(f->body);
   this->EndScope(func_scope);
   this->PrintIndent();
