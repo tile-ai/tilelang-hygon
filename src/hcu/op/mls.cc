@@ -620,7 +620,6 @@ LayoutMap MatrixLoadNode::InferLayout(const LayoutInferArgs &T,
 
 Stmt MatrixLoadNode::Lower(const LowerArgs &T,
                            arith::Analyzer *analyzer) const {
-  (void)analyzer;
   if (!TargetIsHCU(T.target)) {
     LOG(FATAL) << "matrix_load is only supported on HCU target";
   }
@@ -714,7 +713,13 @@ Stmt MatrixLoadNode::Lower(const LowerArgs &T,
      << ", " << warp_k << ", " << dtype_str << ", 1, "
      << (mls_trans ? "true" : "false")
      << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
-     << lds_physical_bits << ", " << k_boundary << ", " << mn_boundary << ">";
+     << lds_physical_bits << ", "
+     << MlsResolveBoundary(k_boundary, block_k_base, k_length_raw, block_k,
+                           analyzer)
+     << ", "
+     << MlsResolveBoundary(mn_boundary, block_mn_base, mn_length_raw, block_mn,
+                           analyzer)
+     << ">";
 
   Buffer src_buf = T.buffer_remap.count(src) ? T.buffer_remap[src] : src;
   Buffer dst_buf = T.buffer_remap.count(dst) ? T.buffer_remap[dst] : dst;
@@ -981,7 +986,6 @@ LayoutMap MatrixStoreNode::InferLayout(const LayoutInferArgs &T,
 
 Stmt MatrixStoreNode::Lower(const LowerArgs &T,
                             arith::Analyzer *analyzer) const {
-  (void)analyzer;
   if (!TargetIsHCU(T.target)) {
     LOG(FATAL) << "matrix_store is only supported on HCU target";
   }
@@ -1041,13 +1045,22 @@ Stmt MatrixStoreNode::Lower(const LowerArgs &T,
   const int warp_mn = partition->first;
   const int warp_k = partition->second;
 
+  const size_t boundary_dr = this->dst_ranges.size();
+  ICHECK_GE(boundary_dr, 2);
+  const int resolved_k_boundary =
+      MlsResolveBoundary(k_boundary, this->dst_ranges[boundary_dr - 1]->min,
+                         dst->shape[boundary_dr - 1], block_k, analyzer);
+  const int resolved_mn_boundary =
+      MlsResolveBoundary(mn_boundary, this->dst_ranges[boundary_dr - 2]->min,
+                         dst->shape[boundary_dr - 2], block_mn, analyzer);
+
   std::stringstream ss;
   ss << "tl::mls::mls_store_tile<tl::sequence<" << block_mn << ", " << block_k
      << ">, tl::sequence<" << tile_mn << ", " << tile_k << ">, " << warp_mn
      << ", " << warp_k << ", " << config->cpp_dtype << ", " << config->alt
      << ", true"
      << ", tl::hcu_target_enum::" << GetHcuArchString(T.target) << ", "
-     << k_boundary << ", " << mn_boundary << ">";
+     << resolved_k_boundary << ", " << resolved_mn_boundary << ">";
 
   Buffer src_buf = T.buffer_remap.count(src) ? T.buffer_remap[src] : src;
   Buffer dst_buf = T.buffer_remap.count(dst) ? T.buffer_remap[dst] : dst;

@@ -921,7 +921,10 @@ class HCUMatrixCoreIntrinEmitter:
         C_local_buf,
         k_inner: PrimExpr | int = 0,
         trans_c: bool = False,
+        clear_accum: bool = False,
     ):
+        # Clear the input accumulator only on the first K issue for each
+        # output tile. The output fragment itself need not be initialized.
         warp_rows = self.warp_rows
         warp_cols = self.warp_cols
         local_size_a = self.local_size_a
@@ -980,6 +983,7 @@ class HCUMatrixCoreIntrinEmitter:
                         (a_local_stride + (i * k_pack + kp) * local_size_a) // a_index_div,
                         C_local_buf.data,
                         (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
+                        tirx.all(clear_accum, k_inner == 0, kp == 0),
                         annotations=mmac_annotations,
                     )
                 else:
@@ -998,6 +1002,7 @@ class HCUMatrixCoreIntrinEmitter:
                         (b_local_stride + (j * k_pack + kp) * local_size_b) // b_index_div,
                         C_local_buf.data,
                         (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
+                        tirx.all(clear_accum, k_inner == 0, kp == 0),
                         annotations=mmac_annotations,
                     )
 
@@ -1020,6 +1025,7 @@ class HCUMatrixCoreIntrinEmitter:
         scale_shape_kb: int,
         scale_format_b: int,
         real_ab_type: int,
+        clear_accum: bool = False,
     ):
         """Issue one scale MMAC call_extern (native FP4 or padded F8F6F4)."""
         required_min_n = scale_format_min_n_per_warp(scale_format_b)
@@ -1038,7 +1044,7 @@ class HCUMatrixCoreIntrinEmitter:
             f"{int(gran_m)}, {int(gran_ka)}, {int(gran_n)}, {int(gran_kb)}, "
             f"{int(scale_shape_ka)}, {int(scale_shape_kb)}, "
             f"{int(self.k_pack)}, {int(self.micro_size_k)}, {int(real_ab_type)}, "
-            f"{row_layout_a}, {row_layout_b}>"
+            f"{row_layout_a}, {row_layout_b}, {str(bool(clear_accum)).lower()}>"
         )
 
         @T.macro

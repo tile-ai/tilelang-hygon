@@ -1963,5 +1963,93 @@ def test_gemm_blockscaled_manual_ws(producer_threads, consumer_threads, copy_on_
     _check_blockscaled_out(actual[1], expected)
 
 
+def _blockscaled_clear_accum(clear_accum_mode, k_pack, gran_k, use_mls, f8=False):
+    mn, k, sk = 32, 256, 256 // gran_k
+    dtype = "float8_e4m3fn" if f8 else "float4_e2m1fn"
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((mn, k), dtype),
+        B: T.Tensor((mn, k), dtype),
+        SA: T.Tensor((sk, mn), "uint8"),
+        SB: T.Tensor((sk, mn), "uint8"),
+        C: T.Tensor((mn, mn), "float32"),
+    ):
+        with T.Kernel(1, threads=64):
+            a = T.alloc_shared((mn, k), dtype)
+            b = T.alloc_shared((mn, k), dtype)
+            sa = T.alloc_shared((sk, mn), "uint8")
+            sb = T.alloc_shared((sk, mn), "uint8")
+            s0 = T.alloc_scale_buffer((sk, mn))
+            s1 = T.alloc_scale_buffer((sk, mn))
+            c = T.alloc_fragment((mn, mn), "float32")
+            if use_mls:
+                T.matrix_load(A, a)
+                T.matrix_load(B, b)
+                T.ptx_wait_group(0)
+            else:
+                T.copy(A, a)
+                T.copy(B, b)
+            T.copy(SA, sa)
+            T.copy(SB, sb)
+            T.copy_scale(sa, s0)
+            T.copy_scale(sb, s1)
+            T.fill(c, 7)
+            for r in T.serial(2):
+                T.gemm_blockscaled(
+                    a,
+                    b,
+                    c,
+                    s0,
+                    s1,
+                    transpose_B=True,
+                    k_pack=k_pack,
+                    sf_a_granularity_k=gran_k,
+                    sf_b_granularity_k=gran_k,
+                    clear_accum=(r == 0) if clear_accum_mode == "first" else True,
+                )
+            T.copy(c, C)
+
+    return main
+
+
+@requires_blockscaled
+@pytest.mark.parametrize("clear_accum_mode", ["first", "always"])
+@pytest.mark.parametrize("use_mls,k_pack,f8", [(False, 1, False), (False, 2, False), (True, 1, False), (True, 1, True)])
+@pytest.mark.parametrize("gran_k", [32, 64])
+def test_gemm_blockscaled_clear_accum(clear_accum_mode, k_pack, gran_k, use_mls, f8):
+    # Each GEMM has multiple K issues; the old nonzero C must be discarded.
+    m, n, k = 32, 32, 256
+    program = _blockscaled_clear_accum(clear_accum_mode, k_pack, gran_k, use_mls, f8)
+    # The model container PyTorch cannot export FP8 through DLPack.
+    kernel = tl.compile(program, out_idx=[4], execution_backend="cython" if f8 else "auto")
+    calls = [line for line in kernel.get_kernel_source().splitlines() if "mmac_scale_fp4_body<" in line]
+    assert calls
+    specialization = "true" if clear_accum_mode == "always" else "false"
+    assert all(f", {specialization}>(" in line for line in calls)
+    al, bl, a, b = _make_fp4_inputs(m, n, k, device="cpu")
+    if f8:
+        a = _fp4_e2m1fn_decode(al).to(torch.float8_e4m3fn)
+        b = _fp4_e2m1fn_decode(bl).to(torch.float8_e4m3fn)
+    sa, sb = _make_e8m0_scales(k // gran_k, m, n, device="cpu")
+    ref = blockscaled_fp4_cpu_ref(
+        al,
+        bl,
+        sa,
+        sb,
+        sf_a_granularity_m=1,
+        sf_a_granularity_k=gran_k,
+        sf_b_granularity_n=1,
+        sf_b_granularity_k=gran_k,
+        a_scale_k_major=False,
+        b_scale_k_major=False,
+        transpose_B=True,
+    )
+    if clear_accum_mode == "first":
+        ref *= 2
+    result = kernel(a.cuda(), b.cuda(), sa.cuda(), sb.cuda()).cpu()
+    _check_blockscaled_out(result, ref)
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

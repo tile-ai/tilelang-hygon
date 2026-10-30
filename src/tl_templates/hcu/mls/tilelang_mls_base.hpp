@@ -635,6 +635,9 @@ mls_store_tile(void *local_src_storage, DataType *p_data,
 
   const auto *local_src = reinterpret_cast<const DataType *>(local_src_storage);
 
+  // Normalize once per store tile, not once per atom descriptor.
+  const auto uniform_stride = __builtin_amdgcn_readfirstlane(mls_stride);
+
   const auto scoped_warp_id =
       __builtin_amdgcn_readfirstlane(::tl::get_warp_id() - warp_id_offset);
   const auto warp_mn = scoped_warp_id % WarpMN;
@@ -678,10 +681,10 @@ mls_store_tile(void *local_src_storage, DataType *p_data,
 
       const ::tl::int32x4_t rsrc =
           Trans ? ::tl::mls::make_mls_resource(
-                      static_cast<const void *>(ptr_offset), mls_stride,
+                      static_cast<const void *>(ptr_offset), uniform_stride,
                       k_filter, mn_filter, mfmt)
                 : ::tl::mls::make_mls_resource(
-                      static_cast<const void *>(ptr_offset), mls_stride,
+                      static_cast<const void *>(ptr_offset), uniform_stride,
                       mn_filter, k_filter, mfmt);
       const auto atom_index = atom_mn * AtomsPerWarpK + atom_k;
       const auto *atom_src = local_src + atom_index * ElementsPerThread;

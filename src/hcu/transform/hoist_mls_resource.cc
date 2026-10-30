@@ -48,6 +48,7 @@
 #include "hcu/op/builtin.h"
 #include "hcu/utils/extern_call_checker.h"
 #include "hcu/utils/mls_boundary.h"
+#include "op/builtin.h"
 
 namespace tvm {
 namespace tl {
@@ -767,6 +768,12 @@ public:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tirx::attr::tilelang_assume) {
+      active_assumptions_.push_back(Downcast<PrimExpr>(op->node));
+      Stmt result = StmtMutator::VisitStmt_(op);
+      active_assumptions_.pop_back();
+      return result;
+    }
     if (op->attr_key == tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       const std::string &tag = iv->thread_tag;
@@ -1893,11 +1900,23 @@ private:
       return false;
     }
     arith::Analyzer analyzer;
+    PrimExpr assumptions = tirx::const_true();
+    auto pass_ctx = tvm::transform::PassContext::Current();
+    if (auto cfg = pass_ctx->GetConfig(kZ3RLimit, ffi::Optional<Integer>())) {
+      analyzer.z3_prover.SetRLimit(static_cast<unsigned>(cfg.value()->value));
+    }
+    for (const auto &condition : active_assumptions_) {
+      assumptions = assumptions && condition;
+    }
+    With<arith::ConstraintContext> scope(&analyzer, assumptions, true);
     for (const auto &loop_range : active_loop_ranges_) {
       analyzer.Bind(loop_range.first, loop_range.second, true);
     }
-    PrimExpr block = tirx::make_const(base.dtype(), block_size);
-    return analyzer.CanProve(analyzer.Simplify(base + block <= length));
+    // This analyzer is already fresh for this boundary check.
+    return MlsResolveBoundary(static_cast<int>(MlsBoundaryMode::kAnalyze), base,
+                              length, block_size, &analyzer,
+                              /*retry_with_fresh_solver=*/false) ==
+           static_cast<int>(MlsBoundaryMode::kSkip);
   }
 
   void ExpireScopes() {
@@ -1957,6 +1976,7 @@ private:
   std::unordered_map<std::string, int> resource_scopes_;
   std::unordered_map<std::string, int> initialized_scopes_;
   std::vector<std::pair<tirx::Var, Range>> active_loop_ranges_;
+  std::vector<PrimExpr> active_assumptions_;
   std::vector<const ForNode *> data_loop_stack_;
   std::unordered_set<const VarNode *> thread_vars_;
   std::unordered_set<const VarNode *> thread_alias_vars_;

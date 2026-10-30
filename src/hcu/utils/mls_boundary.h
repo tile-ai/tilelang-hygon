@@ -12,10 +12,13 @@
 #ifndef TVM_TL_HCU_UTILS_MLS_BOUNDARY_H_
 #define TVM_TL_HCU_UTILS_MLS_BOUNDARY_H_
 
-#include "support/check.h"
+#include <tvm/arith/analyzer.h>
+#include <tvm/tirx/op.h>
 
 #include <string>
 #include <vector>
+
+#include "support/check.h"
 
 namespace tvm {
 namespace tl {
@@ -25,6 +28,36 @@ enum class MlsBoundaryMode : int {
   kSkip = 0,
   kRefresh = 1,
 };
+
+inline int MlsResolveBoundary(int mode, const PrimExpr &base,
+                              const PrimExpr &length, int64_t block,
+                              arith::Analyzer *analyzer,
+                              bool retry_with_fresh_solver = true) {
+  // Explicit boundary policies remain caller contracts. Only analyze mode
+  // may be specialized, using the caller's scoped assumptions and ranges.
+  if (mode != static_cast<int>(MlsBoundaryMode::kAnalyze)) {
+    return mode;
+  }
+  auto prove_bounds = [&](arith::Analyzer *proof_analyzer) {
+    return proof_analyzer->CanProve(base >= 0,
+                                    arith::ProofStrength::kSymbolicBound) &&
+           proof_analyzer->CanProve(
+               base + tirx::make_const(base.dtype(), block) <= length,
+               arith::ProofStrength::kSymbolicBound);
+  };
+  if (prove_bounds(analyzer)) {
+    return static_cast<int>(MlsBoundaryMode::kSkip);
+  }
+  // Keep the fast path and its incremental solver. On failure, retry once
+  // with copied constraints and rlimit but a freshly constructed solver.
+  if (retry_with_fresh_solver) {
+    auto fresh = analyzer->Clone();
+    if (prove_bounds(fresh.get())) {
+      return static_cast<int>(MlsBoundaryMode::kSkip);
+    }
+  }
+  return mode;
+}
 
 inline bool MlsIsModeToken(const std::string &s) {
   return s == "-1" || s == "0" || s == "1";
