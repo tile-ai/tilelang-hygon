@@ -24,23 +24,23 @@ _configure_torch_extensions_dir()
 
 random.seed(0)
 
-try:
-    import torch
-except ImportError:
-    pass
-else:
-    torch.manual_seed(0)
-    # Workaround: hipBLASLt on ROCm 7.1 nightly has a bug with certain matmul shapes.
-    # Prefer hipblas first, then fall back to hipblaslt if PyTorch rejects "hipblas".
-    # if hasattr(torch.version, "hip") and torch.version.hip:
-    #     _blas = getattr(torch.backends.cuda, "preferred_blas_library", None)
-    #     if callable(_blas):
-    #         for _name in ("hipblas", "hipblaslt"):
-    #             try:
-    #                 _blas(_name)
-    #                 break
-    #             except RuntimeError:
-    #                 continue
+
+def pytest_configure(config):
+    # Avoid initializing HIP in the parent of explicitly selected IPC tests.
+    from pathlib import Path
+
+    distributed = Path(REPO_ROOT) / "testing/python/hcu/distributed"
+    skip_seed = any(
+        (Path(config.invocation_params.dir) / str(arg).split("::", 1)[0]).resolve().is_relative_to(distributed) for arg in config.args
+    )
+    if not skip_seed:
+        try:
+            import torch
+        except ImportError:
+            pass
+        else:
+            torch.manual_seed(0)
+
 
 try:
     import numpy as np
@@ -91,6 +91,10 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             "-",
             "Skipped the Ascend test suite: the Ascend backend is not built into this library.",
         )
+        return
+    skipped = terminalreporter.stats.get("skipped", [])
+    if executed_count == 0 and skipped and all("HCU preflight:" in str(report.longrepr) for report in skipped):
+        terminalreporter.write_sep("-", "HCU tests skipped: environment preflight requirements were not met.")
         return
     if executed_count == 0:
         terminalreporter.write_sep(

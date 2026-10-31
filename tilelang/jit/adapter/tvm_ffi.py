@@ -116,6 +116,12 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             self.ir_module = func_or_mod
 
         self.target = Target(determine_target(target))
+        from tilelang.distributed.metadata import validate_artifact_source
+
+        validate_artifact_source(device_kernel_source, self.target)
+        from tilelang.distributed.metadata import requirements_for_target
+
+        self.distributed_requirements = requirements_for_target(self.target)
 
         self.host_mod = host_mod
         self.device_mod = device_mod
@@ -128,8 +134,77 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         self.kernel_global_source = self.device_kernel_source
         self.executable = None
         self._executable_lock = threading.Lock()
+        self._distributed_initializer = None
 
         self._post_init()
+
+    def _distributed_metadata_required(self) -> bool:
+        """Read the artifact contract once, retaining helper fallback for old sources."""
+        cached = getattr(self, "_requires_distributed_metadata", None)
+        if cached is not None:
+            return cached
+        from tilelang.distributed.metadata import source_uses_distributed_metadata
+
+        required = source_uses_distributed_metadata(getattr(self, "device_kernel_source", None))
+        if not required:
+            # Fresh adapters own rt_mod; disk-cache adapters own the executable
+            # Module. Inspect these without creating a second executable/module.
+            module = getattr(self, "rt_mod", None)
+            if module is None:
+                module = getattr(self, "executable", None)
+            if module is not None:
+                imports = getattr(module, "imports", None) or []
+                for candidate in [module, *imports]:
+                    try:
+                        helper = candidate.get_function("__tilelang_init_distributed_metadata", query_imports=False)
+                    except AttributeError:
+                        continue
+                    if helper is not None:
+                        required = True
+                        break
+        self._requires_distributed_metadata = required
+        return required
+
+    def initialize_distributed_metadata(self, allocator, stream=None) -> bool:
+        """Initialize distributed metadata for this adapter's device module.
+
+        The helper runs on the requested PyTorch HIP stream through TVM's
+        ROCm stream bridge and initializes the module used for kernel launch.
+        """
+        if not self._distributed_metadata_required():
+            return False
+        from tilelang.distributed.host import DistributedMetadataInitializer, tvm_hcu_stream
+        from tilelang.distributed.metadata import incompatible
+
+        if self._distributed_initializer is None:
+            self._distributed_initializer = DistributedMetadataInitializer(self.distributed_requirements)
+        initializer = self._distributed_initializer
+        backend = str(self.target.attrs.get("dist_backend", ""))
+        if initializer.binding is not None:
+            modules = [initializer.binding.module]
+        else:
+            if self.rt_mod is None and self.executable is None:
+                raise RuntimeError("Distributed metadata initialization requires a runtime module")
+            # Reuse the exact executable/module that launches the kernel.
+            execution_module = self.executable if self.rt_mod is None else self._get_executable().jit()
+            modules = [execution_module, *execution_module.imports]
+        stream = self.get_current_stream_functor()() if stream is None else stream
+        for module in modules:
+            try:
+                helper = module.get_function("__tilelang_init_distributed_metadata", query_imports=False)
+            except AttributeError:
+                continue
+            if helper is not None:
+                with tvm_hcu_stream(allocator.device, stream):
+                    return initializer.initialize(module, allocator, backend=backend)
+        raise incompatible("compiled kernel does not contain the common distributed initializer")
+
+    @property
+    def backend_id(self) -> int | None:
+        """Read-only registry ID after the first successful runtime binding."""
+        initializer = self._distributed_initializer
+        binding = None if initializer is None else initializer.binding
+        return None if binding is None else binding.registration.backend_id
 
     def _make_executable(self) -> tvm.runtime.Executable:
         if self.rt_mod is None:
@@ -336,7 +411,15 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             if out_device is not None:
                 self._prepare_torch_device(out_device)
             executable = self._get_executable()
-            executable(*tensor_list)
+            if self._distributed_metadata_required():
+                if self._distributed_initializer is None:
+                    raise RuntimeError("Distributed kernel must be initialized before launch")
+                self._distributed_initializer.launch(
+                    lambda: executable(*tensor_list),
+                    backend=str(self.target.attrs.get("dist_backend", "")),
+                )
+            else:
+                executable(*tensor_list)
 
             # Return outputs in the requested form
             if len(self.result_idx) == 1:
@@ -418,6 +501,12 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         adapter.target = Target(determine_target(target))
 
         adapter.verbose = verbose
+        from tilelang.distributed.metadata import validate_artifact_source
+
+        validate_artifact_source(device_kernel_source, adapter.target)
+        from tilelang.distributed.metadata import load_library_requirements
+
+        adapter.distributed_requirements = load_library_requirements(kernel_lib_path, adapter.target)
         adapter.libpath = kernel_lib_path
         adapter.kernel_global_source = device_kernel_source.text
         adapter.rt_mod = None
@@ -425,6 +514,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         adapter._ffi_callee_allocated_output_abi = adapter._uses_ffi_callee_allocated_output_abi()
         adapter.dynamic_symbolic_map = None if adapter._ffi_callee_allocated_output_abi else adapter._process_dynamic_symbolic()
         adapter._executable_lock = threading.Lock()
+        adapter._distributed_initializer = None
         adapter._post_init()
         return adapter
 
