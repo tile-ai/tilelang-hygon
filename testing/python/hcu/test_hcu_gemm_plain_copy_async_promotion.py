@@ -13,7 +13,7 @@ from hcu_test_utils import current_hcu_arch_string
 
 
 pytestmark = pytest.mark.skipif(
-    current_hcu_arch_string() not in {"gfx936", "gfx938", "gfx92a", "gfx946"},
+    current_hcu_arch_string() not in {"gfx936", "gfx938", "gfx92a", "gfx946", "gfx948"},
     reason="plain GEMM copy promotion requires a supported HCU target",
 )
 

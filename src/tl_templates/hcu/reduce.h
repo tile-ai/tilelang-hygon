@@ -2,7 +2,7 @@
 
 #include <tl_templates/hcu/common.h>
 #if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx92a__) ||                 \
-    defined(__gfx946__)
+    defined(__gfx946__) || defined(__gfx948__)
 #include <tl_templates/hcu/barrier.h>
 #endif
 
@@ -96,7 +96,7 @@ struct SyncThreadsBarrier {
 };
 
 #if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx92a__) ||                 \
-    defined(__gfx946__)
+    defined(__gfx946__) || defined(__gfx948__)
 // HCU partial barrier policy. The compiler allocates BarrierId from the exact
 // participating thread range before this template is instantiated.
 template <int BarrierId, int WaveCount> struct EBarrier {

@@ -20,7 +20,7 @@ namespace {
 
 const std::set<std::string> &HcuMcpuSet() {
   static const std::set<std::string> kSet = {"gfx928", "gfx936", "gfx938",
-                                             "gfx92a", "gfx946"};
+                                             "gfx92a", "gfx946", "gfx948"};
   return kSet;
 }
 
@@ -44,14 +44,16 @@ bool TargetSupportsHcuWdra(Target target) {
   if (!TargetIsHCU(target) || !TargetHasMcpu(target)) {
     return false;
   }
-  return GetMcpu(target) == "gfx946";
+  const std::string arch = GetMcpu(target);
+  return arch == "gfx946" || arch == "gfx948";
 }
 
 bool TargetSupportsHcuEBarrier(Target target) {
   if (!TargetIsHCU(target) || !TargetHasMcpu(target)) {
     return false;
   }
-  static const std::set<std::string> kSupported = {"gfx92a", "gfx946"};
+  static const std::set<std::string> kSupported = {"gfx92a", "gfx946",
+                                                   "gfx948"};
   return kSupported.count(GetMcpu(target)) > 0;
 }
 
@@ -59,14 +61,15 @@ bool TargetSupportsHcuABarrier(Target target) {
   if (!TargetIsHCU(target) || !TargetHasMcpu(target)) {
     return false;
   }
-  return GetMcpu(target) == "gfx946";
+  const std::string arch = GetMcpu(target);
+  return arch == "gfx946" || arch == "gfx948";
 }
 
 bool TargetHasMmacLitLts(Target target) {
   if (!TargetIsHCU(target) || !TargetHasMcpu(target)) {
     return false;
   }
-  static const std::set<std::string> kSet = {"gfx938", "gfx946"};
+  static const std::set<std::string> kSet = {"gfx938", "gfx946", "gfx948"};
   return kSet.count(GetMcpu(target)) > 0;
 }
 
@@ -82,7 +85,7 @@ bool TargetHcuHasAsyncCopy(Target target) {
     return false;
   }
   static const std::set<std::string> kSupported = {"gfx936", "gfx938", "gfx92a",
-                                                   "gfx946"};
+                                                   "gfx946", "gfx948"};
   return kSupported.count(GetMcpu(target)) > 0;
 }
 
@@ -91,7 +94,7 @@ bool IsHCUEnableAutoAsyncCopyTarget(Target target) {
     return false;
   }
   static const std::set<std::string> auto_async_whitelist = {
-      "gfx936", "gfx938", "gfx92a", "gfx946"};
+      "gfx936", "gfx938", "gfx92a", "gfx946", "gfx948"};
   return auto_async_whitelist.count(GetMcpu(target)) > 0;
 }
 
@@ -117,7 +120,7 @@ int TargetHcuGetLdsBankCount(Target target) {
   if (arch == "gfx936" || arch == "gfx938" || arch == "gfx92a") {
     return 32;
   }
-  if (arch == "gfx946") {
+  if (arch == "gfx946" || arch == "gfx948") {
     return 64;
   }
   ICHECK(false) << "LDS bank count is not defined for HCU architecture: "
@@ -149,7 +152,7 @@ HcuLdsWrapConfig TargetHcuGetLdsWrapConfig(Target target) {
     return {/*field_bits=*/5, /*field_shift=*/24,
             /*lds_offset_bits=*/16, HcuLdsWrapEncoding::kHybridFourAndOneDword};
   }
-  if (arch == "gfx946") {
+  if (arch == "gfx946" || arch == "gfx948") {
     return {/*field_bits=*/6, /*field_shift=*/24,
             /*lds_offset_bits=*/17, HcuLdsWrapEncoding::kOneDword};
   }

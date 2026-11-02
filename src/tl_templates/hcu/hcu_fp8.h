@@ -3,7 +3,8 @@
 #include <tl_templates/hcu/common.h>
 
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__))
+    (defined(__gfx938__) || defined(__gfx92a__) || defined(__gfx946__) ||      \
+     defined(__gfx948__))
 #define HIP_FP8_ENABLED 1
 #endif
 
