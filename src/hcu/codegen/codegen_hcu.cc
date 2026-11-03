@@ -815,7 +815,13 @@ void CodeGenTileLangHCU::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
 
 bool CodeGenTileLangHCU::TryEmitDistributedCall(const Call &call,
                                                 std::ostream &os) {
-  enum class DistributedCallKind { kRank, kNumRanks, kBlockGet };
+  enum class DistributedCallKind {
+    kRank,
+    kNumRanks,
+    kBlockGet,
+    kSignalOp,
+    kSignalWait
+  };
   const auto *op = call.get();
   DistributedCallKind kind;
   if (op->op.same_as(tl::get_rank())) {
@@ -824,6 +830,10 @@ bool CodeGenTileLangHCU::TryEmitDistributedCall(const Call &call,
     kind = DistributedCallKind::kNumRanks;
   } else if (op->op.same_as(tl::get_block())) {
     kind = DistributedCallKind::kBlockGet;
+  } else if (op->op.same_as(tl::signal_op())) {
+    kind = DistributedCallKind::kSignalOp;
+  } else if (op->op.same_as(tl::signal_wait_until())) {
+    kind = DistributedCallKind::kSignalWait;
   } else {
     return false;
   }
@@ -832,6 +842,9 @@ bool CodeGenTileLangHCU::TryEmitDistributedCall(const Call &call,
   const auto capability =
       kind == DistributedCallKind::kBlockGet
           ? tl::hcu::DistributedCapability::kBlockRemoteGet
+      : (kind == DistributedCallKind::kSignalOp ||
+         kind == DistributedCallKind::kSignalWait)
+          ? tl::hcu::DistributedCapability::kSignal
           : tl::hcu::DistributedCapability::kRankAndWorldSize;
   tl::hcu::RequireDistributedCapability(backend, capability);
   switch (kind) {
@@ -848,6 +861,29 @@ bool CodeGenTileLangHCU::TryEmitDistributedCall(const Call &call,
     const std::string size = PrintExpr(op->args[2]);
     const std::string src_pe = PrintExpr(op->args[3]);
     os << backend.EmitBlockGetExpr(src, dst, size, src_pe);
+    break;
+  }
+  case DistributedCallKind::kSignalOp:
+  case DistributedCallKind::kSignalWait: {
+    const bool is_signal_op = kind == DistributedCallKind::kSignalOp;
+    ICHECK_EQ(op->args.size(), is_signal_op ? 4U : 3U);
+    const auto *operation = op->args[is_signal_op ? 2 : 1].as<IntImmNode>();
+    if (operation == nullptr || operation->value < 0 ||
+        operation->value > (is_signal_op ? 1 : 5)) {
+      TVM_FFI_THROW(ValueError)
+          << (is_signal_op ? "signal_op" : "signal_wait_until")
+          << " requires a supported compile-time operation";
+    }
+    const std::string address = PrintExpr(op->args[0]);
+    const std::string value = PrintExpr(op->args[is_signal_op ? 1 : 2]);
+    const std::string peer = is_signal_op ? PrintExpr(op->args[3]) : "";
+    os << (is_signal_op ? "tl::distributed_signal_op<"
+                        : "tl::distributed_signal_wait_until<")
+       << operation->value << ">(" << address << ", " << value;
+    if (is_signal_op) {
+      os << ", " << peer;
+    }
+    os << ")";
     break;
   }
   }

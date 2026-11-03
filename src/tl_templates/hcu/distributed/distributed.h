@@ -15,8 +15,11 @@
 #ifndef TILELANG_TEMPLATES_HCU_DISTRIBUTED_DISTRIBUTED_H_
 #define TILELANG_TEMPLATES_HCU_DISTRIBUTED_DISTRIBUTED_H_
 
+#include <hip/hip_runtime.h>
+
 #include "ipc_payload.h"
 #include "metadata_runtime.h"
+#include "signal.h"
 #include <stdint.h>
 
 namespace tl {
@@ -59,6 +62,27 @@ __device__ __forceinline__ void ipc_get_block(const SrcT *local_src, DstT *dst,
   for (int64_t index = thread_id; index < count; index += thread_count) {
     dst[index] = static_cast<DstT>(remote_src[index]);
   }
+}
+
+// The signal address is local and symmetric; pe selects its remote counterpart.
+// As with get_block, the caller guarantees peer validity and arena ownership.
+template <int Operation>
+__device__ __forceinline__ void
+distributed_signal_op(uint64_t *signal, uint64_t value, int32_t pe) {
+  uint64_t *remote = signal;
+  if (pe != distributed_get_rank()) {
+    const uintptr_t offset = reinterpret_cast<uintptr_t>(signal) -
+                             ipc_get_peer_base(distributed_get_rank());
+    remote = reinterpret_cast<uint64_t *>(ipc_get_peer_base(pe) + offset);
+  }
+  signal_update<Operation>(remote, value);
+}
+
+template <int Compare>
+__device__ __forceinline__ uint64_t
+distributed_signal_wait_until(const uint64_t *signal, uint64_t value) {
+  // IPC additionally permits a peer-mapped address in this process.
+  return signal_wait_until<Compare>(signal, value);
 }
 
 } // namespace tl

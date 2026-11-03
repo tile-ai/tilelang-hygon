@@ -21,6 +21,9 @@ namespace hcu {
 enum class DistributedCapability {
   kRankAndWorldSize,
   kBlockRemoteGet,
+  // DeviceIncludes supplies distributed_signal_op<Op>(address, value, pe)
+  // and distributed_signal_wait_until<Compare>(address, value).
+  kSignal,
 };
 
 /*! \brief Host runtime helper signatures contributed by a backend. */

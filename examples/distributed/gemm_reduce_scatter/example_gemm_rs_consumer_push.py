@@ -281,6 +281,6 @@ def gemm_consumer_push(
 
 
 if __name__ == "__main__":
-    from examples.distributed.gemm_reduce_scatter._benchmark import run_benchmark
+    from examples.distributed.gemm_reduce_scatter.utils import run_benchmark
 
     run_benchmark(gemm_consumer_push, "consumer_push")

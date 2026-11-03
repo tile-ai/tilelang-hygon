@@ -55,7 +55,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   hcu::RegisterHcuDistributedBackend(
       "ipc", ::tl::ipc_payload::kBackendId, hcu::GetIpcDistributedBackend,
       {hcu::DistributedCapability::kRankAndWorldSize,
-       hcu::DistributedCapability::kBlockRemoteGet});
+       hcu::DistributedCapability::kBlockRemoteGet,
+       hcu::DistributedCapability::kSignal});
   tvm::ffi::reflection::GlobalDef().def("tl.hcu.ipc.payload_layout", []() {
     using namespace ::tl::ipc_payload;
     return tvm::ffi::String(

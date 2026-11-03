@@ -34,6 +34,41 @@ native registration. Select the backend with target attribute
 `dist_backend="my_backend"`. Native implementations must be built/loaded before
 use; dynamically loaded native plugins must remain loaded.
 
+## Signal operations
+
+```python
+T.signal_op(signal[0], epoch, "set", pe)  # or "add"
+observed = T.signal_wait_until(signal[0], "ge", epoch)
+```
+
+Signals are 8-byte-aligned `uint64` global-memory elements (or their addresses).
+SET/ADD use system-scope release semantics; waits use system-scope acquire and
+return the observed value. Comparisons are `eq/ne/gt/ge/lt/le`. Names and leading
+arguments follow SHMEM, with compile-time strings selecting operations; raw
+NVSHMEM/rocSHMEM enum numbers are not accepted as portable operation IDs.
+Each calling thread updates/waits independently: these are not CTA collectives.
+Complete other writers' work and synchronize them before a leader publishes.
+
+For IPC, `signal_op` translates a local symmetric arena address to PE `pe`;
+`pe=T.get_rank()` publishes locally. `signal_wait_until` accepts a local or
+already peer-mapped address; the latter is an IPC extension, not a promise for
+other transports. Callers guarantee valid peers, symmetric layouts, alignment
+and lifetime. Select `dist_backend="ipc"` and initialize the kernel with its
+allocator as for `get_block`.
+
+The public wait blocks until its condition holds, as in SHMEM; it has no timeout.
+Avoid waits that prevent the producer from being scheduled. The GEMM RS example
+also uses this standard blocking primitive, without a custom bounded wait,
+status buffer or inline C++ diagnostics. The backend
+capability `kSignal` requires
+`distributed_signal_op<Operation>` and `distributed_signal_wait_until<Compare>`
+in its device includes, without adding backend virtual methods.
+
+`test_signal.py` covers frontend validation and source-only lowering without
+launching GPU work. The GEMM RS signal integration passed four-rank 4096³
+random/reuse/delay/Graph checks. Remote-destination updates, ADD and the full
+public wait comparison matrix have not yet been independently tested at runtime.
+
 ## Examples and tests
 
 - Example: `examples/distributed/gemm_allreduce/example_gemm_ar_ipc.py`

@@ -14,6 +14,8 @@ namespace tl {
 const Op &get_rank();
 const Op &get_num_ranks();
 const Op &get_block();
+const Op &signal_op();
+const Op &signal_wait_until();
 
 } // namespace tl
 } // namespace tvm

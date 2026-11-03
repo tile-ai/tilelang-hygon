@@ -1,4 +1,4 @@
-"""Shared validation and complete-call timing for the two GEMM push examples."""
+"""Rank discovery and consumer-push validation/benchmark helpers."""
 
 import argparse
 import gc
@@ -31,7 +31,7 @@ def _reduce_local(elements, world_size):
     return main
 
 
-def _rank_env(name):
+def rank_env(name):
     mpi_name = {"RANK": "OMPI_COMM_WORLD_RANK", "WORLD_SIZE": "OMPI_COMM_WORLD_SIZE", "LOCAL_RANK": "OMPI_COMM_WORLD_LOCAL_RANK"}[name]
     return int(os.environ.get(name) or os.environ[mpi_name])
 
@@ -44,7 +44,7 @@ def run_benchmark(kernel_factory, variant):
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--dump-source", type=Path)
     args = parser.parse_args()
-    rank, world, device = (_rank_env(key) for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK"))
+    rank, world, device = (rank_env(key) for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK"))
     n = args.size
     k = args.k if args.k is not None else n
     if world not in (2, 4, 8) or n <= 0 or n % (256 * world) or k < 64 or k % 64 or args.repeats < 1:

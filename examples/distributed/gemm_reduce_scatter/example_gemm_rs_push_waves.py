@@ -1,10 +1,9 @@
-"""GEMM + reduce-scatter with eight compute waves and four dedicated push waves.
+"""Persistent GEMM + reduce-scatter with system-scope IPC ready flags.
 
-Persistent CTAs retain the previous completed FP16 tile in push registers.
-Its peer stores are issued between barriers of the next tile's GEMM.
-Eight independent 8 KiB LDS stages are reused for the inter-tile handoff.
-The four payload stores are spread across the next tile's K loop.
-Random/reuse/graph correctness has been checked on two, four and eight ranks.
+Two TileLang kernels: persistent GEMM/push and waiting local reduce, followed
+by a stream-ordered RCCL barrier protecting inbox reuse. Payload and ready flags
+use hipDeviceMallocFinegrained. Two ranks use row order; four ranks rotate tile
+groups by source rank. No host flag writes after setup. Signal waits use standard blocking semantics.
 """
 
 import tilelang.language as T
@@ -23,8 +22,6 @@ def gemm_push_waves(
     accum_dtype="float32",
     steady_wait=8,
     shared_0_wait=6,
-    swizzle_panel_size=0,
-    swizzle_order="row",
     persistent_blocks=80,
 ):
     if (block_M, block_N, block_K, dtype, accum_dtype) != (256, 256, 16, "float16", "float32"):
@@ -33,8 +30,6 @@ def gemm_push_waves(
         raise ValueError("push_waves requires full M/N tiles, rank-aligned row shards and K divisible by 64")
     if not isinstance(persistent_blocks, int) or persistent_blocks < 1:
         raise ValueError("persistent_blocks must be a positive integer")
-    if swizzle_order not in ("row", "col"):
-        raise ValueError("swizzle_order must be row or col")
     m_tiles, n_tiles = M // block_M, N // block_N
     total_tiles = m_tiles * n_tiles
     # gfx936 on this machine reports 80 CUs. This is a CTA count, not a CU
@@ -45,19 +40,10 @@ def gemm_push_waves(
     k_groups = K // (4 * block_K)
 
     def tile_coordinates(index):
-        if not swizzle_panel_size:
-            return index % n_tiles, index // n_tiles
-        if swizzle_order == "row":
-            panel = index // (swizzle_panel_size * n_tiles)
-            offset = index % (swizzle_panel_size * n_tiles)
-            width = T.min(swizzle_panel_size, m_tiles - panel * swizzle_panel_size)
-            column = offset // width
-            return T.if_then_else(panel % 2 == 0, column, n_tiles - 1 - column), panel * swizzle_panel_size + offset % width
-        panel = index // (swizzle_panel_size * m_tiles)
-        offset = index % (swizzle_panel_size * m_tiles)
-        width = T.min(swizzle_panel_size, n_tiles - panel * swizzle_panel_size)
-        row = offset // width
-        return panel * swizzle_panel_size + offset % width, T.if_then_else(panel % 2 == 0, row, m_tiles - 1 - row)
+        # Rotate traversal only: tile ownership and the inbox source plane stay fixed.
+        if world_size == 4 and rank != 0:
+            index = (index + rank * (total_tiles // world_size)) % total_tiles
+        return index % n_tiles, index // n_tiles
 
     @T.macro
     def async_copy_a(A, A_shared, by, k_tile):
@@ -153,7 +139,12 @@ def gemm_push_waves(
             T.sync_warp()
 
     @T.prim_func
-    def gemm(A: T.Tensor((M, K), dtype), B: T.Tensor((K, N), dtype), peers: T.Tensor((world_size,), "uint64")):
+    def gemm(
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((K, N), dtype),
+        peers: T.Tensor((world_size,), "uint64"),
+        control: T.Tensor((grid_size + 1, 32), "uint64"),
+    ):
         with T.Kernel(grid_size, threads=768) as block_id:
             tx = T.get_thread_binding()
             warp_idx = T.get_warp_idx()
@@ -432,10 +423,270 @@ def gemm_push_waves(
                 push_output(p2, peers, last_by, last_bx, 2)
                 push_output(p3, peers, last_by, last_bx, 3)
 
+            # Every writer fences its own peer stores before the CTA leader
+            # publishes completion. No grid barrier and no completion atomics.
+            T.call_extern("void", "__threadfence_system")
+            T.sync_warp()
+            if tx == 0:
+                epoch = T.alloc_var("uint64", init=control[block_id + 1, 0] + T.uint64(1))
+                T.device_assert(epoch != 0, no_stack_info=True)
+                T.signal_op(control[block_id + 1, 0], epoch, "set", rank)
+
     return gemm
 
 
-if __name__ == "__main__":
-    from examples.distributed.gemm_reduce_scatter._benchmark import run_benchmark
+def waiting_reduce(n, world, rank, grid):
+    rows = n // world
+    total_tiles = (n // 256) ** 2
 
-    run_benchmark(gemm_push_waves, "push_waves")
+    @T.prim_func
+    def main(
+        inbox: T.Tensor((world, rows, n), "float16"),
+        output: T.Tensor((rows, n), "float16"),
+        peers: T.Tensor((world,), "uint64"),
+        consumed: T.Tensor((rows // 256, n // 256), "uint64"),
+    ):
+        with T.Kernel(n // 256, rows // 256, threads=512) as (bx, by):
+            tile = (rank * (rows // 256) + by) * (n // 256) + bx
+            if T.get_thread_binding() == 0:
+                epoch = T.alloc_var("uint64", init=consumed[by, bx] + T.uint64(1))
+                T.device_assert(epoch != 0, no_stack_info=True)
+                for peer in T.serial(world):
+                    scheduled = tile
+                    if world == 4:
+                        scheduled = (tile + total_tiles - peer * (total_tiles // world)) % total_tiles
+                    producer = scheduled % grid
+                    flags = T.make_tensor_from_addr(peers[peer], (grid + 1, 32), "uint64")
+                    T.signal_wait_until(flags[producer + 1, 0], "ge", epoch)
+                consumed[by, bx] = epoch
+            T.sync_threads()
+            # Every reader wave acquires before reading the peer-written payload.
+            T.call_extern("void", "__builtin_amdgcn_fence", 2, "")
+            acc = T.alloc_fragment((256, 256), "float32")
+            T.clear(acc)
+            for peer in T.serial(world):
+                for i, j in T.Parallel(256, 256):
+                    acc[i, j] += inbox[peer, by * 256 + i, bx * 256 + j]
+            T.copy(acc, output[by * 256 : (by + 1) * 256, bx * 256 : (bx + 1) * 256])
+
+    return main
+
+
+def run():
+    import argparse
+    import ctypes
+    import gc
+    import os
+    import statistics
+    import time
+    from datetime import timedelta
+    from pathlib import Path
+
+    import torch
+    import torch.distributed as dist
+    import tilelang as tl
+    from tilelang.distributed.backends.ipc import IpcAllocator, _FfiIpcRuntime, ipc_metadata_layout
+    from examples.distributed.gemm_reduce_scatter.utils import rank_env
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--size", type=int, default=1024)
+    parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--repeats", type=int, default=30)
+    parser.add_argument("--dump-source", type=Path)
+    args = parser.parse_args()
+    rank, world, device = (rank_env(key) for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK"))
+    n = args.size
+    if world not in (2, 4) or n < 256 * world or n % (256 * world):
+        raise ValueError("use 2 or 4 ranks and size divisible by 256*world")
+    if args.repeats <= 0:
+        raise ValueError("repeats must be positive")
+    os.environ["TILELANG_CACHE_DIR"] = str(Path(os.environ.get("TILELANG_CACHE_DIR", "/tmp/tl-kernel-barrier")) / f"rank-{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group("gloo", rank=rank, world_size=world, timeout=timedelta(seconds=180))
+    rccl = dist.new_group(backend="nccl", timeout=timedelta(seconds=180))
+    hip = ctypes.CDLL("/opt/dtk/hip/lib/libamdhip64.so")
+
+    def hip_check(code, operation):
+        if code:
+            raise RuntimeError(f"{operation}: HIP error {code}")
+
+    grid = min(80, (n // 256) ** 2)
+    runtime = _FfiIpcRuntime()
+    hip.hipExtMallocWithFlags.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint]
+
+    def fine_malloc(size):
+        pointer = ctypes.c_void_p()
+        hip_check(hip.hipExtMallocWithFlags(ctypes.byref(pointer), size, 1), "hipDeviceMallocFinegrained")
+        return pointer.value
+
+    runtime.malloc = fine_malloc
+    arena = IpcAllocator(
+        n * n * 2 + (grid + 1) * 256 + 4096,
+        rank=rank,
+        world_size=world,
+        device=device,
+        group=dist.group.WORLD,
+        runtime=runtime,
+    )
+    arena.initialize()
+
+    inbox = tl.tensor((world, n // world, n), torch.float16, allocator=arena)
+    control = tl.tensor((grid + 1, 32), torch.uint64, allocator=arena)
+    inbox.fill_(float("nan"))
+    # Initialization only. Slot zero is reserved; each producer advances its own ready counter.
+    control.zero_()
+    consumed = torch.zeros((n // world // 256, n // 256), device="cuda", dtype=torch.uint64)
+
+    def peer_addresses(tensor):
+        bases = arena.metadata[ipc_metadata_layout()["peer_base"] :]
+        offset = tensor.data_ptr() - arena.base_ptr
+        return torch.tensor([base + offset for base in bases], dtype=torch.uint64, device="cuda")
+
+    peers = peer_addresses(inbox)
+    flag_peers = peer_addresses(control)
+    target = {"kind": "hcu", "mcpu": torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0], "dist_backend": "ipc"}
+    gemm = tl.compile(
+        gemm_push_waves(n, n, n, rank, world),
+        out_idx=[],
+        target=target,
+        pass_configs={tl.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True},
+    )
+    reduce = tl.compile(waiting_reduce(n, world, rank, grid), out_idx=[], target=target)
+    gemm.initialize(arena)
+    reduce.initialize(arena)
+    if args.dump_source:
+        args.dump_source.mkdir(parents=True, exist_ok=True)
+        for name, kernel in [("gemm_push", gemm), ("reduce_wait", reduce)]:
+            (args.dump_source / f"{name}.rank-{rank}.hip").write_text(kernel.get_kernel_source())
+
+    a = torch.empty((n, n), device="cuda", dtype=torch.float16)
+    b = torch.empty_like(a)
+    output = torch.empty((n // world, n), device="cuda", dtype=torch.float16)
+
+    def enqueue():
+        gemm(a, b, peers, control)
+        reduce(inbox, output, flag_peers, consumed)
+        # Protect previous readers before the next call can overwrite any inbox.
+        work = dist.barrier(group=rccl, device_ids=[device], async_op=True)
+        work.block_current_stream()
+
+    def random_inputs():
+        a.normal_().mul_(n**-0.5)
+        b.normal_()
+
+    def reference():
+        full = (a.float() @ b.float()).cpu()
+        dist.all_reduce(full)
+        return full[rank * (n // world) : (rank + 1) * (n // world)].to(device="cuda", dtype=torch.float16)
+
+    def verify(expected, label):
+        torch.cuda.current_stream().synchronize()
+        torch.testing.assert_close(
+            output,
+            expected,
+            atol=1e-2,
+            rtol=1e-2,
+            msg=lambda msg: f"{label} rank={rank}: {msg}",
+        )
+        print(
+            f"{label} rank={rank}/{world} sample={output[0, 0].item():.6g} max_abs={(output - expected).abs().max().item():.6g} passed",
+            flush=True,
+        )
+
+    def queued_check(fn, label):
+        # Retain every output to detect intermittent reuse failures.
+        saved = []
+        for iteration in range(20):
+            random_inputs()
+            local_reference = a.float() @ b.float()
+            if iteration == 7 and rank == world - 1:
+                time.sleep(0.05)
+            fn()
+            saved.append((output.clone(), local_reference))
+        torch.cuda.current_stream().synchronize()
+        for iteration, (actual, full) in enumerate(saved):
+            total = full.cpu()
+            dist.all_reduce(total)
+            expected = total[rank * (n // world) : (rank + 1) * (n // world)].to(device="cuda", dtype=torch.float16)
+            torch.testing.assert_close(
+                actual,
+                expected,
+                atol=1e-2,
+                rtol=1e-2,
+                msg=lambda msg, iteration=iteration: f"{label} rank={rank} iteration={iteration}: {msg}",
+            )
+        print(f"{label} rank={rank}/{world} calls=20 checked=20 passed", flush=True)
+
+    def capture(fn):
+        for _ in range(3):
+            fn()
+        torch.cuda.current_stream().synchronize()
+        dist.barrier()
+        before = (control.cpu().clone(), consumed.cpu().clone())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fn()
+        torch.cuda.current_stream().synchronize()
+        assert torch.equal(control.cpu(), before[0]), "capture advanced producer counters"
+        assert torch.equal(consumed.cpu(), before[1]), "capture advanced consumer counters"
+        return graph
+
+    torch.manual_seed(1234 + rank)
+    for trial in range(3):
+        random_inputs()
+        expected = reference()
+        if trial == 1 and rank == world - 1:
+            time.sleep(0.05)
+        enqueue()
+        verify(expected, f"random-check trial={trial}")
+    queued_check(enqueue, "queued-random-check")
+
+    graph = capture(enqueue)
+    for trial in range(3):
+        random_inputs()
+        expected = reference()
+        if trial == 1 and rank == world - 1:
+            time.sleep(0.05)
+        graph.replay()
+        verify(expected, f"graph-check trial={trial}")
+    queued_check(graph.replay, "queued-graph-check")
+    print(f"correctness-complete rank={rank}/{world} size={n}", flush=True)
+
+    def device_ms(fn):
+        # Like the Triton tutorial: warm up, enqueue timed calls, then wait once.
+        # The full path includes the RCCL tail; no CPU barrier between calls.
+        torch.cuda.current_stream().synchronize()
+        dist.barrier()
+        for _ in range(5):
+            fn()
+        events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(args.repeats)]
+        for start, end in events:
+            start.record()
+            fn()
+            end.record()
+        torch.cuda.current_stream().synchronize()
+        return statistics.median(start.elapsed_time(end) for start, end in events)
+
+    if args.benchmark:
+        random_inputs()
+        expected = reference()
+        results = {"gpu_event_ms": device_ms(enqueue), "graph_gpu_event_ms": device_ms(graph.replay)}
+        verify(expected, "post-timing-check")
+        reports = [None] * world
+        dist.all_gather_object(reports, results)
+        if rank == 0:
+            worst = {key: max(row[key] for row in reports) for key in results}
+            print(f"timings world_size={world} size={n} by_rank={reports}", flush=True)
+            print(f"summary world_size={world} size={n} max_rank={worst}", flush=True)
+
+    torch.cuda.current_stream().synchronize()
+    dist.barrier()
+    graph.reset()
+    inbox = control = peers = flag_peers = consumed = None
+    gc.collect()
+    arena.close()
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    run()

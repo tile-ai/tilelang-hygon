@@ -129,9 +129,17 @@ ffi::String GetHcuDistributedRequirements(const std::string &name) {
     if (!first)
       json << ",";
     first = false;
-    json << std::quoted(capability == DistributedCapability::kRankAndWorldSize
-                            ? "rank_world_size"
-                            : "block_remote_get");
+    switch (capability) {
+    case DistributedCapability::kRankAndWorldSize:
+      json << std::quoted("rank_world_size");
+      break;
+    case DistributedCapability::kBlockRemoteGet:
+      json << std::quoted("block_remote_get");
+      break;
+    case DistributedCapability::kSignal:
+      json << std::quoted("signal");
+      break;
+    }
   }
   json << "],\"init_spec\":{\"initialize\":{\"name\":"
        << std::quoted(spec.initialize.name) << ",\"argument_types\":[";
@@ -186,6 +194,7 @@ const char *DistributedCapabilityName(DistributedCapability capability) {
   static const std::map<DistributedCapability, const char *> wording = {
       {DistributedCapability::kRankAndWorldSize, "rank/world-size intrinsics"},
       {DistributedCapability::kBlockRemoteGet, "block remote get"},
+      {DistributedCapability::kSignal, "signal operations"},
   };
   return wording.at(capability);
 }
