@@ -106,6 +106,16 @@ TL_DEVICE bfloat16_t hcu_habs(bfloat16_t a) {
   return static_cast<bfloat16_t>(v >= 0.0f ? v : -v);
 }
 
+TL_DEVICE half_t hexp(half_t x) {
+  __half hx = static_cast<__half>(x);
+  return static_cast<half_t>(::hexp(hx));
+}
+
+TL_DEVICE bfloat16_t hexp(bfloat16_t x) {
+  __hip_bfloat16 bx = static_cast<__hip_bfloat16>(static_cast<float>(x));
+  return static_cast<bfloat16_t>(static_cast<float>(::hexp(bx)));
+}
+
 // __shfl overload for _Float16/half_t
 // There is no half_t version of __shfl in HIP, so we implement it ourselves
 // here.
@@ -172,6 +182,22 @@ TL_DEVICE unsigned __pack_bfloat162(const bfloat16_t x, const bfloat16_t y) {
 }
 
 namespace tl {
+
+// Replicate a small repeating unit across a wider vector type. Works
+// for any (V, U) with sizeof(V) % sizeof(U) == 0, so codegen does not
+// need a make_<type> constructor for every lane count.
+template <typename V, typename U> TL_DEVICE V broadcast(const U unit) {
+  static_assert(sizeof(V) % sizeof(U) == 0,
+                "tl::broadcast requires the vector size to be a multiple of "
+                "the unit size");
+  V result;
+  U *parts = reinterpret_cast<U *>(&result);
+#pragma unroll
+  for (int i = 0; i < static_cast<int>(sizeof(V) / sizeof(U)); ++i) {
+    parts[i] = unit;
+  }
+  return result;
+}
 
 namespace detail {
 

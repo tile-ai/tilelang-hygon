@@ -192,6 +192,16 @@ private:
   friend void PrintConst(const FloatImmNode *op, std::ostream &os,
                          CodeGenTileLangHCU *p);
 
+  // Global curand state
+  std::string hiprand_random_generator_state;
+  std::string hiprand_random_generator_state_type;
+  // Function-scope curand state declarations: tl.rng_init call node -> var
+  // name. States are declared at kernel top (see AddFunction) because
+  // sync-insertion passes may split the block containing rng_init across
+  // __syncthreads(), which would put a call-site declaration out of scope
+  // for later rng_rand / rng_rand_float uses.
+  std::unordered_map<const CallNode *, std::string> rng_state_name_map_;
+
   // whether need math_constants.h
   bool need_math_constants_h_{false};
   // whether need mfma.h
@@ -213,6 +223,8 @@ private:
   bool need_mma_h_{false};
   // whether need cast_smem_ptr_to_int helper function
   bool need_cast_smem_ptr_to_int_{false};
+  // whether need hiprand_kernel.h
+  bool need_hiprand_kernel_h_{false};
   // The name of the barrier array in shared memory
   const std::string barrier_name_ = "barrier";
   // The alignment of the barrier array in shared memory
