@@ -458,10 +458,7 @@ bool CanProveMixedWrapAtMostTwoWay(const CopyNode &copy,
     const Gemm &gemm = consumer.gemm;
     const bool feeds_a = consumer.input.same_as(gemm->a_);
     if (!consumer.input.same_as(copy.dst) ||
-        !is_full_static_region(feeds_a ? gemm->aRegion_ : gemm->bRegion_) ||
-        (IsAtBnAccess(consumer) &&
-         (gemm->kPack_ < 1 || gemm->kPack_ > 2 ||
-          at_bn->read_bytes_per_lane != 8 * gemm->kPack_)))
+        !is_full_static_region(feeds_a ? gemm->aRegion_ : gemm->bRegion_))
       return false;
   }
 
@@ -513,8 +510,10 @@ bool CanProveMixedWrapAtMostTwoWay(const CopyNode &copy,
            at_most_two_way(mask | low_bit(row - column));
   };
 
-  // Native pack1 has consecutive row IDs; on 64 banks it also varies the
-  // adjacent 8B column. Pack2's phase couples row bit 2 to the N16 selector.
+  // Use the derived physical read width, independently of the consumer's
+  // arithmetic dtype or kpack. An 8B read has consecutive row IDs; on 64
+  // banks it also varies the adjacent 8B column. A 16B read's phase couples
+  // row bit 2 to the N16 selector.
   uint64_t row_mask = low_bit(r0) | low_bit(r1);
   bool native_ok;
   if (at_bn->read_bytes_per_lane == 8) {
