@@ -310,7 +310,9 @@ def test_pure_bank64_row_word_mapping(bits, width):
 def test_matrix_identity_layout_selection(bits, banks, width, mixed):
     shape = (32, width)
     kinds, packs = ([1, 0], [1, 1]) if mixed else ([1], [1])
-    layout = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")(shape, banks, 4, bits, 256 // bits, 32, 128 // bits, 16, kinds, packs)
+    layout = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")(
+        shape, banks, 4, bits, 256 // bits, 32, [128 // bits if kind == 1 else 64 // bits * pack for kind, pack in zip(kinds, packs)], kinds
+    )
     assert layout is not None
     addresses = enumerate_layout(layout, shape)
     expected_identity = not mixed and width == 32 and (bits == 16 or banks == 32)
@@ -321,7 +323,7 @@ def test_matrix_identity_layout_selection(bits, banks, width, mixed):
 def test_b16_bank64_both_native_packs(width, packs):
     shape = (32, width)
     factory = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")
-    layout = factory(shape, 64, 4, 16, 16, 32, 8, 16, [1, 0, 0], [1, *packs])
+    layout = factory(shape, 64, 4, 16, 16, 32, [8, *(4 * pack for pack in packs)], [1, 0, 0])
     tile = enumerate_layout(layout, shape, preserve_rows=width != 32)
     assert footprint_summary(tile, 64, 1) == (1, 1, 1)
     assert footprint_summary(tile, 64, 2) == (1, 1, 1)
@@ -331,7 +333,7 @@ def test_b16_bank64_both_native_packs(width, packs):
 def test_b16_bank64_joint_layout_inverse(rows, stages):
     shape = (*stages, rows, 32)
     factory = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")
-    layout = factory(shape, 64, 4, 16, 16, 32, 8, 16, [1, 0, 0], [1, 1, 2])
+    layout = factory(shape, 64, 4, 16, 16, 32, [8, 4, 8], [1, 0, 0])
     forward = enumerate_layout(layout, shape, preserve_rows=False)
     backward = enumerate_layout(layout.inverse(), shape, preserve_rows=False)
     identity = np.arange(np.prod(shape))

@@ -74,7 +74,7 @@ WIDTHS = [32, 64, 128, 256, 512]
 
 def make_layout(shape, banks, packs):
     factory = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")
-    raw = factory(shape, banks, 4, 8, 32, 32, 16, 16, [1] + [0] * len(packs), [1] + list(packs))
+    raw = factory(shape, banks, 4, 8, 32, 32, [16] + [8 * pack for pack in packs], [1] + [0] * len(packs))
     assert raw is not None
     return raw
 
@@ -208,32 +208,34 @@ def test_b8_identity_single_common_comparison(banks, width, pack):
         assert common_result[1] == expected
 
 
-@pytest.mark.parametrize("field,value", [(3, 16), (4, 16), (5, 16), (6, 8), (7, 8)])
+@pytest.mark.parametrize("field,value", [(3, 16), (4, 16), (5, 16), (6, [8])])
 def test_b8_rejects_inconsistent_contract(field, value):
-    args = [(32, 64), 32, 4, 8, 32, 32, 16, 16, [1], [1]]
+    args = [(32, 64), 32, 4, 8, 32, 32, [16], [1]]
     args[field] = value
     assert tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")(*args) is None
 
 
-def test_b8_rejects_anbt_pack2():
-    assert tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")((32, 64), 32, 4, 8, 32, 32, 16, 16, [1], [2]) is None
+def test_b8_rejects_nonmatrix_anbt_width():
+    assert tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")((32, 64), 32, 4, 8, 32, 32, [32], [1]) is None
 
 
 @pytest.mark.parametrize("shape", [(16, 64), (32, 16), (48, 64), (32, 48)])
 def test_b8_rejects_incompatible_shape(shape):
-    assert tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")(shape, 32, 4, 8, 32, 32, 16, 16, [1], [1]) is None
+    assert tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")(shape, 32, 4, 8, 32, 32, [16], [1]) is None
 
 
 def test_b8_combines_all_consumers():
     factory = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")
-    args = [(32, 128), 64, 4, 8, 32, 32, 16, 16]
+    args = [(32, 128), 64, 4, 8, 32, 32]
     expected = enumerate_layout(make_layout((32, 128), 64, (1, 2)), (32, 128), require_n8=False)
     for kinds, packs in [([0, 1, 0], [2, 1, 1]), ([0, 0, 1], [1, 2, 1])]:
-        actual = enumerate_layout(factory(*args, kinds, packs), (32, 128), require_n8=False)
+        actual = enumerate_layout(
+            factory(*args, [16 if kind == 1 else 8 * pack for kind, pack in zip(kinds, packs)], kinds), (32, 128), require_n8=False
+        )
         np.testing.assert_array_equal(actual, expected)
-    assert factory(*args, [0], [1]) is None
-    assert factory(*args, [1, 0], [1, 3]) is None
-    assert factory(*args, [0, 1], [1, 2]) is None
+    assert factory(*args, [8], [0]) is None
+    assert factory(*args, [16, 24], [1, 0]) is None
+    assert factory(*args, [8, 32], [0, 1]) is None
 
 
 @pytest.mark.parametrize("packs", [(), (1,), (2,), (1, 2)])

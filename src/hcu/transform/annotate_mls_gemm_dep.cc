@@ -34,6 +34,7 @@
 #include <tvm/tirx/transform.h>
 
 #include <algorithm>
+#include <bitset>
 #include <map>
 #include <optional>
 #include <tuple>
@@ -429,6 +430,113 @@ bool IsAtBnAccess(const GemmWithInput &consumer) {
   const bool feeds_a = consumer.input.same_as(gemm->a_);
   ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
   return GetHcuGemmLdsAccessKind(*gemm, feeds_a) == HcuGemmLdsAccessKind::kAtBn;
+}
+
+// This certificate applies only to native AN/BT storage selected together with
+// a compatible AT/BN wrap plan. It inspects static metadata, never IR proofs.
+bool CanProveMixedWrapAtMostTwoWay(const CopyNode &copy,
+                                   const std::vector<GemmWithInput> &consumers,
+                                   const HcuGemmAtBnLdsStrategy &at_bn,
+                                   const HcuGemmAnBtLdsStrategy &an_bt) {
+  auto is_full_static_region = [](const BufferRegion &region) {
+    const Buffer &buffer = region->buffer;
+    if (buffer->shape.size() != 2 || region->region.size() != 2 ||
+        !buffer->strides.empty() || !is_zero(buffer->elem_offset))
+      return false;
+    for (size_t dim = 0; dim < 2; ++dim) {
+      const auto &range = region->region[dim];
+      const int64_t *extent = as_const_int(range->extent);
+      const int64_t *shape = as_const_int(buffer->shape[dim]);
+      if (!is_zero(range->min) || !extent || !shape || *extent != *shape)
+        return false;
+    }
+    return true;
+  };
+  if (!is_full_static_region(BufferRegion(copy.dst, copy.dst_range)))
+    return false;
+  for (const GemmWithInput &consumer : consumers) {
+    const Gemm &gemm = consumer.gemm;
+    const bool feeds_a = consumer.input.same_as(gemm->a_);
+    if (!consumer.input.same_as(copy.dst) ||
+        !is_full_static_region(feeds_a ? gemm->aRegion_ : gemm->bRegion_) ||
+        (IsAtBnAccess(consumer) &&
+         (gemm->kPack_ < 1 || gemm->kPack_ > 2 ||
+          at_bn->read_bytes_per_lane != 8 * gemm->kPack_)))
+      return false;
+  }
+
+  const int banks = an_bt->bank_num;
+  const int element_bytes = an_bt->element_bytes;
+  const int transaction_bytes = an_bt->copy_transaction_bytes;
+  const int wrap_count = an_bt->wrap_idx_mask + 1;
+  const int64_t row_bytes = int64_t{an_bt->block_mn} * element_bytes;
+  const int64_t wave_bytes = int64_t{64} * transaction_bytes;
+  if ((banks != 32 && banks != 64) || an_bt->bank_width_bytes != 4 ||
+      an_bt->warp_size != 64 || (element_bytes != 1 && element_bytes != 2) ||
+      an_bt->read_bytes_per_lane != 16 || an_bt->panel_mn != 32 ||
+      (transaction_bytes != 4 && transaction_bytes != 8 &&
+       transaction_bytes != 16) ||
+      row_bytes <= 0 || row_bytes > wave_bytes || wave_bytes % row_bytes ||
+      wave_bytes % (banks * 4) || wrap_count <= 0 || wrap_count > 16 ||
+      (wrap_count & (wrap_count - 1)) ||
+      (wrap_count == 1 ? an_bt->wrap_offset != 0
+                       : an_bt->wrap_offset <= 0 || an_bt->wrap_offset % 4))
+    return false;
+
+  // A copy wave contains whole rows and a whole number of bank rings. After
+  // row permutation and wrap, its bank word is
+  //   (row / wrap_count) * row_words + (row % wrap_count) * wrap_offset
+  //   + column_word (mod banks).
+  // Hence the coefficients of row bits 0..3 are available without evaluating
+  // the storage Layout or enumerating lanes, addresses, or banks.
+  auto row_coefficient = [&](int bit) -> int64_t {
+    return bit < wrap_count ? int64_t{bit} * an_bt->wrap_offset
+                            : (bit / wrap_count) * (row_bytes / 4);
+  };
+  auto low_bit = [banks](int64_t coefficient) -> uint64_t {
+    uint64_t value = static_cast<uint64_t>(coefficient) & (banks - 1);
+    return value & (~value + 1);
+  };
+  auto at_most_two_way = [banks](uint64_t mask) {
+    // Choose one binary variable per distinct lowest coefficient bit. These
+    // form triangular parity constraints, even in the presence of carries.
+    // Each phase has banks dword requests, so its multiplicity is bounded by
+    // banks / 2^popcount(mask). Coincident low bits give a conservative bound.
+    return (uint64_t{1} << std::bitset<64>(mask).count()) >=
+           static_cast<uint64_t>(banks / 2);
+  };
+  const int64_t r0 = row_coefficient(1), r1 = row_coefficient(2);
+  const int64_t r2 = row_coefficient(4), r3 = row_coefficient(8);
+  auto paired_phases_at_most_two_way = [&](uint64_t mask, int64_t row,
+                                           int column) {
+    return at_most_two_way(mask | low_bit(row + column)) &&
+           at_most_two_way(mask | low_bit(row - column));
+  };
+
+  // Native pack1 has consecutive row IDs; on 64 banks it also varies the
+  // adjacent 8B column. Pack2's phase couples row bit 2 to the N16 selector.
+  uint64_t row_mask = low_bit(r0) | low_bit(r1);
+  bool native_ok;
+  if (at_bn->read_bytes_per_lane == 8) {
+    native_ok = at_most_two_way((banks == 64 ? 3 : 1) | row_mask | low_bit(r2) |
+                                low_bit(r3));
+  } else if (at_bn->read_bytes_per_lane == 16) {
+    native_ok = paired_phases_at_most_two_way(
+        3 | row_mask | (banks == 64 ? low_bit(r3) : 0), r2, 4);
+  } else {
+    return false;
+  }
+  if (!native_ok)
+    return false;
+
+  // Matrix phases: b16 couples row bit 2 with column word bit 3; 32-bank b8
+  // couples row bit 3 with column word bit 2. On 64-bank b8, N16 is fixed.
+  if (element_bytes == 2)
+    return paired_phases_at_most_two_way(
+        7 | low_bit(r0) | (banks == 64 ? low_bit(r1) : 0), r2, 8);
+  if (banks == 32)
+    return paired_phases_at_most_two_way(3 | row_mask, r3, 4);
+  return at_most_two_way(3 | row_mask | low_bit(r2) | low_bit(r3));
 }
 
 bool IsGlobalLikeBuffer(const Buffer &buffer) {
@@ -1542,8 +1650,9 @@ private:
       const std::vector<GemmWithInput> &consumers) {
     if (!MatrixReadersEligible(copy.dst, consumers))
       return std::nullopt;
-    // Mixed consumers first try common storage, independently of dtype or
-    // native wrap count. Pure AN/BT also tries it for insufficient phases.
+    // Prefer a legal mixed wrap when both read kinds are proven <=2-way.
+    // Otherwise try common; an unproven bound is not a measured conflict.
+    // Pure AN/BT keeps its existing policy for insufficient wrap phases.
     // Retain the legal native plan if common cannot be built or would
     // contradict an explicitly annotated storage layout.
     auto [at_bn_strategy, an_bt_strategy] = SelectWrapStrategy(copy, consumers);
@@ -1553,8 +1662,11 @@ private:
           TrySelectCopyStrategy(copy, at_bn_strategy, an_bt_strategy);
     }
     if (copy_strategy.defined() && an_bt_strategy.defined() &&
-        (at_bn_strategy.defined() ||
-         HasPartialHcuGemmAnBtWrap(an_bt_strategy.value()))) {
+        (at_bn_strategy.defined()
+             ? !CanProveMixedWrapAtMostTwoWay(copy, consumers,
+                                              at_bn_strategy.value(),
+                                              an_bt_strategy.value())
+             : HasPartialHcuGemmAnBtWrap(an_bt_strategy.value()))) {
       Optional<HcuGemmAnBtLdsStrategy> common_an_bt =
           TrySelectCommonAnBtStrategy(copy, consumers);
       if (common_an_bt.defined()) {

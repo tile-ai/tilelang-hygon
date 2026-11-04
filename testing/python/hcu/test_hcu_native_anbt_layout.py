@@ -3,6 +3,7 @@
 """Matrix AN/BT strategy selection and generic HCU-layout fallback."""
 
 from itertools import product
+from collections import Counter
 
 import pytest
 import torch
@@ -475,9 +476,7 @@ def test_pure_anbt_unified_wrap_phase_policy(dtype, arch, width, threads):
     for plan in plans:
         assert int(plan.wrap_idx_mask) + 1 == expected_count
         if expected_count == 1:
-            expected = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")(
-                (32, width), 64, 4, bits, 256 // bits, 32, 128 // bits, 16, [1], [1]
-            )
+            expected = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")((32, width), 64, 4, bits, 256 // bits, 32, [128 // bits], [1])
             assert int(plan.wrap_offset) == 0
             tvm.ir.assert_structural_equal(plan.storage_layout.index, expected.index)
     assert "ds_read_vector" in artifact.kernel_source and "cp_async_gs" in artifact.kernel_source
@@ -509,11 +508,20 @@ def test_partial_wrap_invalid_explicit_storage_is_rejected():
         lower_with_captures(fp8_gather_program(width=128, storage=identity), "gfx946", enable_async=True)
 
 
-@pytest.mark.parametrize("arch,dtype,pack", list(product(["gfx938", "gfx946"], ["float16", "float8_e4m3fn", "float8_e5m2"], [1, 2])))
-def test_async_mixed_prefers_common_storage(arch, dtype, pack):
+@pytest.mark.parametrize(
+    "arch,dtype,pack,width",
+    [(*case, 128) for case in product(["gfx938", "gfx946"], ["float16", "float8_e4m3fn", "float8_e5m2"], [1, 2])]
+    + [
+        ("gfx946", "float8_e4m3fn", 2, 64),
+        ("gfx938", "float8_e4m3fn", 2, 512),
+        ("gfx938", "float16", 2, 256),
+        ("gfx946", "float16", 1, 32),
+    ],
+)
+def test_async_mixed_wrap_priority(arch, dtype, pack, width):
     from test_hcu_gemm_fp8_async_layout import async_program
 
-    captures, artifact = lower_with_captures(async_program(dtype=dtype, mixed=True, pack=pack, width=128, threads=256, stages=2), arch)
+    captures, artifact = lower_with_captures(async_program(dtype=dtype, mixed=True, pack=pack, width=width, threads=256, stages=2), arch)
     mod = captures["tl.MaterializeHcuGemmLdsStrategy"]
     plans = []
 
@@ -522,17 +530,116 @@ def test_async_mixed_prefers_common_storage(arch, dtype, pack):
             plans.append(node.annotations["tl.hcu_gemm_an_bt_lds_strategy"])
 
     tvm.tirx.stmt_functor.post_order_visit(mod["main"].body, visit)
+    if width == 32:
+        # Four waves split this small GEMM into MN16 warps, outside Matrix
+        # eligibility. Neither wrap nor common may override that contract.
+        assert not plans and not has_matrix_read(mod)
+        assert "cp_async_gs" in artifact.kernel_source
+        return
     assert plans and has_matrix_read(mod)
     bits = 16 if dtype == "float16" else 8
     banks = 32 if arch == "gfx938" else 64
-    expected = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")(
-        [32, 128], banks, 4, bits, 256 // bits, 32, 128 // bits, 16, [1, 0], [1, pack]
-    )
+    keeps_wrap = (banks == 32 and pack == 2) or (banks == 64 and bits == 8 and (pack == 1 or width == 64))
     for plan in plans:
-        assert int(plan.wrap_offset) == int(plan.wrap_idx_mask) == 0
-        tvm.ir.assert_structural_equal(plan.storage_layout.index, expected.index)
+        if keeps_wrap:
+            assert int(plan.wrap_offset) > 0 and int(plan.wrap_idx_mask) > 0
+        else:
+            expected = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")(
+                [32, width], banks, 4, bits, 256 // bits, 32, [128 // bits, 64 // bits * pack], [1, 0]
+            )
+            assert int(plan.wrap_offset) == int(plan.wrap_idx_mask) == 0
+            tvm.ir.assert_structural_equal(plan.storage_layout.index, expected.index)
+        read_ways = mixed_read_ways(plan.storage_layout, bits, banks, pack)
+        assert max(read_ways) <= 2
+        print("MIXED_WRAP_PRIORITY", arch, dtype, pack, width, "wrap" if keeps_wrap else "common", read_ways)
     assert "ds_read_vector" in artifact.kernel_source
     assert "cp_async_gs" in artifact.kernel_source
+
+
+def mixed_read_ways(storage, bits, banks, pack):
+    """Independent documented phase enumeration, applied to the real Layout."""
+    from test_hcu_plain_copy_lds_formula import MATRIX_PHASES as B16_PHASES, MATRIX_PHASES_64 as B16_PHASES_64, enumerate_layout
+    from test_hcu_plain_copy_lds_formula_b8 import MATRIX_PHASES as B8_PHASES
+    from test_hcu_plain_copy_lds_formula_b8 import B128_PHASES_32, B128_READ_PHASES_64, MATRIX_PHASES_64
+
+    width = int(storage.get_input_shape()[-1])
+    addresses = enumerate_layout(storage, (32, width), preserve_rows=False) * (bits // 8)
+    matrix_phases = (B8_PHASES if bits == 8 else B16_PHASES) if banks == 32 else (MATRIX_PHASES_64 if bits == 8 else B16_PHASES_64)
+
+    def way(starts, nbytes):
+        words = Counter()
+        for row, column in starts:
+            address = int(addresses[row, column])
+            assert address % nbytes == 0
+            words.update((address // 4 + word) % banks for word in range(nbytes // 4))
+        return max(words.values())
+
+    matrix = max(
+        way([(row + (lane >> (1 if bits == 8 else 2)), col + (lane & (1 if bits == 8 else 3)) * (128 // bits)) for lane in phase], 16)
+        for row in range(0, 32, 256 // bits)
+        for col in range(0, width, 32)
+        for phase in matrix_phases
+    )
+    elements = (64 // bits) * pack
+    native_phases = (
+        (B128_PHASES_32 if banks == 32 else B128_READ_PHASES_64)
+        if pack == 2
+        else tuple(tuple(range(i, i + banks // 2)) for i in range(0, 64, banks // 2))
+    )
+    native = max(
+        way([(row + lane % 16, col + (lane // 16) * elements) for lane in phase], 8 * pack)
+        for row in range(0, 32, 16)
+        for col in range(0, width, 4 * elements)
+        for phase in native_phases
+    )
+    return matrix, native
+
+
+@pytest.mark.parametrize("arch,dtype", list(product(["gfx938", "gfx946"], ["float16", "float8_e4m3fn"])))
+def test_async_mixed_unknown_bound_keeps_legal_wrap_without_common(arch, dtype):
+    # Leading-unit storage is supported by native wrap, but outside both the
+    # scalar certificate's scope and the common async ownership constructor.
+    @T.prim_func
+    def main(
+        A: T.Tensor((32, 32), dtype),
+        S: T.Tensor((32, 128), dtype),
+        B: T.Tensor((32, 128), dtype),
+        C: T.Tensor((32, 128), T.float32),
+        D: T.Tensor((32, 32), T.float32),
+    ):
+        with T.Kernel(1, threads=256):
+            s = T.alloc_shared((1, 32, 128), dtype)
+            a = T.alloc_fragment((32, 32), dtype)
+            b = T.alloc_fragment((32, 128), dtype)
+            c = T.alloc_fragment((32, 128), T.float32)
+            d = T.alloc_fragment((32, 32), T.float32)
+            T.async_copy(S, s[0, :, :])
+            T.copy(A, a)
+            T.copy(B, b)
+            T.ptx_wait_group(0)
+            T.sync_threads()
+            T.clear(c)
+            T.clear(d)
+            gemm(a, s[0, :, :], c, False, False)
+            gemm(s[0, :, :], b, d, False, True)
+            T.copy(c, C)
+            T.copy(d, D)
+
+    captures, _ = lower_with_captures(main, arch)
+    plans = []
+
+    def visit(node):
+        if isinstance(node, tvm.tirx.Call) and "tl.hcu_gemm_an_bt_lds_strategy" in node.annotations:
+            plans.append(node.annotations["tl.hcu_gemm_an_bt_lds_strategy"])
+
+    tvm.tirx.stmt_functor.post_order_visit(captures["tl.MaterializeHcuGemmLdsStrategy"]["main"].body, visit)
+    assert plans
+    for plan in plans:
+        assert int(plan.wrap_offset) > 0 and int(plan.wrap_idx_mask) > 0
+        assert len(plan.storage_layout.get_input_shape()) == 3
+        storage = tl.layout.Layout((32, 128), lambda k, n, layout=plan.storage_layout: layout.map_forward_index([0, k, n])[1:])
+        read_ways = mixed_read_ways(storage, 16 if dtype == "float16" else 8, 32 if arch == "gfx938" else 64, 1)
+        print("UNKNOWN_BOUND_COMMON_UNAVAILABLE", arch, dtype, read_ways)
 
 
 @pytest.mark.parametrize("arch,dtype", list(product(["gfx938", "gfx946"], ["float16", "float8_e4m3fn"])))

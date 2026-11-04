@@ -203,10 +203,10 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
     }
   }
   // Keep the vector suffix explicit for vectorization and ds-read proofs.
-  PrimExpr physical_col =
-      ((floordiv(col, swizzle_group_elements) ^ floordiv(shift, swizzle_group_elements)) *
-       swizzle_group_elements) +
-      floormod(col, swizzle_group_elements);
+  PrimExpr physical_col = ((floordiv(col, swizzle_group_elements) ^
+                            floordiv(shift, swizzle_group_elements)) *
+                           swizzle_group_elements) +
+                          floormod(col, swizzle_group_elements);
   Layout layout(Array<PrimExpr>{Integer(rows), Integer(width)},
                 {row, physical_col});
   Array<PrimExpr> leading;
