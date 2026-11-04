@@ -12,6 +12,8 @@
 #include "op/copy.h"
 #include "transform/loop_vectorize.h"
 
+#include <tvm/arith/analyzer.h>
+
 #include <climits>
 #include <numeric>
 
@@ -45,29 +47,32 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
   }
   bool has_an_bt = false;
   bool has_at_bn = false;
-  bool has_at_bn_pack2 = false;
+  bool has_at_bn_b128 = false;
   const int element_bits = consumers.front().element_bits;
   if (element_bits != 8 && element_bits != 16)
     return std::nullopt;
-  const int elements_per_read = 128 / element_bits;
+  // Preserve the existing shared swizzle's 128-bit contiguous groups,
+  // independently of each consumer's instruction width.
+  const int swizzle_group_elements = 128 / element_bits;
   const int read_tile_k = element_bits == 8 ? 32 : 16;
   if (rows < read_tile_k)
     return std::nullopt;
   for (const auto &read : consumers) {
     if (read.element_bits != element_bits || read.read_tile_k != read_tile_k ||
-        read.read_tile_mn != 32 ||
-        read.elements_per_read != elements_per_read ||
-        read.read_bytes_per_lane != 16)
+        read.read_tile_mn != 32 || read.elements_per_read <= 0 ||
+        read.elements_per_read > 128 / element_bits ||
+        !IsPowerOfTwo(read.elements_per_read))
       return std::nullopt;
+    const int read_bytes_per_lane = read.elements_per_read * element_bits / 8;
     if (read.consumer_kind == HcuGemmLdsAccessKind::kAnBt) {
-      if (read.consumer_k_pack != 1)
+      if (read_bytes_per_lane != 16)
         return std::nullopt;
       has_an_bt = true;
-    } else {
-      if (read.consumer_k_pack != 1 && read.consumer_k_pack != 2)
-        return std::nullopt;
+    } else if (read.consumer_kind == HcuGemmLdsAccessKind::kAtBn) {
       has_at_bn = true;
-      has_at_bn_pack2 |= read.consumer_k_pack == 2;
+      has_at_bn_b128 |= read_bytes_per_lane == 16;
+    } else {
+      return std::nullopt;
     }
   }
   // Pure AT/BN keeps the existing makeHCUSwizzledLayout path. This
@@ -92,7 +97,7 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
       if (width == 128 || (has_at_bn && width >= 128))
         shift = ((row & 1) << 5) ^ ((row & 10) << 3);
       if (has_at_bn) {
-        // Cover the full b128 phase for AT/BN kp2 as well as the matrix
+        // Cover the full b128 phase for AT/BN as well as the matrix
         // phase. At width 64, r3 is broadcast into both N16-group bits.
         if (width == 32)
           shift = (row & 4) << 2;
@@ -111,12 +116,12 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
         if (width >= 64)
           shift = shift ^ ((row & 8) << 2);
       }
-      if (width == 64 && (!has_at_bn || has_at_bn_pack2)) {
+      if (width == 64 && (!has_at_bn || has_at_bn_b128)) {
         // SB's 16-lane matrix and b128-read phases need independent row
         // bits in both N16 selectors. Keep r2 off the low selector: the
         // ordinary-read phase already pairs that bit with its N16 column.
-        // A pack1-only mixed consumer already has zero conflicts; retain
-        // its existing mapping rather than changing its producer addresses.
+        // Retain the existing mapping for narrower ordinary reads rather
+        // than changing their producer addresses.
         shift = ((row & 4) << 3) ^ ((row & 8) << 1);
       }
     }
@@ -140,10 +145,10 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
   }
   // Express the preserved vector bits explicitly so vectorization and the
   // symbolic ds-read contiguity check can see the affine vector suffix.
-  PrimExpr physical_col =
-      ((floordiv(col, elements_per_read) ^ floordiv(shift, elements_per_read)) *
-       elements_per_read) +
-      floormod(col, elements_per_read);
+  PrimExpr physical_col = ((floordiv(col, swizzle_group_elements) ^
+                            floordiv(shift, swizzle_group_elements)) *
+                           swizzle_group_elements) +
+                          floormod(col, swizzle_group_elements);
   Layout layout(Array<PrimExpr>{Integer(rows), Integer(width)},
                 {row, physical_col});
   Array<PrimExpr> leading;
@@ -294,18 +299,16 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       "tl.hcu.MakePlainGemmLdsLayout",
       [](Array<PrimExpr> shape, int bank_count, int bank_width_bytes,
          int element_bits, int read_tile_k, int read_tile_mn,
-         int elements_per_read, int read_bytes_per_lane,
-         Array<Integer> consumer_kinds, Array<Integer> consumer_k_packs) {
-        ICHECK_EQ(consumer_kinds.size(), consumer_k_packs.size());
+         Array<Integer> elements_per_read, Array<Integer> consumer_kinds) {
+        ICHECK_EQ(consumer_kinds.size(), elements_per_read.size());
         std::vector<HcuGemmLdsReadPattern> consumers;
         for (size_t i = 0; i < consumer_kinds.size(); ++i) {
           ICHECK(consumer_kinds[i]->value == 0 ||
                  consumer_kinds[i]->value == 1);
           consumers.push_back(
-              {element_bits, read_tile_k, read_tile_mn, elements_per_read,
-               read_bytes_per_lane,
-               static_cast<HcuGemmLdsAccessKind>(consumer_kinds[i]->value),
-               int(consumer_k_packs[i]->value)});
+              {element_bits, read_tile_k, read_tile_mn,
+               int(elements_per_read[i]->value),
+               static_cast<HcuGemmLdsAccessKind>(consumer_kinds[i]->value)});
         }
         return MakeHcuPlainGemmLdsLayout(shape, bank_count, bank_width_bytes,
                                          consumers);

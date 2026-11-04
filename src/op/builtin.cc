@@ -63,6 +63,12 @@ TIR_DEFINE_TL_BUILTIN(clamp)
                                Integer(CallEffectKind::kPure))
     .set_attr<TVectorizable>("TVectorizable", true);
 
+TIR_DEFINE_TL_BUILTIN(scaled_cast)
+    .set_num_inputs(3)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure))
+    .set_attr<TVectorizable>("TVectorizable", true);
+
 TIR_DEFINE_TL_BUILTIN(region).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kPure));
 

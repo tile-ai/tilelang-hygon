@@ -576,7 +576,9 @@ std::string HcuCkTemplateElemType(DataType dtype) {
   if (elem_type.is_float4_e2m1fn()) {
     switch (dtype.lanes()) {
     case 2:
-      return "uint8_t";
+      // CK's byte-load implementation accepts int8_t, not uint8_t. The
+      // packed FP4 byte is bit-reinterpreted, so signedness is immaterial.
+      return "int8_t";
     case 4:
       return "uint16_t";
     case 8:
@@ -810,6 +812,9 @@ std::string CodeGenTileLangHCU::Finish() {
 
   if (enable_fp8_) {
     decl_stream << "#include <tl_templates/hcu/hcu_fp8.h>\n";
+  }
+  if (enable_scaled_cast_) {
+    decl_stream << "#include <tl_templates/hcu/scaled_cast.h>\n";
   }
 
   decl_stream << "#include <tl_templates/hcu/atomic.h>\n";
@@ -2016,6 +2021,8 @@ void CodeGenTileLangHCU::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
         //
         ICHECK_EQ(lanes % 2, 0) << "only support even lane for half type";
         os << "uint" << lanes / 2;
+      } else if (lanes == 16) {
+        os << "float16x16";
       } else {
         fail = true;
       }
@@ -2085,6 +2092,10 @@ void CodeGenTileLangHCU::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
   } else if (t.is_float4_e2m1fn()) {
     if (t.is_scalar()) {
       os << "tl::pk_fp4_t";
+      return;
+    } else if (t.lanes() == 2) {
+      // Match the one-byte payload used by GetFp4PackedVectorDesc(2).
+      os << "uint8_t";
       return;
     } else if (t.lanes() <= 4) {
       os << "int16_t";
@@ -2453,6 +2464,11 @@ void CodeGenTileLangHCU::PrintVecElemLoad(const std::string &vec, DataType t,
     return;
   }
 
+  if (t.code() == DataType::kFloat8_e8m0fnu) {
+    os << vec << ".data[" << i << "]";
+    return;
+  }
+
   static const char access[] = {'x', 'y', 'z', 'w'};
   ICHECK(i >= 0 && i < (t.bits() == 8                        ? 16
                         : t.is_float4_e2m1fn()               ? 16
@@ -2474,6 +2490,8 @@ void CodeGenTileLangHCU::PrintVecElemLoad(const std::string &vec, DataType t,
   } else if (t.lanes() == 16 && t.is_bfloat16()) {
     // bfloat16x16: aggregate with inner data[N]; element access uses .data[i].
     os << vec << ".data[" << i << "]";
+  } else if (t.is_float16() && t.lanes() == 16) {
+    os << vec << "[" << i << "]";
   } else if (t.is_float16()) {
     os << "((half2*)(&(" << vec << "." << access[i / 2] << ")))->"
        << access[i % 2];
@@ -2518,6 +2536,10 @@ void CodeGenTileLangHCU::PrintVecElemLoad(const std::string &vec, DataType t,
 void CodeGenTileLangHCU::PrintVecElemStore(const std::string &vec, DataType t,
                                            int i, const std::string &value) {
   this->PrintIndent();
+  if (t.code() == DataType::kFloat8_e8m0fnu) {
+    stream << vec << ".data[" << i << "] = " << value << ";\n";
+    return;
+  }
   static const char access[] = {'x', 'y', 'z', 'w'};
   ICHECK(i >= 0 && i < (t.bits() == 8                        ? 16
                         : t.is_float4_e2m1fn()               ? 16
@@ -2543,6 +2565,8 @@ void CodeGenTileLangHCU::PrintVecElemStore(const std::string &vec, DataType t,
     stream << vec << "[" << i << "] = " << value << ";\n";
   } else if (t.lanes() == 16 && t.is_bfloat16()) {
     stream << vec << ".data[" << i << "] = " << value << ";\n";
+  } else if (t.is_float16() && t.lanes() == 16) {
+    stream << vec << "[" << i << "] = " << value << ";\n";
   } else if (t.is_float16()) {
     stream << "*((half_t*)(&(((half2*)(&(" << vec << "." << access[i / 2]
            << ")))->" << access[i % 2] << "))) = " << value << ";\n";
@@ -2658,6 +2682,9 @@ std::string CodeGenTileLangHCU::CastFromTo(std::string value, DataType from,
                                            DataType target) {
   if (from == target)
     return value;
+  ICHECK(from.code() != DataType::kFloat8_e8m0fnu &&
+         target.code() != DataType::kFloat8_e8m0fnu)
+      << "E8M0 is a bit carrier; use T.reinterpret, not a numeric cast";
   std::ostringstream os;
   os << "((";
   this->PrintType(target, os);
@@ -2680,6 +2707,10 @@ void CodeGenTileLangHCU::VisitExpr_(const CastNode *op, std::ostream &os) {
   DataType from_ty = op->value.dtype();
   DataType target_ty = op->dtype;
   ICHECK_EQ(target_ty.lanes(), from_ty.lanes());
+  ICHECK(from_ty == target_ty ||
+         (from_ty.code() != DataType::kFloat8_e8m0fnu &&
+          target_ty.code() != DataType::kFloat8_e8m0fnu))
+      << "E8M0 is a bit carrier; use T.reinterpret, not a numeric cast";
 
   if (from_ty.is_scalar()) {
     // Non-fp8: plain C cast. fp8: CastFromTo inserts fp8_cvt_t/bf8_cvt_t.
@@ -2909,6 +2940,68 @@ std::string CodeGenTileLangHCU::GetBufferRef(DataType t,
 }
 
 void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
+  if (op->op.same_as(tl::scaled_cast()) ||
+      op->op.same_as(tl::hcu_scaled_cast())) {
+    ICHECK_EQ(tl::GetHcuArchString(target_), "gfx946")
+        << "scaled_cast currently requires HCU gfx946";
+    ICHECK_EQ(op->args.size(), 3U);
+    const auto src = op->args[0].dtype();
+    const auto dst = op->dtype;
+    const auto sf = op->args[1].dtype();
+    auto is_low = [](DataType t) {
+      return t.is_float8_e4m3fn() || t.is_float8_e5m2() || t.is_float4_e2m1fn();
+    };
+    auto is_high = [](DataType t) {
+      return t.is_float16() || t.is_bfloat16() ||
+             (t.is_float() && t.bits() == 32);
+    };
+    const bool widen = is_low(src);
+    ICHECK((widen && is_high(dst)) || (is_high(src) && is_low(dst)))
+        << "scaled_cast unsupported conversion: " << src << " -> " << dst;
+    ICHECK_EQ(src.lanes(), dst.lanes());
+    ICHECK(!(src.is_float4_e2m1fn() || dst.is_float4_e2m1fn()) ||
+           src.lanes() >= 2)
+        << "scaled_cast packed FP4 requires vectorized pairs; scalar FP4 "
+           "buffer accesses do not preserve logical nibble indexing";
+    ICHECK_EQ(sf.bits(), 8);
+    ICHECK_EQ(sf.code(), DataType::kFloat8_e8m0fnu);
+    ICHECK(sf.lanes() == 1 || sf.lanes() == src.lanes());
+    auto scalar_control = [](PrimExpr e) {
+      while (const auto *broadcast = e.as<BroadcastNode>())
+        e = broadcast->value;
+      const auto *imm = e.as<IntImmNode>();
+      ICHECK(imm) << "scaled_cast controls must be compile-time constants";
+      return imm->value;
+    };
+    const int64_t clamp = scalar_control(op->args[2]);
+    ICHECK(clamp == 0 || clamp == 1);
+    ICHECK(widen || !clamp) << "scaled_cast clamp requires widening conversion";
+    PrimExpr scale = op->args[1];
+    if (const auto *broadcast = scale.as<BroadcastNode>())
+      scale = broadcast->value;
+    const bool shared_scale = scale.dtype().is_scalar();
+    enable_scaled_cast_ = true;
+    if (!(src.is_float8() && (dst.is_float16() || dst.is_bfloat16()))) {
+      const auto low = widen ? src : dst;
+      const auto high = widen ? dst : src;
+      const int low_id = low.is_float4_e2m1fn() ? 2
+                         : low.is_float8_e5m2() ? 1
+                                                : 0;
+      const int high_id = high.bits() == 32 ? 2 : high.is_bfloat16() ? 1 : 0;
+      os << "tl::hcu::scaled_cast_convert<";
+      PrintType(dst, os);
+      os << ", " << dst.lanes() << ", " << low_id << ", " << high_id << ", "
+         << widen << ", " << clamp << ", " << shared_scale << ">("
+         << PrintExpr(op->args[0]) << ", " << PrintExpr(scale) << ")";
+      return;
+    }
+    os << "tl::hcu::scaled_cast<";
+    PrintType(dst, os);
+    os << ", " << dst.lanes() << ", " << src.is_float8_e5m2() << ", "
+       << dst.is_bfloat16() << ", " << clamp << ", " << shared_scale << ">("
+       << PrintExpr(op->args[0]) << ", " << PrintExpr(scale) << ")";
+    return;
+  }
   // Optimize if_then_else(cond, BufferLoad/Cast(BufferLoad), zeros) to use
   // buffer_load with predicate instead of if-else.
   if (op->op.same_as(builtin::if_then_else()) && op->args.size() == 3) {
@@ -3921,6 +4014,18 @@ void CodeGenTileLangHCU::VisitExpr_(const ShuffleNode *op,
 void CodeGenTileLangHCU::VisitExpr_(const BroadcastNode *op,
                                     std::ostream &os) { // NOLINT(*)
   int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
+  if (op->dtype.code() == DataType::kFloat8_e8m0fnu) {
+    const std::string value = PrintExpr(op->value);
+    PrintType(op->dtype, os);
+    os << "{{";
+    for (int i = 0; i < lanes; ++i) {
+      if (i)
+        os << ", ";
+      os << value;
+    }
+    os << "}}";
+    return;
+  }
   if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8 &&
       lanes == 4) {
     // make_int8x4
@@ -3936,6 +4041,17 @@ void CodeGenTileLangHCU::VisitExpr_(const BroadcastNode *op,
     return;
   }
 
+  if (op->dtype.is_float16() && lanes == 16) {
+    std::string value = PrintExpr(op->value);
+    os << "float16x16{";
+    for (int i = 0; i < lanes; ++i) {
+      if (i)
+        os << ", ";
+      os << value;
+    }
+    os << "}";
+    return;
+  }
   if (op->dtype.is_float16()) {
     std::string v = PrintExpr(op->value);
     os << "make_";
@@ -4049,6 +4165,15 @@ void CodeGenTileLangHCU::VisitExpr_(const BroadcastNode *op,
 
 inline void PrintConst(const FloatImmNode *op, std::ostream &os,
                        CodeGenTileLangHCU *p) { // NOLINT(*)
+  // Safe-memory legalization inserts typed zero padding for BF8 loads.
+  // Emit its bits directly; the numeric conversion wrapper may select a
+  // different FP8 encoding according to the toolchain's architecture macros.
+  if (op->dtype.is_float8_e5m2() && op->value == 0.0) {
+    os << "__builtin_bit_cast(";
+    p->PrintType(op->dtype, os);
+    os << ", (uint8_t)" << (std::signbit(op->value) ? 128 : 0) << ")";
+    return;
+  }
   // Type code is kBFloat
   if (op->dtype.is_bfloat16()) {
     os << "bfloat16_t(";
@@ -4124,6 +4249,24 @@ void CodeGenTileLangHCU::PrintVecElemLoadExpr(DataType t, int i,
                                               const std::string &value,
                                               std::ostream &os) {
   ICHECK_GT(t.lanes(), 1);
+  if (t.code() == DataType::kFloat8_e8m0fnu) {
+    if (i == 0) {
+      PrintType(t, os);
+      os << "{{";
+    } else {
+      os << ", ";
+    }
+    os << value;
+    if (i == t.lanes() - 1)
+      os << "}}";
+    return;
+  }
+  if (t.is_float16() && t.lanes() == 16) {
+    os << (i == 0 ? "float16x16{" : ", ") << value;
+    if (i == 15)
+      os << "}";
+    return;
+  }
   if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
     if (!(t.lanes() == 2 || t.lanes() == 3)) {
       if (i != 0) {

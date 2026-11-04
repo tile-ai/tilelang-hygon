@@ -46,6 +46,7 @@ TIR_DEFINE_HCU_BUILTIN(hcu_get_wave_idx_sync, -1, kPure);
 TIR_DEFINE_HCU_BUILTIN(hcu_get_wave_group_idx, -1, kPure);
 TIR_DEFINE_HCU_BUILTIN(hcu_set_max_nreg, 2, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(hcu_ieee_fmaf, 4, kPure);
+TIR_DEFINE_HCU_BUILTIN(hcu_scaled_cast, 3, kPure);
 TIR_DEFINE_HCU_BUILTIN(hcu_mmac, -1, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(hcu_mmac_store, -1, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(hcu_wmma, -1, kOpaque);

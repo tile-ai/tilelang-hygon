@@ -198,6 +198,7 @@ private:
   bool need_wmma_h_{false};
   // whether need fp8.h
   bool enable_fp8_{false};
+  bool enable_scaled_cast_{false};
   // whether need gemm_mls.h (when gemm uses MLS or matrix_load exists)
   bool enable_gemm_mls_{false};
   // whether need tilelang_ds_read_format.hpp for layout-aware ds_read_m32x16

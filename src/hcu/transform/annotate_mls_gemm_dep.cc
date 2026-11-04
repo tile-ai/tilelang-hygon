@@ -17,6 +17,7 @@
 #include "hcu/utils/propagation_tir_collector.h"
 #include "hcu/utils/propagation_util.h"
 #include "layout/layout.h"
+#include "layout/utils.h"
 #include "op/copy.h"
 #include "op/gemm.h"
 #include "op/gemm_blockscaled.h"
@@ -26,11 +27,16 @@
 
 #include "arith/ir_mutator_with_analyzer.h"
 
+#include <climits>
+#include <tvm/ffi/function.h>
 #include <tvm/ir/transform.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <algorithm>
+#include <map>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -251,6 +257,14 @@ bool IsStaticMultipleOf(const PrimExpr &expr, int64_t value) {
   return imm && value != 0 && imm->value % value == 0;
 }
 
+bool IsVectorReadPreferred(const CopyNode *copy) {
+  auto value = copy->annotations.Get("prefer_instruction");
+  if (!value)
+    return false;
+  auto text = value.value().as<StringImmNode>();
+  return text && text->value == "ds_read_vector";
+}
+
 bool IsAnBtLinearDsReadCopyCandidate(const CopyNode *copy,
                                      const GemmWithInput &consumer) {
   if (!copy || !IsSharedBuffer(copy->src) ||
@@ -258,7 +272,7 @@ bool IsAnBtLinearDsReadCopyCandidate(const CopyNode *copy,
     return false;
   const GemmNode *gemm = consumer.gemm.get();
   const int read_tile_k = copy->src->dtype.bits() == 8 ? 32 : 16;
-  if (!gemm || gemm->k_ % read_tile_k != 0 || gemm->kPack_ != 1)
+  if (!gemm || gemm->k_ % read_tile_k != 0)
     return false;
   const bool feeds_a = consumer.input.same_as(gemm->a_);
   if (!(feeds_a || consumer.input.same_as(gemm->b_)) ||
@@ -382,7 +396,9 @@ bool HaveSameCopyStrategyParameters(const HcuGemmLdsCopyStrategy &lhs,
 
 MlsGemmDepMeta BuildCopyToGemmLinearMeta(const GemmWithInput &consumer,
                                          bool a_from_mls, bool b_from_mls,
-                                         Target target) {
+                                         Target target, int warp_m = 0,
+                                         int warp_n = 0, int warp_k = 0,
+                                         int min_n = 0) {
   const GemmNode *gemm = consumer.gemm.get();
   const bool feeds_a = consumer.input.same_as(gemm->a_);
   ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
@@ -400,6 +416,10 @@ MlsGemmDepMeta BuildCopyToGemmLinearMeta(const GemmWithInput &consumer,
     node->gemm_policy = gemm->policy_->policy_type;
   node->a_from_mls = a_from_mls;
   node->b_from_mls = b_from_mls;
+  node->plain_warp_m = warp_m;
+  node->plain_warp_n = warp_n;
+  node->plain_warp_k = warp_k;
+  node->plain_min_n = min_n;
   return MlsGemmDepMeta(std::move(node));
 }
 
@@ -416,6 +436,75 @@ bool IsGlobalLikeBuffer(const Buffer &buffer) {
 }
 
 using BufferSet = std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>;
+
+// Proof summaries only: graph traversal remains in propagation_util and uses
+// PropagationTirCollector. Unknown summaries veto automatic promotion, never
+// explicit ds_read_format or ds_read_vector dependency propagation.
+class AutomaticRegisterAccessProof : public StmtExprVisitor {
+public:
+  std::unordered_map<Buffer, BufferSet, ObjectPtrHash, ObjectPtrEqual> sources;
+  BufferSet invalid;
+  std::vector<Var> loop_vars;
+
+  void VisitStmt_(const ForNode *op) final {
+    loop_vars.push_back(op->loop_var);
+    StmtExprVisitor::VisitStmt_(op);
+    loop_vars.pop_back();
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    StmtExprVisitor::VisitStmt_(op);
+    if (!IsFragmentBuffer(op->buffer) && op->buffer.scope() != "local")
+      return;
+    bool valid = SideEffect(op->value) <= CallEffectKind::kReadState;
+    BufferSet inputs;
+    PostOrderVisit(op->value, [&](const ObjectRef &node) {
+      if (const auto *load = node.as<BufferLoadNode>()) {
+        // Recurrences over an axis absent from the output require reduction
+        // inference. This proof is used only by automatic read selection.
+        if (load->buffer.same_as(op->buffer)) {
+          for (const Var &axis : loop_vars) {
+            bool output_uses_axis = false;
+            for (const auto &index : op->indices)
+              output_uses_axis |= UsesVar(
+                  index, [&](const VarNode *v) { return v == axis.get(); });
+            if (!output_uses_axis)
+              valid = false;
+          }
+        }
+        if (!StructuralEqual()(load->buffer->shape, op->buffer->shape))
+          return;
+        if ((!IsFragmentBuffer(load->buffer) &&
+             load->buffer.scope() != "local") ||
+            !StructuralEqual()(load->indices, op->indices)) {
+          valid = false;
+        } else if (!load->buffer.same_as(op->buffer)) {
+          inputs.insert(load->buffer);
+        }
+      }
+      if (const auto *call = node.as<CallNode>()) {
+        static auto vectorizable = Op::GetAttrMap<Bool>("TVectorizable");
+        const auto *callee = call->op.as<OpNode>();
+        // TIR's vectorizer handles these structural elementwise operations
+        // directly; they do not carry the TVectorizable attribute.
+        const bool structural = call->op.same_as(builtin::reinterpret()) ||
+                                call->op.same_as(builtin::if_then_else());
+        if (!callee ||
+            (!structural && !vectorizable.get(GetRef<Op>(callee), Bool(false))))
+          valid = false;
+      }
+    });
+    if (!valid)
+      invalid.insert(op->buffer);
+    sources[op->buffer].insert(inputs.begin(), inputs.end());
+  }
+
+  bool Preserves(const Buffer &input, const Buffer &output) const {
+    auto it = sources.find(output);
+    return !invalid.count(output) && it != sources.end() &&
+           it->second.count(input);
+  }
+};
 
 std::optional<GemmWithInput> GemmWithInputFromReaderCall(const CallNode *call,
                                                          const Buffer &input) {
@@ -438,6 +527,7 @@ std::optional<GemmWithInput> GemmWithInputFromReaderCall(const CallNode *call,
   GemmWithInput result;
   result.gemm = GetRef<Gemm>(gemm);
   result.input = input;
+  result.site = GetRef<Call>(call);
   return result;
 }
 
@@ -473,6 +563,7 @@ public:
     AnnotateMlsGemmDepMutator mutator(&collector, target.value(),
                                       thread.block_threads, thread.thread_var,
                                       &analyzer, Mode::kCollectCandidates);
+    mutator.register_access_proof_(f->body);
     PrimFuncNode *fn = f.CopyOnWrite();
     fn->body = mutator(f->body);
     return f;
@@ -494,6 +585,7 @@ public:
         &collector, target.value(), thread.block_threads, thread.thread_var,
         &analyzer, Mode::kMaterialize, std::move(selected_calls));
     PlainCopyWriterGate writer_gate;
+    mutator.register_access_proof_(f->body);
     writer_gate(f->body);
     mutator.blocked_plain_buffers_ = std::move(writer_gate.blocked);
     mutator.blocked_plain_data_ = std::move(writer_gate.blocked_data);
@@ -504,6 +596,196 @@ public:
   }
 
 private:
+  struct PlainReadContract {
+    int warp_m, warp_n, warp_k, min_n;
+    Fragment layout;
+  };
+
+  using ContractKey = std::tuple<const BufferNode *, const GemmNode *, bool>;
+  // Keep the GEMM object alive with the entry: parsed operators are temporary
+  // objects, so caching a bare node address alone would permit address reuse.
+  mutable std::map<ContractKey,
+                   std::pair<Gemm, std::optional<PlainReadContract>>>
+      contracts_;
+
+  // Consumer facts are independent of the upstream source dtype. Query Python
+  // at most once per GEMM operand in this pass, keeping the key owner alive.
+  mutable std::map<std::pair<const Object *, bool>,
+                   std::pair<ObjectRef, Array<ObjectRef>>>
+      consumer_layouts_;
+
+  Array<ObjectRef> QueryConsumerLayout(const GemmWithInput &consumer) const {
+    const auto &gemm = consumer.gemm;
+    const bool feeds_a = consumer.input.same_as(gemm->a_);
+    ObjectRef owner = consumer.site.defined() ? ObjectRef(consumer.site.value())
+                                              : ObjectRef(gemm);
+    const auto key = std::make_pair(owner.get(), feeds_a);
+    auto cached = consumer_layouts_.find(key);
+    if (cached != consumer_layouts_.end())
+      return cached->second.second;
+    auto node = tvm::ffi::make_object<GemmNode>(*gemm.get());
+    node->annotations_ =
+        AnnotateGemmHcuMlsFlags(gemm->annotations_, gemm.get(), collector_);
+    node->policy_ = GemmWarpPolicy(gemm->policy_->policy_type);
+    const auto query =
+        tvm::ffi::Function::GetGlobal("tl.hcu.query_gemm_operand_layout");
+    ICHECK(query.has_value())
+        << "HCU Python operand-layout query is not registered";
+    auto result = Downcast<Array<ObjectRef>>(
+        (*query)(Gemm(node), target_, block_threads_, feeds_a));
+    ICHECK_EQ(result.size(), 7U);
+    consumer_layouts_.emplace(key, std::make_pair(owner, result));
+    return result;
+  }
+
+  std::optional<PlainReadContract>
+  PlainReadLayoutContract(const Buffer &source, const GemmWithInput &consumer,
+                          bool explicit_read = false) const {
+    ContractKey key{source.get(), consumer.gemm.get(), explicit_read};
+    auto cached = contracts_.find(key);
+    if (cached != contracts_.end())
+      return cached->second.second;
+    auto result = InferPlainReadLayoutContract(source, consumer, explicit_read);
+    contracts_.emplace(key, std::make_pair(consumer.gemm, result));
+    return result;
+  }
+
+  std::optional<PlainReadContract>
+  InferPlainReadLayoutContract(const Buffer &source,
+                               const GemmWithInput &consumer,
+                               bool explicit_read) const {
+    const auto &gemm = consumer.gemm;
+    const bool feeds_a = consumer.input.same_as(gemm->a_);
+    if (!explicit_read && gemm->a_.same_as(gemm->b_))
+      return std::nullopt;
+    if ((!feeds_a && !consumer.input.same_as(gemm->b_)) ||
+        GetHcuGemmLdsAccessKind(*gemm.get(), feeds_a) !=
+            HcuGemmLdsAccessKind::kAnBt ||
+        gemm->IsInstance<GemmBlockScaledNode>() ||
+        (source->dtype.bits() != 8 && source->dtype.bits() != 16))
+      return std::nullopt;
+    // Verify every register-side consumer, stopping at LDS. Layout
+    // compatibility cannot make a path through a second shared-memory buffer
+    // eligible.
+    if (!explicit_read) {
+      auto downstream = GetExclusiveGemmConsumersAfterCall(source, nullptr);
+      if (!downstream || downstream->empty())
+        return std::nullopt;
+    }
+
+    // ParseOperator may create several GemmNodes for one call. Use its stable
+    // call site so different source candidates share the consumer query.
+    const auto consumer_layout = QueryConsumerLayout(consumer);
+    int wm = Downcast<Integer>(consumer_layout[0])->value;
+    int wn = Downcast<Integer>(consumer_layout[1])->value;
+    int wk = Downcast<Integer>(consumer_layout[2])->value;
+    int min_n = Downcast<Integer>(consumer_layout[4])->value;
+    const int mn = feeds_a ? gemm->m_ : gemm->n_;
+    const int warp_mn = feeds_a ? wm : wn;
+    const int native_k = 256 / source->dtype.bits();
+    // Do not change the consumer partition or introduce extra MN replication
+    // to make a matrix read fit. The instruction owns MN32 per wave.
+    if (wk != 1 || warp_mn <= 0 || mn % warp_mn || mn / warp_mn < 32 ||
+        (mn / warp_mn) % 32 || gemm->k_ % native_k)
+      return std::nullopt;
+    Fragment producer =
+        feeds_a ? makeGemmFragmentAHCU(gemm->m_, gemm->n_, gemm->k_, wm, wn, wk,
+                                       source->dtype.bits(), 1, gemm->transA_)
+                : makeGemmFragmentBHCU(gemm->m_, gemm->n_, gemm->k_, wm, wn, wk,
+                                       source->dtype.bits(), 1, gemm->transB_,
+                                       min_n);
+    if (explicit_read)
+      return PlainReadContract{wm, wn, wk, min_n, producer};
+    Fragment required = Downcast<Fragment>(consumer_layout[5]);
+    if (!StructuralEqual()(producer->InputShape(), required->InputShape()))
+      return std::nullopt;
+    Array<PrimExpr> indices;
+    arith::Analyzer analyzer;
+    for (int i = 0; i < producer->InputDim(); ++i) {
+      Var index("plain_read_index");
+      analyzer.Bind(index, Range(0, producer->InputShape()[i]));
+      indices.push_back(index);
+    }
+    if (!ProveFragmentContains(required, producer, indices, indices, analyzer))
+      return std::nullopt;
+    return PlainReadContract{wm, wn, wk, min_n, producer};
+  }
+
+  std::optional<PlainReadContract>
+  CommonPlainReadLayoutContract(const Buffer &source,
+                                const CallNode *after_call) const {
+    auto consumers = GetExclusiveGemmConsumersAfterCall(source, after_call);
+    if (!consumers || consumers->empty())
+      return std::nullopt;
+    std::optional<PlainReadContract> common;
+    for (const auto &consumer : *consumers) {
+      auto next = PlainReadLayoutContract(source, consumer);
+      if (!next ||
+          (common &&
+           (common->warp_m != next->warp_m || common->warp_n != next->warp_n ||
+            common->warp_k != next->warp_k || common->min_n != next->min_n ||
+            !common->layout->IsEqual(next->layout.get()))))
+        return std::nullopt;
+      common = next;
+    }
+    return common;
+  }
+
+  bool IsPreferredMatrixConsumer(const Buffer &source,
+                                 const GemmWithInput &consumer) const {
+    for (const auto &reader : collector_->GetReaderCalls(source)) {
+      if (!reader.call || !reader.call->op.same_as(Copy::Get()))
+        continue;
+      auto copy = Downcast<Copy>(ParseOperator(GetRef<Call>(reader.call)));
+      if (!IsVectorReadPreferred(copy.get()))
+        continue;
+      auto next = PropagateToFindGemmConsumerOpWithInputAfterCall(
+          copy->dst, collector_, reader.call);
+      if (next && next->site.defined() && consumer.site.defined() &&
+          next->site.value().same_as(consumer.site.value()) &&
+          next->input.same_as(consumer.input))
+        return true;
+    }
+    return false;
+  }
+
+  std::optional<PlainReadContract>
+  MatrixReaderContract(const Buffer &source,
+                       const GemmWithInput &consumer) const {
+    return PlainReadLayoutContract(source, consumer,
+                                   IsPreferredMatrixConsumer(source, consumer));
+  }
+
+  // A failed AN/BT matrix candidate vetoes this buffer's whole joint plan.
+  // Pure AT/BN consumers retain the existing strategy path.
+  bool
+  MatrixReadersEligible(const Buffer &source,
+                        const std::vector<GemmWithInput> &consumers) const {
+    for (const auto &consumer : consumers) {
+      if (!IsAtBnAccess(consumer) && !MatrixReaderContract(source, consumer))
+        return false;
+    }
+    return true;
+  }
+
+  std::optional<HcuGemmLdsReadPattern>
+  MatrixReadPattern(const CopyNode &copy, const GemmWithInput &consumer) const {
+    if (IsAtBnAccess(consumer) || !MatrixReaderContract(copy.dst, consumer) ||
+        copy.dst_range.size() < 2)
+      return std::nullopt;
+    const auto &gemm = consumer.gemm;
+    const bool feeds_a = consumer.input.same_as(gemm->a_);
+    const size_t rank = copy.dst_range.size();
+    if (!analyzer_->CanProveEqual(copy.dst_range[rank - 2]->extent,
+                                  Integer(gemm->k_)) ||
+        !analyzer_->CanProveEqual(copy.dst_range[rank - 1]->extent,
+                                  Integer(feeds_a ? gemm->m_ : gemm->n_)))
+      return std::nullopt;
+    const int bits = copy.dst->dtype.bits();
+    return HcuGemmLdsReadPattern{bits, 256 / bits, 32, 128 / bits,
+                                 HcuGemmLdsAccessKind::kAnBt};
+  }
+
   struct ParallelGatherCopy {
     Copy copy;
   };
@@ -662,7 +944,44 @@ private:
     return true;
   }
 
+  // A single stage/batch slice of a compact LDS buffer. Unlike a full-buffer
+  // region, its leading coordinates may be dynamic and have unit extents.
+  bool IsFullLdsTileRegion(const BufferRegion &region) const {
+    const Buffer &buffer = region->buffer;
+    const size_t rank = buffer->shape.size();
+    if (rank < 2 || region->region.size() != rank || !buffer->strides.empty())
+      return false;
+    for (size_t i = 0; i < rank; ++i) {
+      if (i + 2 < rank) {
+        if (!analyzer_->CanProveEqual(region->region[i]->extent, 1))
+          return false;
+      } else if (!is_zero(region->region[i]->min) ||
+                 !analyzer_->CanProveEqual(region->region[i]->extent,
+                                           buffer->shape[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  Array<PrimExpr> LdsTileShape(const Buffer &buffer) const {
+    const size_t rank = buffer->shape.size();
+    ICHECK_GE(rank, 2U);
+    return {buffer->shape[rank - 2], buffer->shape[rank - 1]};
+  }
+
   Optional<Layout> TryMakePlainLayout(const Buffer &buffer) const {
+    // Explicit reader preference does not authorize replacing an async
+    // producer's pending/active storage and ownership plan with a plain one.
+    // Reader preference is consumed by MatrixReaderContract; it never owns a
+    // separate storage-layout selection path.
+    for (const auto &writer : collector_->GetProducerRecords(buffer)) {
+      if (writer.call) {
+        Call call = GetRef<Call>(writer.call);
+        if (HasAsyncCopySemantics(call) || selected_calls_.count(call))
+          return std::nullopt;
+      }
+    }
     if (block_threads_ < TargetHcuGetWarpSize(target_) ||
         block_threads_ % TargetHcuGetWarpSize(target_) != 0 ||
         !IsSharedBuffer(buffer) || HasAnnotatedLayout(buffer) ||
@@ -671,7 +990,7 @@ private:
         !(buffer->dtype.is_float16() || buffer->dtype.is_bfloat16() ||
           buffer->dtype.is_float8_e4m3fn() || buffer->dtype.is_float8_e5m2()) ||
         buffer->dtype.lanes() != 1 || !buffer->strides.empty() ||
-        buffer->shape.size() != 2 || !is_zero(buffer->elem_offset))
+        buffer->shape.size() < 2 || !is_zero(buffer->elem_offset))
       return std::nullopt;
     auto writers = collector_->GetProducerRecords(buffer);
     if (writers.empty())
@@ -687,17 +1006,15 @@ private:
       const auto *copy = parsed.as<CopyNode>();
       if (!copy || IsMatrixLoadPreferredCopy(*copy) ||
           copy->src->dtype != buffer->dtype ||
-          !IsFullPlainRegion(BufferRegion(buffer, copy->dst_range)))
+          !IsFullLdsTileRegion(BufferRegion(buffer, copy->dst_range)))
         return std::nullopt;
       if (IsGlobalLikeBuffer(copy->src)) {
-        if (copy->src_range.size() < 2 ||
-            !analyzer_->CanProveEqual(floormod(copy->src_range.back()->min, 8),
-                                      0))
-          return std::nullopt;
+        // Ordinary global copies own their vectorization and padding. A
+        // global slice's alignment is not a constraint on the LDS read atom.
       } else if (copy->src.scope() == "local.fragment") {
         if (!copy->dst.same_as(buffer) || !copy->src->strides.empty() ||
             !is_zero(copy->src->elem_offset) ||
-            !StructuralEqual()(copy->src->shape, buffer->shape) ||
+            !StructuralEqual()(copy->src->shape, LdsTileShape(buffer)) ||
             !IsFullPlainRegion(BufferRegion(copy->src, copy->src_range)))
           return std::nullopt;
         has_fragment_writer = true;
@@ -705,31 +1022,118 @@ private:
         return std::nullopt;
       }
     }
-    auto consumers = GetExclusiveGemmConsumersAfterCall(buffer, nullptr);
+    auto consumers = GetStrategyGemmConsumers(buffer, nullptr);
     if (!consumers || consumers->empty())
       return std::nullopt;
     return TryMakeCommonGemmLayout(buffer, *consumers, has_fragment_writer);
+  }
+
+  using OrdinaryReadKey = std::tuple<const BufferNode *, const Object *, bool>;
+  mutable std::map<
+      OrdinaryReadKey,
+      std::tuple<Buffer, ObjectRef, std::optional<HcuOrdinaryLdsReadInfo>>>
+      ordinary_readers_;
+
+  std::optional<HcuOrdinaryLdsReadInfo>
+  PrepareOrdinaryLdsRead(const Buffer &buffer,
+                         const GemmWithInput &consumer) const {
+    const auto &gemm = consumer.gemm;
+    const bool feeds_a = consumer.input.same_as(gemm->a_);
+    ObjectRef owner = consumer.site.defined() ? ObjectRef(consumer.site.value())
+                                              : ObjectRef(gemm);
+    const OrdinaryReadKey key{buffer.get(), owner.get(), feeds_a};
+    auto cached = ordinary_readers_.find(key);
+    if (cached != ordinary_readers_.end())
+      return std::get<2>(cached->second);
+    auto result = InferOrdinaryLdsRead(buffer, consumer);
+    ordinary_readers_.emplace(key, std::make_tuple(buffer, owner, result));
+    return result;
+  }
+
+  std::optional<HcuOrdinaryLdsReadInfo>
+  InferOrdinaryLdsRead(const Buffer &buffer,
+                       const GemmWithInput &consumer) const {
+    const auto &gemm = consumer.gemm;
+    if (!IsAtBnAccess(consumer) || buffer->shape.size() < 2 ||
+        (buffer->dtype.bits() != 8 && buffer->dtype.bits() != 16 &&
+         buffer->dtype.bits() != 32) ||
+        gemm->a_.same_as(gemm->b_) || gemm->IsInstance<GemmBlockScaledNode>())
+      return std::nullopt;
+    // Use the existing same-coordinate propagation, including its LDS stop.
+    // Unknown indexing/reductions cannot supply a native-wrap read contract.
+    auto consumers = GetExclusiveGemmConsumersAfterCall(buffer, nullptr);
+    if (!consumers || consumers->empty())
+      return std::nullopt;
+    const bool feeds_a = consumer.input.same_as(gemm->a_);
+    const auto facts = QueryConsumerLayout(consumer);
+    const int wm = Downcast<Integer>(facts[0])->value;
+    const int wn = Downcast<Integer>(facts[1])->value;
+    const int wk = Downcast<Integer>(facts[2])->value;
+    const int warp_size = TargetHcuGetWarpSize(target_);
+    const int mn_atom = Downcast<Integer>(facts[feeds_a ? 3 : 4])->value;
+    const int mmac_k = Downcast<Integer>(facts[6])->value;
+    const int mn = feeds_a ? gemm->m_ : gemm->n_;
+    const auto shape = LdsTileShape(buffer);
+    const auto *block_mn = as_const_int(shape[0]);
+    const auto *block_k = as_const_int(shape[1]);
+    if (wk != 1 || wm <= 0 || wn <= 0 || warp_size <= 0 ||
+        block_threads_ % warp_size || wm * wn != block_threads_ / warp_size ||
+        !block_mn || !block_k || mn <= 0 || *block_mn < mn || *block_mn % mn ||
+        *block_k != gemm->k_ || mn_atom <= 0 || mmac_k <= 0 ||
+        gemm->kPack_ <= 0)
+      return std::nullopt;
+    // Preserve the original MMAC element grouping. Only its storage bytes
+    // change across a same-coordinate, one-to-one conversion chain.
+    const int64_t packed_elements = int64_t(mn_atom) * mmac_k * gemm->kPack_;
+    if (packed_elements % warp_size || packed_elements / warp_size > INT_MAX)
+      return std::nullopt;
+    const int elements = packed_elements / warp_size;
+    const int bits = buffer->dtype.bits();
+    return HcuOrdinaryLdsReadInfo{
+        {bits, 256 / bits, 32, elements, HcuGemmLdsAccessKind::kAtBn},
+        mn,
+        feeds_a ? wm : wn,
+        mn_atom};
   }
 
   Optional<Layout>
   TryMakeCommonGemmLayout(const Buffer &buffer,
                           const std::vector<GemmWithInput> &consumers,
                           bool has_fragment_writer = false) const {
+    if (!MatrixReadersEligible(buffer, consumers))
+      return std::nullopt;
+    // Pure ordinary readers retain the existing AT/BN strategy. Do not query
+    // Python when there is no matrix reader
+    // with which to share the storage layout.
+    if (std::none_of(
+            consumers.begin(), consumers.end(),
+            [](const auto &consumer) { return !IsAtBnAccess(consumer); }))
+      return std::nullopt;
     const int element_bits = buffer->dtype.bits();
     const int read_tile_k = element_bits == 8 ? 32 : 16;
     std::vector<HcuGemmLdsReadPattern> reads;
+    std::vector<HcuOrdinaryLdsReadInfo> ordinary_readers;
     for (const GemmWithInput &consumer : consumers) {
       const Gemm &gemm = consumer.gemm;
+      const bool feeds_a = consumer.input.same_as(gemm->a_);
+      const auto kind = GetHcuGemmLdsAccessKind(*gemm.get(), feeds_a);
+      const bool matrix_read = kind == HcuGemmLdsAccessKind::kAnBt;
+      const auto contract =
+          matrix_read ? MatrixReaderContract(buffer, consumer) : std::nullopt;
       if (gemm->a_.same_as(gemm->b_) ||
           gemm->IsInstance<GemmBlockScaledNode>() ||
-          gemm->k_ % (read_tile_k * gemm->kPack_) != 0 ||
-          gemm->a_->dtype != buffer->dtype || gemm->b_->dtype != buffer->dtype)
+          (matrix_read && (gemm->k_ % read_tile_k || !contract)))
         return std::nullopt;
-      bool feeds_a = consumer.input.same_as(gemm->a_);
-      HcuGemmLdsAccessKind kind = GetHcuGemmLdsAccessKind(*gemm.get(), feeds_a);
+      if (!matrix_read) {
+        auto reader = PrepareOrdinaryLdsRead(buffer, consumer);
+        if (!reader)
+          return std::nullopt;
+        ordinary_readers.push_back(*reader);
+      }
       const BufferRegion &input = feeds_a ? gemm->aRegion_ : gemm->bRegion_;
       // First-stage scope is full compact tiles, including identity relays.
-      if (!IsFullPlainRegion(input))
+      if (!(IsSharedBuffer(input->buffer) ? IsFullLdsTileRegion(input)
+                                          : IsFullPlainRegion(input)))
         return std::nullopt;
       if (!consumer.input.same_as(buffer)) {
         for (const auto &relay : collector_->GetReaderCalls(buffer)) {
@@ -745,34 +1149,26 @@ private:
                copy->dst->dtype != buffer->dtype ||
                !copy->dst->strides.empty() || !is_zero(copy->dst->elem_offset)))
             return std::nullopt;
-          if (!IsFullPlainRegion(BufferRegion(copy->src, copy->src_range)) ||
+          if (!IsFullLdsTileRegion(BufferRegion(copy->src, copy->src_range)) ||
               !IsFullPlainRegion(BufferRegion(copy->dst, copy->dst_range)) ||
-              !StructuralEqual()(copy->src->shape, copy->dst->shape) ||
+              !StructuralEqual()(LdsTileShape(copy->src), copy->dst->shape) ||
               copy->dst.scope() != "local.fragment")
             return std::nullopt;
         }
       }
-      if (kind == HcuGemmLdsAccessKind::kAnBt) {
-        if (gemm->kPack_ != 1 ||
-            GetHcuGemmLdsMnExtent(*gemm.get(), feeds_a) % 32)
-          return std::nullopt;
-        GemmWarpPolicy policy(gemm->policy_->policy_type);
-        hcu::ComputeWarpPartitionHCU(
-            *policy.get(), gemm->m_, gemm->n_, gemm->k_, gemm->kPack_,
-            buffer->dtype.bits(), block_threads_, target_,
-            IsFromMls(gemm->a_, collector_), IsFromMls(gemm->b_, collector_),
-            !gemm->transA_, gemm->transB_);
-        int warp_mn = feeds_a ? policy->m_warp : policy->n_warp;
-        int mn = GetHcuGemmLdsMnExtent(*gemm.get(), feeds_a);
-        if (policy->k_warp != 1 || mn % warp_mn || (mn / warp_mn) % 32)
-          return std::nullopt;
-      }
-      reads.push_back({element_bits, read_tile_k, 32, 128 / element_bits, 16,
-                       kind, gemm->kPack_});
+      reads.push_back(matrix_read
+                          ? HcuGemmLdsReadPattern{element_bits, read_tile_k, 32,
+                                                  128 / element_bits, kind}
+                          : ordinary_readers.back().read);
     }
-    return MakeHcuPlainGemmLdsLayout(
+    // Supply actual ordinary-read widths to the existing strategy. No new
+    // candidate generation, bank scoring, or layout ranking takes place here.
+    auto layout = MakeHcuPlainGemmLdsLayout(
         buffer->shape, TargetHcuGetLdsBankCount(target_),
         TargetHcuGetLdsBankWidthBytes(target_), reads);
+    if (!layout)
+      return std::nullopt;
+    return layout;
   }
 
   Range CurrentStrategyThreadBounds() const {
@@ -885,26 +1281,21 @@ private:
   Optional<HcuGemmAtBnLdsStrategy>
   TryDeriveAtBnStrategy(const CopyNode &copy,
                         const GemmWithInput &consumer) const {
-    const GemmNode *gemm = consumer.gemm.get();
-    if (gemm == nullptr) {
+    auto reader = PrepareOrdinaryLdsRead(copy.dst, consumer);
+    if (!reader)
       return std::nullopt;
-    }
-    const bool feeds_a = consumer.input.same_as(gemm->a_);
-    ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
-    return DeriveHcuGemmAtBnLdsStrategy(copy, *gemm, feeds_a,
+    return DeriveHcuGemmAtBnLdsStrategy(copy, *reader,
                                         CurrentStrategyThreadBounds(), target_);
   }
 
   Optional<HcuGemmAnBtLdsStrategy>
   TryDeriveAnBtStrategy(const CopyNode &copy, const GemmWithInput &consumer,
                         Optional<Layout> storage_layout = std::nullopt) const {
-    const GemmNode *gemm = consumer.gemm.get();
-    if (gemm == nullptr) {
+    auto read = MatrixReadPattern(copy, consumer);
+    if (!read) {
       return std::nullopt;
     }
-    const bool feeds_a = consumer.input.same_as(gemm->a_);
-    ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
-    return DeriveHcuGemmAnBtLdsStrategy(copy, *gemm, feeds_a,
+    return DeriveHcuGemmAnBtLdsStrategy(copy, *read,
                                         CurrentStrategyThreadBounds(), target_,
                                         std::move(storage_layout));
   }
@@ -913,20 +1304,17 @@ private:
   TryDeriveAnBtCommonWrapStrategy(const CopyNode &copy,
                                   const GemmWithInput &consumer,
                                   int wrap_count) const {
-    const GemmNode *gemm = consumer.gemm.get();
-    if (gemm == nullptr) {
+    auto read = MatrixReadPattern(copy, consumer);
+    if (!read) {
       return std::nullopt;
     }
-    const bool feeds_a = consumer.input.same_as(gemm->a_);
-    ICHECK(feeds_a || consumer.input.same_as(gemm->b_));
     return DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
-        copy, *gemm, feeds_a, CurrentStrategyThreadBounds(), target_,
-        wrap_count);
+        copy, *read, CurrentStrategyThreadBounds(), target_, wrap_count);
   }
 
   Optional<HcuGemmAnBtLdsStrategy> TrySelectCommonAnBtStrategy(
       const CopyNode &copy, const std::vector<GemmWithInput> &consumers) const {
-    if (IsFullPlainRegion(BufferRegion(copy.dst, copy.dst_range))) {
+    if (IsFullLdsTileRegion(BufferRegion(copy.dst, copy.dst_range))) {
       if (Optional<Layout> layout =
               TryMakeCommonGemmLayout(copy.dst, consumers)) {
         for (const GemmWithInput &consumer : consumers) {
@@ -1087,65 +1475,73 @@ private:
     return true;
   }
 
-  bool CollectExclusiveGemmConsumersAfterCall(
-      const Buffer &buffer, int after_order, BufferSet *visited_buffers,
-      std::unordered_set<const CallNode *, CallNodePtrHash, CallNodePtrEqual>
-          *seen_calls,
-      std::vector<GemmWithInput> *result) const {
-    if (collector_ == nullptr || !visited_buffers->insert(buffer).second) {
-      return true;
-    }
-    bool has_reader = false;
-    for (const ReaderCallRecord &reader : collector_->GetReaderCalls(buffer)) {
-      if (reader.call == nullptr || reader.stmt_order <= after_order) {
-        continue;
-      }
-      has_reader = true;
-      if (auto gemm = GemmWithInputFromReaderCall(reader.call, buffer)) {
-        if (seen_calls->insert(reader.call).second) {
-          result->push_back(*gemm);
-        }
-        continue;
-      }
-      Optional<TileOperator> reader_op =
-          ParseOperator(ffi::GetRef<Call>(reader.call));
-      if (!reader_op.defined()) {
-        return false;
-      }
-      const auto *relay_copy = reader_op.as<CopyNode>();
-      if (relay_copy == nullptr || IsSharedBuffer(reader.write) ||
-          !reader.write.defined()) {
-        return false;
-      }
-      if (!CollectExclusiveGemmConsumersAfterCall(
-              reader.write, after_order, visited_buffers, seen_calls, result)) {
-        return false;
-      }
-    }
-    return has_reader;
-  }
-
   std::optional<std::vector<GemmWithInput>>
   GetExclusiveGemmConsumersAfterCall(const Buffer &buffer,
                                      const CallNode *after_site_call) const {
-    int after_order = -1;
-    if (collector_ != nullptr && after_site_call != nullptr) {
-      after_order = collector_->GetCallStmtOrder(after_site_call);
-    }
-    BufferSet visited_buffers;
-    std::unordered_set<const CallNode *, CallNodePtrHash, CallNodePtrEqual>
-        seen_calls;
-    std::vector<GemmWithInput> result;
-    if (!CollectExclusiveGemmConsumersAfterCall(
-            buffer, after_order, &visited_buffers, &seen_calls, &result)) {
-      return std::nullopt;
-    }
+    const int order =
+        after_site_call ? collector_->GetCallStmtOrder(after_site_call) : -1;
+    const auto key = std::make_pair(buffer.get(), after_site_call);
+    auto cached = consumer_queries_.find(key);
+    if (cached != consumer_queries_.end())
+      return cached->second;
+    auto result = QueryGemmConsumers(
+        buffer, collector_, order, true,
+        [&](const Buffer &input, const Buffer &output, const CallNode *call) {
+          if (!call)
+            return register_access_proof_.Preserves(input, output);
+          auto parsed = ParseOperator(GetRef<Call>(call));
+          const auto *copy = parsed.as<CopyNode>();
+          if (copy && IsSharedBuffer(input) && input->shape.size() > 2 &&
+              output->shape.size() == 2 && IsFragmentBuffer(output)) {
+            return StructuralEqual()(LdsTileShape(input), output->shape) &&
+                   IsFullLdsTileRegion(BufferRegion(input, copy->src_range)) &&
+                   IsFullPlainRegion(BufferRegion(output, copy->dst_range));
+          }
+          return copy && IsFragmentBuffer(output) &&
+                 StructuralEqual()(input->shape, output->shape) &&
+                 IsFullPlainRegion(BufferRegion(input, copy->src_range)) &&
+                 IsFullPlainRegion(BufferRegion(output, copy->dst_range));
+        });
+    consumer_queries_.emplace(key, result);
     return result;
+  }
+
+  // Explicit matrix readers contribute their fixed instruction geometry even
+  // when their later register chain is not an automatic-selection candidate.
+  // Unknown ordinary readers are never silently omitted from a joint plan.
+  std::optional<std::vector<GemmWithInput>>
+  GetStrategyGemmConsumers(const Buffer &buffer,
+                           const CallNode *after_call) const {
+    if (auto consumers = GetExclusiveGemmConsumersAfterCall(buffer, after_call))
+      return consumers;
+    auto readers = collector_->GetReaderCalls(buffer);
+    if (readers.empty())
+      return std::nullopt;
+    for (const auto &reader : readers) {
+      if (!reader.call || !reader.call->op.same_as(Copy::Get()))
+        return std::nullopt;
+      auto copy = Downcast<Copy>(ParseOperator(GetRef<Call>(reader.call)));
+      if (!IsVectorReadPreferred(copy.get()) || !IsFragmentBuffer(copy->dst))
+        return std::nullopt;
+    }
+    auto consumers = QueryGemmConsumers(
+        buffer, collector_,
+        after_call ? collector_->GetCallStmtOrder(after_call) : -1, true);
+    if (!consumers || consumers->empty())
+      return std::nullopt;
+    for (const auto &consumer : *consumers) {
+      if (IsAtBnAccess(consumer) ||
+          !IsPreferredMatrixConsumer(buffer, consumer))
+        return std::nullopt;
+    }
+    return consumers;
   }
 
   Optional<Map<String, ObjectRef>> TryBuildPendingGemmCopyAnnotations(
       const CopyNode &copy, const Map<String, ObjectRef> &base_annotations,
       const std::vector<GemmWithInput> &consumers) {
+    if (!MatrixReadersEligible(copy.dst, consumers))
+      return std::nullopt;
     // Prefer native wrap for async producers at the derived vector width.
     // Ordinary copies still materialize their common layout independently.
     auto [at_bn_strategy, an_bt_strategy] = SelectWrapStrategy(copy, consumers);
@@ -1463,12 +1859,32 @@ private:
       }
       auto consumer = PropagateToFindGemmConsumerOpWithInputAfterCall(
           copy->dst, collector_, call);
+      const bool explicit_read = IsVectorReadPreferred(copy.get());
+      if (explicit_read) {
+        ICHECK(consumer.has_value())
+            << "ds_read_vector requires a register-side GEMM consumer";
+        ICHECK(IsAnBtLinearDsReadCopyCandidate(copy.get(), *consumer))
+            << "ds_read_vector requires a supported MN-major LDS-to-fragment "
+               "tile";
+        if (mode_ == Mode::kCollectCandidates)
+          return IRMutatorWithAnalyzer::VisitStmt_(op);
+      }
       const bool can_materialize_ds_read =
-          mode_ == Mode::kMaterialize || HasAnnotatedLayout(copy->src) ||
+          explicit_read || mode_ == Mode::kMaterialize ||
+          HasAnnotatedLayout(copy->src) ||
           auto_copy_strategies_.count(copy->src->data) ||
           async_copy_linear_outputs_.count(copy->src->data);
-      if (can_materialize_ds_read && consumer &&
-          IsAnBtLinearDsReadCopyCandidate(copy.get(), consumer.value())) {
+      auto contract =
+          can_materialize_ds_read && consumer &&
+                  IsAnBtLinearDsReadCopyCandidate(copy.get(), consumer.value())
+              ? (explicit_read
+                     ? PlainReadLayoutContract(copy->dst, *consumer, true)
+                     : CommonPlainReadLayoutContract(copy->dst, call))
+              : std::nullopt;
+      ICHECK(!explicit_read || contract.has_value())
+          << "ds_read_vector tile is incompatible with the GEMM warp partition "
+             "(MN32 required)";
+      if (contract) {
         const GemmNode *consumer_gemm = consumer->gemm.get();
         const bool feeds_a = consumer->input.same_as(consumer_gemm->a_);
         const bool has_layout = HasAnnotatedLayout(copy->src) ||
@@ -1476,6 +1892,8 @@ private:
         // The fallback template is B-specific. AN must have an explicit
         // logical-to-physical map before it can use the generic vector read.
         if ((feeds_a || copy->src->dtype.bits() == 8) && !has_layout) {
+          ICHECK(!explicit_read)
+              << "ds_read_vector requires a legal MN-major LDS storage layout";
           return IRMutatorWithAnalyzer::VisitStmt_(op);
         }
         auto annotations = call->annotations;
@@ -1483,17 +1901,8 @@ private:
         const bool a_from_mls = IsFromMls(gemm->a_, collector_);
         const bool b_from_mls = IsFromMls(gemm->b_, collector_);
         MlsGemmDepMeta meta = BuildCopyToGemmLinearMeta(
-            consumer.value(), a_from_mls, b_from_mls, target_);
-        GemmWarpPolicy policy(meta->gemm_policy);
-        hcu::ComputeWarpPartitionHCU(
-            *policy.get(), meta->gemm_m, meta->gemm_n, meta->gemm_k,
-            meta->gemm_k_pack, copy->dst->dtype.bits(), block_threads_, target_,
-            a_from_mls, b_from_mls, !meta->gemm_trans_a, meta->gemm_trans_b,
-            meta->min_m_per_warp, meta->min_n_per_warp, meta->gemm_mmac_k);
-        const int warp_mn = feeds_a ? policy->m_warp : policy->n_warp;
-        const int mn = GetHcuGemmLdsMnExtent(*gemm.get(), feeds_a);
-        if (policy->k_warp != 1 || mn % warp_mn || (mn / warp_mn) % 32)
-          return IRMutatorWithAnalyzer::VisitStmt_(op);
+            consumer.value(), a_from_mls, b_from_mls, target_, contract->warp_m,
+            contract->warp_n, contract->warp_k, contract->min_n);
         annotations.Set(attr::kMlsGemmDep, meta);
         annotations.Set(attr::kHcuLinearDsRead, IntImm(DataType::Int(32), 1));
         if (has_layout) {
@@ -1518,8 +1927,7 @@ private:
       if (mode_ == Mode::kCollectCandidates && !IsAsyncCopyOp(tir_op) &&
           consumer && IsGlobalLikeBuffer(copy->src) &&
           IsSharedBuffer(copy->dst)) {
-        if (auto consumers =
-                GetExclusiveGemmConsumersAfterCall(copy->dst, call)) {
+        if (auto consumers = GetStrategyGemmConsumers(copy->dst, call)) {
           if (auto annotations = TryBuildPendingGemmCopyAnnotations(
                   *copy.get(), call->annotations, *consumers)) {
             Map<String, ObjectRef> updated_annotations = annotations.value();
@@ -1592,6 +2000,10 @@ private:
 
   std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
       blocked_plain_buffers_;
+  AutomaticRegisterAccessProof register_access_proof_;
+  mutable std::map<std::pair<const BufferNode *, const CallNode *>,
+                   std::optional<std::vector<GemmWithInput>>>
+      consumer_queries_;
   std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> blocked_plain_data_;
   std::unordered_map<Var, Layout, ObjectPtrHash, ObjectPtrEqual> plain_layouts_;
   PropagationTirCollector *collector_;

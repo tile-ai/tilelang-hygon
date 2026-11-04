@@ -8,7 +8,6 @@
 
 #include "gemm_at_bn_lds_strategy.h"
 
-#include "hcu/op/gemm_partition.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/gemm_lds_access.h"
 #include "hcu/utils/gemm_lds_strategy_utils.h"
@@ -358,8 +357,9 @@ void HcuGemmAtBnLdsStrategyNode::RegisterReflection() {
 }
 
 Optional<HcuGemmAtBnLdsStrategy>
-DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
-                             bool feeds_a, Range thread_bounds, Target target) {
+DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy,
+                             const HcuOrdinaryLdsReadInfo &reader,
+                             Range thread_bounds, Target target) {
   const int64_t *thread_offset = as_const_int(thread_bounds->min);
   const int64_t *thread_extent = as_const_int(thread_bounds->extent);
   if (thread_offset == nullptr || thread_extent == nullptr ||
@@ -389,45 +389,16 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   const int block_mn = static_cast<int>(*dst_m);
   const int block_k = static_cast<int>(*dst_k);
   const int element_bits = copy.dst->dtype.bits();
-  // AT (A, transA=false) and BN (B, transB=true) share the same
-  // spatial-leading MMAC load layout. Their physical LDS shape is [MN, K].
-  const bool has_at_bn_access =
-      GetHcuGemmLdsAccessKind(gemm, feeds_a) == HcuGemmLdsAccessKind::kAtBn;
-  const int gemm_mn = GetHcuGemmLdsMnExtent(gemm, feeds_a);
-  const DataType operand_dtype = GetHcuGemmOperandDType(gemm, feeds_a);
-  if (!has_at_bn_access || gemm_mn <= 0 || gemm_mn > block_mn ||
-      block_mn % gemm_mn != 0 || gemm.k_ != block_k || gemm.kPack_ <= 0 ||
-      operand_dtype != copy.dst->dtype) {
-    return std::nullopt;
-  }
-
-  const hcu::HcuMmacModeInfo mmac_mode =
-      hcu::ResolveHcuMmacModeForGemm(&gemm, target);
-  if (element_bits <= 0 || element_bits % 8 != 0 ||
-      mmac_mode.element_bits != element_bits || mmac_mode.mmac_k <= 0 ||
-      block_k % mmac_mode.mmac_k != 0) {
-    return std::nullopt;
-  }
-
-  GemmWarpPolicy policy(gemm.policy_->policy_type);
-  const hcu::HcuMnPerWarp mn_per_warp = hcu::ComputeWarpPartitionHCU(
-      *policy.get(), gemm.m_, gemm.n_, gemm.k_, gemm.kPack_, element_bits,
-      block_threads, target,
-      /*A_from_mls=*/false,
-      /*B_from_mls=*/false,
-      /*A_mls_trans=*/false,
-      /*B_mls_trans=*/false,
-      /*extra_min_m_per_warp=*/0,
-      /*extra_min_n_per_warp=*/0, mmac_mode.mmac_k);
+  const int reader_mn = reader.mn_extent;
   const int warp_size = TargetHcuGetWarpSize(target);
-  const int warp_mn_count = feeds_a ? policy->m_warp : policy->n_warp;
-  const int operand_mn_atom =
-      feeds_a ? mn_per_warp.m_per_warp : mn_per_warp.n_per_warp;
-  if (block_threads % warp_size != 0 || warp_mn_count <= 0 ||
-      operand_mn_atom <= 0 || !IsPowerOfTwo(warp_mn_count) ||
-      policy->k_warp != 1 ||
-      policy->m_warp * policy->n_warp * policy->k_warp !=
-          block_threads / warp_size) {
+  const int warp_mn_count = reader.warp_mn_count;
+  const int operand_mn_atom = reader.mn_atom;
+  if (reader.read.consumer_kind != HcuGemmLdsAccessKind::kAtBn ||
+      reader.read.element_bits != element_bits || element_bits <= 0 ||
+      element_bits % 8 != 0 || reader.read.elements_per_read <= 0 ||
+      reader_mn <= 0 || reader_mn > block_mn || block_mn % reader_mn != 0 ||
+      block_threads % warp_size != 0 || warp_mn_count <= 0 ||
+      operand_mn_atom <= 0 || !IsPowerOfTwo(warp_mn_count)) {
     return std::nullopt;
   }
 
@@ -446,13 +417,8 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
   // Derive the LDS-to-VGPR conflict requirement independently from the
   // Global-to-LDS copy transaction width.
   const int row_bytes = block_k * params.element_bytes;
-  const int64_t packed_mmac_elements =
-      static_cast<int64_t>(operand_mn_atom) * mmac_mode.mmac_k * gemm.kPack_;
-  if (packed_mmac_elements % params.warp_size != 0) {
-    return std::nullopt;
-  }
-  params.read_bytes_per_lane = static_cast<int>(
-      packed_mmac_elements / params.warp_size * params.element_bytes);
+  params.read_bytes_per_lane =
+      reader.read.elements_per_read * params.element_bytes;
   if (params.read_bytes_per_lane % params.element_bytes != 0 ||
       row_bytes % params.read_bytes_per_lane != 0) {
     return std::nullopt;
@@ -536,7 +502,7 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
       operand_mn_atom % params.row_period != 0) {
     return std::nullopt;
   }
-  if (gemm_mn % params.warp_mn_count != 0) {
+  if (reader_mn % params.warp_mn_count != 0) {
     return std::nullopt;
   }
   const bool uses_ds_read_b128 =

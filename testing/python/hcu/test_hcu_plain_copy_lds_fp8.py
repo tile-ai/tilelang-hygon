@@ -73,9 +73,9 @@ def pure_program(dtype="float8_e4m3fn", pack=1, identity=False, relay=False, fra
 def test_pure_atbn_factory(banks, packs):
     factory = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")
     args = [(32, 128), banks, 4]
-    actual = factory(*args, 8, 32, 32, 16, 16, [0] * len(packs), list(packs))
+    actual = factory(*args, 8, 32, 32, [8 * pack for pack in packs], [0] * len(packs))
     assert actual is None
-    assert factory(*args, 16, 16, 32, 8, 16, [0] * len(packs), list(packs)) is None
+    assert factory(*args, 16, 16, 32, [4 * pack for pack in packs], [0] * len(packs)) is None
 
 
 @pytest.mark.parametrize(

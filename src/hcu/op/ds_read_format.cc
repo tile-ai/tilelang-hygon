@@ -165,11 +165,19 @@ LayoutMap InferLayoutWithGemmDep(const DsReadFormatNode *self,
   int element_bits = self->dst->dtype.bits();
   const bool a_mls_trans = !meta->gemm_trans_a;
   const bool b_mls_trans = meta->gemm_trans_b;
-  hcu::HcuMnPerWarp floors = hcu::ComputeWarpPartitionHCU(
-      *policy.get(), meta->gemm_m, meta->gemm_n, meta->gemm_k,
-      meta->gemm_k_pack, element_bits, block_size, T.target, meta->a_from_mls,
-      meta->b_from_mls, a_mls_trans, b_mls_trans, meta->min_m_per_warp,
-      meta->min_n_per_warp, meta->gemm_mmac_k);
+  hcu::HcuMnPerWarp floors;
+  if (meta->plain_warp_m > 0) {
+    policy->m_warp = meta->plain_warp_m;
+    policy->n_warp = meta->plain_warp_n;
+    policy->k_warp = meta->plain_warp_k;
+    floors.n_per_warp = meta->plain_min_n;
+  } else {
+    floors = hcu::ComputeWarpPartitionHCU(
+        *policy.get(), meta->gemm_m, meta->gemm_n, meta->gemm_k,
+        meta->gemm_k_pack, element_bits, block_size, T.target, meta->a_from_mls,
+        meta->b_from_mls, a_mls_trans, b_mls_trans, meta->min_m_per_warp,
+        meta->min_n_per_warp, meta->gemm_mmac_k);
+  }
   int warp_m = policy->m_warp;
   int warp_n = policy->n_warp;
   int warp_k = policy->k_warp;
@@ -391,12 +399,18 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     ICHECK_EQ(read_mn % 32, 0);
 
     GemmWarpPolicy policy(meta->gemm_policy);
-    hcu::ComputeWarpPartitionHCU(
-        *policy.get(), meta->gemm_m, meta->gemm_n, meta->gemm_k,
-        meta->gemm_k_pack, dst->dtype.bits(), block_size, T.target,
-        meta->a_from_mls, meta->b_from_mls, !meta->gemm_trans_a,
-        meta->gemm_trans_b, meta->min_m_per_warp, meta->min_n_per_warp,
-        meta->gemm_mmac_k);
+    if (meta->plain_warp_m > 0) {
+      policy->m_warp = meta->plain_warp_m;
+      policy->n_warp = meta->plain_warp_n;
+      policy->k_warp = meta->plain_warp_k;
+    } else {
+      hcu::ComputeWarpPartitionHCU(
+          *policy.get(), meta->gemm_m, meta->gemm_n, meta->gemm_k,
+          meta->gemm_k_pack, dst->dtype.bits(), block_size, T.target,
+          meta->a_from_mls, meta->b_from_mls, !meta->gemm_trans_a,
+          meta->gemm_trans_b, meta->min_m_per_warp, meta->min_n_per_warp,
+          meta->gemm_mmac_k);
+    }
     int warp_mn = feeds_a ? policy->m_warp : policy->n_warp;
     int warp_k = policy->k_warp;
     ICHECK_EQ(warp_k, 1) << "linear AN/BT ds_read requires WarpK == 1";

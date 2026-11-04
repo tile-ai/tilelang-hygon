@@ -8,9 +8,9 @@
 #ifndef TVM_TL_HCU_UTILS_GEMM_AN_BT_LDS_STRATEGY_H_
 #define TVM_TL_HCU_UTILS_GEMM_AN_BT_LDS_STRATEGY_H_
 
+#include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "layout/layout.h"
 #include "op/copy.h"
-#include "op/gemm.h"
 
 #include <optional>
 
@@ -65,12 +65,16 @@ public:
 };
 
 Optional<HcuGemmAnBtLdsStrategy>
-DeriveHcuGemmAnBtLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
-                             bool feeds_a, Range thread_bounds, Target target,
+// The caller has already proved the matrix-reader contract against the real
+// GEMM fragment. Producer planning uses LDS instruction geometry, not GEMM
+// dtype/kpack; this also applies to the common-storage fallback.
+DeriveHcuGemmAnBtLdsStrategy(const CopyNode &copy,
+                             const HcuGemmLdsReadPattern &read,
+                             Range thread_bounds, Target target,
                              Optional<Layout> storage_layout = std::nullopt);
 
 Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
-    const CopyNode &copy, const GemmNode &gemm, bool feeds_a,
+    const CopyNode &copy, const HcuGemmLdsReadPattern &read,
     Range thread_bounds, Target target, int wrap_count);
 
 void ValidateHcuGemmAnBtStorageLayout(const Layout &actual,

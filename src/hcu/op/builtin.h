@@ -58,6 +58,7 @@ TVM_DLL const Op &hcu_get_wave_idx_sync();
 TVM_DLL const Op &hcu_get_wave_group_idx();
 TVM_DLL const Op &hcu_set_max_nreg();
 TVM_DLL const Op &hcu_ieee_fmaf();
+TVM_DLL const Op &hcu_scaled_cast();
 TVM_DLL const Op &hcu_mmac();
 TVM_DLL const Op &hcu_mmac_store();
 TVM_DLL const Op &hcu_wmma();

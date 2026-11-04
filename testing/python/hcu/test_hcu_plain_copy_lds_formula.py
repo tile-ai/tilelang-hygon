@@ -50,8 +50,8 @@ def make_layout(shape, banks, common_pack):
     """Use the production closed-form factory, also used by materialization."""
     factory = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")
     kinds = [1] if common_pack is None else [1, 0]
-    packs = [1] if common_pack is None else [1, common_pack]
-    raw = factory(shape, banks, BANK_WIDTH_BYTES, 16, 16, 32, 8, 16, kinds, packs)
+    elements = [8] if common_pack is None else [8, 4 * common_pack]
+    raw = factory(shape, banks, BANK_WIDTH_BYTES, 16, 16, 32, elements, kinds)
     assert raw is not None
     assert isinstance(raw, Layout)
     return raw
