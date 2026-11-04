@@ -77,6 +77,9 @@ Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
     const CopyNode &copy, const HcuGemmLdsReadPattern &read,
     Range thread_bounds, Target target, int wrap_count);
 
+/// Whether native AN/BT supplies too few wrap phases, including no-wrap plans.
+bool HasPartialHcuGemmAnBtWrap(const HcuGemmAnBtLdsStrategy &strategy);
+
 void ValidateHcuGemmAnBtStorageLayout(const Layout &actual,
                                       const HcuGemmAnBtLdsStrategy &strategy);
 

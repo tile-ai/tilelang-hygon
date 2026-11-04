@@ -1542,13 +1542,34 @@ private:
       const std::vector<GemmWithInput> &consumers) {
     if (!MatrixReadersEligible(copy.dst, consumers))
       return std::nullopt;
-    // Prefer native wrap for async producers at the derived vector width.
-    // Ordinary copies still materialize their common layout independently.
+    // Mixed consumers first try common storage, independently of dtype or
+    // native wrap count. Pure AN/BT also tries it for insufficient phases.
+    // Retain the legal native plan if common cannot be built or would
+    // contradict an explicitly annotated storage layout.
     auto [at_bn_strategy, an_bt_strategy] = SelectWrapStrategy(copy, consumers);
     Optional<HcuGemmLdsCopyStrategy> copy_strategy;
     if (at_bn_strategy.defined() || an_bt_strategy.defined()) {
       copy_strategy =
           TrySelectCopyStrategy(copy, at_bn_strategy, an_bt_strategy);
+    }
+    if (copy_strategy.defined() && an_bt_strategy.defined() &&
+        (at_bn_strategy.defined() ||
+         HasPartialHcuGemmAnBtWrap(an_bt_strategy.value()))) {
+      Optional<HcuGemmAnBtLdsStrategy> common_an_bt =
+          TrySelectCommonAnBtStrategy(copy, consumers);
+      if (common_an_bt.defined()) {
+        Optional<HcuGemmLdsCopyStrategy> common_copy =
+            TrySelectCopyStrategy(copy, std::nullopt, common_an_bt);
+        Optional<Layout> existing = FindAnnotatedLayout(copy.dst);
+        if (common_copy.defined() &&
+            (!existing.defined() ||
+             existing.value()->IsEqual(
+                 common_an_bt.value()->storage_layout.get()))) {
+          at_bn_strategy = std::nullopt;
+          an_bt_strategy = common_an_bt;
+          copy_strategy = common_copy;
+        }
+      }
     }
     if (!copy_strategy.defined()) {
       // Also fall back when the consumers cannot share one wrap copy plan.

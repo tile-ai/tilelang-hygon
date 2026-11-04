@@ -89,6 +89,21 @@ Layout ExpandStorageLayout(const Layout &layout, const Buffer &buffer) {
 
 bool IsPowerOfTwo(int value) { return value > 0 && (value & (value - 1)) == 0; }
 
+int GetRequiredWrapCount(int bytes_per_row, int bank_num, int bank_width_bytes,
+                         int element_bytes) {
+  const int phase_lanes = bank_num * bank_width_bytes / kDsReadBytesPerLane;
+  // b16 phases include all four N8 columns. b8 includes both N16
+  // columns on 32 banks, but fixes that selector on 64 banks.
+  const int column_groups =
+      element_bytes == 1 && bank_num == 64
+          ? 1
+          : kDsReadPanelN * element_bytes / kDsReadBytesPerLane;
+  const int row_classes = phase_lanes / column_groups;
+  const int row_bank_stride = bytes_per_row / bank_width_bytes;
+  const int row_period = bank_num / std::gcd(bank_num, row_bank_stride);
+  return std::max(1, row_classes / row_period);
+}
+
 Fragment MakeCopyLoopLayout(const AnBtStrategyParams &params, bool permute_rows,
                             int rows_per_copy_wave = 0,
                             int wrap_count = kDsReadWrapCount,
@@ -273,10 +288,9 @@ bool SelectWrapStrategy(AnBtStrategyParams *params, Fragment *copy_layout,
     // The 32-bank b8 phase varies four K classes and its N16 selector.
     // The 64-bank phase instead fixes N16 and varies sixteen K rows.
     const int row_classes = params->bank_num == 32 ? 4 : 16;
-    const int row_bank_stride = bytes_per_row / params->bank_width_bytes;
-    const int row_period =
-        params->bank_num / std::gcd(params->bank_num, row_bank_stride);
-    const int required_wrap_count = std::max(1, row_classes / row_period);
+    const int required_wrap_count =
+        GetRequiredWrapCount(bytes_per_row, params->bank_num,
+                             params->bank_width_bytes, params->element_bytes);
     if (required_wrap_count == 1)
       return true;
     const int row_phases = params->read_tile_k / geometry->rows_per_group;
@@ -515,6 +529,13 @@ Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
   }
   return DeriveHcuGemmAnBtLdsStrategyImpl(copy, read, thread_bounds, target,
                                           wrap_count);
+}
+
+bool HasPartialHcuGemmAnBtWrap(const HcuGemmAnBtLdsStrategy &strategy) {
+  const int required_wrap_count = GetRequiredWrapCount(
+      strategy->block_mn * strategy->element_bytes, strategy->bank_num,
+      strategy->bank_width_bytes, strategy->element_bytes);
+  return strategy->wrap_idx_mask + 1 < required_wrap_count;
 }
 
 void ValidateHcuGemmAnBtStorageLayout(const Layout &actual,

@@ -29,16 +29,23 @@ using namespace tirx;
 
 namespace {
 
-constexpr int kStrategyVersion = 10;
+constexpr int kStrategyVersion = 11;
 // These are instruction semantics, not kernel tile parameters.
 constexpr int kLdsIssueBytes = 128;
 constexpr int kDsReadB128BytesPerLane = 16;
-constexpr int kDsReadB128ConflictGroupLanes = 4;
 constexpr int kDsReadB128WrapStepBytes = 32;
+constexpr int kDsReadB128RowGroup = 16;
 
-int GetAtBnIssueGroupLanes(int read_bytes_per_lane) {
+int GetAtBnConflictRowClasses(int read_bytes_per_lane, int bank_num,
+                              int bank_width_bytes) {
   if (read_bytes_per_lane == kDsReadB128BytesPerLane) {
-    return kDsReadB128ConflictGroupLanes;
+    // order2/order3 contain 8/16 lanes on 32/64 banks. The two 16B
+    // column groups already distinguish r2, leaving 4/8 row classes
+    // for wrap to separate. These are not the physical phase lane counts.
+    const int phase_bytes = bank_num * bank_width_bytes;
+    if (phase_bytes <= 0 || phase_bytes % (2 * read_bytes_per_lane) != 0)
+      return 0;
+    return phase_bytes / (2 * read_bytes_per_lane);
   }
   if (read_bytes_per_lane <= 0 || kLdsIssueBytes % read_bytes_per_lane != 0) {
     return 0;
@@ -46,17 +53,17 @@ int GetAtBnIssueGroupLanes(int read_bytes_per_lane) {
   return kLdsIssueBytes / read_bytes_per_lane;
 }
 
-int GetAtBnRequiredWrapCount(int row_period, int issue_group_lanes) {
-  if (row_period <= 0 || issue_group_lanes <= 0) {
+int GetAtBnRequiredWrapCount(int row_period, int conflict_row_classes) {
+  if (row_period <= 0 || conflict_row_classes <= 0) {
     return 0;
   }
-  if (row_period >= issue_group_lanes) {
+  if (row_period >= conflict_row_classes) {
     return 1;
   }
-  if (issue_group_lanes % row_period != 0) {
+  if (conflict_row_classes % row_period != 0) {
     return 0;
   }
-  return issue_group_lanes / row_period;
+  return conflict_row_classes / row_period;
 }
 
 struct AtBnStrategyParams {
@@ -73,7 +80,7 @@ struct AtBnStrategyParams {
   int copy_transaction_bytes{0};
   int copy_transactions_per_lane{0};
   int read_bytes_per_lane{0};
-  int issue_group_lanes{0};
+  int conflict_row_classes{0};
   int row_bank_stride{0};
   int row_period{0};
   int rows_per_copy_wave{0};
@@ -181,8 +188,18 @@ PrimExpr AtBnRowPermute(const PrimExpr &row, const AtBnStrategyParams &params) {
   const int copy_warp_count = params.block_threads / params.warp_size;
   const int groups_per_copy_warp =
       params.rows_per_copy_warp_transaction / params.row_period;
-  PrimExpr row_group = floordiv(row, Integer(params.row_period));
-  PrimExpr inner_row = floormod(row, Integer(params.row_period));
+  PrimExpr phase_row = row;
+  if (params.bank_num == 64 &&
+      params.read_bytes_per_lane == kDsReadB128BytesPerLane) {
+    // In order3, r2 selects the native column group while r3 varies
+    // within the same phase. Assign wrap phases to r3 before r2, or
+    // increasing the count alone still repeats banks within that phase.
+    phase_row = floordiv(row, kDsReadB128RowGroup) * kDsReadB128RowGroup +
+                floormod(row, 4) + floormod(floordiv(row, 8), 2) * 4 +
+                floormod(floordiv(row, 4), 2) * 8;
+  }
+  PrimExpr row_group = floordiv(phase_row, Integer(params.row_period));
+  PrimExpr inner_row = floormod(phase_row, Integer(params.row_period));
   const int wrap_count = params.wrap_idx_mask + 1;
   if (wrap_count > copy_warp_count) {
     // A copy wave owns multiple statically unrolled transactions. Spread each
@@ -423,22 +440,23 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy,
       row_bytes % params.read_bytes_per_lane != 0) {
     return std::nullopt;
   }
-  params.issue_group_lanes = GetAtBnIssueGroupLanes(params.read_bytes_per_lane);
-  if (params.issue_group_lanes <= 0 ||
-      params.warp_size % params.issue_group_lanes != 0) {
-    return std::nullopt;
-  }
   params.bank_num = TargetHcuGetLdsBankCount(target);
   params.bank_width_bytes = TargetHcuGetLdsBankWidthBytes(target);
   if (params.bank_num <= 0 || params.bank_width_bytes <= 0 ||
       row_bytes % params.bank_width_bytes != 0) {
     return std::nullopt;
   }
+  params.conflict_row_classes = GetAtBnConflictRowClasses(
+      params.read_bytes_per_lane, params.bank_num, params.bank_width_bytes);
+  if (params.conflict_row_classes <= 0 ||
+      params.warp_size % params.conflict_row_classes != 0) {
+    return std::nullopt;
+  }
   params.row_bank_stride = row_bytes / params.bank_width_bytes;
   params.row_period =
       params.bank_num / std::gcd(params.bank_num, params.row_bank_stride);
   const int required_wrap_count =
-      GetAtBnRequiredWrapCount(params.row_period, params.issue_group_lanes);
+      GetAtBnRequiredWrapCount(params.row_period, params.conflict_row_classes);
   if (required_wrap_count <= 0) {
     return std::nullopt;
   }
@@ -519,6 +537,11 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy,
   if (!IsPowerOfTwo(wrap_count) || wrap_count > available_wrap_phases) {
     return std::nullopt;
   }
+  if (uses_ds_read_b128 && params.bank_num == 64 && wrap_count > 1 &&
+      block_mn % kDsReadB128RowGroup != 0) {
+    // The order3 row-bit permutation must stay inside complete MN atoms.
+    return std::nullopt;
+  }
   params.wrap_idx_mask = wrap_count - 1;
   if (wrap_count == 1) {
     params.wrap_offset = 0;
@@ -565,7 +588,7 @@ DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy,
   node->rows_per_copy_wave = params.rows_per_copy_wave;
   node->wrap_offset = params.wrap_offset;
   node->wrap_idx_mask = params.wrap_idx_mask;
-  // Column segment shift/carry completes the conflict-free physical layout.
+  // Reproduce the selected wrap and column carry in the physical layout.
   node->storage_layout =
       ExpandStorageLayout(MakeStorageLayout(params), copy.dst);
   node->copy_loop_layout = MakeCopyLoopLayout(params);
@@ -602,10 +625,11 @@ void ValidateHcuGemmAtBnCopyLayout(const Fragment &actual,
 }
 
 int GetHcuGemmAtBnRequiredWrapCount(const HcuGemmAtBnLdsStrategy &strategy) {
-  const int issue_group_lanes =
-      GetAtBnIssueGroupLanes(strategy->read_bytes_per_lane);
+  const int conflict_row_classes =
+      GetAtBnConflictRowClasses(strategy->read_bytes_per_lane,
+                                strategy->bank_num, strategy->bank_width_bytes);
   const int required_wrap_count =
-      GetAtBnRequiredWrapCount(strategy->row_period, issue_group_lanes);
+      GetAtBnRequiredWrapCount(strategy->row_period, conflict_row_classes);
   ICHECK_GT(required_wrap_count, 0)
       << "Invalid HCU GEMM AT/BN bank-conflict geometry";
   return required_wrap_count;
