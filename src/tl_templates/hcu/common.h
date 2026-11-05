@@ -6,6 +6,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <tl_templates/hcu/core.hpp>
+#include <type_traits>
 
 #define HIPRT_INF_F __int_as_float(0x7f800000)
 #define HIPRT_NEGINF_F __int_as_float(0xff800000)
@@ -451,6 +452,59 @@ template <> TL_DEVICE bfloat16_t shfl(bfloat16_t val, int srcLane) {
   float f = static_cast<float>(val);
   float r = __shfl(f, srcLane);
   return static_cast<bfloat16_t>(r);
+}
+
+// Constant XOR distances used by reductions. Keep the runtime-mask overload
+// above for general shuffles and preserve its conversion rules for 16-bit FP.
+// As with warp shuffle reductions, every participating lane must have an active
+// XOR partner. Values fetched from inactive source lanes are not defined.
+template <int Mask, typename T> TL_DEVICE T shfl_xor(T val) {
+  static_assert(Mask == 1 || Mask == 2 || Mask == 4 || Mask == 8 ||
+                Mask == 16 || Mask == 32);
+  if constexpr (std::is_same<T, half_t>::value ||
+                std::is_same<T, bfloat16_t>::value) {
+    return static_cast<T>(shfl_xor<Mask>(static_cast<float>(val)));
+  } else if constexpr (sizeof(T) == sizeof(unsigned int)) {
+    unsigned int bits;
+    __builtin_memcpy(&bits, &val, sizeof(bits));
+    if constexpr (Mask == 1 || Mask == 2) {
+      // quad_perm:[1,0,3,2] / quad_perm:[2,3,0,1].
+      bits = __builtin_amdgcn_mov_dpp(bits, Mask == 1 ? 0xb1 : 0x4e, 0xf, 0xf,
+                                      true);
+    } else if constexpr (Mask == 4) {
+      // Alternate four-lane banks read right/left by four. A row rotation
+      // by four alone is NOT XOR 4 for the middle banks of a 16-lane row.
+      unsigned int tmp =
+          __builtin_amdgcn_update_dpp(bits, bits, 0x104, 0xf, 0x5, true);
+      bits = __builtin_amdgcn_update_dpp(tmp, bits, 0x114, 0xf, 0xa, true);
+    } else if constexpr (Mask == 8) {
+      bits = __builtin_amdgcn_mov_dpp(bits, 0x128, 0xf, 0xf, true);
+    } else {
+#if defined(__gfx946__) && __has_builtin(__builtin_hcu_permlane16_swap_b32) && \
+    __has_builtin(__builtin_hcu_permlane32_swap_b32)
+      // Each result holds the original value on one half and the peer on
+      // the other. Select the peer rather than assuming the reducer is
+      // commutative. Fetch-inactive stays disabled.
+      auto pair =
+          Mask == 16
+              ? __builtin_hcu_permlane16_swap_b32(bits, bits, false, false)
+              : __builtin_hcu_permlane32_swap_b32(bits, bits, false, false);
+      bits = (__lane_id() & Mask) ? pair[0] : pair[1];
+#else
+      if constexpr (Mask == 16) {
+        // Bit mode: and_mask=31, or_mask=0, xor_mask=16.
+        bits = __builtin_amdgcn_ds_swizzle(bits, 0x401f);
+      } else {
+        bits = __builtin_amdgcn_ds_bpermute((__lane_id() ^ Mask) << 2, bits);
+      }
+#endif
+    }
+    T result;
+    __builtin_memcpy(&result, &bits, sizeof(result));
+    return result;
+  } else {
+    return tl::shfl_xor(val, Mask);
+  }
 }
 
 } // namespace tl

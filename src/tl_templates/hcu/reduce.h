@@ -126,7 +126,7 @@ struct AllReduce {
       Barrier::sync();
       x = Reducer()(x, red_buf[(threadIdx.x - thread_offset) ^ offset]);
     } else {
-      x = Reducer()(x, tl::shfl_xor(x, offset));
+      x = Reducer()(x, tl::shfl_xor<offset>(x));
     }
     if constexpr (offset == scale) {
       return x;
@@ -157,7 +157,7 @@ struct AllReduce {
     } else {
 #pragma unroll
       for (int i = 0; i < batch_size; ++i) {
-        x[i] = Reducer()(x[i], tl::shfl_xor(x[i], offset));
+        x[i] = Reducer()(x[i], tl::shfl_xor<offset>(x[i]));
       }
     }
     if constexpr (offset != scale) {
@@ -169,12 +169,12 @@ struct AllReduce {
 
 template <typename T, typename ReduceOp>
 TL_DEVICE T warp_reduce(T value, ReduceOp op) {
-  value = op(value, __shfl_xor(value, 32));
-  value = op(value, __shfl_xor(value, 16));
-  value = op(value, __shfl_xor(value, 8));
-  value = op(value, __shfl_xor(value, 4));
-  value = op(value, __shfl_xor(value, 2));
-  value = op(value, __shfl_xor(value, 1));
+  value = op(value, tl::shfl_xor<32>(value));
+  value = op(value, tl::shfl_xor<16>(value));
+  value = op(value, tl::shfl_xor<8>(value));
+  value = op(value, tl::shfl_xor<4>(value));
+  value = op(value, tl::shfl_xor<2>(value));
+  value = op(value, tl::shfl_xor<1>(value));
   return value;
 }
 
