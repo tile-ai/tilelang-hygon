@@ -466,9 +466,6 @@ Layout MakeGemmABLayoutHopper(int mat_stride, int mat_continuous,
                               bool k_inner = true);
 Layout MakeGemmABLayoutSm100(int mat_stride, int mat_continuous, int continuity,
                              int element_size, bool k_inner = true);
-Layout MakeGemmABLayoutCDNA(int stride, int continuous, int element_size,
-                            int kPack);
-
 Fragment MakeGemmVoltaFragmentC(const int block_m, const int block_n,
                                 const int warp_m, const int warp_n,
                                 const int element_size);

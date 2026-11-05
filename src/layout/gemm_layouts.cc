@@ -7,7 +7,9 @@
 #include "support/check.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/extra/structural_equal.h>
+#include <tvm/ffi/function.h>
 #include <tvm/runtime/logging.h>
+#include <tvm/target/target.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
 
@@ -879,21 +881,44 @@ Layout MakeFullBankSwizzleLayout(const Buffer &buffer) {
 // Detail implementation please ref to
 // bitblas::tl::mfma_layout::make_mfma_swizzle_layout
 Layout makeMatrixCoreSwizzleLayout(int stride, int continuous, int element_size,
-                                   int kPack = 1) {
-  const int numBanks = 32;
+                                   int kPack = 1, int numBanks = 32) {
   const int bankBitWidth = 32;
   const int SIMDWidth = 16;
-  const int vecSize = (64 / element_size) * kPack;
+  // vecSize is in elements; 64 banks retain at least 16 contiguous bytes.
+  const int vecSize =
+      numBanks == 64 ? std::max(128 / element_size, (64 / element_size) * kPack)
+                     : (64 / element_size) * kPack;
   const int innerDimLength = continuous;
   const int typeWidthInBit = element_size;
 
   const int elemsPerOneBanksRow = (numBanks * bankBitWidth) / typeWidthInBit;
+  // perPhase counts whole rows per bank ring, not hardware instruction phases.
   const int perPhase = std::max(1, elemsPerOneBanksRow / innerDimLength);
-  const int maxPhase = std::min(SIMDWidth / perPhase, innerDimLength / vecSize);
+  // maxPhase bounds the column-vector selector.
+  int maxPhase = std::min(SIMDWidth / perPhase, innerDimLength / vecSize);
 
   IterVar row = MakeIterVar("row", stride);
   IterVar col = MakeIterVar("col", continuous);
-  PrimExpr phase = FloorMod(FloorDiv(row, perPhase), maxPhase);
+  PrimExpr phase = FloorDiv(row, perPhase);
+  if (numBanks == 64) {
+    // Round the selector count up to a power of two for XOR addressing.
+    int phaseCount = 1;
+    while (phaseCount < maxPhase)
+      phaseCount *= 2;
+    maxPhase = phaseCount;
+    // 64-bank selector: rN is row bit N; pN is selector bit N.
+    if (perPhase == 1) {
+      // p0=r0, p1=r1, p2=r2^r4, p3=r3^r5.
+      phase = FloorMod(row, 16) ^ (FloorMod(FloorDiv(row, 16), 4) * 4);
+    } else {
+      // p0=r1^r3^r5, p1=r2^r4, p2=r2^r3.
+      phase = FloorMod(FloorDiv(row, 2), 8) ^ FloorMod(FloorDiv(row, 8), 4) ^
+              FloorMod(FloorDiv(row, 32), 2) ^
+              (FloorMod(FloorDiv(row, 4), 2) * 4);
+    }
+  }
+  phase = FloorMod(phase, maxPhase);
+  // XOR the column-vector index; keep the offset within each vector.
   PrimExpr colOffSwizzled = (FloorDiv(col, vecSize) ^ phase) * vecSize;
   PrimExpr colOffOrdered = FloorMod(col, vecSize);
   PrimExpr colOff = colOffSwizzled + colOffOrdered;
@@ -1262,11 +1287,6 @@ Layout MakeGemmABLayoutSm100(int mat_stride, int mat_continuous, int continuity,
   TILELANG_COMPILER_UNREACHABLE(); // to prevent compiler warning
 }
 
-Layout MakeGemmABLayoutCDNA(int stride, int continuous, int element_size,
-                            int kPack) {
-  return makeMatrixCoreSwizzleLayout(stride, continuous, element_size, kPack);
-}
-
 Layout MakeSwizzledLayout(const Buffer &buffer, bool k_inner, bool allow_pad) {
   auto info = GetSwizzleShapeInfoChecked(buffer);
   Layout base;
@@ -1284,9 +1304,18 @@ Layout MakeSwizzledLayout(const Buffer &buffer, bool k_inner, bool allow_pad) {
 
 Layout makeHCUSwizzledLayout(const Buffer &buffer, int kPack) {
   auto info = GetSwizzleShapeInfoChecked(buffer);
-  auto base = MakeGemmABLayoutCDNA(static_cast<int>(info.stride),
-                                   static_cast<int>(info.continuous),
-                                   info.element_size, kPack);
+  int bank_count = 32;
+  Target target = Target::Current(/*allow_not_defined=*/true);
+  if (target.defined() && target->kind->name == "hcu") {
+    // Query through FFI to keep the HCU backend optional.
+    auto get_bank_count =
+        ffi::Function::GetGlobal("tl.TargetHcuGetLdsBankCount");
+    ICHECK(get_bank_count.has_value());
+    bank_count = (*get_bank_count)(target).cast<int>();
+  }
+  auto base = makeMatrixCoreSwizzleLayout(static_cast<int>(info.stride),
+                                          static_cast<int>(info.continuous),
+                                          info.element_size, kPack, bank_count);
   Layout layout = ExpandLayout2D(base, buffer);
   arith::Analyzer analyzer;
   Array<PrimExpr> output_shape = layout->OutputShape();
@@ -1294,8 +1323,7 @@ Layout makeHCUSwizzledLayout(const Buffer &buffer, int kPack) {
     if (!analyzer.CanProveEqual(layout->InputShape()[i], output_shape[i]))
       return layout;
   }
-  // The compact XOR map is self-inverse. Preserve its forward map and
-  // expose the inverse wherever this shared layout is used.
+  // A compact row-wise XOR layout is self-inverse.
   return layout->WithInverse(layout);
 }
 
