@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <bitset>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <tuple>
 #include <unordered_map>
@@ -703,6 +704,147 @@ public:
   }
 
 private:
+  struct MnSlice {
+    int axis;
+    int64_t offset;
+    int64_t extent;
+  };
+
+  mutable std::unordered_map<Call, std::optional<MnSlice>, ObjectPtrHash,
+                             ObjectPtrEqual>
+      mn_slice_relays_;
+  mutable std::unordered_map<Buffer, std::vector<MnSlice>, ObjectPtrHash,
+                             ObjectPtrEqual>
+      mn_slices_;
+  mutable std::unordered_map<Buffer, GemmWithInput, ObjectPtrHash,
+                             ObjectPtrEqual>
+      mn_slice_readers_;
+
+  bool SameReadTemplate(const GemmWithInput &lhs,
+                        const GemmWithInput &rhs) const {
+    const auto &a = lhs.gemm;
+    const auto &b = rhs.gemm;
+    return lhs.input.same_as(a->a_) == rhs.input.same_as(b->a_) &&
+           a->m_ == b->m_ && a->n_ == b->n_ && a->k_ == b->k_ &&
+           a->kPack_ == b->kPack_ && a->transA_ == b->transA_ &&
+           a->transB_ == b->transB_ && a->a_->dtype == b->a_->dtype &&
+           a->b_->dtype == b->b_->dtype && a->c_->dtype == b->c_->dtype &&
+           a->policy_->policy_type == b->policy_->policy_type &&
+           !a->IsInstance<GemmBlockScaledNode>() &&
+           !b->IsInstance<GemmBlockScaledNode>();
+  }
+
+  Map<String, ObjectRef> ReadAnnotations(const GemmWithInput &reader) const {
+    const auto &gemm = reader.gemm;
+    Map<String, ObjectRef> result;
+    for (const auto &[key, value] :
+         AnnotateGemmHcuMlsFlags(gemm->annotations_, gemm.get(), collector_)) {
+      // Keep HCU mode/layout controls; unrelated GEMM metadata is immaterial.
+      const std::string name = key;
+      if (name.rfind("tl.hcu", 0) == 0 || name == "tl.a_from_mls" ||
+          name == "tl.b_from_mls" || name == "trans_c")
+        result.Set(key, value);
+    }
+    return result;
+  }
+
+  bool IsIdentityCopy(const CopyNode &copy) const {
+    if (!IsFragmentBuffer(copy.dst))
+      return false;
+    if (IsSharedBuffer(copy.src) && copy.src->shape.size() > 2 &&
+        copy.dst->shape.size() == 2) {
+      return StructuralEqual()(LdsTileShape(copy.src), copy.dst->shape) &&
+             IsFullLdsTileRegion(BufferRegion(copy.src, copy.src_range)) &&
+             IsFullPlainRegion(BufferRegion(copy.dst, copy.dst_range));
+    }
+    return StructuralEqual()(copy.src->shape, copy.dst->shape) &&
+           IsFullPlainRegion(BufferRegion(copy.src, copy.src_range)) &&
+           IsFullPlainRegion(BufferRegion(copy.dst, copy.dst_range));
+  }
+
+  mutable std::unordered_map<Call, bool, ObjectPtrHash, ObjectPtrEqual>
+      identity_relays_;
+
+  bool IsIdentityRelay(const Buffer &input, const Buffer &output,
+                       const CallNode *call) const {
+    if (!call)
+      return register_access_proof_.Preserves(input, output);
+    const Call site = GetRef<Call>(call);
+    auto cached = identity_relays_.find(site);
+    if (cached != identity_relays_.end())
+      return cached->second;
+    auto parsed = ParseOperator(site);
+    const auto *copy = parsed.as<CopyNode>();
+    const bool identity = copy && IsIdentityCopy(*copy);
+    identity_relays_.emplace(site, identity);
+    return identity;
+  }
+
+  std::optional<MnSlice> MatchMnSliceRelay(const Call &call) const {
+    auto cached = mn_slice_relays_.find(call);
+    if (cached != mn_slice_relays_.end())
+      return cached->second;
+    auto match = [&]() -> std::optional<MnSlice> {
+      auto parsed = ParseOperator(call);
+      const auto *copy = parsed.as<CopyNode>();
+      if (!copy || !IsSharedBuffer(copy->src) || !IsFragmentBuffer(copy->dst) ||
+          copy->src->shape.size() != 2 || copy->dst->shape.size() != 2 ||
+          !copy->src->strides.empty() || !is_zero(copy->src->elem_offset) ||
+          copy->src->dtype != copy->dst->dtype || copy->src_range.size() != 2 ||
+          !IsFullPlainRegion(BufferRegion(copy->dst, copy->dst_range)))
+        return std::nullopt;
+      int axis = -1;
+      int64_t offset = 0, extent = 0;
+      for (int i = 0; i < 2; ++i) {
+        const auto *size = as_const_int(copy->src->shape[i]);
+        const auto *begin = as_const_int(copy->src_range[i]->min);
+        const auto *length = as_const_int(copy->src_range[i]->extent);
+        if (!size || !begin || !length || *begin < 0 || *length <= 0 ||
+            *length > *size || *begin > *size - *length ||
+            !StructuralEqual()(copy->src_range[i]->extent, copy->dst->shape[i]))
+          return std::nullopt;
+        if (*begin != 0 || *length != *size) {
+          if (axis != -1 || *size % *length)
+            return std::nullopt;
+          axis = i;
+          offset = *begin;
+          extent = *length;
+        }
+      }
+      if (axis == -1)
+        return std::nullopt;
+      return MnSlice{axis, offset, extent};
+    };
+    auto result = match();
+    mn_slice_relays_.emplace(call, result);
+    return result;
+  }
+
+  bool MnSlicesMatchStrategy(const Buffer &buffer,
+                             const HcuGemmAtBnLdsStrategy &strategy,
+                             int mn_atom) const {
+    auto slices = mn_slices_.find(buffer);
+    if (slices == mn_slices_.end())
+      return true;
+    const auto &p = strategy;
+    int period = p->row_period;
+    if (p->wrap_idx_mask != 0) {
+      // Repeat a complete copy-slot permutation, not just a bank ring.
+      period = p->block_threads * p->copy_transaction_bytes /
+               (p->block_k * p->element_bytes);
+      if (p->wrap_idx_mask + 1 > p->block_threads / p->warp_size)
+        period *= p->copy_transactions_per_lane;
+      if (p->bank_num == 64 && p->read_bytes_per_lane == 16)
+        period = std::lcm(period, 16);
+    }
+    period = std::lcm(period, mn_atom);
+    for (const auto &slice : slices->second) {
+      if (slice.axis != 0 || slice.offset % period || slice.extent % mn_atom)
+        return false;
+    }
+    return true;
+  }
+
   struct PlainReadContract {
     int warp_m, warp_n, warp_k, min_n;
     Fragment layout;
@@ -782,7 +924,10 @@ private:
 
     // ParseOperator may create several GemmNodes for one call. Use its stable
     // call site so different source candidates share the consumer query.
-    const auto consumer_layout = QueryConsumerLayout(consumer);
+    auto slice_reader = mn_slice_readers_.find(source);
+    const auto consumer_layout = QueryConsumerLayout(
+        slice_reader == mn_slice_readers_.end() ? consumer
+                                                : slice_reader->second);
     int wm = Downcast<Integer>(consumer_layout[0])->value;
     int wn = Downcast<Integer>(consumer_layout[1])->value;
     int wk = Downcast<Integer>(consumer_layout[2])->value;
@@ -884,10 +1029,23 @@ private:
     const bool feeds_a = consumer.input.same_as(gemm->a_);
     const size_t rank = copy.dst_range.size();
     if (!analyzer_->CanProveEqual(copy.dst_range[rank - 2]->extent,
-                                  Integer(gemm->k_)) ||
-        !analyzer_->CanProveEqual(copy.dst_range[rank - 1]->extent,
-                                  Integer(feeds_a ? gemm->m_ : gemm->n_)))
+                                  Integer(gemm->k_)))
       return std::nullopt;
+    const int mn = feeds_a ? gemm->m_ : gemm->n_;
+    auto slices = mn_slices_.find(copy.dst);
+    if (slices == mn_slices_.end()) {
+      if (!analyzer_->CanProveEqual(copy.dst_range[rank - 1]->extent,
+                                    Integer(mn)))
+        return std::nullopt;
+    } else {
+      if (!IsFullLdsTileRegion(BufferRegion(copy.dst, copy.dst_range)))
+        return std::nullopt;
+      for (const auto &slice : slices->second) {
+        if (slice.axis != 1 || slice.extent != mn || slice.offset % 32 ||
+            slice.extent % 32)
+          return std::nullopt;
+      }
+    }
     const int bits = copy.dst->dtype.bits();
     return HcuGemmLdsReadPattern{bits, 256 / bits, 32, 128 / bits,
                                  HcuGemmLdsAccessKind::kAnBt};
@@ -1172,7 +1330,10 @@ private:
     if (!consumers || consumers->empty())
       return std::nullopt;
     const bool feeds_a = consumer.input.same_as(gemm->a_);
-    const auto facts = QueryConsumerLayout(consumer);
+    auto slice_reader = mn_slice_readers_.find(buffer);
+    const auto facts = QueryConsumerLayout(
+        slice_reader == mn_slice_readers_.end() ? consumer
+                                                : slice_reader->second);
     const int wm = Downcast<Integer>(facts[0])->value;
     const int wn = Downcast<Integer>(facts[1])->value;
     const int wk = Downcast<Integer>(facts[2])->value;
@@ -1256,10 +1417,9 @@ private:
                copy->dst->dtype != buffer->dtype ||
                !copy->dst->strides.empty() || !is_zero(copy->dst->elem_offset)))
             return std::nullopt;
-          if (!IsFullLdsTileRegion(BufferRegion(copy->src, copy->src_range)) ||
-              !IsFullPlainRegion(BufferRegion(copy->dst, copy->dst_range)) ||
-              !StructuralEqual()(LdsTileShape(copy->src), copy->dst->shape) ||
-              copy->dst.scope() != "local.fragment")
+          if (!IsIdentityCopy(*copy.get()) &&
+              (!MatchMnSliceRelay(GetRef<Call>(relay.call)) ||
+               !GetExclusiveGemmConsumersAfterCall(buffer, nullptr)))
             return std::nullopt;
         }
       }
@@ -1391,8 +1551,15 @@ private:
     auto reader = PrepareOrdinaryLdsRead(copy.dst, consumer);
     if (!reader)
       return std::nullopt;
-    return DeriveHcuGemmAtBnLdsStrategy(copy, *reader,
-                                        CurrentStrategyThreadBounds(), target_);
+    if (mn_slices_.count(copy.dst) &&
+        !IsFullLdsTileRegion(BufferRegion(copy.dst, copy.dst_range)))
+      return std::nullopt;
+    auto strategy = DeriveHcuGemmAtBnLdsStrategy(
+        copy, *reader, CurrentStrategyThreadBounds(), target_);
+    if (strategy.defined() &&
+        !MnSlicesMatchStrategy(copy.dst, strategy.value(), reader->mn_atom))
+      return std::nullopt;
+    return strategy;
   }
 
   Optional<HcuGemmAnBtLdsStrategy>
@@ -1444,6 +1611,9 @@ private:
     Optional<HcuGemmAnBtLdsStrategy> an_bt_strategy;
     std::optional<GemmWithInput> an_bt_consumer;
     for (const GemmWithInput &consumer : consumers) {
+      if (mn_slices_.count(copy.dst) &&
+          (at_bn_strategy.defined() || an_bt_strategy.defined()))
+        continue;
       Optional<HcuGemmAtBnLdsStrategy> current_at_bn =
           TryDeriveAtBnStrategy(copy, consumer);
       Optional<HcuGemmAnBtLdsStrategy> current_an_bt =
@@ -1594,21 +1764,56 @@ private:
     auto result = QueryGemmConsumers(
         buffer, collector_, order, true,
         [&](const Buffer &input, const Buffer &output, const CallNode *call) {
-          if (!call)
-            return register_access_proof_.Preserves(input, output);
-          auto parsed = ParseOperator(GetRef<Call>(call));
-          const auto *copy = parsed.as<CopyNode>();
-          if (copy && IsSharedBuffer(input) && input->shape.size() > 2 &&
-              output->shape.size() == 2 && IsFragmentBuffer(output)) {
-            return StructuralEqual()(LdsTileShape(input), output->shape) &&
-                   IsFullLdsTileRegion(BufferRegion(input, copy->src_range)) &&
-                   IsFullPlainRegion(BufferRegion(output, copy->dst_range));
-          }
-          return copy && IsFragmentBuffer(output) &&
-                 StructuralEqual()(input->shape, output->shape) &&
-                 IsFullPlainRegion(BufferRegion(input, copy->src_range)) &&
-                 IsFullPlainRegion(BufferRegion(output, copy->dst_range));
+          return IsIdentityRelay(input, output, call) ||
+                 (call && MatchMnSliceRelay(GetRef<Call>(call)).has_value());
         });
+    if (result && !result->empty()) {
+      std::vector<MnSlice> slices;
+      for (const auto &reader : collector_->GetReaderCalls(buffer)) {
+        if (!reader.call || reader.stmt_order <= order)
+          continue;
+        auto slice = mn_slice_relays_.find(GetRef<Call>(reader.call));
+        if (slice != mn_slice_relays_.end() && slice->second)
+          slices.push_back(*slice->second);
+      }
+      if (!slices.empty()) {
+        if (after_site_call) {
+          // One allocation has one layout: validate all consumers once. Only
+          // the unfiltered query owns buffer-wide slice facts.
+          if (!GetExclusiveGemmConsumersAfterCall(buffer, nullptr))
+            result = std::nullopt;
+        } else {
+          const auto &representative = result->front();
+          const auto annotations = ReadAnnotations(representative);
+          for (size_t i = 1; i < result->size(); ++i) {
+            const auto &reader = (*result)[i];
+            if (!SameReadTemplate(representative, reader) ||
+                !StructuralEqual()(annotations, ReadAnnotations(reader))) {
+              result = std::nullopt;
+              break;
+            }
+          }
+          if (result) {
+            const bool feeds_a =
+                representative.input.same_as(representative.gemm->a_);
+            const int axis = IsAtBnAccess(representative) ? 0 : 1;
+            const int mn =
+                GetHcuGemmLdsMnExtent(*representative.gemm.get(), feeds_a);
+            for (const auto &slice : slices) {
+              if (slice.axis != axis || slice.extent != mn ||
+                  (axis == 1 && (slice.offset % 32 || slice.extent % 32))) {
+                result = std::nullopt;
+                break;
+              }
+            }
+          }
+          if (result) {
+            mn_slices_.emplace(buffer, std::move(slices));
+            mn_slice_readers_.emplace(buffer, representative);
+          }
+        }
+      }
+    }
     consumer_queries_.emplace(key, result);
     return result;
   }
