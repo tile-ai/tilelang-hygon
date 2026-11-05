@@ -87,6 +87,7 @@ struct HcuOrdinaryLdsReadInfo {
   int mn_extent;
   int warp_mn_count;
   int mn_atom;
+  int warp_k_count{1};
 };
 
 /*! \brief Closed-form ordinary-copy layout; leading dimensions are unchanged.

@@ -295,48 +295,6 @@ bool IsAnBtLinearDsReadCopyCandidate(const CopyNode *copy,
          IsStaticMultipleOf(copy->dst_range[dr - 1]->extent, 32);
 }
 
-struct ThreadExtentInfo {
-  int block_threads{-1};
-  IterVar thread_var;
-};
-
-class ThreadExtentCollector : public StmtExprVisitor {
-public:
-  static ThreadExtentInfo Collect(const Stmt &body) {
-    ThreadExtentCollector collector;
-    collector(body);
-    if (collector.thread_x_extent_ <= 1 || collector.thread_y_extent_ != 1 ||
-        collector.thread_z_extent_ != 1) {
-      return {};
-    }
-    return {collector.thread_x_extent_, collector.thread_x_var_};
-  }
-
-private:
-  void VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tirx::attr::thread_extent) {
-      if (const auto *iter_var = op->node.as<IterVarNode>()) {
-        if (const int64_t *extent = as_const_int(op->value)) {
-          if (iter_var->thread_tag == "threadIdx.x") {
-            thread_x_extent_ = static_cast<int>(*extent);
-            thread_x_var_ = GetRef<IterVar>(iter_var);
-          } else if (iter_var->thread_tag == "threadIdx.y") {
-            thread_y_extent_ = static_cast<int>(*extent);
-          } else if (iter_var->thread_tag == "threadIdx.z") {
-            thread_z_extent_ = static_cast<int>(*extent);
-          }
-        }
-      }
-    }
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
-  int thread_x_extent_{-1};
-  int thread_y_extent_{1};
-  int thread_z_extent_{1};
-  IterVar thread_x_var_;
-};
-
 bool HaveCompatibleAtBnStrategyParameters(const HcuGemmAtBnLdsStrategy &lhs,
                                           const HcuGemmAtBnLdsStrategy &rhs) {
   // warp_mn_count is consumer-local partition metadata. It validates strategy
@@ -643,16 +601,15 @@ std::optional<GemmWithInput> GemmWithInputFromReaderCall(const CallNode *call,
 
 class AnnotateMlsGemmDepMutator : public arith::IRMutatorWithAnalyzer {
 public:
-  enum class Mode { kCollectCandidates, kMaterialize };
+  enum class Mode { kCollectThreadDomains, kCollectCandidates, kMaterialize };
 
   AnnotateMlsGemmDepMutator(
-      PropagationTirCollector *collector, Target target, int block_threads,
-      IterVar thread_var, arith::Analyzer *analyzer, Mode mode,
+      PropagationTirCollector *collector, Target target,
+      arith::Analyzer *analyzer, Mode mode,
       std::unordered_set<Call, ObjectPtrHash, ObjectPtrEqual> selected_calls =
           {})
       : arith::IRMutatorWithAnalyzer(analyzer), collector_(collector),
-        target_(std::move(target)), block_threads_(block_threads),
-        thread_var_(std::move(thread_var)), mode_(mode),
+        target_(std::move(target)), mode_(mode),
         selected_calls_(std::move(selected_calls)) {}
 
   static PrimFunc Substitute(PrimFunc f) {
@@ -666,11 +623,10 @@ public:
     Map<Var, Buffer> buffer_map = BuildBufferMap(f);
     PropagationTirCollector collector(buffer_map);
     collector.Collect(f->body);
-    ThreadExtentInfo thread = ThreadExtentCollector::Collect(f->body);
     arith::Analyzer analyzer;
-    AnnotateMlsGemmDepMutator mutator(&collector, target.value(),
-                                      thread.block_threads, thread.thread_var,
-                                      &analyzer, Mode::kCollectCandidates);
+    AnnotateMlsGemmDepMutator mutator(&collector, target.value(), &analyzer,
+                                      Mode::kCollectCandidates);
+    mutator.CollectConsumerThreads(f->body);
     mutator.register_access_proof_(f->body);
     PrimFuncNode *fn = f.CopyOnWrite();
     fn->body = mutator(f->body);
@@ -686,13 +642,13 @@ public:
     Map<Var, Buffer> buffer_map = BuildBufferMap(f);
     PropagationTirCollector collector(buffer_map);
     collector.Collect(f->body);
-    ThreadExtentInfo thread = ThreadExtentCollector::Collect(f->body);
     arith::Analyzer analyzer;
     auto selected_calls = PipelineAsyncProducerCollector::Collect(f->body);
-    AnnotateMlsGemmDepMutator mutator(
-        &collector, target.value(), thread.block_threads, thread.thread_var,
-        &analyzer, Mode::kMaterialize, std::move(selected_calls));
+    AnnotateMlsGemmDepMutator mutator(&collector, target.value(), &analyzer,
+                                      Mode::kMaterialize,
+                                      std::move(selected_calls));
     PlainCopyWriterGate writer_gate;
+    mutator.CollectConsumerThreads(f->body);
     mutator.register_access_proof_(f->body);
     writer_gate(f->body);
     mutator.blocked_plain_buffers_ = std::move(writer_gate.blocked);
@@ -704,6 +660,25 @@ public:
   }
 
 private:
+  // Queries can originate at an allocation or in a producer branch. Record
+  // each GEMM's own thread domain before matching producers to consumers.
+  void CollectConsumerThreads(const Stmt &body) {
+    const Mode saved_mode = mode_;
+    mode_ = Mode::kCollectThreadDomains;
+    (*this)(body);
+    mode_ = saved_mode;
+  }
+
+  int ConsumerThreads(const GemmWithInput &consumer) const {
+    ICHECK(consumer.site.defined()) << "GEMM consumer has no call site";
+    auto it = consumer_threads_.find(consumer.site.value());
+    ICHECK(it != consumer_threads_.end()) << "Missing GEMM thread domain";
+    return it->second;
+  }
+
+  std::unordered_map<Call, int, ObjectPtrHash, ObjectPtrEqual>
+      consumer_threads_;
+
   struct MnSlice {
     int axis;
     int64_t offset;
@@ -730,6 +705,7 @@ private:
            a->transB_ == b->transB_ && a->a_->dtype == b->a_->dtype &&
            a->b_->dtype == b->b_->dtype && a->c_->dtype == b->c_->dtype &&
            a->policy_->policy_type == b->policy_->policy_type &&
+           ConsumerThreads(lhs) == ConsumerThreads(rhs) &&
            !a->IsInstance<GemmBlockScaledNode>() &&
            !b->IsInstance<GemmBlockScaledNode>();
   }
@@ -881,7 +857,7 @@ private:
     ICHECK(query.has_value())
         << "HCU Python operand-layout query is not registered";
     auto result = Downcast<Array<ObjectRef>>(
-        (*query)(Gemm(node), target_, block_threads_, feeds_a));
+        (*query)(Gemm(node), target_, ConsumerThreads(consumer), feeds_a));
     ICHECK_EQ(result.size(), 7U);
     consumer_layouts_.emplace(key, std::make_pair(owner, result));
     return result;
@@ -937,8 +913,12 @@ private:
     const int native_k = 256 / source->dtype.bits();
     // Do not change the consumer partition or introduce extra MN replication
     // to make a matrix read fit. The instruction owns MN32 per wave.
-    if (wk != 1 || warp_mn <= 0 || mn % warp_mn || mn / warp_mn < 32 ||
-        (mn / warp_mn) % 32 || gemm->k_ % native_k)
+    if (wm <= 0 || wn <= 0 || wk <= 0 ||
+        int64_t(wm) * wn * wk * TargetHcuGetWarpSize(target_) !=
+            ConsumerThreads(consumer) ||
+        mn % warp_mn || mn / warp_mn < 32 || (mn / warp_mn) % 32 ||
+        gemm->k_ % wk || (gemm->k_ / wk) % native_k ||
+        (wk > 1 && gemm->n_ < wn * min_n))
       return std::nullopt;
     Fragment producer =
         feeds_a ? makeGemmFragmentAHCU(gemm->m_, gemm->n_, gemm->k_, wm, wn, wk,
@@ -1150,6 +1130,8 @@ private:
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
+    if (mode_ == Mode::kCollectThreadDomains)
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
     if (mode_ == Mode::kMaterialize) {
       if (auto value = op->annotations.Get(attr::kHcuGemmAnBtLdsStrategy)) {
         HcuGemmAnBtLdsStrategy strategy =
@@ -1344,11 +1326,13 @@ private:
     const auto shape = LdsTileShape(buffer);
     const auto *block_mn = as_const_int(shape[0]);
     const auto *block_k = as_const_int(shape[1]);
-    if (wk != 1 || wm <= 0 || wn <= 0 || warp_size <= 0 ||
-        block_threads_ % warp_size || wm * wn != block_threads_ / warp_size ||
+    if (wk <= 0 || wm <= 0 || wn <= 0 || warp_size <= 0 ||
+        ConsumerThreads(consumer) % warp_size ||
+        int64_t(wm) * wn * wk != ConsumerThreads(consumer) / warp_size ||
         !block_mn || !block_k || mn <= 0 || *block_mn < mn || *block_mn % mn ||
         *block_k != gemm->k_ || mn_atom <= 0 || mmac_k <= 0 ||
-        gemm->kPack_ <= 0)
+        gemm->kPack_ <= 0 || gemm->k_ % wk ||
+        (gemm->k_ / wk) % (int64_t(mmac_k) * gemm->kPack_))
       return std::nullopt;
     // Preserve the original MMAC element grouping. Only its storage bytes
     // change across a same-coordinate, one-to-one conversion chain.
@@ -1361,7 +1345,8 @@ private:
         {bits, 256 / bits, 32, elements, HcuGemmLdsAccessKind::kAtBn},
         mn,
         feeds_a ? wm : wn,
-        mn_atom};
+        mn_atom,
+        wk};
   }
 
   Optional<Layout>
@@ -1461,6 +1446,8 @@ private:
   }
 
   Stmt VisitStmt_(const SBlockNode *op) final {
+    if (mode_ == Mode::kCollectThreadDomains)
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
     Map<Var, Layout> block_layout_map;
     if (auto value = op->annotations.Get(attr::kLayoutMap)) {
       if (auto layout_map = value.value().as<Map<Var, Layout>>()) {
@@ -1549,7 +1536,7 @@ private:
   TryDeriveAtBnStrategy(const CopyNode &copy,
                         const GemmWithInput &consumer) const {
     auto reader = PrepareOrdinaryLdsRead(copy.dst, consumer);
-    if (!reader)
+    if (!reader || reader->warp_k_count != 1)
       return std::nullopt;
     if (mn_slices_.count(copy.dst) &&
         !IsFullLdsTileRegion(BufferRegion(copy.dst, copy.dst_range)))
@@ -1566,7 +1553,8 @@ private:
   TryDeriveAnBtStrategy(const CopyNode &copy, const GemmWithInput &consumer,
                         Optional<Layout> storage_layout = std::nullopt) const {
     auto read = MatrixReadPattern(copy, consumer);
-    if (!read) {
+    auto contract = MatrixReaderContract(copy.dst, consumer);
+    if (!read || !contract || (!storage_layout && contract->warp_k != 1)) {
       return std::nullopt;
     }
     return DeriveHcuGemmAnBtLdsStrategy(copy, *read,
@@ -1579,7 +1567,8 @@ private:
                                   const GemmWithInput &consumer,
                                   int wrap_count) const {
     auto read = MatrixReadPattern(copy, consumer);
-    if (!read) {
+    auto contract = MatrixReaderContract(copy.dst, consumer);
+    if (!read || !contract || contract->warp_k != 1) {
       return std::nullopt;
     }
     return DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
@@ -2012,10 +2001,16 @@ private:
       Map<String, ObjectRef> read_annotations;
       read_annotations.Set(attr::kHcuLinearDsRead, Integer(1));
       read_annotations.Set(attr::kHcuLayoutDsRead, Integer(1));
-      read_annotations.Set(attr::kMlsGemmDep,
-                           BuildCopyToGemmLinearMeta(
-                               {gemm, input}, IsFromMls(gemm->a_, collector_),
-                               IsFromMls(gemm->b_, collector_), target_));
+      GemmWithInput consumer{gemm, input, call};
+      auto contract = MatrixReaderContract(input, consumer);
+      ICHECK(contract)
+          << "layout-aware GEMM read requires a native fragment contract";
+      read_annotations.Set(
+          attr::kMlsGemmDep,
+          BuildCopyToGemmLinearMeta(consumer, IsFromMls(gemm->a_, collector_),
+                                    IsFromMls(gemm->b_, collector_), target_,
+                                    contract->warp_m, contract->warp_n,
+                                    contract->warp_k, contract->min_n));
       statements.push_back(Evaluate(
           Call(call->dtype, DsReadFormat::Get(),
                {args[slot], MakePlainFragmentRegion(fragment, kAccessWrite)},
@@ -2034,7 +2029,55 @@ private:
     return SBlockRealize({}, const_true(), block);
   }
 
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    const auto *iv = op->node.as<IterVarNode>();
+    int axis = -1;
+    if (op->attr_key == tirx::attr::thread_extent && iv) {
+      if (iv->thread_tag == "threadIdx.x")
+        axis = 0;
+      else if (iv->thread_tag == "threadIdx.y")
+        axis = 1;
+      else if (iv->thread_tag == "threadIdx.z")
+        axis = 2;
+    }
+    if (axis < 0)
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
+
+    // Scope the warp partition to the current kernel, not the last kernel
+    // in the PrimFunc. Only one-dimensional thread blocks are supported.
+    const int previous_extent = thread_extents_[axis];
+    const int previous_threads = block_threads_;
+    const IterVar previous_var = thread_var_;
+    const int64_t *extent = as_const_int(op->value);
+    thread_extents_[axis] =
+        extent && *extent > 0 && *extent <= INT_MAX ? *extent : -1;
+    if (axis == 0)
+      thread_var_ = GetRef<IterVar>(iv);
+    block_threads_ = thread_extents_[0] > 1 && thread_extents_[1] == 1 &&
+                             thread_extents_[2] == 1
+                         ? thread_extents_[0]
+                         : -1;
+    Stmt result = IRMutatorWithAnalyzer::VisitStmt_(op);
+    thread_extents_[axis] = previous_extent;
+    block_threads_ = previous_threads;
+    thread_var_ = previous_var;
+    return result;
+  }
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
+    if (mode_ == Mode::kCollectThreadDomains) {
+      if (const auto *call = op->value.as<CallNode>();
+          call && IsGemmTileOpCall(call)) {
+        Range bounds = ComputeThreadBounds(thread_var_, *analyzer_);
+        const int64_t *extent = as_const_int(bounds->extent);
+        consumer_threads_.emplace(GetRef<Call>(call),
+                                  block_threads_ > 0 && extent && *extent > 0 &&
+                                          *extent <= INT_MAX
+                                      ? static_cast<int>(*extent)
+                                      : -1);
+      }
+      return GetRef<Stmt>(op);
+    }
     auto call = op->value.as<CallNode>();
     if (call == nullptr || !call->op.as<OpNode>()) {
       return IRMutatorWithAnalyzer::VisitStmt_(op);
@@ -2226,9 +2269,10 @@ private:
         const bool feeds_a = consumer->input.same_as(consumer_gemm->a_);
         const bool has_layout = HasAnnotatedLayout(copy->src) ||
                                 auto_an_bt_strategies_.count(copy->src->data);
-        // The fallback template is B-specific. AN must have an explicit
-        // logical-to-physical map before it can use the generic vector read.
-        if ((feeds_a || copy->src->dtype.bits() == 8) && !has_layout) {
+        // The unmapped fallback supports only b16 B reads with WarpK=1.
+        if ((feeds_a || copy->src->dtype.bits() == 8 ||
+             contract->warp_k != 1) &&
+            !has_layout) {
           ICHECK(!explicit_read)
               << "ds_read_vector requires a legal MN-major LDS storage layout";
           return IRMutatorWithAnalyzer::VisitStmt_(op);
@@ -2345,6 +2389,7 @@ private:
   std::unordered_map<Var, Layout, ObjectPtrHash, ObjectPtrEqual> plain_layouts_;
   PropagationTirCollector *collector_;
   Target target_;
+  int thread_extents_[3]{-1, 1, 1};
   int block_threads_{-1};
   IterVar thread_var_;
   Mode mode_;

@@ -413,7 +413,6 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
     }
     int warp_mn = feeds_a ? policy->m_warp : policy->n_warp;
     int warp_k = policy->k_warp;
-    ICHECK_EQ(warp_k, 1) << "linear AN/BT ds_read requires WarpK == 1";
 
     Buffer src_buf = T.buffer_remap.count(src) ? T.buffer_remap[src] : src;
     Buffer dst_buf = T.buffer_remap.count(dst) ? T.buffer_remap[dst] : dst;
@@ -445,10 +444,19 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
 
       int warp_size = TargetHcuGetWarpSize(T.target);
       int total_warp = block_size / warp_size;
-      ICHECK_EQ(total_warp % warp_mn, 0);
+      ICHECK_GT(policy->m_warp, 0);
+      ICHECK_GT(policy->n_warp, 0);
+      ICHECK_GT(warp_k, 0);
+      ICHECK_EQ(total_warp, policy->m_warp * policy->n_warp * warp_k);
+      ICHECK_EQ(read_k % warp_k, 0);
+      const int per_warp_k = read_k / warp_k;
+      ICHECK_EQ(per_warp_k % read_tile_k, 0)
+          << "matrix ds_read requires a complete K atom per warp";
       int warp_mn_no_recompute =
           feeds_a ? warp_mn : std::min(warp_mn, static_cast<int>(read_mn / 32));
       ICHECK_GT(warp_mn_no_recompute, 0);
+      ICHECK(warp_k == 1 || warp_mn_no_recompute == warp_mn)
+          << "matrix ds_read does not support WarpK with MN recompute";
       ICHECK_EQ(read_mn % warp_mn_no_recompute, 0);
       int per_warp_mn = read_mn / warp_mn_no_recompute;
       ICHECK_EQ(per_warp_mn % 32, 0);
@@ -463,22 +471,29 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
       if (feeds_a) {
         warp_mn_idx = FloorMod(warp_id, make_const(warp_id.dtype(), warp_mn));
       } else {
-        warp_mn_idx =
-            FloorDiv(warp_id, make_const(warp_id.dtype(), policy->m_warp));
+        warp_mn_idx = FloorMod(
+            FloorDiv(warp_id, make_const(warp_id.dtype(), policy->m_warp)),
+            make_const(warp_id.dtype(), policy->n_warp));
       }
       if (warp_mn_no_recompute != warp_mn) {
         warp_mn_idx = FloorMod(
             warp_mn_idx, make_const(warp_mn_idx.dtype(), warp_mn_no_recompute));
       }
 
+      // GEMM orders warps M, N, K from the innermost dimension outward.
+      PrimExpr warp_k_idx =
+          FloorDiv(warp_id, make_const(warp_id.dtype(),
+                                       policy->m_warp * policy->n_warp));
       Array<Stmt> reads;
       for (int mn_panel = 0; mn_panel < per_warp_mn / 32; ++mn_panel) {
-        for (int k_tile = 0; k_tile < read_k / read_tile_k; ++k_tile) {
+        for (int k_tile = 0; k_tile < per_warp_k / read_tile_k; ++k_tile) {
           PrimExpr panel = analyzer->Simplify(
               warp_mn_idx * make_const(warp_mn_idx.dtype(), per_warp_mn / 32) +
               make_const(warp_mn_idx.dtype(), mn_panel));
           PrimExpr logical_k = analyzer->Simplify(
-              origin_dim0 + make_const(lane.dtype(), k_tile * read_tile_k) +
+              origin_dim0 +
+              warp_k_idx * make_const(warp_id.dtype(), per_warp_k) +
+              make_const(lane.dtype(), k_tile * read_tile_k) +
               FloorDiv(lane, make_const(lane.dtype(), lanes_per_row)));
           PrimExpr logical_n = analyzer->Simplify(
               origin_dim1 + panel * make_const(panel.dtype(), 32) +
@@ -530,6 +545,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
       return reads.size() == 1 ? reads[0] : SeqStmt(reads);
     }
 
+    ICHECK_EQ(warp_k, 1) << "unmapped linear AN/BT ds_read requires WarpK == 1";
     ICHECK(!feeds_a)
         << "GEMM AN linear ds_read requires a compiler-derived or explicit "
            "LDS layout";
