@@ -4,6 +4,7 @@
  */
 
 #include "support/check.h"
+#include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ir/cast.h>
 #include <tvm/ir/repr.h>
 #include <tvm/runtime/logging.h>
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <deque>
 #include <functional>
+#include <list>
 #include <memory>
 #include <optional>
 #include <queue>
@@ -442,6 +444,35 @@ public:
             layout_map.Set(buffer, layout);
             // Propagate to alias buffers as well
             propagate_alias(buffer, layout);
+            // Identity containment keeps a frozen read valid, but a write also
+            // requires the widened fragment's threads to stay inside the loop.
+            // An equal resubmit takes this path too; skip the recheck unless
+            // the thread map can differ. Compare input shapes first:
+            // Fragment::IsEqual returns true without comparing threads when
+            // those shapes are not structurally equal. Pass update_queue=false
+            // so a passing check cannot pull an unfinished user ahead of the
+            // anchor-first scan. kFree is the only level with an
+            // attempt-discard channel for this check.
+            bool changed = !StructuralEqual()(dst_layout->InputShape(),
+                                              src_layout->InputShape()) ||
+                           !dst_layout->IsEqual(src_layout.get());
+            if (changed && level == InferLevel::kFree &&
+                use_list_.count(buffer)) {
+              for (int idx : use_list_[buffer]) {
+                const auto *par = infer_list_[idx].as<ParallelOpNode>();
+                if (par == nullptr ||
+                    !par->IsLayoutInferenceComplete(InferLevel::kFree)) {
+                  continue;
+                }
+                const auto &indice_map = par->GetIndiceMap();
+                auto access = indice_map.find(buffer);
+                if (access == indice_map.end() || !access->second.is_write) {
+                  continue;
+                }
+                RunInferStep(idx, InferLevel::kFree, /*update_queue=*/false,
+                             layout_map, strict_layout_map, q, in_queue);
+              }
+            }
             continue;
           }
         }
@@ -1325,7 +1356,10 @@ private:
 
   // One complete free-mode attempt over `members`: seed pre-owned layouts
   // (used by the wide fallback), solve `attempt_root` first, propagate
-  // breadth-first, then run the remaining members in program order. A
+  // breadth-first, then prefer constraint propagation among the remaining
+  // members: an operator that touches a known layout runs before an
+  // unconstrained operator is allowed to create a free candidate. If no such
+  // operator remains, the earliest pending member becomes the next free seed. A
   // finalize that runs before its update nests are solved stays silent; the
   // reducer-edge wake in RunInferStep re-enqueues it the moment a site nest
   // solves (see ReducerDstSteering::FinalizesAwaitingSite), so every
@@ -1362,13 +1396,47 @@ private:
                    strict_layout_map, q, in_queue, candidate_vector_size_limit);
       FinishInferQueue(InferLevel::kFree, tmp_layout_map, strict_layout_map, q,
                        in_queue);
-      for (int other : members) {
-        if (other != attempt_root) {
-          RunInferStep(other, InferLevel::kFree, true, tmp_layout_map,
-                       strict_layout_map, q, in_queue);
-          FinishInferQueue(InferLevel::kFree, tmp_layout_map, strict_layout_map,
-                           q, in_queue);
+
+      // Keep the root enumeration unchanged, including reducer nests: the
+      // scalar candidate cap is applied only when that nest is the root.
+      // Among the remaining unfinished members, first run an operator that can
+      // propagate a known layout. Only fall back to a free candidate when none
+      // can. Re-scan after every step because a newly committed layout can
+      // constrain another member. Already-complete members are not part of
+      // this selection, so they cannot change who invents the next layout.
+      //
+      // Erasing a selected member preserves program order for both the
+      // anchored scan and the free fallback. Nodes that are already complete
+      // stay out of this list. A later in-place fragment widen rechecks a
+      // frozen Parallel that writes the widened buffer.
+      std::list<int> pending;
+      for (int member : members) {
+        if (member != attempt_root &&
+            !infer_list_[member]->IsLayoutInferenceComplete(
+                InferLevel::kFree)) {
+          pending.push_back(member);
         }
+      }
+      while (!pending.empty()) {
+        auto selected = pending.end();
+        for (auto it = pending.begin(); it != pending.end(); ++it) {
+          if (HasKnownLayoutAnchor(*it, tmp_layout_map)) {
+            selected = it;
+            break;
+          }
+        }
+
+        // If no remaining member has an anchor, preserve the old program-order
+        // fallback and let the first member create the next free candidate.
+        if (selected == pending.end()) {
+          selected = pending.begin();
+        }
+        int next = *selected;
+        pending.erase(selected);
+        RunInferStep(next, InferLevel::kFree, true, tmp_layout_map,
+                     strict_layout_map, q, in_queue);
+        FinishInferQueue(InferLevel::kFree, tmp_layout_map, strict_layout_map,
+                         q, in_queue);
       }
     } catch (const LayoutConflictException &e) {
       ok = false;
