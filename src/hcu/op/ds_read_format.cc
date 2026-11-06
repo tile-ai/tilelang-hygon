@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <map>
+#include <sstream>
 
 namespace tvm {
 namespace tl {
@@ -207,10 +208,11 @@ LayoutMap InferLayoutWithGemmDep(const DsReadFormatNode *self,
   auto layout = fragment->BindThreadRange(T.thread_bounds);
   if (T.layout_map.count(self->dst)) {
     if (!StructuralEqual()(layout, T.layout_map[self->dst])) {
-      LOG(FATAL) << "DsReadFormat layout conflict: inferred layout differs "
-                    "from existing "
-                    "layout for buffer "
-                 << self->dst;
+      std::ostringstream oss;
+      oss << "DsReadFormat layout conflict: inferred layout differs from "
+             "existing layout for buffer "
+          << self->dst;
+      throw LayoutConflictException(oss.str());
     }
   } else {
     result.Set(self->dst, layout);
@@ -310,10 +312,11 @@ LayoutMap DsReadFormatNode::InferLayout(const LayoutInferArgs &T,
     auto layout = fragment->BindThreadRange(T.thread_bounds);
     if (T.layout_map.count(dst)) {
       if (!StructuralEqual()(layout, T.layout_map[dst])) {
-        LOG(FATAL)
-            << "DsReadFormat layout conflict: inferred layout differs from "
+        std::ostringstream oss;
+        oss << "DsReadFormat layout conflict: inferred layout differs from "
                "existing layout for buffer "
             << dst;
+        throw LayoutConflictException(oss.str());
       }
     } else {
       result.Set(dst, layout);
