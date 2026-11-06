@@ -1425,7 +1425,8 @@ private:
             async_annotations, thread_binding_->var, buffer_remap_);
         ICHECK(inject_result.injected_hcu_async_copy || !parallel_prefer_async)
             << "T.Parallel(prefer_async=True) did not contain an eligible "
-               "HCU global-to-shared copy";
+               "HCU global-to-shared copy. "
+            << inject_result.rejection_reason;
         lowered = inject_result.stmt;
       }
     }
