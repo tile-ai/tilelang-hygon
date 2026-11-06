@@ -11,6 +11,7 @@
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/op.h>
 
+#include <map>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -25,7 +26,9 @@ namespace codegen {
 class CodeGenTileLangHCU final : public CodeGenC {
 public:
   CodeGenTileLangHCU();
+  void Init(bool output_ssa);
   std::string Finish();
+  bool UsesDistributedMetadata() const { return uses_distributed_metadata_; }
   void SetTarget(Target target) { target_ = std::move(target); }
   // override behavior
   void PrintFuncPrefix(std::ostream &os) final;
@@ -213,6 +216,11 @@ private:
   bool need_mma_h_{false};
   // whether need cast_smem_ptr_to_int helper function
   bool need_cast_smem_ptr_to_int_{false};
+  // Module state accumulates across AddFunction calls until Finish().
+  bool uses_distributed_metadata_{false};
+
+  bool TryEmitDistributedCall(const tirx::Call &call, std::ostream &os);
+  void EmitDistributedDeclarations(std::ostream &os);
   // The name of the barrier array in shared memory
   const std::string barrier_name_ = "barrier";
   // The alignment of the barrier array in shared memory

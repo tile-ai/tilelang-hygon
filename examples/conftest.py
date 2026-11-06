@@ -17,12 +17,21 @@ _configure_torch_extensions_dir()
 
 random.seed(0)
 
-try:
-    import torch
-except ImportError:
-    pass
-else:
-    torch.manual_seed(0)
+
+def pytest_configure(config):
+    # Avoid initializing HIP in the parent of distributed example ranks.
+    from pathlib import Path
+
+    distributed = Path(__file__).parent / "distributed"
+    if any((Path(config.invocation_params.dir) / str(arg).split("::", 1)[0]).resolve().is_relative_to(distributed) for arg in config.args):
+        return
+    try:
+        import torch
+    except ImportError:
+        pass
+    else:
+        torch.manual_seed(0)
+
 
 try:
     import numpy as np
@@ -119,6 +128,14 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         "warnings",
         "error",
     }
+    skipped = terminalreporter.stats.get("skipped", [])
+    if (
+        skipped
+        and all("HCU preflight:" in str(report.longrepr) for report in skipped)
+        and not any(terminalreporter.stats.get(kind) for kind in known_types.difference({"skipped", "deselected"}))
+    ):
+        terminalreporter.write_sep("-", "HCU tests skipped: environment preflight requirements were not met.")
+        return
     if sum(len(terminalreporter.stats.get(k, [])) for k in known_types.difference({"skipped", "deselected"})) == 0:
         terminalreporter.write_sep(
             "!",
