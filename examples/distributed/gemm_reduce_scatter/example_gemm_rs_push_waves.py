@@ -579,17 +579,18 @@ def run():
         dist.all_reduce(full)
         return full[rank * (n // world) : (rank + 1) * (n // world)].to(device="cuda", dtype=torch.float16)
 
-    def verify(expected, label):
+    def verify(expected, label, actual=None):
+        actual = output if actual is None else actual
         torch.cuda.current_stream().synchronize()
         torch.testing.assert_close(
-            output,
+            actual,
             expected,
             atol=1e-2,
             rtol=1e-2,
             msg=lambda msg: f"{label} rank={rank}: {msg}",
         )
         print(
-            f"{label} rank={rank}/{world} sample={output[0, 0].item():.6g} max_abs={(output - expected).abs().max().item():.6g} passed",
+            f"{label} rank={rank}/{world} sample={actual[0, 0].item():.6g} max_abs={(actual - expected).abs().max().item():.6g} passed",
             flush=True,
         )
 
@@ -672,12 +673,43 @@ def run():
         expected = reference()
         results = {"gpu_event_ms": device_ms(enqueue), "graph_gpu_event_ms": device_ms(graph.replay)}
         verify(expected, "post-timing-check")
+
+        # Preallocate the FP16 GEMM intermediate and RS output, just as the
+        # fused path preallocates its inbox/output. The CPU reference above is
+        # a correctness oracle; the timed baseline stays entirely on the GPU.
+        torch_partial = torch.empty_like(a)
+        torch_output = torch.empty_like(output)
+
+        def torch_path():
+            torch.mm(a, b, out=torch_partial)
+            dist.reduce_scatter_tensor(torch_output, torch_partial, group=rccl)
+
+        torch_path()
+        verify(expected, "torch-check", torch_output)
+        torch_graph = capture(torch_path)
+        torch_graph.replay()
+        verify(expected, "torch-graph-check", torch_output)
+        results["torch_gpu_event_ms"] = device_ms(torch_path)
+        results["torch_graph_gpu_event_ms"] = device_ms(torch_graph.replay)
+        verify(expected, "torch-post-timing-check", torch_output)
+
         reports = [None] * world
         dist.all_gather_object(reports, results)
         if rank == 0:
             worst = {key: max(row[key] for row in reports) for key in results}
             print(f"timings world_size={world} size={n} by_rank={reports}", flush=True)
             print(f"summary world_size={world} size={n} max_rank={worst}", flush=True)
+            for mode, ours_key, torch_key in (
+                ("eager", "gpu_event_ms", "torch_gpu_event_ms"),
+                ("graph", "graph_gpu_event_ms", "torch_graph_gpu_event_ms"),
+            ):
+                ours_ms, torch_ms = worst[ours_key], worst[torch_key]
+                print(
+                    f"world_size={world} size={n} mode={mode} "
+                    f"tilelang_ms={ours_ms:.6f} torch_ms={torch_ms:.6f} speedup={torch_ms / ours_ms:.3f}x",
+                    flush=True,
+                )
+        torch_graph.reset()
 
     torch.cuda.current_stream().synchronize()
     dist.barrier()

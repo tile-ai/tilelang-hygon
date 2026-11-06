@@ -18,7 +18,7 @@ HIP_VISIBLE_DEVICES=0,1 TILELANG_CACHE_DIR=/tmp/tl-rs-example \
   --size 4096 --benchmark
 ```
 
-默认先验证随机输入、连续复用、延迟发送与 Graph；`--benchmark` 再测当前完整流程，不运行旧方案比较。需要单机 2 或 4 张互通的 GPU，以及支持 RCCL 的 PyTorch。
+默认先验证随机输入、连续复用、延迟发送与 Graph；`--benchmark` 再测当前完整流程及 `torch.mm + RCCL reduce_scatter_tensor` 基线。两者使用相同输入、预热次数、重复次数和 GPU Event 计时，分别报告普通调用与 Graph replay 的中位耗时。`timings` 打印各 rank 结果，`summary` 取各指标的最慢 rank；随后按 `mode=eager/graph` 打印 TileLang/Torch 耗时与 `Torch / TileLang` 加速比。TileLang 耗时包含自身所需的尾屏障，Torch 基线包含 matmul 和 reduce-scatter，不额外添加尾屏障。需要单机 2 或 4 张互通的 GPU，以及支持 RCCL 的 PyTorch。
 
 当前实现采用已选定的配置：双卡原始顺序、四卡 rank swizzle、grid 80。以下为同批 Torch MM + RCCL RS 对比：连续 8 次 Graph replay 的每次平均时间，取 120 轮中位数；包含 reduce 和尾屏障。K 为每 rank 本地 K。
 
