@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import tvm_ffi
 
 from tilelang import _ffi_api
 from tilelang import language as T
@@ -291,6 +292,31 @@ def _parse_scale_shape(shape, k_major: bool) -> tuple[int, int]:
     return int(shape[-1]), int(shape[-2])
 
 
+def _make_hcu_operand_fragment(gemm, meta, partition, feeds_a: bool):
+    """Construct one operand using the same Python rules as final inference."""
+    wm, wn, wk, _min_m, min_n = partition
+    operand = gemm.A if feeds_a else gemm.B
+    bits = _hcu_layout_bits_for_dtype(operand.dtype, fp4_mmac_mode=meta.mmac_mode)
+    args = (int(gemm.M), int(gemm.N), int(gemm.K), wm, wn, wk, bits, int(gemm.k_pack))
+    if feeds_a:
+        return make_gemm_fragment_a_hcu(*args, bool(gemm.trans_A), mmac_k_dim=int(meta.mmac_k))
+    return make_gemm_fragment_b_hcu(*args, bool(gemm.trans_B), min_n, mmac_k_dim=int(meta.mmac_k), interleave=int(meta.b_ds_read_alt))
+
+
+@tvm_ffi.register_global_func("tl.hcu.query_gemm_operand_layout")
+def _query_hcu_gemm_operand_layout(gemm_node, target: Target, thread_nums: int, feeds_a: bool):
+    """Local consumer query only: no graph traversal or LayoutInference pass.
+
+    The caller supplies a private GemmNode/policy because partitioning updates
+    the policy. Return a typed FFI Array, not a Python-only tuple/list handle.
+    """
+    gemm = GemmHCUMMAC(gemm_node)
+    meta = _resolve_hcu_mls_meta(gemm_node, gemm.A, gemm.B, int(thread_nums), target)
+    partition = _compute_hcu_warp_partition(gemm, int(thread_nums), target, meta)
+    fragment = _make_hcu_operand_fragment(gemm, meta, partition, feeds_a)
+    return tvm_ffi.convert([tirx.IntImm("int32", x) for x in partition] + [fragment, tirx.IntImm("int32", int(meta.mmac_k))])
+
+
 class GemmHCUMMAC(GemmBase):
     """HCU matrix core GEMM: layout and lowering via Python ``HCUMatrixCoreIntrinEmitter``."""
 
@@ -307,12 +333,9 @@ class GemmHCUMMAC(GemmBase):
             raise ValueError("GemmHCUMMAC requires an HCU target")
         meta = _resolve_hcu_mls_meta(self.gemm_node, self.A, self.B, int(thread_nums), target)
         block_size = int(thread_nums)
-        fp4_mmac_mode = meta.mmac_mode
-        warp_m, warp_n, warp_k, _m_per_warp, min_n_per_warp = _compute_hcu_warp_partition(self, block_size, target, meta)
+        partition = _compute_hcu_warp_partition(self, block_size, target, meta)
+        warp_m, warp_n, warp_k, _m_per_warp, min_n_per_warp = partition
         elem_bits_c = int(DataType(self.C.dtype).bits)
-        elem_bits_a = _hcu_layout_bits_for_dtype(self.A.dtype, fp4_mmac_mode=fp4_mmac_mode)
-        elem_bits_b = _hcu_layout_bits_for_dtype(self.B.dtype, fp4_mmac_mode=fp4_mmac_mode)
-        mmac_k = int(meta.mmac_k)
         frag_c = make_gemm_fragment_hcu(
             int(self.M),
             int(self.N),
@@ -334,18 +357,7 @@ class GemmHCUMMAC(GemmBase):
             else:
                 out[self.A] = make_hcu_swizzled_layout(self.A, int(self.k_pack))
         elif is_fragment(self.A):
-            out[self.A] = make_gemm_fragment_a_hcu(
-                int(self.M),
-                int(self.N),
-                int(self.K),
-                warp_m,
-                warp_n,
-                warp_k,
-                elem_bits_a,
-                int(self.k_pack),
-                bool(self.trans_A),
-                mmac_k_dim=mmac_k,
-            )
+            out[self.A] = _make_hcu_operand_fragment(self, meta, partition, True)
         else:
             raise ValueError(f"Unsupported A scope for HCU gemm: {self.A.scope()}")
         if _is_shared_like(self.B):
@@ -356,20 +368,7 @@ class GemmHCUMMAC(GemmBase):
             else:
                 out[self.B] = make_hcu_swizzled_layout(self.B, int(self.k_pack))
         elif is_fragment(self.B):
-            out[self.B] = make_gemm_fragment_b_hcu(
-                int(self.M),
-                int(self.N),
-                int(self.K),
-                warp_m,
-                warp_n,
-                warp_k,
-                elem_bits_b,
-                int(self.k_pack),
-                bool(self.trans_B),
-                min_n_per_warp,
-                mmac_k_dim=mmac_k,
-                interleave=int(meta.b_ds_read_alt),
-            )
+            out[self.B] = _make_hcu_operand_fragment(self, meta, partition, False)
         else:
             raise ValueError(f"Unsupported B scope for HCU gemm: {self.B.scope()}")
         return out

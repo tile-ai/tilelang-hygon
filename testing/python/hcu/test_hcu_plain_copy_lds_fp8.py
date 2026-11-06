@@ -73,9 +73,9 @@ def pure_program(dtype="float8_e4m3fn", pack=1, identity=False, relay=False, fra
 def test_pure_atbn_factory(banks, packs):
     factory = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")
     args = [(32, 128), banks, 4]
-    actual = factory(*args, 8, 32, 32, 16, 16, [0] * len(packs), list(packs))
+    actual = factory(*args, 8, 32, 32, [8 * pack for pack in packs], [0] * len(packs))
     assert actual is None
-    assert factory(*args, 16, 16, 32, 8, 16, [0] * len(packs), list(packs)) is None
+    assert factory(*args, 16, 16, 32, [4 * pack for pack in packs], [0] * len(packs)) is None
 
 
 @pytest.mark.parametrize(
@@ -103,7 +103,7 @@ def test_fp8_anbt_materializes_entire_buffer(dtype, pack, relay):
 
 
 @pytest.mark.parametrize("dtype,identity", list(product(["float8_e4m3fn", "float8_e5m2"], [False, True])))
-def test_fp8_anbt_materialize_guard(dtype, identity):
+def test_fp8_explicit_anbt_layout_is_preserved(dtype, identity):
     mod = prepare_materialize(shared_program(dtype=dtype, stages=0), collect=False)
 
     def annotate(node):
@@ -131,12 +131,15 @@ def test_fp8_anbt_materialize_guard(dtype, identity):
         return func.with_body(tvm.tirx.stmt_functor.ir_transform(func.body, None, annotate, ["tirx.SBlock"]))
 
     mod = tvm.tirx.transform.prim_func_pass(transform, opt_level=0)(mod)
-    if identity:
-        MaterializeHcuGemmLdsStrategy()(mod)
-    else:
-        with pytest.raises(tvm.error.InternalError, match="fp8 AN/BT buffer s requires row-major storage") as error:
-            MaterializeHcuGemmLdsStrategy()(mod)
-        print("GUARD_TRIGGERED", str(error.value).splitlines()[-1])
+    result = MaterializeHcuGemmLdsStrategy()(mod)
+    plans, maps = plans_and_maps(result)
+    assert not any(buffer.name == "s" for buffer, _ in plans)
+    actual = next(layout for data, layout in maps.items() if data.name == "s")
+    expected = tl.layout.Layout((32, 64), lambda i, j: (i, j)) if identity else make_layout((32, 64), 64, (1,))
+    tvm.ir.assert_structural_equal(actual.index, expected.index)
+    # An explicit layout is handled by the ordinary GEMM reader, rather
+    # than being overwritten or forced through an incompatible linear read.
+    assert "tl.hcu_b_respect_layout_map" in str(result)
 
 
 @pytest.mark.parametrize("pack,k", [(1, 48), (2, 32)])

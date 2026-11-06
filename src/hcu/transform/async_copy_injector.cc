@@ -852,8 +852,13 @@ private:
             expr, {{thread_var_, IntImm(thread_var_->dtype, thread)},
                    {loop.loop_var, IntImm(loop.loop_var->dtype, value)}}));
         int64_t delta = 0;
-        if (!TryGetConstInt64(analyzer_.Simplify(curr - prev), &delta) ||
-            delta != 1) {
+        if (TryGetConstInt64(analyzer_.Simplify(curr - prev), &delta)) {
+          if (delta != 1) {
+            return false;
+          }
+        } else if (!analyzer_.CanProveEqual(curr, prev + 1)) {
+          // Swizzled offsets may retain modulo terms in outer loop variables.
+          // Require a proof of unit stride when simplification is inconclusive.
           return false;
         }
         prev = curr;
@@ -883,6 +888,10 @@ private:
         }
       }
       if (!src_contiguous || !dst_contiguous) {
+        rejection_reason_ = !src_contiguous ? "Cannot prove contiguous global "
+                                              "addresses across vector lanes."
+                                            : "Cannot prove contiguous shared "
+                                              "addresses across vector lanes.";
         return false;
       }
     }

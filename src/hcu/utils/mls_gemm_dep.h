@@ -51,6 +51,12 @@ public:
   int gemm_k{0};
   int gemm_k_pack{1};
   int gemm_mmac_k{0};
+  // Ordinary LDS reads retain the consumer's pre-selection warp partition.
+  // Zero means the explicit MLS ds_read_format path (historical inference).
+  int plain_warp_m{0};
+  int plain_warp_n{0};
+  int plain_warp_k{0};
+  int plain_min_n{0};
   bool gemm_trans_a{false};
   bool gemm_trans_b{false};
   bool a_from_mls{false};
@@ -73,6 +79,10 @@ public:
         .def_ro("gemm_k", &MlsGemmDepMetaNode::gemm_k)
         .def_ro("gemm_k_pack", &MlsGemmDepMetaNode::gemm_k_pack)
         .def_ro("gemm_mmac_k", &MlsGemmDepMetaNode::gemm_mmac_k)
+        .def_ro("plain_warp_m", &MlsGemmDepMetaNode::plain_warp_m)
+        .def_ro("plain_warp_n", &MlsGemmDepMetaNode::plain_warp_n)
+        .def_ro("plain_warp_k", &MlsGemmDepMetaNode::plain_warp_k)
+        .def_ro("plain_min_n", &MlsGemmDepMetaNode::plain_min_n)
         .def_ro("gemm_trans_a", &MlsGemmDepMetaNode::gemm_trans_a)
         .def_ro("gemm_trans_b", &MlsGemmDepMetaNode::gemm_trans_b)
         .def_ro("a_from_mls", &MlsGemmDepMetaNode::a_from_mls)

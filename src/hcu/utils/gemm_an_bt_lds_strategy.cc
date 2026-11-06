@@ -8,7 +8,6 @@
 
 #include "gemm_an_bt_lds_strategy.h"
 
-#include "hcu/op/gemm_partition.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/gemm_lds_access.h"
 #include "hcu/utils/gemm_lds_strategy_utils.h"
@@ -31,7 +30,6 @@ namespace {
 constexpr int kStrategyVersion = 7;
 constexpr int kDsReadPanelN = 32;
 constexpr int kDsReadPhaseBytes = 128;
-constexpr int kDsReadBytesPerLane = 16;
 constexpr int kDsReadWrapStepBytes = 64;
 constexpr int kDsReadWrapCount = 2;
 
@@ -90,6 +88,21 @@ Layout ExpandStorageLayout(const Layout &layout, const Buffer &buffer) {
 }
 
 bool IsPowerOfTwo(int value) { return value > 0 && (value & (value - 1)) == 0; }
+
+int GetRequiredWrapCount(int bytes_per_row, int bank_num, int bank_width_bytes,
+                         int element_bytes, int read_bytes_per_lane) {
+  const int phase_lanes = bank_num * bank_width_bytes / read_bytes_per_lane;
+  // b16 phases include all four N8 columns. b8 includes both N16
+  // columns on 32 banks, but fixes that selector on 64 banks.
+  const int column_groups =
+      element_bytes == 1 && bank_num == 64
+          ? 1
+          : kDsReadPanelN * element_bytes / read_bytes_per_lane;
+  const int row_classes = phase_lanes / column_groups;
+  const int row_bank_stride = bytes_per_row / bank_width_bytes;
+  const int row_period = bank_num / std::gcd(bank_num, row_bank_stride);
+  return std::max(1, row_classes / row_period);
+}
 
 Fragment MakeCopyLoopLayout(const AnBtStrategyParams &params, bool permute_rows,
                             int rows_per_copy_wave = 0,
@@ -275,10 +288,9 @@ bool SelectWrapStrategy(AnBtStrategyParams *params, Fragment *copy_layout,
     // The 32-bank b8 phase varies four K classes and its N16 selector.
     // The 64-bank phase instead fixes N16 and varies sixteen K rows.
     const int row_classes = params->bank_num == 32 ? 4 : 16;
-    const int row_bank_stride = bytes_per_row / params->bank_width_bytes;
-    const int row_period =
-        params->bank_num / std::gcd(params->bank_num, row_bank_stride);
-    const int required_wrap_count = std::max(1, row_classes / row_period);
+    const int required_wrap_count = GetRequiredWrapCount(
+        bytes_per_row, params->bank_num, params->bank_width_bytes,
+        params->element_bytes, params->read_bytes_per_lane);
     if (required_wrap_count == 1)
       return true;
     const int row_phases = params->read_tile_k / geometry->rows_per_group;
@@ -353,7 +365,7 @@ void HcuGemmAnBtLdsStrategyNode::RegisterReflection() {
 }
 
 static Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategyImpl(
-    const CopyNode &copy, const GemmNode &gemm, bool feeds_a,
+    const CopyNode &copy, const HcuGemmLdsReadPattern &read,
     Range thread_bounds, Target target, int forced_wrap_count,
     Optional<Layout> common_storage = std::nullopt) {
   const int64_t *thread_offset = as_const_int(thread_bounds->min);
@@ -369,31 +381,18 @@ static Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategyImpl(
       !(copy.dst->dtype.is_float16() || copy.dst->dtype.is_bfloat16() ||
         copy.dst->dtype.is_float8_e4m3fn() ||
         copy.dst->dtype.is_float8_e5m2()) ||
-      !HasOnlyUnitLeadingExtents(copy.dst_range) || gemm.kPack_ != 1) {
+      !HasOnlyUnitLeadingExtents(copy.dst_range)) {
     return std::nullopt;
   }
 
-  // AN (A, transA=true) and BT (B, transB=false) share the same
-  // K-leading MMAC fragment layout. Their physical LDS shape is [K, MN].
-  const bool has_an_bt_access =
-      GetHcuGemmLdsAccessKind(gemm, feeds_a) == HcuGemmLdsAccessKind::kAnBt;
-  if (!has_an_bt_access) {
+  // A verified AN/BT matrix reader owns this geometry. The downstream GEMM
+  // may use another dtype/kpack after register-side conversion.
+  if (read.consumer_kind != HcuGemmLdsAccessKind::kAnBt ||
+      read.element_bits != copy.dst->dtype.bits() ||
+      read.read_tile_k != 256 / read.element_bits ||
+      read.read_tile_mn != kDsReadPanelN ||
+      read.elements_per_read * read.element_bits != 128) {
     return std::nullopt;
-  }
-  if (!common_storage.defined()) {
-    // Match the Matrix read's per-warp MN32 contract, just as the common
-    // planner does. Extra waves cannot turn an MN16 warp into a Matrix read.
-    GemmWarpPolicy policy(gemm.policy_->policy_type);
-    if (block_threads % TargetHcuGetWarpSize(target) != 0)
-      return std::nullopt;
-    hcu::ComputeWarpPartitionHCU(*policy.get(), gemm.m_, gemm.n_, gemm.k_,
-                                 gemm.kPack_, copy.dst->dtype.bits(),
-                                 block_threads, target, false, false,
-                                 !gemm.transA_, gemm.transB_);
-    const int warp_mn = feeds_a ? policy->m_warp : policy->n_warp;
-    const int mn = GetHcuGemmLdsMnExtent(gemm, feeds_a);
-    if (policy->k_warp != 1 || mn % warp_mn || (mn / warp_mn) % 32)
-      return std::nullopt;
   }
 
   // The shared destination is the canonical logical GEMM tile.  A global
@@ -401,17 +400,15 @@ static Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategyImpl(
   // and H extents); CopyNode already maps those unit dimensions onto the
   // destination iteration domain.  Deriving the tile from the source's last
   // two dimensions would therefore reject otherwise valid copies.
-  const int read_tile_k = 256 / copy.dst->dtype.bits();
-  const int panel_mn = kDsReadPanelN;
+  const int read_tile_k = read.read_tile_k;
+  const int panel_mn = read.read_tile_mn;
   const size_t dst_rank = copy.dst_range.size();
   std::optional<int64_t> dst_k = StaticExtent(copy.dst_range, dst_rank - 2);
   std::optional<int64_t> dst_n = StaticExtent(copy.dst_range, dst_rank - 1);
   if (!dst_k || !dst_n || *dst_k <= 0 || *dst_n <= 0 ||
       *dst_k % read_tile_k != 0 || *dst_n % panel_mn != 0 ||
       !IsPowerOfTwo(static_cast<int>(*dst_k)) ||
-      !IsPowerOfTwo(static_cast<int>(*dst_n)) || gemm.k_ != *dst_k ||
-      GetHcuGemmLdsMnExtent(gemm, feeds_a) != *dst_n ||
-      GetHcuGemmOperandDType(gemm, feeds_a) != copy.dst->dtype) {
+      !IsPowerOfTwo(static_cast<int>(*dst_n))) {
     return std::nullopt;
   }
 
@@ -428,7 +425,7 @@ static Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategyImpl(
   params.bank_num = TargetHcuGetLdsBankCount(target);
   params.bank_width_bytes = TargetHcuGetLdsBankWidthBytes(target);
   params.element_bytes = copy.dst->dtype.bits() / 8;
-  params.read_bytes_per_lane = kDsReadBytesPerLane;
+  params.read_bytes_per_lane = read.elements_per_read * read.element_bits / 8;
   params.phase_bytes = kDsReadPhaseBytes;
   params.panel_mn = panel_mn;
   if (params.warp_size != 64 || params.block_threads % params.warp_size != 0 ||
@@ -516,23 +513,30 @@ static Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategyImpl(
   return strategy;
 }
 
-Optional<HcuGemmAnBtLdsStrategy>
-DeriveHcuGemmAnBtLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
-                             bool feeds_a, Range thread_bounds, Target target,
-                             Optional<Layout> storage_layout) {
-  return DeriveHcuGemmAnBtLdsStrategyImpl(copy, gemm, feeds_a, thread_bounds,
-                                          target, /*forced_wrap_count=*/0,
+Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategy(
+    const CopyNode &copy, const HcuGemmLdsReadPattern &read,
+    Range thread_bounds, Target target, Optional<Layout> storage_layout) {
+  return DeriveHcuGemmAnBtLdsStrategyImpl(copy, read, thread_bounds, target,
+                                          /*forced_wrap_count=*/0,
                                           std::move(storage_layout));
 }
 
 Optional<HcuGemmAnBtLdsStrategy> DeriveHcuGemmAnBtLdsStrategyWith64ByteWrap(
-    const CopyNode &copy, const GemmNode &gemm, bool feeds_a,
+    const CopyNode &copy, const HcuGemmLdsReadPattern &read,
     Range thread_bounds, Target target, int wrap_count) {
   if (wrap_count != kDsReadWrapCount) {
     return std::nullopt;
   }
-  return DeriveHcuGemmAnBtLdsStrategyImpl(copy, gemm, feeds_a, thread_bounds,
-                                          target, wrap_count);
+  return DeriveHcuGemmAnBtLdsStrategyImpl(copy, read, thread_bounds, target,
+                                          wrap_count);
+}
+
+bool HasPartialHcuGemmAnBtWrap(const HcuGemmAnBtLdsStrategy &strategy) {
+  const int required_wrap_count = GetRequiredWrapCount(
+      strategy->block_mn * strategy->element_bytes, strategy->bank_num,
+      strategy->bank_width_bytes, strategy->element_bytes,
+      strategy->read_bytes_per_lane);
+  return strategy->wrap_idx_mask + 1 < required_wrap_count;
 }
 
 void ValidateHcuGemmAnBtStorageLayout(const Layout &actual,

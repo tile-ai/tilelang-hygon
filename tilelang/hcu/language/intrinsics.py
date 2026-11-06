@@ -1,6 +1,6 @@
 """HCU-owned intrinsic frontends and compatibility spellings."""
 
-from tvm import tirx
+from tvm import DataType, tirx
 
 from tilelang.language.builtin import (
     annotate_consumer_reg_alloc,
@@ -48,6 +48,42 @@ def set_max_nreg_dec(reg_count):
 
 def ieee_fmaf(x, y, z, rounding_mode="rn"):
     return tirx.call_intrin(x.dtype, tirx.op.Op.get("tl.hcu_ieee_fmaf"), x, y, z, rounding_mode)
+
+
+def scaled_cast(value, scale, dtype, *, clamp=False):
+    """Convert between low-precision floats and float16/bfloat16/float32.
+
+    ``scale`` must have dtype ``float8_e8m0fnu``. A scalar scale broadcasts;
+    vector scales must match the source lanes. Raw scale bytes must be
+    explicitly reinterpreted as E8M0, not numerically cast.
+
+    ``clamp=True`` requests the instruction's [0, 1] clamp, not finite
+    saturation. This is one scaled conversion, not two casts and a multiply.
+    Widening multiplies by the decoded E8M0 scale; narrowing divides by it
+    before rounding to the destination format. Stochastic rounding is
+    not supported. ``clamp`` is available only for widening conversions.
+    """
+    value, scale = tirx.convert(value), tirx.convert(scale)
+    src, sf, dst = DataType(value.dtype), DataType(scale.dtype), DataType(dtype)
+    src_element = str(src).split("x")[0]
+    sf_element = str(sf).split("x")[0]
+    dst_element = str(dst).split("x")[0]
+    low = ("float8_e4m3fn", "float8_e5m2", "float4_e2m1fn")
+    high = ("float16", "bfloat16", "float32")
+    if not ((src_element in low and dst_element in high) or (src_element in high and dst_element in low)):
+        raise TypeError(f"scaled_cast unsupported conversion: {src} -> {dst}")
+    if sf_element != "float8_e8m0fnu":
+        raise TypeError(f"scaled_cast scale must be float8_e8m0fnu, got {sf}")
+    if dst.lanes not in (1, src.lanes):
+        raise ValueError("scaled_cast output lanes must match the source")
+    if sf.lanes not in (1, src.lanes):
+        raise ValueError("scaled_cast scale must be scalar or match the source lanes")
+    if not isinstance(clamp, bool):
+        raise TypeError("scaled_cast clamp must be a compile-time bool")
+    if clamp and dst_element in low:
+        raise ValueError("scaled_cast clamp is only supported for widening conversions")
+    result_dtype = dst_element if src.lanes == 1 else f"{dst_element}x{src.lanes}"
+    return tirx.call_intrin(result_dtype, tirx.op.Op.get("tl.scaled_cast"), value, scale, tirx.const(clamp, "bool"))
 
 
 def abarrier_init(abar_id, arrive_waves):
@@ -151,6 +187,7 @@ __all__ = (
     "set_max_nreg_inc",
     "set_max_nreg_dec",
     "ieee_fmaf",
+    "scaled_cast",
     "s_waitcnt",
     "sched_barrier",
 )

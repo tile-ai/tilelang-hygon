@@ -4,6 +4,11 @@
 from tilelang.transform import _ffi_api
 
 
+def LowerHcuScaledCast():
+    """Finalize scaled-conversion operand roles after vectorization."""
+    return _ffi_api.LowerHcuScaledCast()
+
+
 def AnnotateMlsGemmDep():
     """Annotate MLS producers and their GEMM consumers."""
     return _ffi_api.AnnotateMlsGemmDep()  # type: ignore
@@ -125,6 +130,7 @@ def VerifyPipelineSync():
 
 
 __all__ = (
+    "LowerHcuScaledCast",
     "AnnotateMlsGemmDep",
     "MaterializeHcuGemmLdsStrategy",
     "InjectHcuCopyIdxen",

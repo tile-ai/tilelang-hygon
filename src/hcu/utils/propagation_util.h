@@ -46,6 +46,8 @@ PropagateToFindGemmConsumerOp(Buffer buffer,
 struct GemmWithInput {
   Gemm gemm;
   Buffer input;
+  // Stable identity across repeated ParseOperator calls in one pass.
+  Optional<tirx::Call> site;
 };
 
 /*!
@@ -69,6 +71,15 @@ std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInputAfterCall(
 std::vector<GemmWithInput> PropagateToFindAllGemmConsumersAfterCall(
     Buffer buffer, const PropagationTirCollector *tir_collector,
     const CallNode *after_site_call);
+
+// Optional edge proof for automatic transformations. An empty predicate keeps
+// ordinary dependency traversal; a rejected edge makes exclusive=true fail.
+using GemmRelayPredicate =
+    std::function<bool(const Buffer &, const Buffer &, const CallNode *)>;
+std::optional<std::vector<GemmWithInput>>
+QueryGemmConsumers(Buffer buffer, const PropagationTirCollector *collector,
+                   int after_order, bool exclusive,
+                   const GemmRelayPredicate &accept = {});
 
 /*!
  * \brief Tile-op consumers that read `buffer`, in program order.

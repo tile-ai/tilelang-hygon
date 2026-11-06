@@ -90,6 +90,9 @@ def HCUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tirx.transform.Simplify()(mod)
     mod = tirx.transform.RemoveNoOp()(mod)
     mod = s_tir.transform.HoistIfThenElse()(mod)
+    # Normalize scalar scale/control arguments after vectorization and cleanup,
+    # before the common final HoistBroadcastValues pass.
+    mod = tilelang.hcu.transform.LowerHcuScaledCast()(mod)
     mod = tilelang.hcu.transform.InjectHcuCopyIdxen()(mod)
 
     mod = tirx.transform.VerifyMemory()(mod)

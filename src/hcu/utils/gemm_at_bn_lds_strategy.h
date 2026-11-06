@@ -8,9 +8,9 @@
 #ifndef TVM_TL_HCU_UTILS_GEMM_AT_BN_LDS_STRATEGY_H_
 #define TVM_TL_HCU_UTILS_GEMM_AT_BN_LDS_STRATEGY_H_
 
+#include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "layout/layout.h"
 #include "op/copy.h"
-#include "op/gemm.h"
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/target/target.h>
@@ -65,8 +65,9 @@ public:
 };
 
 Optional<HcuGemmAtBnLdsStrategy>
-DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy, const GemmNode &gemm,
-                             bool feeds_a, Range thread_bounds, Target target);
+DeriveHcuGemmAtBnLdsStrategy(const CopyNode &copy,
+                             const HcuOrdinaryLdsReadInfo &reader,
+                             Range thread_bounds, Target target);
 
 void ValidateHcuGemmAtBnStorageLayout(const Layout &actual,
                                       const HcuGemmAtBnLdsStrategy &strategy);

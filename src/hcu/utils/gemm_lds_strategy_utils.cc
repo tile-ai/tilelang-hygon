@@ -12,6 +12,8 @@
 #include "op/copy.h"
 #include "transform/loop_vectorize.h"
 
+#include <tvm/arith/analyzer.h>
+
 #include <climits>
 #include <numeric>
 
@@ -45,29 +47,34 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
   }
   bool has_an_bt = false;
   bool has_at_bn = false;
-  bool has_at_bn_pack2 = false;
+  bool has_at_bn_b64 = false;
+  bool has_at_bn_b128 = false;
   const int element_bits = consumers.front().element_bits;
   if (element_bits != 8 && element_bits != 16)
     return std::nullopt;
-  const int elements_per_read = 128 / element_bits;
+  // Preserve the existing shared swizzle's 128-bit contiguous groups,
+  // independently of each consumer's instruction width.
+  const int swizzle_group_elements = 128 / element_bits;
   const int read_tile_k = element_bits == 8 ? 32 : 16;
   if (rows < read_tile_k)
     return std::nullopt;
   for (const auto &read : consumers) {
     if (read.element_bits != element_bits || read.read_tile_k != read_tile_k ||
-        read.read_tile_mn != 32 ||
-        read.elements_per_read != elements_per_read ||
-        read.read_bytes_per_lane != 16)
+        read.read_tile_mn != 32 || read.elements_per_read <= 0 ||
+        read.elements_per_read > 128 / element_bits ||
+        !IsPowerOfTwo(read.elements_per_read))
       return std::nullopt;
+    const int read_bytes_per_lane = read.elements_per_read * element_bits / 8;
     if (read.consumer_kind == HcuGemmLdsAccessKind::kAnBt) {
-      if (read.consumer_k_pack != 1)
+      if (read_bytes_per_lane != 16)
         return std::nullopt;
       has_an_bt = true;
-    } else {
-      if (read.consumer_k_pack != 1 && read.consumer_k_pack != 2)
-        return std::nullopt;
+    } else if (read.consumer_kind == HcuGemmLdsAccessKind::kAtBn) {
       has_at_bn = true;
-      has_at_bn_pack2 |= read.consumer_k_pack == 2;
+      has_at_bn_b64 |= read_bytes_per_lane == 8;
+      has_at_bn_b128 |= read_bytes_per_lane == 16;
+    } else {
+      return std::nullopt;
     }
   }
   // Pure AT/BN keeps the existing makeHCUSwizzledLayout path. This
@@ -76,74 +83,130 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
     return std::nullopt;
   PrimExpr row = InputPlaceholder(0);
   PrimExpr col = InputPlaceholder(1);
+  // Measure row stride in bank words, not elements or read vectors.
+  // A stride of bank_count words returns to the same bank. The read's
+  // contiguous 16B suffix remains a separate instruction constraint.
+  const int element_bytes = element_bits / 8;
+  const int64_t row_bytes = width * element_bytes;
+  const int64_t row_bank_words = row_bytes / bank_width_bytes;
+  const int panel_bank_words = 32 * element_bytes / bank_width_bytes;
+  const int row_bank_period = static_cast<int>(
+      bank_count / std::gcd(static_cast<int64_t>(bank_count), row_bank_words));
+  // Keep row-major storage only when the pure matrix-read phase is
+  // already separated by the row stride. b8 and b16 have different phases.
+  const bool keep_identity_layout =
+      !has_at_bn &&
+      ((element_bits == 16 && row_bank_words == panel_bank_words) ||
+       (element_bits == 8 && bank_count == 32 && row_bank_period >= 4));
+  // Emit shifts in element coordinates to retain the established TIR
+  // form and code generation while selecting them by bank-word geometry.
+  const int read_log2_elements = element_bits == 8 ? 4 : 3;
+  auto map_row_bits = [&](int mask, int column_shift) {
+    return (row & mask) << column_shift;
+  };
   PrimExpr shift = Integer(0);
-  if (element_bits == 8) {
-    // b8 preserves a 16-element suffix. Its K32/N32 requests need a
-    // distinct row-bit mapping from the b16 K16/N32 contract.
-    if (bank_count == 32) {
-      if (width == 64)
-        shift = (row & 2) << 4;
-      if (width >= 128)
-        shift = (row & 3) << 5;
-      // NMZ b128 phases pair lanes 0..3 with 20..23. At width 128,
-      // injecting r1 into column bit 6 cancels the producer's lane bit 2.
-      // Use r1 for column bit 4 and r3 for bit 6 instead; the b8 matrix
-      // phase's r3/c relation preserves its three independent bank bits.
-      if (width == 128 || (has_at_bn && width >= 128))
-        shift = ((row & 1) << 5) ^ ((row & 10) << 3);
-      if (has_at_bn) {
-        // Cover the full b128 phase for AT/BN kp2 as well as the matrix
-        // phase. At width 64, r3 is broadcast into both N16-group bits.
-        if (width == 32)
-          shift = (row & 4) << 2;
-        else if (width == 64)
-          shift = ((row & 6) << 3) ^ ((row & 8) * 6);
-        else
-          shift = shift ^ ((row & 4) << 4);
+  if (!keep_identity_layout) {
+    if (bank_count == 64) {
+      if (element_bits == 16 && row_bank_words == panel_bank_words) {
+        if (has_at_bn_b64 && has_at_bn_b128) {
+          // Both native read widths need a joint row/vector permutation. Keep
+          // each 16B vector intact and encode its original column in the
+          // physical row, separating all three read phases and the store.
+          PrimExpr vector_col = floordiv(col, swizzle_group_elements);
+          PrimExpr physical_row =
+              floordiv(row, 16) * 16 + vector_col * 4 +
+              floormod(floordiv(row, 4), 2) +
+              ((floormod(floordiv(row, 8), 2) ^ floormod(vector_col, 2)) * 2);
+          PrimExpr physical_col =
+              ((floormod(row, 2) ^ floordiv(vector_col, 2)) *
+               swizzle_group_elements) +
+              floormod(floordiv(row, 2), 2) * (2 * swizzle_group_elements) +
+              floormod(col, swizzle_group_elements);
+
+          // This permutation is not self-inverse. Recover the original
+          // vector column before reconstructing the four low row bits.
+          PrimExpr inverse_vector_col = floormod(floordiv(row, 4), 4);
+          PrimExpr stored_row_bits = floordiv(col, swizzle_group_elements);
+          PrimExpr inverse_row =
+              floordiv(row, 16) * 16 +
+              (floormod(stored_row_bits, 2) ^ floordiv(inverse_vector_col, 2)) +
+              floordiv(stored_row_bits, 2) * 2 + floormod(row, 2) * 4 +
+              ((floormod(floordiv(row, 2), 2) ^
+                floormod(inverse_vector_col, 2)) *
+               8);
+          PrimExpr inverse_col = inverse_vector_col * swizzle_group_elements +
+                                 floormod(col, swizzle_group_elements);
+          Array<PrimExpr> matrix_shape{Integer(rows), Integer(width)};
+          Layout layout(matrix_shape, {physical_row, physical_col});
+          Layout inverse(matrix_shape, {inverse_row, inverse_col});
+          Array<PrimExpr> leading;
+          for (size_t i = 0; i + 2 < shape.size(); ++i)
+            leading.push_back(shape[i]);
+          return layout->Expand(leading)->WithInverse(inverse->Expand(leading));
+        }
+        // A single native read width only needs the original column selectors:
+        // 8B uses r2/r3; 16B uses r0/r3.
+        const int row_selector_mask = has_at_bn_b64 ? 4 : 1;
+        shift = ((row & row_selector_mask) *
+                 (swizzle_group_elements / row_selector_mask)) ^
+                map_row_bits(8, read_log2_elements - 2);
+      } else if (element_bits == 16 && has_at_bn && !has_at_bn_b128) {
+        // The existing short-read mapping is already conflict-free. Retain its
+        // expression to avoid extra register spills on wide b16 tiles.
+        shift =
+            map_row_bits(12, read_log2_elements - 2) ^
+            map_row_bits(4 - row_bank_period,
+                         read_log2_elements + (row_bank_period == 1 ? 2 : 1));
+      } else {
+        // A 256B read phase needs sixteen distinct 16B bank groups.
+        // Row stride supplies low row bits. Put r3 in the first column
+        // selector to avoid cancelling the native b128 column bit, then
+        // map the remaining r0..r2 above it, preserving each lane's 16B
+        // vector and row boundary.
+        const int remaining_row_mask = 8 - row_bank_period;
+        shift = map_row_bits(8, read_log2_elements - 3) ^
+                ((row & remaining_row_mask) *
+                 (2 * swizzle_group_elements / row_bank_period));
+      }
+    } else if (element_bits == 8) {
+      // b8 / 32 banks: four K classes in each matrix-read phase.
+      if (row_bank_period >= 4) {
+        // Pure reads kept identity above; mixed readers need r2.
+        shift = map_row_bits(4, read_log2_elements - 2);
+      } else if (row_bank_period == 2) {
+        // r3 fans out to the two available selectors for mixed reads.
+        shift = has_at_bn ? (map_row_bits(6, read_log2_elements - 1) ^
+                             ((row & 8) * (3 * swizzle_group_elements / 8)))
+                          : map_row_bits(2, read_log2_elements);
+      } else {
+        // A single bank ring couples the b128 producer's lane bit with
+        // r1. Use r3 instead; mixed readers need the same assignment.
+        shift = row_bank_words == bank_count || has_at_bn
+                    ? (map_row_bits(1, read_log2_elements + 1) ^
+                       map_row_bits(10, read_log2_elements - 1))
+                    : map_row_bits(3, read_log2_elements + 1);
+        if (has_at_bn)
+          shift = shift ^ map_row_bits(4, read_log2_elements);
       }
     } else {
-      if (width == 128)
-        shift = (row & 2) << 5;
-      if (width >= 256)
-        shift = (row & 3) << 6;
-      if (has_at_bn) {
-        shift = shift ^ ((row & 4) << 2);
-        if (width >= 64)
-          shift = shift ^ ((row & 8) << 2);
-      }
-      if (width == 64 && (!has_at_bn || has_at_bn_pack2)) {
-        // SB's 16-lane matrix and b128-read phases need independent row
-        // bits in both N16 selectors. Keep r2 off the low selector: the
-        // ordinary-read phase already pairs that bit with its N16 column.
-        // A pack1-only mixed consumer already has zero conflicts; retain
-        // its existing mapping rather than changing its producer addresses.
-        shift = ((row & 4) << 3) ^ ((row & 8) << 1);
+      // b16 / 32 banks: combine matrix, ordinary-read and store
+      // constraints without changing the continuous N8 suffix.
+      if (row_bank_period > 1) {
+        shift = map_row_bits(2, read_log2_elements) ^
+                map_row_bits(4, read_log2_elements - 2);
+      } else {
+        shift = map_row_bits(1, read_log2_elements + 1) ^
+                map_row_bits(2, read_log2_elements - 1) ^
+                map_row_bits(4, read_log2_elements) ^
+                map_row_bits(8, read_log2_elements - 2);
       }
     }
-  } else if (!has_at_bn) {
-    const int row_period = bank_count / std::gcd(bank_count, int(width / 2));
-    if (row_period == 1)
-      shift = (row & 1) << 5;
-  } else if (bank_count == 64) {
-    shift = (row & 12) << 1;
-    if (width == 64)
-      shift = shift ^ ((row & 2) << 4);
-    if (width >= 128)
-      shift = shift ^ ((row & 3) << 5);
-  } else {
-    shift = ((row & 2) << 3) ^ ((row & 4) << 1);
-    // Mix the fourth row bit as well: scalar AnBt reads can access rows
-    // eight apart in the same wave. Preserve the N8 vector suffix.
-    if (width >= 64)
-      shift = ((row & 1) << 4) ^ ((row & 2) << 2) ^ ((row & 4) << 3) ^
-              ((row & 8) << 1);
   }
-  // Express the preserved vector bits explicitly so vectorization and the
-  // symbolic ds-read contiguity check can see the affine vector suffix.
-  PrimExpr physical_col =
-      ((floordiv(col, elements_per_read) ^ floordiv(shift, elements_per_read)) *
-       elements_per_read) +
-      floormod(col, elements_per_read);
+  // Keep the vector suffix explicit for vectorization and ds-read proofs.
+  PrimExpr physical_col = ((floordiv(col, swizzle_group_elements) ^
+                            floordiv(shift, swizzle_group_elements)) *
+                           swizzle_group_elements) +
+                          floormod(col, swizzle_group_elements);
   Layout layout(Array<PrimExpr>{Integer(rows), Integer(width)},
                 {row, physical_col});
   Array<PrimExpr> leading;
@@ -294,18 +357,16 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       "tl.hcu.MakePlainGemmLdsLayout",
       [](Array<PrimExpr> shape, int bank_count, int bank_width_bytes,
          int element_bits, int read_tile_k, int read_tile_mn,
-         int elements_per_read, int read_bytes_per_lane,
-         Array<Integer> consumer_kinds, Array<Integer> consumer_k_packs) {
-        ICHECK_EQ(consumer_kinds.size(), consumer_k_packs.size());
+         Array<Integer> elements_per_read, Array<Integer> consumer_kinds) {
+        ICHECK_EQ(consumer_kinds.size(), elements_per_read.size());
         std::vector<HcuGemmLdsReadPattern> consumers;
         for (size_t i = 0; i < consumer_kinds.size(); ++i) {
           ICHECK(consumer_kinds[i]->value == 0 ||
                  consumer_kinds[i]->value == 1);
           consumers.push_back(
-              {element_bits, read_tile_k, read_tile_mn, elements_per_read,
-               read_bytes_per_lane,
-               static_cast<HcuGemmLdsAccessKind>(consumer_kinds[i]->value),
-               int(consumer_k_packs[i]->value)});
+              {element_bits, read_tile_k, read_tile_mn,
+               int(elements_per_read[i]->value),
+               static_cast<HcuGemmLdsAccessKind>(consumer_kinds[i]->value)});
         }
         return MakeHcuPlainGemmLdsLayout(shape, bank_count, bank_width_bytes,
                                          consumers);

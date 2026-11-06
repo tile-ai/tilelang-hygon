@@ -20,6 +20,32 @@ using fp8_e5_4_t = tl::bf8x4_t;
 using fp8_e5_8_t = tl::bf8x8_t;
 using fp8_e5_16_t = tl::bf8x16_t;
 
+// E8M0 has its own C++ identity. These are only bit carriers: no numeric
+// constructors, conversion operators, arithmetic, or BF8 template aliases.
+// Use bit_cast / T.reinterpret to enter or leave the encoded representation.
+struct fp8_e8_t {
+  uint8_t bits;
+};
+template <int Lanes> struct alignas(Lanes) fp8_e8_storage {
+  fp8_e8_t data[Lanes];
+};
+using fp8_e8_2_t = fp8_e8_storage<2>;
+using fp8_e8_4_t = fp8_e8_storage<4>;
+using fp8_e8_8_t = fp8_e8_storage<8>;
+using fp8_e8_16_t = fp8_e8_storage<16>;
+
+static_assert(sizeof(fp8_e8_t) == 1 && std::is_trivially_copyable_v<fp8_e8_t>);
+#define TL_E8M0_CHECK(N)                                                       \
+  static_assert(sizeof(fp8_e8_##N##_t) == N);                                  \
+  static_assert(alignof(fp8_e8_##N##_t) == N);                                 \
+  static_assert(std::is_trivially_copyable_v<fp8_e8_##N##_t>);                 \
+  static_assert(!std::is_same_v<fp8_e8_##N##_t, fp8_e5_##N##_t>);
+TL_E8M0_CHECK(2)
+TL_E8M0_CHECK(4)
+TL_E8M0_CHECK(8)
+TL_E8M0_CHECK(16)
+#undef TL_E8M0_CHECK
+
 // Tilelang's own fp8_e4_t (FP8 E4M3) conversion class
 // This provides true conversion with float and supports conversion to tl::fp8_t
 struct __align__(1) fp8_cvt_t {

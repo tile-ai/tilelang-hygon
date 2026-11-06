@@ -73,10 +73,21 @@ struct HcuGemmLdsReadPattern {
   int element_bits;
   int read_tile_k;
   int read_tile_mn;
+  // Logical LDS elements read by each lane in one instruction.
   int elements_per_read;
-  int read_bytes_per_lane;
   HcuGemmLdsAccessKind consumer_kind;
-  int consumer_k_pack;
+};
+
+// Ordinary-reader facts resolved before storage selection. Element groups
+// come from the real consumer MMAC geometry; byte widths come
+// exclusively from LDS storage. No arithmetic dtype or kpack is needed by a
+// storage strategy. MN geometry describes the existing AT/BN access family.
+struct HcuOrdinaryLdsReadInfo {
+  HcuGemmLdsReadPattern read;
+  int mn_extent;
+  int warp_mn_count;
+  int mn_atom;
+  int warp_k_count{1};
 };
 
 /*! \brief Closed-form ordinary-copy layout; leading dimensions are unchanged.

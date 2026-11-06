@@ -167,6 +167,8 @@ TVM_DLL const Op &tvm_ffi_call_with_result();
 /*! \brief Elementwise clamp with NaN propagation and single-evaluation
  * operands. */
 TVM_DLL const Op &clamp();
+/*! \brief Elementwise scaled conversion: value, E8M0 scale, clamp. */
+TVM_DLL const Op &scaled_cast();
 
 /*! \brief Shared clamp expansion for backends without a device helper. */
 TVM_DLL PrimExpr LowerClamp(PrimExpr expr);

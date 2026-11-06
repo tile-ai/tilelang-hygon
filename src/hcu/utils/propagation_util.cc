@@ -43,18 +43,8 @@ static std::optional<GemmWithInput> GemmWithInputFromCall(const CallNode *call,
   GemmWithInput r;
   r.gemm = gemm;
   r.input = input;
+  r.site = GetRef<Call>(call);
   return r;
-}
-
-static std::optional<ProducerRecord>
-FindGemmProducerReading(const PropagationTirCollector *tir,
-                        const Buffer &write_buf, const Buffer &read_buf,
-                        int after_stmt_order) {
-  if (after_stmt_order < 0) {
-    return tir->FindLastGemmProducerReading(write_buf, read_buf);
-  }
-  return tir->FindFirstGemmProducerReading(write_buf, read_buf,
-                                           after_stmt_order);
 }
 
 static bool IsSharedLikeScope(const Buffer &buffer) {
@@ -64,58 +54,13 @@ static bool IsSharedLikeScope(const Buffer &buffer) {
 
 using BufferSet = std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>;
 
-static Optional<TileOperator> PropagateToFindGemmConsumerOpTirImpl(
-    const Buffer &buffer, const PropagationTirCollector *tir,
-    int after_stmt_order, BufferSet *visited_buffers) {
-  if (!tir || !visited_buffers->insert(buffer).second)
-    return Optional<TileOperator>();
-  for (const Buffer &out_buf : tir->GetConsumerOutputs(buffer)) {
-    // Stop at shared: register-side chains (fragment/local) keep propagating.
-    if (IsSharedLikeScope(out_buf))
-      continue;
-    if (auto rec =
-            FindGemmProducerReading(tir, out_buf, buffer, after_stmt_order)) {
-      if (auto found = GemmWithInputFromCall(rec->call, buffer)) {
-        return found->gemm;
-      }
-    }
-    auto found = PropagateToFindGemmConsumerOpTirImpl(
-        out_buf, tir, after_stmt_order, visited_buffers);
-    if (found.defined())
-      return found;
-  }
-  return Optional<TileOperator>();
-}
-
 static Optional<TileOperator>
 PropagateToFindGemmConsumerOpTir(const Buffer &buffer,
                                  const PropagationTirCollector *tir,
                                  int after_stmt_order) {
-  BufferSet visited_buffers;
-  return PropagateToFindGemmConsumerOpTirImpl(buffer, tir, after_stmt_order,
-                                              &visited_buffers);
-}
-
-static std::optional<GemmWithInput>
-PropagateToFindGemmConsumerOpWithInputTirImpl(
-    const Buffer &buffer, const PropagationTirCollector *tir,
-    int after_stmt_order, BufferSet *visited_buffers) {
-  if (!tir || !visited_buffers->insert(buffer).second)
-    return std::nullopt;
-  for (const Buffer &out_buf : tir->GetConsumerOutputs(buffer)) {
-    if (IsSharedLikeScope(out_buf))
-      continue;
-    if (auto rec =
-            FindGemmProducerReading(tir, out_buf, buffer, after_stmt_order)) {
-      if (auto found = GemmWithInputFromCall(rec->call, buffer)) {
-        return found;
-      }
-    }
-    auto found = PropagateToFindGemmConsumerOpWithInputTirImpl(
-        out_buf, tir, after_stmt_order, visited_buffers);
-    if (found)
-      return found;
-  }
+  auto result = QueryGemmConsumers(buffer, tir, after_stmt_order, false);
+  if (result && !result->empty())
+    return result->front().gemm;
   return std::nullopt;
 }
 
@@ -123,9 +68,10 @@ static std::optional<GemmWithInput>
 PropagateToFindGemmConsumerOpWithInputTir(const Buffer &buffer,
                                           const PropagationTirCollector *tir,
                                           int after_stmt_order) {
-  BufferSet visited_buffers;
-  return PropagateToFindGemmConsumerOpWithInputTirImpl(
-      buffer, tir, after_stmt_order, &visited_buffers);
+  auto result = QueryGemmConsumers(buffer, tir, after_stmt_order, false);
+  if (result && !result->empty())
+    return result->front();
+  return std::nullopt;
 }
 
 bool PropagateToFindGemmConsumer(Buffer buffer,
@@ -157,55 +103,87 @@ std::optional<GemmWithInput> PropagateToFindGemmConsumerOpWithInputAfterCall(
                                                 after_order);
 }
 
-namespace {
-
-void CollectAllGemmConsumers(
-    const Buffer &buffer, const PropagationTirCollector *tir_collector,
-    int after_order,
-    std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual> *visited_buffers,
-    std::unordered_set<const CallNode *, CallNodePtrHash, CallNodePtrEqual>
-        *seen_calls,
-    std::vector<GemmWithInput> *result) {
-  if (!visited_buffers->insert(buffer).second) {
-    return;
-  }
-  for (const ReaderCallRecord &reader : tir_collector->GetReaderCalls(buffer)) {
-    if (reader.stmt_order <= after_order || reader.call == nullptr) {
-      continue;
-    }
-    if (auto gemm = GemmWithInputFromCall(reader.call, buffer)) {
-      if (seen_calls->insert(reader.call).second) {
-        result->push_back(*gemm);
-      }
-      continue;
-    }
-    if (!IsSharedLikeScope(reader.write)) {
-      CollectAllGemmConsumers(reader.write, tir_collector, after_order,
-                              visited_buffers, seen_calls, result);
-    }
-  }
-}
-
-} // namespace
-
-std::vector<GemmWithInput> PropagateToFindAllGemmConsumersAfterCall(
-    Buffer buffer, const PropagationTirCollector *tir_collector,
-    const CallNode *after_site_call) {
+std::optional<std::vector<GemmWithInput>>
+QueryGemmConsumers(Buffer buffer, const PropagationTirCollector *collector,
+                   int after_order, bool exclusive,
+                   const GemmRelayPredicate &accept) {
+  if (!collector)
+    return std::nullopt;
+  BufferSet visited;
+  std::unordered_set<const CallNode *, CallNodePtrHash, CallNodePtrEqual> seen;
   std::vector<GemmWithInput> result;
-  if (tir_collector == nullptr) {
-    return result;
-  }
-  int after_order = after_site_call == nullptr
-                        ? -1
-                        : tir_collector->GetCallStmtOrder(after_site_call);
-  std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual> visited_buffers;
-  std::unordered_set<const CallNode *, CallNodePtrHash, CallNodePtrEqual>
-      seen_calls;
-  CollectAllGemmConsumers(buffer, tir_collector, after_order, &visited_buffers,
-                          &seen_calls, &result);
+  std::function<bool(const Buffer &)> visit = [&](const Buffer &input) {
+    if (!visited.insert(input).second)
+      return true;
+    bool has_reader = false;
+    // Preserve the existing consumer-output traversal order. In particular,
+    // an expression relay preceding a direct GEMM must not be reordered after
+    // that GEMM just because the latter has a ReaderCallRecord.
+    const auto readers = collector->GetReaderCalls(input);
+    for (const auto &output : collector->GetConsumerOutputs(input)) {
+      if (IsSharedLikeScope(output)) {
+        if (exclusive)
+          return false;
+        continue;
+      }
+      const auto preferred =
+          after_order < 0
+              ? collector->FindLastGemmProducerReading(output, input)
+              : collector->FindFirstGemmProducerReading(output, input,
+                                                        after_order);
+      if (preferred) {
+        if (auto gemm = GemmWithInputFromCall(preferred->call, input)) {
+          has_reader = true;
+          if (seen.insert(preferred->call).second)
+            result.push_back(*gemm);
+        }
+      }
+      bool call_output = false;
+      bool relay = false;
+      for (const auto &reader : readers) {
+        if (!reader.call || !reader.write.same_as(output))
+          continue;
+        call_output = true;
+        if (reader.stmt_order <= after_order)
+          continue;
+        has_reader = true;
+        if (auto gemm = GemmWithInputFromCall(reader.call, input)) {
+          if (seen.insert(reader.call).second)
+            result.push_back(*gemm);
+        } else if (!accept || accept(input, output, reader.call)) {
+          relay = true;
+        } else if (exclusive) {
+          return false;
+        }
+      }
+      if (!call_output) {
+        has_reader = true;
+        if (accept && !accept(input, output, nullptr)) {
+          if (exclusive)
+            return false;
+          continue;
+        }
+        relay = true;
+      }
+      if (relay && !visit(output) && exclusive)
+        return false;
+    }
+    return has_reader || !exclusive;
+  };
+  if (!visit(buffer))
+    return std::nullopt;
   return result;
 }
 
+std::vector<GemmWithInput> PropagateToFindAllGemmConsumersAfterCall(
+    Buffer buffer, const PropagationTirCollector *collector,
+    const CallNode *after_site_call) {
+  int order = collector && after_site_call
+                  ? collector->GetCallStmtOrder(after_site_call)
+                  : -1;
+  auto result = QueryGemmConsumers(buffer, collector, order, false);
+  return result.value_or(std::vector<GemmWithInput>{});
+}
 std::vector<ReaderCallRecord>
 GetReaderCallsFromTir(Buffer buffer,
                       const PropagationTirCollector *tir_collector) {

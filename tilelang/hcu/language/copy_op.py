@@ -32,6 +32,11 @@ def copy(
     keyword arguments.  The hint is carried as tile-op metadata and consumed
     only by HCU lowering.
 
+    ``prefer_instruction="ds_read_vector"`` requires an MN-major ordinary
+    LDS-to-fragment matrix read. Unsupported tiles or incompatible consumer
+    layouts raise an error; explicit selection never silently falls back.
+    This does not select the MLS layout used by ``ds_read_format``.
+
     ``disable_tma`` is accepted solely for source compatibility with kernels
     written against the former CUDA-shaped common facade.  HCU has no TMA
     lowering, so either value has identical semantics and no annotation is

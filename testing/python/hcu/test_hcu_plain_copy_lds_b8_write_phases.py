@@ -53,7 +53,7 @@ def test_b128_write_phase_partition():
 def test_b8_atbn_kp1_retains_default_layout(width):
     shape = (32, width)
     factory = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")
-    assert factory(shape, 32, 4, 8, 32, 32, 16, 16, [0], [1]) is None
+    assert factory(shape, 32, 4, 8, 32, 32, [8], [0]) is None
     layout = make_hcu_swizzled_layout(tvm.tirx.decl_buffer(shape, "float8_e4m3fn", scope="shared"), 1)
     addresses = enumerate_layout(layout, shape, require_n8=True)
     # Unlike b128, NMZ b64 ignores the lane-order table and consumes sixteen
@@ -71,7 +71,8 @@ def test_b8_atbn_kp1_retains_default_layout(width):
 def test_b8_scope_and_n16_consumers(kinds, packs):
     shape = (32, 128)
     factory = tvm.get_global_func("tl.hcu.MakePlainGemmLdsLayout")
-    layout = factory(shape, 32, 4, 8, 32, 32, 16, 16, kinds, packs)
+    elements = [16 if kind == 1 else 8 * pack for kind, pack in zip(kinds, packs)]
+    layout = factory(shape, 32, 4, 8, 32, 32, elements, kinds)
     if 1 not in kinds:
         assert layout is None
         return
