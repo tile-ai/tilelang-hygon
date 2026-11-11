@@ -23,10 +23,13 @@
 #include <utility>
 #include <vector>
 
+#include "hcu/distributed/backend.h"
 #include "hcu/op/builtin.h"
 #include "hcu/target_utils.h"
 #include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "hcu/utils/mls_boundary.h"
+#include "op/builtin.h"
+#include "op/distributed.h"
 
 namespace tvm {
 namespace codegen {
@@ -700,6 +703,11 @@ private:
 
 CodeGenTileLangHCU::CodeGenTileLangHCU() { restrict_keyword_ = "__restrict__"; }
 
+void CodeGenTileLangHCU::Init(bool output_ssa) {
+  CodeGenC::Init(output_ssa);
+  uses_distributed_metadata_ = false;
+}
+
 void CodeGenTileLangHCU::PrintFuncPrefix(std::ostream &os) {
   os << "extern \"C\" __global__ ";
 }
@@ -807,8 +815,98 @@ void CodeGenTileLangHCU::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
   }
 }
 
+bool CodeGenTileLangHCU::TryEmitDistributedCall(const Call &call,
+                                                std::ostream &os) {
+  enum class DistributedCallKind {
+    kRank,
+    kNumRanks,
+    kBlockGet,
+    kSignalOp,
+    kSignalWait
+  };
+  const auto *op = call.get();
+  DistributedCallKind kind;
+  if (op->op.same_as(tl::get_rank())) {
+    kind = DistributedCallKind::kRank;
+  } else if (op->op.same_as(tl::get_num_ranks())) {
+    kind = DistributedCallKind::kNumRanks;
+  } else if (op->op.same_as(tl::get_block())) {
+    kind = DistributedCallKind::kBlockGet;
+  } else if (op->op.same_as(tl::signal_op())) {
+    kind = DistributedCallKind::kSignalOp;
+  } else if (op->op.same_as(tl::signal_wait_until())) {
+    kind = DistributedCallKind::kSignalWait;
+  } else {
+    return false;
+  }
+
+  const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
+  const auto capability =
+      kind == DistributedCallKind::kBlockGet
+          ? tl::hcu::DistributedCapability::kBlockRemoteGet
+      : (kind == DistributedCallKind::kSignalOp ||
+         kind == DistributedCallKind::kSignalWait)
+          ? tl::hcu::DistributedCapability::kSignal
+          : tl::hcu::DistributedCapability::kRankAndWorldSize;
+  tl::hcu::RequireDistributedCapability(backend, capability);
+  switch (kind) {
+  case DistributedCallKind::kRank:
+    os << backend.EmitRankExpr();
+    break;
+  case DistributedCallKind::kNumRanks:
+    os << backend.EmitNumRanksExpr();
+    break;
+  case DistributedCallKind::kBlockGet: {
+    ICHECK_EQ(op->args.size(), 4U);
+    const std::string src = PrintExpr(op->args[0]);
+    const std::string dst = PrintExpr(op->args[1]);
+    const std::string size = PrintExpr(op->args[2]);
+    const std::string src_pe = PrintExpr(op->args[3]);
+    os << backend.EmitBlockGetExpr(src, dst, size, src_pe);
+    break;
+  }
+  case DistributedCallKind::kSignalOp:
+  case DistributedCallKind::kSignalWait: {
+    const bool is_signal_op = kind == DistributedCallKind::kSignalOp;
+    ICHECK_EQ(op->args.size(), is_signal_op ? 4U : 3U);
+    const auto *operation = op->args[is_signal_op ? 2 : 1].as<IntImmNode>();
+    if (operation == nullptr || operation->value < 0 ||
+        operation->value > (is_signal_op ? 1 : 5)) {
+      TVM_FFI_THROW(ValueError)
+          << (is_signal_op ? "signal_op" : "signal_wait_until")
+          << " requires a supported compile-time operation";
+    }
+    const std::string address = PrintExpr(op->args[0]);
+    const std::string value = PrintExpr(op->args[is_signal_op ? 1 : 2]);
+    const std::string peer = is_signal_op ? PrintExpr(op->args[3]) : "";
+    os << (is_signal_op ? "tl::distributed_signal_op<"
+                        : "tl::distributed_signal_wait_until<")
+       << operation->value << ">(" << address << ", " << value;
+    if (is_signal_op) {
+      os << ", " << peer;
+    }
+    os << ")";
+    break;
+  }
+  }
+  uses_distributed_metadata_ = true;
+  return true;
+}
+
+void CodeGenTileLangHCU::EmitDistributedDeclarations(std::ostream &os) {
+  if (!uses_distributed_metadata_) {
+    return;
+  }
+  os << "// tilelang_distributed_metadata: 1\n";
+  const auto &backend = tl::hcu::GetHcuDistributedBackend(target_);
+  os << backend.DeviceIncludes();
+  os << backend.ModulePreamble();
+}
+
 std::string CodeGenTileLangHCU::Finish() {
   decl_stream << "#include <hip/hip_runtime.h>\n";
+
+  EmitDistributedDeclarations(decl_stream);
 
   if (enable_fp8_) {
     decl_stream << "#include <tl_templates/hcu/hcu_fp8.h>\n";
@@ -3676,6 +3774,8 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << wmma_replacer.rewrite(call_wmma_code);
   } else if (op->op.same_as(builtin::thread_return())) {
     os << "return";
+  } else if (TryEmitDistributedCall(GetRef<Call>(op), os)) {
+    // The distributed emitter owns validation and usage tracking.
   } else if (op->op.same_as(tl::loop_break())) {
     this->PrintIndent();
     this->stream << "break;\n";
@@ -4388,6 +4488,9 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   buffer_ops_rebase_param_names_.clear();
   block_index_vars_.clear();
   thread_index_vars_.clear();
+  auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
+  ICHECK(global_symbol.has_value())
+      << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
   PostOrderVisit(f->body, [&](const ObjectRef &object) {
     const auto *attr = object.as<AttrStmtNode>();
     if (!attr || attr->attr_key != tirx::attr::thread_extent)
@@ -4406,9 +4509,6 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   mls_resource_object_counter_ = 0;
   wdra_init_emitted_ = false;
 
-  auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
-  ICHECK(global_symbol.has_value())
-      << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
   bool no_alias = f->HasNonzeroAttr(tirx::attr::kNoAlias);
   std::unordered_set<const VarNode *> non_restrict;
   if (auto opt =
@@ -4420,7 +4520,7 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   this->PrintFuncPrefix(stream);
   CodeGenC::PrintType(f->ret_type, stream);
   this->PrintExtraAttrs(f, stream);
-  this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
+  this->stream << " " << global_symbol.value() << "(";
 
   for (size_t i = 0; i < f->params.size(); ++i) {
     tirx::Var v = f->params[i];

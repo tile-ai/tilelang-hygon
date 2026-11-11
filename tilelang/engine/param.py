@@ -164,6 +164,7 @@ class CompiledArtifact:
     rt_mod: tvm.runtime.Module | None = None  # Runtime module for execution, may be lazily initialized
     target: tvm.target.Target | None = None  # Normalized device target used for lowering
     target_host: tvm.target.Target | None = None  # Normalized host target used for host codegen/export
+    distributed_requirements: dict | None = None  # Versioned codegen/runtime contract, exported with library
 
 
 def dump_kernel_params(params: list[KernelParam]) -> str:

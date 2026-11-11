@@ -41,6 +41,7 @@ def _make_adapter():
     adapter.dynamic_symbolic_map = {}
     adapter._ffi_callee_allocated_output_abi = False
     adapter.executable = None
+    adapter._distributed_initializer = None
     adapter._executable_lock = threading.Lock()
 
     created = []

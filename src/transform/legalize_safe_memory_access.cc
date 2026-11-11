@@ -18,6 +18,7 @@
 #include <utility>
 
 #include "../op/builtin.h"
+#include "../op/distributed.h"
 #include "../op/parallel.h"
 #include "arith/ir_mutator_with_analyzer.h"
 #include "common/access_ptr_utils.h"
@@ -318,6 +319,24 @@ struct SafeMemChecker : public StmtExprVisitor {
     }
   }
 
+  // A block read covers a range, not just the address of its first element.
+  void CheckBufferRange(const BufferLoad &load, const PrimExpr &count) {
+    Array<PrimExpr> indices;
+    for (const PrimExpr &index : load->indices)
+      indices.push_back(cast(DataType::Int(64), index));
+    const auto offsets = load->buffer.OffsetOf(indices);
+    ICHECK_EQ(offsets.size(), 1U) << "get_block requires a contiguous source";
+    PrimExpr offset =
+        offsets[0] - cast(DataType::Int(64), load->buffer->elem_offset);
+    PrimExpr extent = IntImm(DataType::Int(64), 1);
+    for (const PrimExpr &dim : load->buffer->shape)
+      extent = extent * cast(DataType::Int(64), dim);
+    PushCondition(count > 0);
+    PushCondition(offset >= 0);
+    PushCondition(offset <= extent);
+    PushCondition(cast(DataType::Int(64), count) <= extent - offset);
+  }
+
   static bool HasAnalyzerFragilePattern(const PrimExpr &expr) {
     bool fragile = false;
     PostOrderVisit(expr, [&](const ObjectRef &obj) {
@@ -605,6 +624,32 @@ private:
            (call->op.as<OpNode>() && IsAtomicOp(Downcast<Op>(call->op)));
   }
 
+  Array<PrimExpr> CollectDistributedGetConditions(const Call &call) {
+    ICHECK_EQ(call->args.size(), 4U);
+    Optional<BufferLoad> source;
+    if (const auto *address = call->args[0].as<CallNode>();
+        address && address->op.same_as(builtin::address_of()) &&
+        address->args.size() == 1) {
+      source = address->args[0].as<BufferLoad>();
+    } else if (auto var = call->args[0].as<Var>()) {
+      if (auto buffer = buffer_data_to_buffer_.Get(var.value())) {
+        Array<PrimExpr> indices;
+        for (size_t i = 0; i < buffer.value()->shape.size(); ++i)
+          indices.push_back(Integer(0));
+        source = BufferLoad(buffer.value(), indices);
+      }
+    }
+    if (!source) {
+      TVM_FFI_THROW(ValueError)
+          << "HCU IPC get_block source has no Buffer information. "
+             "A bare Var without buffer_map cannot be bounds-checked; "
+             "use T.address_of(<kernel parameter>[...]).";
+    }
+    SafeMemChecker checker(analyzer_, /*recursively_collect_conds=*/false);
+    checker.CheckBufferRange(source.value(), call->args[2]);
+    return checker.GetConditions();
+  }
+
   Array<PrimExpr> CollectCPAsyncConditions(const Call &call) {
     ICHECK_GE(call->args.size(), 3U)
         << "cp.async expects at least 3 arguments, but got " << call->args;
@@ -760,6 +805,9 @@ private:
 
     if (const CallNode *call_node = op->value.as<CallNode>()) {
       Call call = Downcast<Call>(op->value);
+      if (call->op.same_as(tl::get_block()))
+        return WrapEvaluateWithConditions(
+            evaluate, CollectDistributedGetConditions(call));
       if (call->op.as<OpNode>() && IsCPAsyncOp(Downcast<Op>(call->op))) {
         Array<PrimExpr> conditions = CollectCPAsyncConditions(call);
         if (conditions.empty()) {
