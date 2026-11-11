@@ -76,7 +76,13 @@ def enumerate_layout(layout, shape, require_n8=True, preserve_rows=True):
                 "tirx.shift_right": np.right_shift,
             }
             return ops[expr.op.name](*(evaluate(arg) for arg in expr.args))
-        ops = {tvm.tirx.Add: np.add, tvm.tirx.Mul: np.multiply, tvm.tirx.FloorDiv: np.floor_divide, tvm.tirx.FloorMod: np.mod}
+        ops = {
+            tvm.tirx.Add: np.add,
+            tvm.tirx.Sub: np.subtract,
+            tvm.tirx.Mul: np.multiply,
+            tvm.tirx.FloorDiv: np.floor_divide,
+            tvm.tirx.FloorMod: np.mod,
+        }
         return ops[type(expr)](evaluate(expr.a), evaluate(expr.b))
 
     physical = [np.broadcast_to(evaluate(expr), shape) for expr in layout.index]

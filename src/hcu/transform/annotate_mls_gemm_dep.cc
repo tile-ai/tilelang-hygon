@@ -1445,6 +1445,51 @@ private:
     return op.same_as(async_copy);
   }
 
+  Optional<Layout> TryMakeExplicitDsReadLayout(const Buffer &buffer) const {
+    if (HasAnnotatedLayout(buffer))
+      return std::nullopt;
+    // Preserve a producer's selected/pending GEMM storage strategy. Ordinary
+    // async copies without such a strategy can honor the same layout map as
+    // synchronous copies; async semantics alone do not constrain storage.
+    for (const auto &writer : collector_->GetProducerRecords(buffer)) {
+      if (!writer.call)
+        continue;
+      const auto &annotations = writer.call->annotations;
+      const bool pending = annotations.count(kPendingGemmLdsCopyStrategy) ||
+                           annotations.count(kPendingGemmAtBnLdsStrategy) ||
+                           annotations.count(kPendingGemmAnBtLdsStrategy);
+      if ((pending && (HasAsyncCopySemantics(GetRef<Call>(writer.call)) ||
+                       selected_calls_.count(GetRef<Call>(writer.call)))) ||
+          annotations.count(attr::kHcuGemmLdsCopyStrategy) ||
+          annotations.count(attr::kHcuGemmAtBnLdsStrategy) ||
+          annotations.count(attr::kHcuGemmAnBtLdsStrategy))
+        return std::nullopt;
+    }
+    for (const auto &reader : collector_->GetReaderCalls(buffer)) {
+      if (!reader.call)
+        continue;
+      auto parsed = ParseOperator(GetRef<Call>(reader.call));
+      const auto *ds = parsed.as<DsReadFormatNode>();
+      if (!ds || !ds->hcu_linear_ds_read_)
+        continue;
+      // Copy-derived reads already have a resolved plain-read contract and
+      // storage decision. Only plan the still-unresolved explicit entry.
+      if (ds->gemm_dep_.defined() && ds->gemm_dep_.value()->plain_warp_m > 0)
+        continue;
+      const int bits = buffer->dtype.bits();
+      return MakeHcuDsReadVectorLdsLayout(
+          buffer->shape, TargetHcuGetLdsBankCount(target_),
+          TargetHcuGetLdsBankWidthBytes(target_), TargetHcuGetWarpSize(target_),
+          {bits, 256 / bits, 32, 128 / bits, HcuGemmLdsAccessKind::kAnBt});
+    }
+    return std::nullopt;
+  }
+
+  bool HasDsReadSourceLayout(const Buffer &buffer) const {
+    return HasAnnotatedLayout(buffer) ||
+           auto_an_bt_strategies_.count(buffer->data);
+  }
+
   Stmt VisitStmt_(const SBlockNode *op) final {
     if (mode_ == Mode::kCollectThreadDomains)
       return IRMutatorWithAnalyzer::VisitStmt_(op);
@@ -1458,10 +1503,15 @@ private:
     annotated_layout_maps_stack_.push_back(block_layout_map);
     if (mode_ == Mode::kMaterialize) {
       for (const Buffer &buffer : op->alloc_buffers) {
-        if (Optional<Layout> layout = TryMakePlainLayout(buffer)) {
-          // Ordinary global and fragment producers share the same storage
-          // map and layout-aware GEMM reads. Their copies remain synchronous.
+        Optional<Layout> layout = TryMakePlainLayout(buffer);
+        if (layout) {
           plain_layouts_.emplace(buffer->data, layout.value());
+        } else {
+          layout = TryMakeExplicitDsReadLayout(buffer);
+        }
+        if (layout) {
+          // Attach storage before readers select their addressing mode. A
+          // native reader's layout alone does not select a direct-GEMM plan.
           block_layout_map.Set(buffer->data, layout.value());
           annotated_layout_maps_stack_.back().Set(buffer->data, layout.value());
           plain_layout_map_changed = true;
@@ -1720,7 +1770,7 @@ private:
         continue;
       }
       ICHECK(!found || alt == ds_read->alt_)
-          << "GEMM B fragment has ds_read_format producers with conflicting "
+          << "GEMM fragment has ds_read_format producers with conflicting "
              "Alt values";
       alt = ds_read->alt_;
       found = true;
@@ -2154,6 +2204,38 @@ private:
     if (tir_op == DsReadFormat::Get()) {
       auto ds =
           Downcast<DsReadFormat>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
+      if (ds->hcu_linear_ds_read_ && mode_ == Mode::kMaterialize &&
+          (!ds->gemm_dep_.defined() ||
+           ds->gemm_dep_.value()->plain_warp_m == 0)) {
+        auto consumer = PropagateToFindGemmConsumerOpWithInputAfterCall(
+            ds->dst, collector_, call);
+        ICHECK(consumer.has_value())
+            << "ds_read_vector requires a register-side GEMM consumer";
+        auto contract = PlainReadLayoutContract(ds->dst, *consumer, true);
+        ICHECK(contract.has_value())
+            << "ds_read_vector tile is incompatible with the GEMM warp "
+               "partition (MN32 required)";
+        const bool has_layout = HasDsReadSourceLayout(ds->src);
+        const Gemm &gemm = consumer->gemm;
+        const bool feeds_a = consumer->input.same_as(gemm->a_);
+        ICHECK(has_layout || (!feeds_a && ds->src->dtype.bits() == 16 &&
+                              contract->warp_k == 1 && ds->alt_ == 1))
+            << "ds_read_vector requires a legal MN-major LDS storage layout "
+               "for buffer "
+            << ds->src->name << " (Alt=" << ds->alt_ << ")";
+        auto annotations = call->annotations;
+        annotations.erase(attr::kHcuLayoutDsRead);
+        if (has_layout)
+          annotations.Set(attr::kHcuLayoutDsRead, Integer(1));
+        annotations.Set(attr::kMlsGemmDep,
+                        BuildCopyToGemmLinearMeta(
+                            *consumer, IsFromMls(gemm->a_, collector_),
+                            IsFromMls(gemm->b_, collector_), target_,
+                            contract->warp_m, contract->warp_n,
+                            contract->warp_k, contract->min_n));
+        return Evaluate(
+            Call(call->dtype, call->op, call->args, annotations, call->span));
+      }
       if (ds->gemm_dep_.defined()) {
         return IRMutatorWithAnalyzer::VisitStmt_(op);
       }
@@ -2267,8 +2349,7 @@ private:
       if (contract) {
         const GemmNode *consumer_gemm = consumer->gemm.get();
         const bool feeds_a = consumer->input.same_as(consumer_gemm->a_);
-        const bool has_layout = HasAnnotatedLayout(copy->src) ||
-                                auto_an_bt_strategies_.count(copy->src->data);
+        const bool has_layout = HasDsReadSourceLayout(copy->src);
         // The unmapped fallback supports only b16 B reads with WarpK=1.
         if ((feeds_a || copy->src->dtype.bits() == 8 ||
              contract->warp_k != 1) &&
@@ -2330,6 +2411,11 @@ private:
       auto gemm = Downcast<Gemm>(ParseOperator(tvm::ffi::GetRef<Call>(call)));
       auto annotations =
           AnnotateGemmHcuMlsFlags(call->annotations, gemm.get(), collector_);
+      const int a_ds_read_alt = GetDsReadAlt(gemm->a_);
+      if (a_ds_read_alt != 1) {
+        annotations.Set(attr::kHcuADsReadAlt,
+                        IntImm(DataType::Int(32), a_ds_read_alt));
+      }
       const int b_ds_read_alt = GetDsReadAlt(gemm->b_);
       if (b_ds_read_alt != 1) {
         annotations.Set(attr::kHcuBDsReadAlt,

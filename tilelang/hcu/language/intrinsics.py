@@ -10,6 +10,32 @@ from tilelang.language.builtin import (
 )
 
 
+def ds_read_vector(dst, local_offset, shared_source=None, *, alt: int = 1):
+    """Read shared memory with an HCU matrix-load instruction.
+
+    The raw form ``(dst, local_offset, shared_source)`` uses an element offset
+    and caller-provided layouts; ``alt=2`` selects BF16 Alt2.
+    The region form ``(src, dst, alt=1|2)`` infers layouts from the GEMM consumer.
+    Both forms require the caller to wait for LDS reads to complete.
+    """
+    if shared_source is None:
+        from tilelang.hcu.language.copy_op import _ds_read_vector_region
+
+        return _ds_read_vector_region(dst, local_offset, alt=alt)
+    if type(alt) is not int or alt not in (1, 2):
+        raise ValueError("ds_read_vector alt must be 1 or 2")
+    if not isinstance(shared_source, tirx.BufferLoad) or not shared_source.buffer.scope().startswith("shared"):
+        raise TypeError("ds_read_vector requires a shared BufferLoad source")
+    return tirx.call_intrin(
+        "handle",
+        tirx.op.Op.get("tl.ds_read_vector"),
+        dst,
+        local_offset,
+        shared_source,
+        annotations={"tl.hcu_ds_read_alt": alt} if alt != 1 else None,
+    )
+
+
 def _optional_intrin(name, *args):
     return tirx.call_intrin("int32", tirx.op.Op.get(name), *args)
 
@@ -188,6 +214,7 @@ __all__ = (
     "set_max_nreg_dec",
     "ieee_fmaf",
     "scaled_cast",
+    "ds_read_vector",
     "s_waitcnt",
     "sched_barrier",
 )

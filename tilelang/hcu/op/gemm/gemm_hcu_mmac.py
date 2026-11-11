@@ -115,6 +115,7 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
     a_at_bn_auto_lds_strategy = _has_annotation(annotations, "tl.hcu_gemm_at_bn_lds_strategy")
     b_from_async_copy_linear = _int_annotation(annotations, "tl.hcu_b_from_async_copy_linear")
     trans_c = _int_annotation(annotations, "trans_c")
+    a_ds_read_alt = _int_annotation(annotations, "tl.hcu_a_ds_read_alt", 1)
     b_ds_read_alt = _int_annotation(annotations, "tl.hcu_b_ds_read_alt", 1)
     trans_a = bool(gemm_node.transA)
     trans_b = bool(gemm_node.transB)
@@ -152,6 +153,7 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
         b_from_async_copy_linear=b_from_async_copy_linear,
         trans_c=trans_c,
         mmac_lit=mmac_lit,
+        a_ds_read_alt=a_ds_read_alt,
         b_ds_read_alt=b_ds_read_alt,
         a_mls_trans=int(a_mls_trans),
         b_mls_trans=int(b_mls_trans),
@@ -299,7 +301,7 @@ def _make_hcu_operand_fragment(gemm, meta, partition, feeds_a: bool):
     bits = _hcu_layout_bits_for_dtype(operand.dtype, fp4_mmac_mode=meta.mmac_mode)
     args = (int(gemm.M), int(gemm.N), int(gemm.K), wm, wn, wk, bits, int(gemm.k_pack))
     if feeds_a:
-        return make_gemm_fragment_a_hcu(*args, bool(gemm.trans_A), mmac_k_dim=int(meta.mmac_k))
+        return make_gemm_fragment_a_hcu(*args, bool(gemm.trans_A), mmac_k_dim=int(meta.mmac_k), interleave=int(meta.a_ds_read_alt))
     return make_gemm_fragment_b_hcu(*args, bool(gemm.trans_B), min_n, mmac_k_dim=int(meta.mmac_k), interleave=int(meta.b_ds_read_alt))
 
 
@@ -347,6 +349,7 @@ class GemmHCUMMAC(GemmBase):
             lit=bool(meta.mmac_lit),
             lts=bool(meta.trans_c),
             b_interleave=int(meta.b_ds_read_alt),
+            a_interleave=int(meta.a_ds_read_alt),
         )
         out = {self.C: frag_c}
         if _is_shared_like(self.A):

@@ -216,6 +216,92 @@ MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
   return expanded->WithInverse(expanded);
 }
 
+Optional<Layout>
+MakeHcuDsReadVectorLdsLayout(const Array<PrimExpr> &shape, int bank_count,
+                             int bank_width_bytes, int warp_size,
+                             const HcuGemmLdsReadPattern &read) {
+  auto fallback = [&]() {
+    return MakeHcuPlainGemmLdsLayout(shape, bank_count, bank_width_bytes,
+                                     {read});
+  };
+  if (shape.size() < 2 || (bank_count != 32 && bank_count != 64) ||
+      bank_width_bytes != 4 || warp_size != 64 || read.element_bits != 16 ||
+      read.read_tile_k != 16 || read.read_tile_mn != 32 ||
+      read.elements_per_read != 8 ||
+      read.consumer_kind != HcuGemmLdsAccessKind::kAnBt)
+    return fallback();
+  // Leading batch/stage axes pass through unchanged, including symbolic axes.
+  for (size_t i = 0; i + 2 < shape.size(); ++i) {
+    if (const int64_t *value = as_const_int(shape[i]); value && *value <= 0)
+      return fallback();
+  }
+  for (size_t i = shape.size() - 2; i < shape.size(); ++i) {
+    const PrimExpr &extent = shape[i];
+    const int64_t *value = as_const_int(extent);
+    if (!value || *value <= 0 || *value > INT_MAX)
+      return fallback();
+  }
+  const int rows = *as_const_int(shape[shape.size() - 2]);
+  const int width = *as_const_int(shape.back());
+  const int vector_elements = read.elements_per_read;
+  const int read_rows = read.read_tile_k;
+  // Each read-row tile is permuted independently; its repeat count need not
+  // be a power of two. Width only needs complete vectors that divide a wave.
+  if (rows % read_rows != 0 || width % vector_elements != 0)
+    return fallback();
+  const int vectors_per_row = width / vector_elements;
+  if (warp_size % vectors_per_row != 0)
+    return fallback();
+  const int rows_per_wave = warp_size / vectors_per_row;
+  if (read_rows % rows_per_wave != 0)
+    return fallback();
+  const int row_classes = read_rows / rows_per_wave;
+  const int element_bytes = read.element_bits / 8;
+  const int panel_bytes = read.read_tile_mn * element_bytes;
+  const int bank_ring_bytes = bank_count * bank_width_bytes;
+  if (bank_ring_bytes % panel_bytes != 0)
+    return fallback();
+  // Each matrix phase varies two/four row classes on 32/64 banks. Rotate
+  // these classes by one MN panel (64B), keeping each 16B vector intact.
+  const int rotations = bank_ring_bytes / panel_bytes;
+  const int rotation_vectors = read.read_tile_mn / vector_elements;
+  if (row_classes % rotations != 0)
+    return fallback();
+
+  PrimExpr row = InputPlaceholder(0);
+  PrimExpr col = InputPlaceholder(1);
+  const int vectors_per_tile = read_rows * vectors_per_row;
+  PrimExpr vector = floordiv(row, read_rows) * vectors_per_tile +
+                    floormod(row, row_classes) * warp_size +
+                    floormod(floordiv(floormod(row, read_rows), row_classes) *
+                                     vectors_per_row +
+                                 floordiv(col, vector_elements) +
+                                 floormod(row, rotations) * rotation_vectors,
+                             warp_size);
+  PrimExpr flat = vector * vector_elements + floormod(col, vector_elements);
+  Layout layout(Array<PrimExpr>{Integer(rows), Integer(width)},
+                {floordiv(flat, width), floormod(flat, width)});
+
+  PrimExpr physical = row * width + col;
+  PrimExpr point = floordiv(physical, vector_elements);
+  PrimExpr row_class = floordiv(floormod(point, vectors_per_tile), warp_size);
+  PrimExpr packed =
+      floormod(floormod(point, warp_size) -
+                   floormod(row_class, rotations) * rotation_vectors,
+               warp_size);
+  PrimExpr logical_row = floordiv(point, vectors_per_tile) * read_rows +
+                         floordiv(packed, vectors_per_row) * row_classes +
+                         row_class;
+  PrimExpr logical_col = floormod(packed, vectors_per_row) * vector_elements +
+                         floormod(physical, vector_elements);
+  Layout inverse(Array<PrimExpr>{Integer(rows), Integer(width)},
+                 {logical_row, logical_col});
+  Array<PrimExpr> leading;
+  for (size_t i = 0; i + 2 < shape.size(); ++i)
+    leading.push_back(shape[i]);
+  return layout->Expand(leading)->WithInverse(inverse->Expand(leading));
+}
+
 void HcuGemmLdsCopyStrategyNode::RegisterReflection() {
   namespace refl = ffi::reflection;
   refl::ObjectDef<HcuGemmLdsCopyStrategyNode>()
@@ -353,6 +439,16 @@ HcuGemmLdsCopyStrategy MakeHcuGemmLdsCopyStrategy(
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   HcuGemmLdsCopyStrategyNode::RegisterReflection();
+  ffi::reflection::GlobalDef().def(
+      "tl.hcu.MakeDsReadVectorLdsLayout",
+      [](Array<PrimExpr> shape, int bank_count, int bank_width_bytes,
+         int warp_size, int element_bits) {
+        ICHECK(element_bits == 8 || element_bits == 16);
+        return MakeHcuDsReadVectorLdsLayout(
+            shape, bank_count, bank_width_bytes, warp_size,
+            {element_bits, 256 / element_bits, 32, 128 / element_bits,
+             HcuGemmLdsAccessKind::kAnBt});
+      });
   ffi::reflection::GlobalDef().def(
       "tl.hcu.MakePlainGemmLdsLayout",
       [](Array<PrimExpr> shape, int bank_count, int bank_width_bytes,

@@ -384,6 +384,7 @@ def make_gemm_fragment_hcu(
     lit: bool = False,
     lts: bool = False,
     b_interleave: int = 1,
+    a_interleave: int = 1,
 ) -> Fragment:
     if element_bits == 64:
         raise ValueError("float64 C fragment is not supported for HCU MMAC")
@@ -399,6 +400,38 @@ def make_gemm_fragment_hcu(
         raise ValueError(f"invalid block/warp tile: block=({block_m},{block_n}) warp=({warp_m},{warp_n})")
     if warp_m % 16 != 0 or warp_n % 16 != 0:
         raise ValueError(f"warp_m and warp_n must be multiples of 16, got ({warp_m}, {warp_n})")
+
+    if a_interleave == 2:
+        if b_interleave != 2 or not lit or lts:
+            raise ValueError("dual Alt2 C layout requires A/B Alt2 and MMAC LIT=1/LTS=0")
+        if warp_m % 32 or warp_n % 32:
+            raise ValueError("dual Alt2 C layout requires 32-aligned warp M/N")
+        # Keep the emitter's original register tile order. Only reinterpret
+        # natural spatial coordinates through the native Alt2 permutation.
+        ordinary = make_gemm_fragment_hcu(
+            block_m,
+            block_n,
+            num_warp_m,
+            num_warp_n,
+            num_warp_k,
+            element_bits,
+            min_n_per_warp,
+            lit=lit,
+            lts=lts,
+        )
+        mapping = IndexMap(ordinary.get_forward_vars(), [ordinary.thread, *ordinary.index], None)
+        replicas = int(ordinary.replicate_size)
+
+        def forward(i, j, rep=None):
+            coords = [i // 32 * 32 + i % 32 // 2 + i % 2 * 16, j // 32 * 32 + j % 32 // 2 + j % 2 * 16]
+            if replicas > 1:
+                coords.insert(0, rep.var)
+            mapped = mapping.map_indices(coords)
+            return mapped[0], convert(mapped[1:])
+
+        return Fragment([block_m, block_n], forward_fn=forward, replicate=replicas)
+    if a_interleave != 1:
+        raise ValueError(f"unsupported A interleave={a_interleave}")
 
     if b_interleave == 2:
         if lit or not lts:
@@ -431,6 +464,7 @@ def make_gemm_fragment_a_hcu(
     transposed: bool,
     *,
     mmac_k_dim: int | None = None,
+    interleave: int = 1,
 ) -> Fragment:
     warp_m = block_m // num_warp_m
     warp_k = block_k // num_warp_k
@@ -440,19 +474,27 @@ def make_gemm_fragment_a_hcu(
     if warp_k % mk != 0:
         raise ValueError(f"warp_k={warp_k} must be divisible by mmac_micro_k={mk}")
 
-    spatial_leading = not transposed
-    base = _micro_ab_fragment(element_bits, k_pack, spatial_leading=spatial_leading, mmac_k_dim=mmac_k_dim).repeat(
-        [1, 1], repeat_on_thread=False
-    )
+    spatial_atom = 16
+    if interleave == 2:
+        if element_bits != 16 or k_pack != 1 or mk != 16 or warp_m % 32:
+            raise ValueError("A Alt2 requires b16/k_pack=1 and warp_m divisible by 32")
+        spatial_atom = 32
+        fn = shared_16x32_to_local_64x8_layout_B_hcu_alt2 if transposed else shared_32x16_to_local_64x8_layout_B_hcu_alt2
+        base = _fragment_from_layout_fn(fn, 16 if transposed else 32, 32 if transposed else 16)
+    else:
+        if interleave != 1:
+            raise ValueError(f"unsupported A interleave={interleave}")
+        base = _micro_ab_fragment(element_bits, k_pack, spatial_leading=not transposed, mmac_k_dim=mmac_k_dim)
+    base = base.repeat([1, 1], repeat_on_thread=False)
     if transposed:
-        warp_layout = base.repeat([warp_k // mk, warp_m // 16], repeat_on_thread=False, lower_dim_first=True)
+        warp_layout = base.repeat([warp_k // mk, warp_m // spatial_atom], repeat_on_thread=False, lower_dim_first=True)
         block_layout = (
             warp_layout.repeat([1, num_warp_m], repeat_on_thread=True, lower_dim_first=True)
             .replicate(num_warp_n)
             .repeat([num_warp_k, 1], repeat_on_thread=True, lower_dim_first=True)
         )
     else:
-        warp_layout = base.repeat([warp_m // 16, warp_k // mk], repeat_on_thread=False, lower_dim_first=False)
+        warp_layout = base.repeat([warp_m // spatial_atom, warp_k // mk], repeat_on_thread=False, lower_dim_first=False)
         block_layout = (
             warp_layout.repeat([num_warp_m, 1], repeat_on_thread=True, lower_dim_first=True)
             .replicate(num_warp_n)
