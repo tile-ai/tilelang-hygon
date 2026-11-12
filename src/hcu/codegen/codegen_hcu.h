@@ -188,6 +188,7 @@ private:
                            const HoistedCPAsyncResource &resource);
   void EmitCPAsyncIdxenResource(const VarNode *source_var,
                                 const HoistedCPAsyncIdxenResource &resource);
+  void GetCacheWarmup(const PrimFunc &f);
 
   friend void PrintConst(const FloatImmNode *op, std::ostream &os,
                          CodeGenTileLangHCU *p);
@@ -201,6 +202,9 @@ private:
   // __syncthreads(), which would put a call-site declaration out of scope
   // for later rng_rand / rng_rand_float uses.
   std::unordered_map<const CallNode *, std::string> rng_state_name_map_;
+
+  // Warmup destinations remain live until the generated function epilogue.
+  std::unordered_map<const CallNode *, std::string> cache_warmup_name_map_;
 
   // whether need math_constants.h
   bool need_math_constants_h_{false};
@@ -226,6 +230,8 @@ private:
   bool need_cast_smem_ptr_to_int_{false};
   // whether need hiprand_kernel.h
   bool need_hiprand_kernel_h_{false};
+  // whether need cache_warmup.h
+  bool enable_cache_warmup_{false};
   // The name of the barrier array in shared memory
   const std::string barrier_name_ = "barrier";
   // The alignment of the barrier array in shared memory

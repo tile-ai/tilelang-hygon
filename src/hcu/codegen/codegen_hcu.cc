@@ -835,6 +835,9 @@ std::string CodeGenTileLangHCU::Finish() {
         << "#include <tl_templates/hcu/mls/tilelang_ds_read_format.hpp>\n";
   }
   decl_stream << "#include <tl_templates/hcu/copy.h>\n";
+  if (enable_cache_warmup_) {
+    decl_stream << "#include <tl_templates/hcu/cache_warmup.h>\n";
+  }
   decl_stream << "#include <tl_templates/hcu/reduce.h>\n";
   decl_stream << "#include <tl_templates/hcu/scan.h>\n";
   decl_stream << "#include <tl_templates/hcu/threadblock_swizzle.h>\n";
@@ -939,6 +942,21 @@ void CodeGenTileLangHCU::EmitCPAsyncIdxenResource(
          << resource.struct_stride_byte_bit
          << ">(reinterpret_cast<const void *>(" << GetVarID(source_var)
          << "), 0xfffffffcu);\n";
+}
+
+void CodeGenTileLangHCU::GetCacheWarmup(const PrimFunc &func) {
+  cache_warmup_name_map_.clear();
+  PostOrderVisit(func->body, [this](const ObjectRef &object) {
+    const auto *call = object.as<CallNode>();
+    if (!call || !call->op.same_as(tl::cache_warmup())) {
+      return;
+    }
+    enable_cache_warmup_ = true;
+    std::string name = name_supply_->FreshName(
+        "cache_warmup_" + std::to_string(cache_warmup_name_map_.size()));
+    ICHECK(cache_warmup_name_map_.emplace(call, name).second)
+        << "cache_warmup requires a distinct call for each request";
+  });
 }
 
 void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
@@ -1619,6 +1637,10 @@ void CodeGenTileLangHCU::PreFunctionBody(const PrimFunc &f) {
 
 void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
   const auto *call = op->value.as<CallNode>();
+  if (call && call->op.same_as(tl::cache_warmup())) {
+    PrintExpr(op->value);
+    return;
+  }
   if (call && call->op.same_as(tvm::tl::device_assert())) {
     ICHECK_EQ(call->args.size(), 1U);
     PrintIndent();
@@ -3019,6 +3041,28 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
        << PrintExpr(op->args[0]) << ", " << PrintExpr(scale) << ")";
     return;
   }
+
+  if (op->op.same_as(tl::cache_warmup())) {
+    auto result = cache_warmup_name_map_.find(op);
+    ICHECK(result != cache_warmup_name_map_.end())
+        << "cache_warmup call was not registered by the AddFunction pre-scan";
+    std::vector<std::string> args;
+    for (const PrimExpr &arg : op->args) {
+      args.push_back(PrintExpr(arg));
+    }
+    PrintIndent();
+    stream << "unsigned " << result->second << " = tl::cache_warmup(";
+    for (size_t i = 0; i < args.size(); ++i) {
+      if (i != 0) {
+        stream << ", ";
+      }
+      stream << args[i];
+    }
+    stream << ");\n";
+    os << result->second;
+    return;
+  }
+
   // Optimize if_then_else(cond, BufferLoad/Cast(BufferLoad), zeros) to use
   // buffer_load with predicate instead of if-else.
   if (op->op.same_as(builtin::if_then_else()) && op->args.size() == 3) {
@@ -4531,6 +4575,7 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   });
   cp_async_resource_var_names_.clear();
   cp_async_idxen_resource_var_names_.clear();
+  GetCacheWarmup(f);
   mls_resource_object_counter_ = 0;
   wdra_init_emitted_ = false;
 
@@ -4607,6 +4652,10 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
     rng_state_name_map_.emplace(call, std::move(name));
   });
   this->PrintStmt(f->body);
+  for (const auto &[call, name] : cache_warmup_name_map_) {
+    PrintIndent();
+    stream << "asm volatile(\"\" : : \"v\"(" << name << ") : \"memory\");\n";
+  }
   this->EndScope(func_scope);
   this->PrintIndent();
   this->stream << "}\n\n";
