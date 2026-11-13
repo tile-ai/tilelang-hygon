@@ -176,6 +176,25 @@ def ds_read_format(src, dst, alt: Literal[1, 2, 4] = 1):
     )
 
 
+def _ds_read_vector_region(src, dst, *, alt=1):
+    """Explicit ordinary-LDS matrix read; no automatic copy selection."""
+    if isinstance(alt, bool) or alt not in (1, 2):
+        raise ValueError("ds_read_vector alt must be 1 or 2")
+    if _buffer(dst) is None or not is_fragment(_buffer(dst)):
+        raise ValueError("ds_read_vector destination must be a fragment")
+    if alt == 2 and (_buffer(src) is None or str(_buffer(src).dtype) != "bfloat16"):
+        raise ValueError("ordinary LDS ds_read_vector alt=2 requires bfloat16")
+    if _buffer(src) is not None and _buffer(src).dtype != _buffer(dst).dtype:
+        raise ValueError("ds_read_vector source and destination dtypes must match")
+    read = ds_read_format(src, dst, alt=alt)
+    return tirx.call_intrin(
+        "handle",
+        read.op,
+        *read.args,
+        annotations={"tl.hcu_linear_ds_read": 1},
+    )
+
+
 def copy_scale(src, dst, *, op_ctrl: int = 0):
     """Copy an LDS scale tile into HCU ``shared.scale`` storage."""
 

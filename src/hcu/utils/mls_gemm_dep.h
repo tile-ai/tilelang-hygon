@@ -30,7 +30,10 @@ static constexpr const char *kHcuAFromAsyncCopyLinear =
     "tl.hcu_a_from_async_copy_linear";
 static constexpr const char *kHcuBFromAsyncCopyLinear =
     "tl.hcu_b_from_async_copy_linear";
+static constexpr const char *kHcuADsReadAlt = "tl.hcu_a_ds_read_alt";
 static constexpr const char *kHcuBDsReadAlt = "tl.hcu_b_ds_read_alt";
+// Native ds-read MN interleave (Alt), not a boolean instruction toggle.
+static constexpr const char *kHcuDsReadAlt = "tl.hcu_ds_read_alt";
 static constexpr const char *kHcuLinearDsRead = "tl.hcu_linear_ds_read";
 static constexpr const char *kHcuLayoutDsRead = "tl.hcu_layout_ds_read";
 } // namespace attr

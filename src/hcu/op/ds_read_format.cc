@@ -189,11 +189,16 @@ LayoutMap InferLayoutWithGemmDep(const DsReadFormatNode *self,
   constexpr int ds_layout_k_pack = 1;
   Fragment fragment;
   if (meta->feeds_slot == 0) {
-    ICHECK_EQ(self->alt_, 1)
-        << "ds_read_format Alt2 is currently supported only for GEMM B";
-    fragment = makeGemmFragmentAHCU(meta->gemm_m, meta->gemm_n, meta->gemm_k,
-                                    warp_m, warp_n, warp_k, element_bits,
-                                    ds_layout_k_pack, meta->gemm_trans_a);
+    if (self->alt_ == 2) {
+      fragment = MakeGemmFragmentAHCUInterleave2(
+          meta->gemm_m, meta->gemm_k, warp_m, warp_n, warp_k, element_bits,
+          ds_layout_k_pack, meta->gemm_trans_a);
+    } else {
+      ICHECK_EQ(self->alt_, 1) << "unsupported GEMM A ds_read Alt";
+      fragment = makeGemmFragmentAHCU(meta->gemm_m, meta->gemm_n, meta->gemm_k,
+                                      warp_m, warp_n, warp_k, element_bits,
+                                      ds_layout_k_pack, meta->gemm_trans_a);
+    }
   } else if (self->alt_ == 2) {
     fragment = makeGemmFragmentBHCUInterleave2(
         meta->gemm_m, meta->gemm_n, meta->gemm_k, warp_m, warp_n, warp_k,
@@ -385,6 +390,9 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
 
   if (hcu_linear_ds_read_) {
     ICHECK(gemm_dep_.defined()) << "linear ds_read requires a GEMM consumer";
+    ICHECK(alt_ == 1 ||
+           (alt_ == 2 && hcu_layout_ds_read_ && src->dtype.is_bfloat16()))
+        << "ordinary LDS Alt2 requires layout-aware BF16 reads";
     const auto *meta = gemm_dep_.get();
     const bool feeds_a = meta->feeds_slot == 0;
     ICHECK(feeds_a || meta->feeds_slot == 1);
@@ -439,7 +447,7 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
 
     if (hcu_layout_ds_read_) {
       ICHECK(T.layout_map.count(src))
-          << "layout-aware AN/BT ds_read requires annotate_layout";
+          << "layout-aware AN/BT ds_read source layout was not inferred";
       Layout layout = T.layout_map.at(src);
       ICHECK_EQ(layout->InputDim(), sr)
           << "layout-aware AN/BT ds_read layout rank must match input rank";
@@ -539,9 +547,14 @@ Stmt DsReadFormatNode::Lower(const LowerArgs &T,
               make_const(dst_leading_offset.dtype(),
                          (k_tile * per_warp_mn / 16 + mn_panel * 2) *
                              (read_tile_k / 4)));
-          reads.push_back(Evaluate(Call(
-              DataType::Handle(), tl::ds_read_vector(),
-              {dst_buf->data, local_offset, BufferLoad(src_buf, physical)})));
+          Map<String, ObjectRef> read_annotations;
+          if (alt_ != 1) {
+            read_annotations.Set(attr::kHcuDsReadAlt, Integer(alt_));
+          }
+          reads.push_back(Evaluate(
+              Call(DataType::Handle(), tl::ds_read_vector(),
+                   {dst_buf->data, local_offset, BufferLoad(src_buf, physical)},
+                   read_annotations)));
         }
       }
       ICHECK(!reads.empty());

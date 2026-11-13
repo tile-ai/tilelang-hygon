@@ -566,6 +566,37 @@ Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
   }
 }
 
+Fragment MakeGemmFragmentAHCUInterleave2(int block_m, int block_k,
+                                         int num_warp_m, int num_warp_n,
+                                         int num_warp_k, int element_size,
+                                         int k_pack, bool transposed) {
+  ICHECK_EQ(element_size, 16);
+  ICHECK_EQ(k_pack, 1);
+  ICHECK_EQ(block_m % num_warp_m, 0);
+  ICHECK_EQ(block_k % num_warp_k, 0);
+  const int warp_m = block_m / num_warp_m;
+  const int warp_k = block_k / num_warp_k;
+  ICHECK_EQ(warp_m % 32, 0);
+  ICHECK_EQ(warp_k % 16, 0);
+  IterVar m = MakeIterVar("m", 32);
+  IterVar k = MakeIterVar("k", 16);
+  IterVar rep = MakeIterVar("rep", 1);
+  Fragment base(transposed ? Array<IterVar>{k, m} : Array<IterVar>{m, k},
+                {4 * FloorMod(m->var, 2) + FloorMod(k->var, 4)},
+                16 * FloorDiv(k->var, 4) + FloorDiv(m->var, 2), rep);
+  base = base->Repeat({1, 1}, false, false);
+  if (transposed) {
+    return base->Repeat({warp_k / 16, warp_m / 32}, false, true)
+        ->Repeat({1, num_warp_m}, true, true)
+        ->Replicate(num_warp_n)
+        ->Repeat({num_warp_k, 1}, true, true);
+  }
+  return base->Repeat({warp_m / 32, warp_k / 16}, false, false)
+      ->Repeat({num_warp_m, 1}, true, true)
+      ->Replicate(num_warp_n)
+      ->Repeat({1, num_warp_k}, true, true);
+}
+
 Fragment
 makeGemmFragmentBHCUInterleave2(const int block_m, const int block_n,
                                 const int block_k, const int num_warp_m,

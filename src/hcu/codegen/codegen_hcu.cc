@@ -27,6 +27,7 @@
 #include "hcu/target_utils.h"
 #include "hcu/utils/gemm_lds_strategy_utils.h"
 #include "hcu/utils/mls_boundary.h"
+#include "hcu/utils/mls_gemm_dep.h"
 
 namespace tvm {
 namespace codegen {
@@ -3139,9 +3140,28 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::ostringstream load_expr;
     PrintExpr(op->args[2], load_expr);
     PrintIndent();
-    stream << "tl::ds_read_vector(*(float32x4 *)(" << dst << " + ("
-           << local_offset << ")), reinterpret_cast<TL_LDS_ADDR "
-           << shared_elem_type << " *>(&(" << load_expr.str() << ")));\n";
+    int64_t alt = 1;
+    if (auto value = op->annotations.Get(tl::attr::kHcuDsReadAlt)) {
+      const auto *interleave = value.value().as<IntImmNode>();
+      ICHECK(interleave && !interleave->dtype.is_bool())
+          << "ds_read_vector Alt must be a compile-time integer interleave";
+      alt = interleave->value;
+    }
+    ICHECK(alt == 1 || alt == 2)
+        << "ds_read_vector unsupported Alt=" << alt << "; expected 1 or 2";
+    if (alt == 2) {
+      ICHECK(shared_dtype.is_bfloat16())
+          << "ds_read_vector Alt=2 requires a bfloat16 source";
+      stream << "*(uint4 *)(" << dst << " + (" << local_offset
+             << ")) = __builtin_bit_cast(uint4, "
+                "__builtin_hcu_ds_read_m32x16_bf16_alt("
+                "reinterpret_cast<TL_LDS_ADDR short *>(&("
+             << load_expr.str() << "))));\n";
+    } else {
+      stream << "tl::ds_read_vector(*(float32x4 *)(" << dst << " + ("
+             << local_offset << ")), reinterpret_cast<TL_LDS_ADDR "
+             << shared_elem_type << " *>(&(" << load_expr.str() << ")));\n";
+    }
   } else if (op->op.same_as(builtin::ptx_commit_group())) {
     print_extern_call_stmt("tl::cp_async_commit");
   } else if (op->op.same_as(builtin::ptx_wait_group())) {

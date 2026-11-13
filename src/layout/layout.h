@@ -443,6 +443,11 @@ Fragment makeGemmFragmentBHCU(const int block_m, const int block_n,
                               bool transposed = false,
                               const int min_n_per_warp = 16);
 
+Fragment MakeGemmFragmentAHCUInterleave2(int block_m, int block_k,
+                                         int num_warp_m, int num_warp_n,
+                                         int num_warp_k, int element_size,
+                                         int k_pack, bool transposed);
+
 Fragment makeGemmFragmentBHCUInterleave2(
     const int block_m, const int block_n, const int block_k,
     const int num_warp_m, const int num_warp_n, const int num_warp_k,

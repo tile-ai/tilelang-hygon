@@ -76,6 +76,7 @@ struct HcuGemmLdsReadPattern {
   // Logical LDS elements read by each lane in one instruction.
   int elements_per_read;
   HcuGemmLdsAccessKind consumer_kind;
+  int ds_read_alt{1};
 };
 
 // Ordinary-reader facts resolved before storage selection. Element groups
@@ -96,6 +97,14 @@ Optional<Layout>
 MakeHcuPlainGemmLdsLayout(const Array<PrimExpr> &shape, int bank_count,
                           int bank_width_bytes,
                           const std::vector<HcuGemmLdsReadPattern> &consumers);
+
+// Native ordinary-LDS matrix reads share storage geometry across Alt modes.
+// Prefer a wave-contiguous row permutation with bank-ring rotations; use the
+// common plain layout for shapes outside that family's supported geometry.
+Optional<Layout>
+MakeHcuDsReadVectorLdsLayout(const Array<PrimExpr> &shape, int bank_count,
+                             int bank_width_bytes, int warp_size,
+                             const HcuGemmLdsReadPattern &read);
 
 struct HcuGemmLdsCopyGeometry {
   int bank_count{0};

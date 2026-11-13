@@ -972,6 +972,31 @@ Fragment ParallelOpNode::ComputeLoopLayoutFromBuffer(
 
   if (IsCommonAccessIndice(buffer)) {
     result = src_layout;
+    // Buffer annotations can be unbound even in an offset thread domain.
+    // Bind the loop candidate only; do not change the shared buffer layout.
+    if (!result->ThreadRange().defined()) {
+      result = result->BindThreadRange(layout_args.thread_bounds);
+    } else {
+      const auto &range = result->ThreadRange();
+      const auto &bounds = layout_args.thread_bounds;
+      // The bound range records the execution context, which can be wider
+      // than the fragment's owners. Preserve its origin, but check the actual
+      // owner map (including replicas) against the active thread domain.
+      Var rep("_owner_rep");
+      analyzer_.Bind(rep, Range(0, result->ReplicateExtent()));
+      PrimExpr owner = range->min + result->ForwardThread(
+                                        GetAccessInfo(buffer).indices, rep);
+      if (!analyzer_.CanProve(owner >= bounds->min) ||
+          !analyzer_.CanProve(owner < bounds->min + bounds->extent)) {
+        std::ostringstream msg;
+        msg << "Cannot infer Parallel layout from buffer `" << buffer->name
+            << "`: fragment owner threads (" << owner
+            << ") are not contained in the active thread range " << bounds
+            << " (bound thread range " << range << ")"
+            << ". Use a fragment owned by the active threads.";
+        throw LayoutConflictException(msg.str());
+      }
+    }
   } else {
     Var rep("_rep");
     auto rep_iter =
