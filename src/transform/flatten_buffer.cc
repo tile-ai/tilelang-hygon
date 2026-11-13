@@ -255,7 +255,18 @@ private:
         safe_indices.push_back(index);
       }
     }
-    return this->IterMapSimplifyWithContext(safe_indices, false);
+    auto simplified = this->IterMapSimplifyWithContext(safe_indices, false);
+    ICHECK_EQ(simplified.size(), safe_indices.size());
+    for (size_t i = 0; i < simplified.size(); ++i) {
+      // IterMapSimplify may combine incompatible padding from nested div/mod
+      // expressions.  In that case its result is not equivalent to the
+      // original element offset (e.g. ((x + 8) / 24 + 6) % 24).  Preserve the
+      // original index unless an independent analyzer can prove the rewrite.
+      if (!analyzer_->CanProveEqual(safe_indices[i], simplified[i])) {
+        simplified.Set(i, safe_indices[i]);
+      }
+    }
+    return simplified;
   }
 
   template <typename Node> Node VisitBufferAccess(Node node) {
