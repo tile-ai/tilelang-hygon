@@ -76,6 +76,7 @@ struct HcuGemmLdsReadPattern {
   // Logical LDS elements read by each lane in one instruction.
   int elements_per_read;
   HcuGemmLdsAccessKind consumer_kind;
+  int ds_read_alt{1};
 };
 
 // Ordinary-reader facts resolved before storage selection. Element groups

@@ -1465,6 +1465,8 @@ private:
           annotations.count(attr::kHcuGemmAnBtLdsStrategy))
         return std::nullopt;
     }
+    bool has_reader = false;
+    int layout_alt = 1;
     for (const auto &reader : collector_->GetReaderCalls(buffer)) {
       if (!reader.call)
         continue;
@@ -1476,13 +1478,20 @@ private:
       // storage decision. Only plan the still-unresolved explicit entry.
       if (ds->gemm_dep_.defined() && ds->gemm_dep_.value()->plain_warp_m > 0)
         continue;
-      const int bits = buffer->dtype.bits();
-      return MakeHcuDsReadVectorLdsLayout(
-          buffer->shape, TargetHcuGetLdsBankCount(target_),
-          TargetHcuGetLdsBankWidthBytes(target_), TargetHcuGetWarpSize(target_),
-          {bits, 256 / bits, 32, 128 / bits, HcuGemmLdsAccessKind::kAnBt});
+      has_reader = true;
+      // Select storage for every reader of this allocation, independent of
+      // visit order. The Alt2 layout also supports ordinary matrix readers.
+      if (ds->alt_ == 2)
+        layout_alt = 2;
     }
-    return std::nullopt;
+    if (!has_reader)
+      return std::nullopt;
+    const int bits = buffer->dtype.bits();
+    return MakeHcuDsReadVectorLdsLayout(
+        buffer->shape, TargetHcuGetLdsBankCount(target_),
+        TargetHcuGetLdsBankWidthBytes(target_), TargetHcuGetWarpSize(target_),
+        {bits, 256 / bits, 32, 128 / bits, HcuGemmLdsAccessKind::kAnBt,
+         layout_alt});
   }
 
   bool HasDsReadSourceLayout(const Buffer &buffer) const {

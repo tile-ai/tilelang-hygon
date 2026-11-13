@@ -252,6 +252,42 @@ MakeHcuDsReadVectorLdsLayout(const Array<PrimExpr> &shape, int bank_count,
   const int vectors_per_row = width / vector_elements;
   if (warp_size % vectors_per_row != 0)
     return fallback();
+  if (read.ds_read_alt == 2) {
+    // b16 Alt2 uses order8 (32 banks) / order9 (64 banks), rather
+    // than the ordinary order4/order5 phases. Keep each 16B vector
+    // intact and separate the row classes missing from the bank index.
+    // These XOR selectors also preserve ordinary matrix reads and b128
+    // stores, so one allocation can serve both Alt1 and Alt2 readers.
+    if (!IsPowerOfTwo(width))
+      return std::nullopt;
+    PrimExpr row = InputPlaceholder(0);
+    PrimExpr col = InputPlaceholder(1);
+    PrimExpr shift;
+    if (bank_count == 32) {
+      shift = width == 32
+                  ? (row & 2)
+                  : ((row & 1) * 2) ^ (((row & 1) ^ ((row >> 1) & 1)) * 4);
+    } else if (width == 32) {
+      shift = ((row >> 2) & 1) ^ (((row >> 3) & 1) * 2);
+    } else if (width == 64) {
+      shift =
+          ((row >> 1) & 1) ^ ((((row >> 1) ^ (row >> 2) ^ (row >> 3)) & 1) * 4);
+    } else {
+      shift = (row & 1) ^ (((row >> 1) & 1) * 4) ^
+              (((row ^ (row >> 2) ^ (row >> 3)) & 1) * 8);
+    }
+    PrimExpr mapped =
+        (floordiv(col, vector_elements) ^ shift) * vector_elements +
+        floormod(col, vector_elements);
+    Layout layout(Array<PrimExpr>{Integer(rows), Integer(width)},
+                  {row, mapped});
+    Array<PrimExpr> leading;
+    for (size_t i = 0; i + 2 < shape.size(); ++i)
+      leading.push_back(shape[i]);
+    Layout expanded = layout->Expand(leading);
+    return expanded->WithInverse(expanded);
+  }
+  ICHECK_EQ(read.ds_read_alt, 1);
   const int rows_per_wave = warp_size / vectors_per_row;
   if (read_rows % rows_per_wave != 0)
     return fallback();
@@ -448,6 +484,16 @@ TVM_FFI_STATIC_INIT_BLOCK() {
             shape, bank_count, bank_width_bytes, warp_size,
             {element_bits, 256 / element_bits, 32, 128 / element_bits,
              HcuGemmLdsAccessKind::kAnBt});
+      });
+  ffi::reflection::GlobalDef().def(
+      "tl.hcu.MakeDsReadVectorLdsLayoutWithAlt",
+      [](Array<PrimExpr> shape, int bank_count, int bank_width_bytes,
+         int warp_size, int element_bits, int alt) {
+        ICHECK(alt == 1 || (alt == 2 && element_bits == 16));
+        return MakeHcuDsReadVectorLdsLayout(
+            shape, bank_count, bank_width_bytes, warp_size,
+            {element_bits, 256 / element_bits, 32, 128 / element_bits,
+             HcuGemmLdsAccessKind::kAnBt, alt});
       });
   ffi::reflection::GlobalDef().def(
       "tl.hcu.MakePlainGemmLdsLayout",
