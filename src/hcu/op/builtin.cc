@@ -23,6 +23,7 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kPipelinedKUnrollFactor, Integer);
                                  Integer(CallEffectKind::Effect))
 
 TIR_DEFINE_HCU_BUILTIN(hcu_cp_async_idxen, 6, kOpaque);
+TIR_DEFINE_HCU_BUILTIN(cache_warmup, 5, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(ds_read_vector, 3, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(async_gld_sld_fence, 1, kOpaque);
 TIR_DEFINE_HCU_BUILTIN(async_gld_fence, 1, kOpaque);

@@ -4,12 +4,14 @@
 
 #include "codegen_hcu.h"
 #include "arith/pattern_match.h"
+#include "backend/common/codegen/codegen_utils.h"
 #include "support/check.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ir/cast.h>
 #include <tvm/s_tir/stmt.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/index_map.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -818,6 +820,10 @@ std::string CodeGenTileLangHCU::Finish() {
     decl_stream << "#include <tl_templates/hcu/scaled_cast.h>\n";
   }
 
+  if (need_hiprand_kernel_h_) {
+    decl_stream << "#include <hiprand/hiprand_kernel.h>\n";
+  }
+
   decl_stream << "#include <tl_templates/hcu/atomic.h>\n";
   if (enable_gemm_mls_) {
     decl_stream << "#include <tl_templates/hcu/mls/tilelang_mls_base.hpp>\n";
@@ -830,6 +836,9 @@ std::string CodeGenTileLangHCU::Finish() {
         << "#include <tl_templates/hcu/mls/tilelang_ds_read_format.hpp>\n";
   }
   decl_stream << "#include <tl_templates/hcu/copy.h>\n";
+  if (enable_cache_warmup_) {
+    decl_stream << "#include <tl_templates/hcu/cache_warmup.h>\n";
+  }
   decl_stream << "#include <tl_templates/hcu/reduce.h>\n";
   decl_stream << "#include <tl_templates/hcu/scan.h>\n";
   decl_stream << "#include <tl_templates/hcu/threadblock_swizzle.h>\n";
@@ -934,6 +943,21 @@ void CodeGenTileLangHCU::EmitCPAsyncIdxenResource(
          << resource.struct_stride_byte_bit
          << ">(reinterpret_cast<const void *>(" << GetVarID(source_var)
          << "), 0xfffffffcu);\n";
+}
+
+void CodeGenTileLangHCU::GetCacheWarmup(const PrimFunc &func) {
+  cache_warmup_name_map_.clear();
+  PostOrderVisit(func->body, [this](const ObjectRef &object) {
+    const auto *call = object.as<CallNode>();
+    if (!call || !call->op.same_as(tl::cache_warmup())) {
+      return;
+    }
+    enable_cache_warmup_ = true;
+    std::string name = name_supply_->FreshName(
+        "cache_warmup_" + std::to_string(cache_warmup_name_map_.size()));
+    ICHECK(cache_warmup_name_map_.emplace(call, name).second)
+        << "cache_warmup requires a distinct call for each request";
+  });
 }
 
 void CodeGenTileLangHCU::EmitHoistedCPAsyncResources(const PrimFunc &func) {
@@ -1614,6 +1638,10 @@ void CodeGenTileLangHCU::PreFunctionBody(const PrimFunc &f) {
 
 void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
   const auto *call = op->value.as<CallNode>();
+  if (call && call->op.same_as(tl::cache_warmup())) {
+    PrintExpr(op->value);
+    return;
+  }
   if (call && call->op.same_as(tvm::tl::device_assert())) {
     ICHECK_EQ(call->args.size(), 1U);
     PrintIndent();
@@ -1910,6 +1938,19 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
     BufferDesc desc = GetBufferDesc(value_dtype, op->buffer.get(), index_expr);
     if (CanUseVMBufferOps(op->buffer.get(), value_dtype.lanes())) {
       std::string value = PrintExpr(op->value);
+
+      // C/C++ integer promotion widens scalar int8/uint8/int16/uint16
+      // arithmetic and bitwise expressions to int.  So restore that
+      // width to result dtype before bit_cast
+      const bool is_narrow_integer =
+          (value_dtype.is_int() || value_dtype.is_uint()) &&
+          (value_dtype.bits() == 8 || value_dtype.bits() == 16);
+      if (desc.num_elements == 1 && value_dtype.is_scalar() &&
+          is_narrow_integer) {
+        std::ostringstream scalar_type;
+        PrintType(value_dtype, scalar_type);
+        value = "static_cast<" + scalar_type.str() + ">(" + value + ")";
+      }
 
       // Convert the value expression to a thread_buffer using bit_cast.
       // For lanes==1 this becomes thread_buffer<T,1>.
@@ -2391,10 +2432,8 @@ std::string CodeGenTileLangHCU::GetVecLoadWithPredicate(
     DataType t, const BufferNode *buffer, PrimExpr base,
     const std::string &pred) {
   if (CanUseVMBufferOps(buffer, t.lanes())) {
-    // Address-rebase annotations are store-only until ordinary VM loads have
-    // been validated independently.  Async/direct-to-LDS loads likewise pass
-    // false at their call sites.
-    auto desc = GetBufferDesc(t, buffer, base, false);
+    // Async/direct-to-LDS loads likewise pass false at their call sites.
+    auto desc = GetBufferDesc(t, buffer, base);
     std::string data_type = HcuCkTemplateElemType(t);
     std::ostringstream os;
     os << "*(";
@@ -3003,6 +3042,28 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
        << PrintExpr(op->args[0]) << ", " << PrintExpr(scale) << ")";
     return;
   }
+
+  if (op->op.same_as(tl::cache_warmup())) {
+    auto result = cache_warmup_name_map_.find(op);
+    ICHECK(result != cache_warmup_name_map_.end())
+        << "cache_warmup call was not registered by the AddFunction pre-scan";
+    std::vector<std::string> args;
+    for (const PrimExpr &arg : op->args) {
+      args.push_back(PrintExpr(arg));
+    }
+    PrintIndent();
+    stream << "unsigned " << result->second << " = tl::cache_warmup(";
+    for (size_t i = 0; i < args.size(); ++i) {
+      if (i != 0) {
+        stream << ", ";
+      }
+      stream << args[i];
+    }
+    stream << ");\n";
+    os << result->second;
+    return;
+  }
+
   // Optimize if_then_else(cond, BufferLoad/Cast(BufferLoad), zeros) to use
   // buffer_load with predicate instead of if-else.
   if (op->op.same_as(builtin::if_then_else()) && op->args.size() == 3) {
@@ -3809,6 +3870,31 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     this->stream << ");\n";
     return;
+  } else if (op->op.same_as(tl::rng_init())) {
+    this->need_hiprand_kernel_h_ = true;
+    auto it = rng_state_name_map_.find(op);
+    ICHECK(it != rng_state_name_map_.end())
+        << "tl.rng_init call was not registered by the AddFunction pre-scan";
+    this->hiprand_random_generator_state = it->second;
+    this->hiprand_random_generator_state_type =
+        op->args[3].as<StringImmNode>()->value;
+    this->PrintIndent();
+    this->stream << "hiprand_init(" << PrintExpr(op->args[0]) << ", "
+                 << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2])
+                 << ", &" << this->hiprand_random_generator_state << ");\n";
+    return;
+  } else if (op->op.same_as(tl::rng_rand())) {
+    this->need_hiprand_kernel_h_ = true;
+    os << "hiprand(&" << this->hiprand_random_generator_state << ")";
+    return;
+  } else if (op->op.same_as(tl::rng_rand_float())) {
+    this->need_hiprand_kernel_h_ = true;
+    os << "hiprand_" << op->args[0].as<StringImmNode>()->value;
+    if (op->dtype.bits() == 64) {
+      os << "_double";
+    }
+    os << "(&" << this->hiprand_random_generator_state << ")";
+    return;
   } else if (op->op.same_as(tl::hcu_set_max_nreg())) {
     this->PrintIndent();
     int nreg = Downcast<IntImm>(op->args[0])->value;
@@ -4046,19 +4132,29 @@ void CodeGenTileLangHCU::VisitExpr_(const BroadcastNode *op,
     os << "}}";
     return;
   }
-  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8 &&
-      lanes == 4) {
-    // make_int8x4
+  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8) {
     const int64_t *p = as_const_int(op->value);
-    ICHECK(p);
-    int64_t v = *p & 0xFF;
-    v = (v << 24) | (v << 16) | (v << 8) | v;
-    if (op->dtype.is_uint()) {
-      os << "(uint)" << v;
-    } else {
-      os << "(int)" << v;
+    if (p && lanes == 4) {
+      // make_int8x4
+      ICHECK(p);
+      int64_t v = *p & 0xFF;
+      v = (v << 24) | (v << 16) | (v << 8) | v;
+      if (op->dtype.is_uint()) {
+        os << "(uint)" << v;
+      } else {
+        os << "(int)" << v;
+      }
+      return;
     }
-    return;
+    // Replicate the byte across the carrier type (int/int2/int4).
+    if ((lanes == 4 || lanes == 8 || lanes == 16) &&
+        tirx::SideEffect(op->value) <= tirx::CallEffectKind::kReadState) {
+      std::string sval = SSAGetID(PrintExpr(op->value), op->value.dtype());
+      os << "tl::broadcast<";
+      PrintType(op->dtype, os);
+      os << ">(" << sval << ")";
+      return;
+    }
   }
 
   if (op->dtype.is_float16() && lanes == 16) {
@@ -4125,6 +4221,27 @@ void CodeGenTileLangHCU::VisitExpr_(const BroadcastNode *op,
     return;
   }
 
+  // 32-bit int/uint broadcast with lanes > 4 lowers to (u)longlong{lanes/2}
+  // (each ulonglong holds two consecutive 32-bit lanes).
+  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 32 &&
+      op->dtype.lanes() > 4 && op->dtype.lanes() % 2 == 0) {
+    int lanes = op->dtype.lanes();
+    std::string v = PrintExpr(op->value);
+    const char *u64 = op->dtype.is_uint() ? "unsigned long long" : "long long";
+    os << "make_";
+    PrintType(op->dtype, os);
+    os << '(';
+    for (int i = 0; i < lanes / 2; ++i) {
+      if (i != 0)
+        os << ", ";
+      // Widen through `unsigned int` so both lanes are zero-extended.
+      os << "(" << u64 << ")(((unsigned long long)(unsigned int)(" << v
+         << ")) | ((unsigned long long)(unsigned int)(" << v << ") << 32))";
+    }
+    os << ')';
+    return;
+  }
+
   if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 4) {
     bool fail = false;
     const int64_t *p = as_const_int(op->value);
@@ -4168,6 +4285,59 @@ void CodeGenTileLangHCU::VisitExpr_(const BroadcastNode *op,
 
     if (!fail) {
       return;
+    }
+  }
+
+  if (auto call = op->value.as<CallNode>()) {
+    if (this->hiprand_random_generator_state_type ==
+        "hiprandStatePhilox4_32_10_t") {
+      if (call->op.same_as(tl::rng_rand()) && lanes == 4) {
+        os << "hiprand4(&" << this->hiprand_random_generator_state << ")";
+        return;
+      }
+      if (call->op.same_as(tl::rng_rand_float())) {
+        int bits = call->dtype.bits();
+        std::string dist = call->args[0].as<StringImmNode>()->value;
+        if (bits == 32) {
+          if (lanes == 4) {
+            os << "hiprand_" << dist << "4(&"
+               << this->hiprand_random_generator_state << ")";
+            return;
+          } else if (lanes == 2 && dist == "normal") {
+            os << "hiprand_normal2(&" << this->hiprand_random_generator_state
+               << ")";
+            return;
+          }
+
+        } else {
+          if (lanes == 2) {
+            os << "hiprand_" << dist << "2_double(&"
+               << this->hiprand_random_generator_state << ")";
+            return;
+          }
+        }
+      }
+    } else if (this->hiprand_random_generator_state_type ==
+                   "hiprandStateMRG32k3a_t" ||
+               this->hiprand_random_generator_state_type ==
+                   "hiprandStateXORWOW_t") {
+      if (call->op.same_as(tl::rng_rand_float())) {
+        int bits = call->dtype.bits();
+        std::string dist = call->args[0].as<StringImmNode>()->value;
+        if (bits == 32) {
+          if (lanes == 2 && dist == "normal") {
+            os << "hiprand_normal2(&" << this->hiprand_random_generator_state
+               << ")";
+            return;
+          }
+        } else {
+          if (lanes == 2 && dist == "normal") {
+            os << "hiprand_normal2_double(&"
+               << this->hiprand_random_generator_state << ")";
+            return;
+          }
+        }
+      }
     }
   }
 
@@ -4224,9 +4394,11 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
     } else if (std::isnan(op->value)) {
       temp << ((op->dtype.bits() == 32) ? "NAN" : "NAN");
     } else {
-      temp << std::scientific << op->value;
+      // temp << std::scientific << op->value;
+      temp << FlexibleHexFormat(op->value);
       if (op->dtype.bits() == 32)
         temp << 'f';
+      temp << "/*" << std::scientific << op->value << "*/";
     }
     p->MarkConst(temp.str());
     os << temp.str();
@@ -4423,6 +4595,7 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   });
   cp_async_resource_var_names_.clear();
   cp_async_idxen_resource_var_names_.clear();
+  GetCacheWarmup(f);
   mls_resource_object_counter_ = 0;
   wdra_init_emitted_ = false;
 
@@ -4482,7 +4655,27 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   int func_scope = this->BeginScope();
   EmitHoistedCPAsyncResources(f);
   this->PreFunctionBody(f);
+  // Declare hiprand states for all tl.rng_init calls at function scope.
+  // Sync-insertion passes may split the block containing rng_init across
+  // __syncthreads(), so a declaration emitted at the call site can go out
+  // of scope before later rng_rand / rng_rand_float uses.
+  rng_state_name_map_.clear();
+  tirx::PostOrderVisit(f->body, [this](const ObjectRef &n) {
+    const auto *call = n.as<CallNode>();
+    if (call == nullptr || !call->op.same_as(tl::rng_init())) {
+      return;
+    }
+    this->need_hiprand_kernel_h_ = true;
+    std::string name = name_supply_->FreshName("__random_generator_state");
+    this->stream << "  " << call->args[3].as<StringImmNode>()->value << " "
+                 << name << ";\n";
+    rng_state_name_map_.emplace(call, std::move(name));
+  });
   this->PrintStmt(f->body);
+  for (const auto &[call, name] : cache_warmup_name_map_) {
+    PrintIndent();
+    stream << "asm volatile(\"\" : : \"v\"(" << name << ") : \"memory\");\n";
+  }
   this->EndScope(func_scope);
   this->PrintIndent();
   this->stream << "}\n\n";
