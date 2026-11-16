@@ -65,5 +65,51 @@ def test_flatten_buffer_keeps_safe_tvm_access_ptr_offset_int32():
     assert str(after_offsets[0].dtype) == "int32"
 
 
+def test_flatten_buffer_preserves_nested_div_mod_offset():
+    @T.prim_func
+    def before(ready: T.Buffer((24, 24, 32), "uint64"), output: T.Buffer((80, 32), "uint64")):
+        for block_id in T.serial(80):
+            for turn in T.serial(32):
+                if block_id >= 64:
+                    if block_id - 64 + turn * 16 < 504:
+                        output[block_id, turn] = ready[
+                            ((block_id - 64 + turn * 16) // 24 + 9) % 24,
+                            (block_id - 64 + turn * 16) % 24,
+                            0,
+                        ]
+
+    mod = tvm.IRModule.from_expr(before.with_attr("global_symbol", "main"))
+    mod = tilelang.transform.FlattenBuffer()(mod)
+    loads = []
+
+    def _visit(node):
+        if isinstance(node, tvm.tirx.BufferLoad) and node.buffer.name.startswith("ready"):
+            loads.append(node)
+
+    tvm.tirx.stmt_functor.post_order_visit(mod["main"].body, _visit)
+    assert len(loads) == 1
+    index = loads[0].indices[0]
+    variables = {}
+
+    def _collect_var(node):
+        if isinstance(node, tvm.tirx.Var):
+            variables[node.name] = node
+
+    tvm.tirx.stmt_functor.post_order_visit(index, _collect_var)
+    analyzer = tvm.arith.Analyzer()
+    for turn, block_id in [(0, 64), (0, 72), (31, 71)]:
+        task = block_id - 64 + turn * 16
+        row, panel = divmod(task, 24)
+        expected = (((row + 9) % 24) * 24 + panel) * 32
+        actual = tvm.tirx.stmt_functor.substitute(
+            index,
+            {
+                variables["turn"]: tvm.tirx.const(turn, "int32"),
+                variables["block_id"]: tvm.tirx.const(block_id, "int32"),
+            },
+        )
+        assert analyzer.simplify(actual).value == expected
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

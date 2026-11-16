@@ -30,7 +30,8 @@ def persistent_allgather_gemm_pull(M, N, K, rank, world, compute_blocks=64):
     total_tiles = (M // 256) * (N // 256)
     panels = K // 256
     local_rows = M // world // 256
-    tasks = (M // 256) * panels
+    # Own rows stay in local_A and are never pulled, so they are not enumerated.
+    tasks = (M // 256 - local_rows) * panels
     comm_blocks = 80 - compute_blocks
     # Tickets visit (row 0, col 0), (row 1, col 0), (row 0, col 1), ...
     # Each CTA claims one ticket independently; there are no fixed partners.
@@ -247,7 +248,10 @@ def persistent_allgather_gemm_pull(M, N, K, rank, world, compute_blocks=64):
             if task < tasks:
                 row = task // panels
                 panel = task % panels
-                global_row = (row + rank * local_rows) % (M // 256)
+                # Own rows are owned by this rank and stay in local_A, so the
+                # task list starts after them and wraps around them: no pulled
+                # panel ever has peer == rank.
+                global_row = (row + (rank + 1) * local_rows) % (M // 256)
                 peer = global_row // local_rows
                 remote = T.make_tensor_from_addr(peers[peer], (M // world, K), dtype)
                 # Keep each read/wait/write group small, but publish only one
@@ -436,9 +440,15 @@ def run():
             torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2,
                                        msg=lambda msg: f'{label} rank={rank}: {msg}')
             if actual is output:
-                assert torch.equal(gathered_A, torch_A), 'AllGather output mismatch'
-                assert bool((ready[:, :, 0] == epoch[0]).all()), 'missing panel readiness'
-                assert bool((ready[:, :, 1:] == 0).all()), 'signal padding overwritten'
+                # This rank's own rows are never pulled into gathered_A.
+                owned = torch.arange(m, device=gathered_A.device) // (m // world) == rank
+                assert torch.equal(gathered_A[~owned], torch_A[~owned]), 'AllGather output mismatch'
+                # Own rows are computed from local_A, so they are never signalled.
+                local_row = owned.view(m // 256, 256)[:, 0]
+                ready_values = ready.to(torch.int64)
+                assert bool((ready_values[~local_row, :, 0] == epoch[0]).all()), 'missing panel readiness'
+                assert bool((ready_values[local_row] == 0).all()), 'local rows signalled'
+                assert bool((ready_values[:, :, 1:] == 0).all()), 'signal padding overwritten'
                 tiles = (m // 256) * (n // 256)
                 assert queue[0].item() == tiles + 80, 'independent queue task count'
                 assert bool((queue[1:] == 0).all()), 'unexpected queue writes'
