@@ -836,6 +836,9 @@ std::string CodeGenTileLangHCU::Finish() {
         << "#include <tl_templates/hcu/mls/tilelang_ds_read_format.hpp>\n";
   }
   decl_stream << "#include <tl_templates/hcu/copy.h>\n";
+  if (enable_cache_warmup_) {
+    decl_stream << "#include <tl_templates/hcu/cache_warmup.h>\n";
+  }
   decl_stream << "#include <tl_templates/hcu/reduce.h>\n";
   decl_stream << "#include <tl_templates/hcu/scan.h>\n";
   decl_stream << "#include <tl_templates/hcu/threadblock_swizzle.h>\n";
@@ -1620,6 +1623,10 @@ void CodeGenTileLangHCU::PreFunctionBody(const PrimFunc &f) {
 
 void CodeGenTileLangHCU::VisitStmt_(const EvaluateNode *op) {
   const auto *call = op->value.as<CallNode>();
+  if (call && call->op.same_as(tl::cache_warmup())) {
+    PrintExpr(op->value);
+    return;
+  }
   if (call && call->op.same_as(tvm::tl::device_assert())) {
     ICHECK_EQ(call->args.size(), 1U);
     PrintIndent();
@@ -3020,6 +3027,57 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
        << PrintExpr(op->args[0]) << ", " << PrintExpr(scale) << ")";
     return;
   }
+
+  if (op->op.same_as(tl::cache_warmup())) {
+    // Each region contributes a pointer and four range parameters.
+    ICHECK(!op->args.empty() && op->args.size() % 5 == 0)
+        << "cache_warmup requires five arguments per region";
+    enable_cache_warmup_ = true;
+    has_cache_warmup_ = true;
+    std::vector<std::string> args;
+    for (const PrimExpr &arg : op->args) {
+      args.push_back(PrintExpr(arg));
+    }
+    const size_t num_regions = args.size() / 5;
+    std::vector<std::string> requests;
+    for (size_t i = 0; i < num_regions; ++i) {
+      std::string name =
+          name_supply_->FreshName("cache_warmup_" + std::to_string(i));
+      requests.push_back(name);
+      PrintIndent();
+      stream << "const auto " << name << " = tl::cache_warmup(";
+      for (size_t j = 0; j < 5; ++j) {
+        if (j != 0) {
+          stream << ", ";
+        }
+        stream << args[5 * i + j];
+      }
+      stream << ");\n";
+    }
+    PrintIndent();
+    stream << "unsigned ret"
+              ";\n";
+    PrintIndent();
+    stream << "asm volatile(\n";
+    for (size_t i = 0; i < num_regions; ++i) {
+      const size_t operand = 1 + 2 * i;
+      PrintIndent();
+      stream << "  \"buffer_load_dword %0, %" << operand << ", %" << operand + 1
+             << ", 0 offen\\n\\t\"\n";
+    }
+    PrintIndent();
+    stream << "  : \"=&v\"(ret)\n";
+    for (size_t i = 0; i < num_regions; ++i) {
+      PrintIndent();
+      stream << (i == 0 ? "  : " : "    ") << "\"v\"(" << requests[i]
+             << ".byte_offset), \"s\"(" << requests[i] << ".resource)"
+             << (i + 1 == num_regions ? "\n" : ",\n");
+    }
+    PrintIndent();
+    stream << "  : \"memory\");\n";
+    return;
+  }
+
   // Optimize if_then_else(cond, BufferLoad/Cast(BufferLoad), zeros) to use
   // buffer_load with predicate instead of if-else.
   if (op->op.same_as(builtin::if_then_else()) && op->args.size() == 3) {
@@ -4553,6 +4611,7 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
   cp_async_idxen_resource_var_names_.clear();
   mls_resource_object_counter_ = 0;
   wdra_init_emitted_ = false;
+  has_cache_warmup_ = false;
 
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol.has_value())
@@ -4627,6 +4686,10 @@ void CodeGenTileLangHCU::AddFunction(const PrimFunc &f) {
     rng_state_name_map_.emplace(call, std::move(name));
   });
   this->PrintStmt(f->body);
+  if (has_cache_warmup_) {
+    PrintIndent();
+    stream << "asm volatile(\"\" : : \"v\"(ret) : \"memory\");\n";
+  }
   this->EndScope(func_scope);
   this->PrintIndent();
   this->stream << "}\n\n";

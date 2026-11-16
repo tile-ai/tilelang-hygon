@@ -226,6 +226,10 @@ private:
   bool need_cast_smem_ptr_to_int_{false};
   // whether need hiprand_kernel.h
   bool need_hiprand_kernel_h_{false};
+  // whether need cache_warmup.h
+  bool enable_cache_warmup_{false};
+  // Whether the current function uses cache warmup
+  bool has_cache_warmup_{false};
   // The name of the barrier array in shared memory
   const std::string barrier_name_ = "barrier";
   // The alignment of the barrier array in shared memory
