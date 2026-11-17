@@ -1904,6 +1904,8 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
     ICHECK(scope == "shared" || scope == "shared.dyn" || scope == "local" ||
            scope == "local.var")
         << "Unexpected packed fp4 store scope: " << scope;
+    // PrintExpr may emit temporary declarations before returning its value.
+    std::string value = PrintExpr(op->value);
     std::string pred = GetCurrentPredicate();
     PrintIndent();
     if (pred != "true")
@@ -1911,7 +1913,7 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
     stream << "*(reinterpret_cast<" << fp4_desc.c_type << "*>("
            << GetVarID(op->buffer->data.get()) << ") + (("
            << PrintExpr(ramp->base) << ") / " << fp4_desc.lanes
-           << ")) = " << PrintExpr(op->value) << ";\n";
+           << ")) = " << value << ";\n";
     return;
   }
 

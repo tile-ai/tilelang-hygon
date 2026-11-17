@@ -34,6 +34,7 @@
 #include <tl_templates/hcu/core/numeric/integral_constant.hpp>
 #include <tl_templates/hcu/core/numeric/math.hpp>
 #include <tl_templates/hcu/core/numeric/numeric.hpp>
+#include <tl_templates/hcu/core/numeric/pk_fp4.hpp>
 #include <tl_templates/hcu/core/numeric/type_convert.hpp>
 #include <tl_templates/hcu/core/numeric/vector_type.hpp>
 
