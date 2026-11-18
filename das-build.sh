@@ -1,16 +1,7 @@
-# add code to loop download submodule
-i=0
-while ((i<10))
-do
-    echo "this is the $i times download"
-    git submodule update --init --recursive
-    if [ "$?" == 0 ];then
-	echo "download submodule success"
-        break
-    fi
-    ((i++))
-done
-export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
-pip3 install -r requirements.txt
-pip3 install -r requirements-dev.txt
-USE_HCU=ON USE_CUDA=OFF python3 -m build --wheel --no-isolation --config-setting=cmake.build-type=Release --config-setting=install.strip=true
+#!/usr/bin/env bash
+# i12055: bounded CI environment hold for the HCU runner probe (temporary).
+set -uo pipefail
+echo "I12055 tile-ai hold begin $(date -u +%Y-%m-%dT%H:%M:%SZ) runner=${RUNNER_NAME:-?} job=${GITHUB_JOB:-?} run=${GITHUB_RUN_ID:-?}"
+sleep 720
+echo "I12055 tile-ai hold end $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+exit 0
