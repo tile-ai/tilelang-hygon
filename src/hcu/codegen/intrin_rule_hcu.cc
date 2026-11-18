@@ -3,6 +3,7 @@
  * \brief HIP intrinsic rules.
  */
 #include "support/check.h"
+#include <functional>
 #include <tvm/ir/cast.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op_attr_types.h>
@@ -148,8 +149,30 @@ template <typename T> static PrimExpr DispatchHCUShuffle(const PrimExpr &e) {
   const CallNode *call = e.as<CallNode>();
   ICHECK(call != nullptr);
   ICHECK_EQ(call->args.size(), 5); // mask, value, warp_id, width, warp_size
-  ffi::Array<PrimExpr> hip_args{
-      {call->args[0], call->args[1], call->args[2], call->args[3]}};
+
+  // HCU exposes non-masked wave64 shuffle builtins. Only discard the source
+  // mask when it denotes the full active wave.
+  std::function<bool(const PrimExpr &)> is_full_active_mask =
+      [&](const PrimExpr &expr) -> bool {
+    if (auto imm = expr.as<IntImm>()) {
+      const int bits = expr.dtype().bits();
+      const uint64_t full_mask =
+          bits >= 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
+      return static_cast<uint64_t>(imm.value()->value) == full_mask;
+    }
+    if (const auto *cast = expr.as<CastNode>())
+      return is_full_active_mask(cast->value);
+    if (const auto *mask_call = expr.as<CallNode>()) {
+      return mask_call->op.same_as(builtin::tvm_warp_activemask()) ||
+             mask_call->op.same_as(Op::Get("tirx.hip.__activemask"));
+    }
+    return false;
+  };
+  ICHECK(is_full_active_mask(call->args[0]))
+      << "HCU shuffle lowering requires a full active-wave mask; "
+         "partial or dynamic masks are unsupported";
+
+  ffi::Array<PrimExpr> hip_args{{call->args[1], call->args[2], call->args[3]}};
   return Call(call->dtype, T()(call->dtype, Downcast<Op>(call->op)), hip_args);
   // NOLINTEND(clang-analyzer-cplusplus.InnerPointer)
 }
@@ -217,7 +240,7 @@ TVM_REGISTER_OP("tirx.tan")
 
 TVM_REGISTER_OP("tirx.cos")
     .set_attr<FLowerIntrinsic>("hcu.FLowerIntrinsic",
-                               DispatchPureExternScalarized<HCUFastMath>);
+                               DispatchPureExternScalarized<HCUMath>);
 
 TVM_REGISTER_OP("tirx.cosh")
     .set_attr<FLowerIntrinsic>("hcu.FLowerIntrinsic",
@@ -225,7 +248,7 @@ TVM_REGISTER_OP("tirx.cosh")
 
 TVM_REGISTER_OP("tirx.sin")
     .set_attr<FLowerIntrinsic>("hcu.FLowerIntrinsic",
-                               DispatchPureExternScalarized<HCUFastMath>);
+                               DispatchPureExternScalarized<HCUMath>);
 
 TVM_REGISTER_OP("tirx.sinh")
     .set_attr<FLowerIntrinsic>("hcu.FLowerIntrinsic",
@@ -270,6 +293,48 @@ TVM_REGISTER_OP("tirx.tvm_warp_activemask")
 TVM_REGISTER_OP("tirx.fmod")
     .set_attr<FLowerIntrinsic>("hcu.FLowerIntrinsic",
                                DispatchPureExternScalarized<HCUMath>);
+
+// Register low-level builtin ops.
+TVM_REGISTER_OP("tirx.hip.__shfl_sync")
+    .set_num_inputs(3)
+    .add_argument("var", "Expr", "The variable to sync.")
+    .add_argument("lane", "Expr", "The source thread id.")
+    .add_argument("width", "Expr",
+                  "The warp thread width, must be a power of 2.")
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "__shfl")
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque))
+    .set_attr<bool>("hip.need_warp_shuffle", true);
+
+TVM_REGISTER_OP("tirx.hip.__shfl_up_sync")
+    .set_num_inputs(3)
+    .add_argument("var", "Expr", "The variable to sync.")
+    .add_argument("delta", "Expr", "The source lane id offset to be added.")
+    .add_argument("width", "Expr",
+                  "The warp thread width, must be a power of 2.")
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "__shfl_up")
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque))
+    .set_attr<bool>("hip.need_warp_shuffle", true);
+
+TVM_REGISTER_OP("tirx.hip.__shfl_down_sync")
+    .set_num_inputs(3)
+    .add_argument("var", "Expr", "The variable to sync.")
+    .add_argument("delta", "Expr",
+                  "The source lane id offset to be subtracted.")
+    .add_argument("width", "Expr",
+                  "The warp thread width, must be a power of 2.")
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "__shfl_down")
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque))
+    .set_attr<bool>("hip.need_warp_shuffle", true);
+
+TVM_REGISTER_OP("tirx.hip.__activemask")
+    .set_num_inputs(0)
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "__builtin_amdgcn_read_exec")
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure))
+    .set_attr<bool>("hip.need_warp_shuffle", true);
 
 } // namespace intrin
 } // namespace codegen

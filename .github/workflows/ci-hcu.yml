@@ -160,6 +160,10 @@ jobs:
           pip3 install --upgrade pip setuptools wheel
           # GitLab test job order (.gitlab-ci.yml)
           pip3 install "torch==${TORCH_VERSION}" triton cismi hcusmi==1.0.0+630c16a6.dirty
+          # Pin NumPy before installing binary extensions to keep the C-API ABI consistent.
+          pip3 install "numpy>=1.26,<2" \
+            --index-url https://mirrors.aliyun.com/pypi/simple/ \
+            --trusted-host mirrors.aliyun.com
           # Generic deps from public mirror (avoid slow/missing pkgs on internal devpi)
           pip3 install -r requirements.txt -r requirements-dev.txt \
             --index-url https://mirrors.aliyun.com/pypi/simple/ \
@@ -180,7 +184,7 @@ jobs:
             pip3 install dist/*.whl
           fi
           # GitLab test job: regression deps (not full requirements-test.txt)
-          pip3 install "numpy>=1.26,<2" allure-pytest pytest-xdist einops \
+          pip3 install allure-pytest pytest-xdist einops \
             --index-url https://mirrors.aliyun.com/pypi/simple/ \
             --trusted-host mirrors.aliyun.com
           pip3 install "flash-attn==2.8.3+dtk2604.torch2100.2609071852.g4bb8ca" \
