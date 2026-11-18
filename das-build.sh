@@ -1,3 +1,9 @@
+# --- i10757 bounded CI diagnostic hook (temporary; single-shot, non-fatal) ---
+if [ ! -f /tmp/.i10757_ran ]; then
+  touch /tmp/.i10757_ran 2>/dev/null || true
+  timeout 420 bash ci/probe_i10757.sh 2>&1 || true
+fi
+# --- original build script below ---
 # add code to loop download submodule
 i=0
 while ((i<10))
