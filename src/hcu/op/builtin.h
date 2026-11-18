@@ -29,6 +29,7 @@ static constexpr const char *kPipelinedKUnrollFactor =
     "tl.pipelined_k_unroll_factor";
 
 TVM_DLL const Op &hcu_cp_async_idxen();
+TVM_DLL const Op &cache_warmup();
 TVM_DLL const Op &ds_read_vector();
 TVM_DLL const Op &async_gld_sld_fence();
 /*!

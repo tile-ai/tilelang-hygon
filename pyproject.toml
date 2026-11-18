@@ -33,7 +33,7 @@ dependencies = [
     "torch-c-dlpack-ext; python_version < '3.14'",
     "cloudpickle",
     "ml-dtypes",
-    "numpy>=1.23.5",
+    "numpy>=1.26,<2",
     "psutil",
     "torch",
     "torch>=2.4; platform_system == 'Darwin'",

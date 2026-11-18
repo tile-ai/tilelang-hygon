@@ -7,6 +7,8 @@ from .allocate import *  # noqa: F401,F403
 from .allocate import __all__ as _ALLOCATE_ALL
 from .annotations import *  # noqa: F401,F403
 from .annotations import __all__ as _ANNOTATION_ALL
+from .cache_warmup import *  # noqa: F401,F403
+from .cache_warmup import __all__ as _CACHE_WARMUP_ALL
 from .copy_op import *  # noqa: F401,F403
 from .copy_op import __all__ as _COPY_ALL
 from .gemm_op import *  # noqa: F401,F403
@@ -17,6 +19,8 @@ from .kernel import *  # noqa: F401,F403
 from .kernel import __all__ as _KERNEL_ALL
 from .loop import *  # noqa: F401,F403
 from .loop import __all__ as _LOOP_ALL
+from .random import *  # noqa: F401,F403
+from .random import __all__ as _RANDOM_ALL
 from .reduce_op import *  # noqa: F401,F403
 from .reduce_op import __all__ as _REDUCE_ALL
 
@@ -55,15 +59,30 @@ __all__ = tuple(
             "device_assert",
             *_ALLOCATE_ALL,
             *_ANNOTATION_ALL,
+            *_CACHE_WARMUP_ALL,
             *_COPY_ALL,
             *_GEMM_ALL,
             *_INTRINSIC_ALL,
             *_KERNEL_ALL,
             *_LOOP_ALL,
+            *_RANDOM_ALL,
             *_REDUCE_ALL,
             *_SCALE_ALL,
         )
     )
 )
 
-del _COMMON_ALL, _ALLOCATE_ALL, _ANNOTATION_ALL, _COPY_ALL, _GEMM_ALL, _INTRINSIC_ALL, _KERNEL_ALL, _LOOP_ALL, _REDUCE_ALL, _SCALE_ALL
+del (
+    _COMMON_ALL,
+    _ALLOCATE_ALL,
+    _ANNOTATION_ALL,
+    _CACHE_WARMUP_ALL,
+    _COPY_ALL,
+    _GEMM_ALL,
+    _INTRINSIC_ALL,
+    _KERNEL_ALL,
+    _LOOP_ALL,
+    _RANDOM_ALL,
+    _REDUCE_ALL,
+    _SCALE_ALL,
+)

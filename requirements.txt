@@ -4,7 +4,7 @@ apache-tvm-ffi>=0.1.11,<0.1.13
 torch-c-dlpack-ext; python_version < '3.14'
 cloudpickle
 ml-dtypes
-numpy>=1.23.5
+numpy>=1.26,<2
 psutil
 torch
 torch>=2.7; platform_system == 'Darwin'
