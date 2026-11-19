@@ -249,7 +249,8 @@ public:
       VisitNewScope(op);
     } else if (op->attr_key == s_tir::attr::virtual_thread) {
       VisitNewScope(op);
-    } else if (op->attr_key == tl::attr::kLexicalAllocScope) {
+    } else if (op->attr_key == tl::attr::kLexicalAllocScope ||
+               op->attr_key == "tl.hcu.thread_binding_alias") {
       VisitNewScope(op);
     } else {
       StmtExprVisitor::VisitStmt_(op);
@@ -1014,7 +1015,8 @@ private:
             lexical_scope_stack_.pop_back();
           }
         } else {
-          ICHECK(op->attr_key == tirx::attr::extern_scope);
+          ICHECK(op->attr_key == tirx::attr::extern_scope ||
+                 op->attr_key == "tl.hcu.thread_binding_alias");
         }
       } else if (s.stmt->IsInstance<ForNode>()) {
         const auto *op = reinterpret_cast<const ForNode *>(s.stmt);

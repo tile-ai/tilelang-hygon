@@ -1946,6 +1946,19 @@ void CodeGenTileLangHCU::VisitStmt_(const BufferStoreNode *op) {
 void CodeGenTileLangHCU::VisitExpr_(const BufferLoadNode *op,
                                     std::ostream &os) {
   DataType value_dtype = op->dtype;
+  // Byte scalars (notably E8M0 scale carriers) otherwise bypass GetVecLoad
+  // and rebuild a 64-bit global address in VGPRs. Use the same resource-based
+  // load and eligibility rules as vector payloads, including dynamic shapes.
+  // This path shares their 32-bit offset contract; it adds no size proof.
+  // Keep existing guarded control flow: predicate-folding is unchanged.
+  if (value_dtype.is_scalar() && value_dtype.bits() == 8 &&
+      (value_dtype.is_int() || value_dtype.is_uint()) &&
+      op->indices.size() == 1 && !op->predicate.defined() &&
+      CanUseVMBufferOps(op->buffer.get(), 1)) {
+    os << GetVecLoadWithPredicate(value_dtype, op->buffer.get(), op->indices[0],
+                                  GetCurrentPredicate());
+    return;
+  }
   if (!value_dtype.is_float4_e2m1fn() || value_dtype.lanes() == 1) {
     CodeGenC::VisitExpr_(op, os);
     return;
@@ -3838,6 +3851,23 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
 }
 
 void CodeGenTileLangHCU::VisitStmt_(const AttrStmtNode *op) {
+  if (op->attr_key == "tl.hcu.thread_binding_alias") {
+    const auto *thread = op->node.as<VarNode>();
+    ICHECK(thread && thread_index_vars_.count(thread) &&
+           var_idmap_.count(thread))
+        << "thread_binding_alias requires a bound thread variable";
+    ICHECK(op->value.dtype().is_scalar() &&
+           (op->value.dtype().is_int() || op->value.dtype().is_uint()))
+        << "thread_binding_alias requires a scalar integer alias";
+    // The caller guarantees this task-local value equals the physical thread
+    // index. Apply only while emitting the lexical body; never rewrite text.
+    std::string alias = PrintExpr(op->value);
+    std::string previous = var_idmap_.at(thread);
+    var_idmap_[thread] = CastFromTo(alias, op->value.dtype(), thread->dtype);
+    VisitStmt(op->body);
+    var_idmap_[thread] = previous;
+    return;
+  }
   if (op->attr_key == tl::attr::kHcuBufferCacheSwizzleStride) {
     const auto *stride = op->value.as<IntImmNode>();
     ICHECK(stride && stride->value > 0)

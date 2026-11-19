@@ -189,6 +189,22 @@ TL_DEVICE Result scaled_cast(Source source, Scale scale) {
   const auto *src = reinterpret_cast<const unsigned char *>(&source);
   const auto *sf = reinterpret_cast<const unsigned char *>(&scale);
   auto *dst = reinterpret_cast<unsigned char *>(&result);
+  // A packed FP8 source word contains two independently selectable pairs.
+  // Preserve it instead of extracting bytes and rebuilding low-half inputs.
+  if constexpr (SharedScale && BF16 && !BF8 && Lanes % 4 == 0) {
+#pragma unroll
+    for (int i = 0; i < Lanes; i += 4) {
+      int word;
+      __builtin_memcpy(&word, src + i, 4);
+      auto lo =
+          __builtin_hcu_cvt_scale_pk_bf16_fp8(word, int(sf[0]), 0, Clamp, 0);
+      auto hi =
+          __builtin_hcu_cvt_scale_pk_bf16_fp8(word, int(sf[0]), 1, Clamp, 0);
+      __builtin_memcpy(dst + 2 * i, &lo, 4);
+      __builtin_memcpy(dst + 2 * i + 4, &hi, 4);
+    }
+    return result;
+  }
 #pragma unroll
   for (int i = 0; i < Lanes; i += (SharedScale ? 2 : 1)) {
     const int s = sf[SharedScale ? 0 : i];

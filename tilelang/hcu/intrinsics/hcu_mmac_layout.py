@@ -434,12 +434,45 @@ def make_gemm_fragment_hcu(
         raise ValueError(f"unsupported A interleave={a_interleave}")
 
     if b_interleave == 2:
-        if lit or not lts:
-            raise ValueError("B Alt2 C layout requires MMAC LIT=0 and LTS=1")
-        if warp_n % 32 != 0:
-            raise ValueError(f"B Alt2 C layout requires warp_n divisible by 32, got {warp_n}")
-        base = _fragment_from_layout_fn(shared_16x32_to_local_64x8_layout_C_hcu_alt2_lts, 16, 32).repeat([1, 1], repeat_on_thread=False)
-        warp_n_atoms = warp_n // 32
+        if lit and lts:
+            raise ValueError("B Alt2 C layout does not support MMAC LIT=1/LTS=1")
+        if lit:
+            if warp_n % 32 != 0:
+                raise ValueError(f"B Alt2 LIT layout requires warp_n divisible by 32, got {warp_n}")
+            # Keep the ordinary LIT register order. Interleave each pair of
+            # adjacent 16-wide N tiles: logical j maps to physical
+            # j//32*32 + (j%32)//2 + (j%2)*16. M is unchanged.
+            ordinary = make_gemm_fragment_hcu(
+                block_m,
+                block_n,
+                num_warp_m,
+                num_warp_n,
+                num_warp_k,
+                element_bits,
+                min_n_per_warp,
+                lit=lit,
+                lts=lts,
+            )
+            mapping = IndexMap(ordinary.get_forward_vars(), [ordinary.thread, *ordinary.index], None)
+            replicas = int(ordinary.replicate_size)
+
+            def forward(i, j, rep=None):
+                coords = [i, j // 32 * 32 + j % 32 // 2 + j % 2 * 16]
+                if replicas > 1:
+                    coords.insert(0, rep.var)
+                mapped = mapping.map_indices(coords)
+                return mapped[0], convert(mapped[1:])
+
+            return Fragment([block_m, block_n], forward_fn=forward, replicate=replicas)
+        else:
+            if warp_n % 32 != 0:
+                raise ValueError(f"B Alt2 LTS layout requires warp_n divisible by 32, got {warp_n}")
+            base = _fragment_from_layout_fn(shared_16x32_to_local_64x8_layout_C_hcu_alt2_lts, 16, 32).repeat([1, 1], repeat_on_thread=False)
+            warp_layout = base.repeat([warp_m // 16, warp_n // 32], repeat_on_thread=False, lower_dim_first=True)
+        block_layout = warp_layout.repeat([block_m // warp_m, block_n // warp_n], repeat_on_thread=True, lower_dim_first=False)
+        if n_recompute > 1 or num_warp_k > 1:
+            block_layout = block_layout.replicate(n_recompute * num_warp_k)
+        return block_layout
     else:
         if b_interleave != 1:
             raise ValueError(f"unsupported B interleave={b_interleave}")
