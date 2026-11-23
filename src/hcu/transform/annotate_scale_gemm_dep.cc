@@ -341,8 +341,9 @@ ResolveConsumerMmacMode(const GemmNode *gemm, const Map<String, ObjectRef> &ann,
   (void)block_size;
   const Buffer &a = gemm->aRegion_->buffer;
   const Buffer &b = gemm->bRegion_->buffer;
+  const Buffer &c = gemm->cRegion_->buffer;
   return hcu::ResolveHcuMmacMode(
-      a->dtype, b->dtype, a.scope() == "local.fragment",
+      a->dtype, b->dtype, c->dtype, a.scope() == "local.fragment",
       b.scope() == "local.fragment", /*is_blockscaled=*/true, gemm->k_,
       scale_format_a, scale_format_b, target);
 }

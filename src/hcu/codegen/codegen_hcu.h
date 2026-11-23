@@ -75,6 +75,9 @@ public:
   // Override this as a work around for __grid_constant__ parameter
   void AddFunction(const PrimFunc &f);
 
+  void EmitPackedX2Call(const std::string &tl_func, DataType t,
+                        const std::vector<PrimExpr> &args, std::ostream &os);
+
 protected:
   // Override BufferStore lowering so we can emit CK buffer store ops for
   // global memory using buffer_store.

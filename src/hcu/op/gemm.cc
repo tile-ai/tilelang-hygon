@@ -33,9 +33,9 @@ constexpr const char *kHCUMMAC = "hcu.mmac";
 constexpr const char *kHCUMMACBlockScaled = "hcu.mmac.blockscaled";
 
 HcuMmacModeInfo ResolveHcuMmacMode(DataType a_dtype, DataType b_dtype,
-                                   bool a_is_fragment, bool b_is_fragment,
-                                   bool is_blockscaled, int block_k,
-                                   ScaleLdsFormat scale_format_a,
+                                   DataType c_dtype, bool a_is_fragment,
+                                   bool b_is_fragment, bool is_blockscaled,
+                                   int block_k, ScaleLdsFormat scale_format_a,
                                    ScaleLdsFormat scale_format_b, Target target,
                                    bool use_tf32) {
   HcuMmacModeInfo info;
@@ -46,8 +46,10 @@ HcuMmacModeInfo ResolveHcuMmacMode(DataType a_dtype, DataType b_dtype,
   const bool a_f8_family = a_fp4 || a_dtype.is_float8() || a_dtype.is_float6();
   const bool b_f8_family = b_fp4 || b_dtype.is_float8() || b_dtype.is_float6();
   const bool pure_fp8 = a_dtype.is_float8() && b_dtype.is_float8();
-  const bool consider_f8f6f4 =
-      ((a_f8_family || b_f8_family) && !pure_fp8) || is_blockscaled;
+  const bool f16_or_bf16_accum = c_dtype.is_float16() || c_dtype.is_bfloat16();
+  const bool consider_f8f6f4 = ((a_f8_family || b_f8_family) && !pure_fp8) ||
+                               is_blockscaled ||
+                               (f16_or_bf16_accum && pure_fp8);
   const bool a_requires_b8 = a_dtype.is_float4_e2m1_unpacked() ||
                              a_dtype.is_float8() || a_dtype.is_float6();
   const bool b_requires_b8 = b_dtype.is_float4_e2m1_unpacked() ||
@@ -141,11 +143,12 @@ HcuMmacModeInfo ResolveHcuMmacModeForGemm(const GemmNode *gemm, Target target) {
       get_int_annotation("tl.hcu.scale_b_format", 0));
   const bool use_tf32 = get_int_annotation("tl.hcu.use_tf32", 0) != 0;
   const Buffer &a = gemm->aRegion_->buffer;
+  const Buffer &c = gemm->cRegion_->buffer;
   const Buffer &b = gemm->bRegion_->buffer;
-  return ResolveHcuMmacMode(a->dtype, b->dtype, a.scope() == "local.fragment",
-                            b.scope() == "local.fragment", is_blockscaled,
-                            gemm->k_, scale_format_a, scale_format_b, target,
-                            use_tf32);
+  return ResolveHcuMmacMode(
+      a->dtype, b->dtype, c->dtype, a.scope() == "local.fragment",
+      b.scope() == "local.fragment", is_blockscaled, gemm->k_, scale_format_a,
+      scale_format_b, target, use_tf32);
 }
 
 HcuMnPerWarp ResolveHcuMnPerWarp(int element_bits, bool A_from_mls,
@@ -446,12 +449,14 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = ffi::reflection;
   refl::GlobalDef().def(
       "tl.ResolveHcuMmacMode",
-      [](DataType a_dtype, DataType b_dtype, bool a_is_fragment,
-         bool b_is_fragment, bool is_blockscaled, int block_k,
-         int scale_format_a, int scale_format_b, Target target, bool use_tf32) {
+      [](DataType a_dtype, DataType b_dtype, DataType c_dtype,
+         bool a_is_fragment, bool b_is_fragment, bool is_blockscaled,
+         int block_k, int scale_format_a, int scale_format_b, Target target,
+         bool use_tf32) {
         hcu::HcuMmacModeInfo info = hcu::ResolveHcuMmacMode(
-            a_dtype, b_dtype, a_is_fragment, b_is_fragment, is_blockscaled,
-            block_k, static_cast<ScaleLdsFormat>(scale_format_a),
+            a_dtype, b_dtype, c_dtype, a_is_fragment, b_is_fragment,
+            is_blockscaled, block_k,
+            static_cast<ScaleLdsFormat>(scale_format_a),
             static_cast<ScaleLdsFormat>(scale_format_b), target, use_tf32);
         return Array<Integer>{Integer(static_cast<int>(info.mode)),
                               Integer(info.element_bits), Integer(info.mmac_k),

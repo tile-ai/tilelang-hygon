@@ -103,6 +103,13 @@ def shared_16x32_to_local_64x8_layout_C_hcu_alt2_lts(i, j):
     return thread_id, local
 
 
+def shared_16x32_to_local_64x8_layout_C_hcu_f16_alt2_lts(i, j):
+    """FP16 MMAC alt2 row permutation identified by one-hot probing."""
+    il = i % 8
+    i = (i // 8) * 8 + (il % 2) * 4 + il // 2
+    return shared_16x32_to_local_64x8_layout_C_hcu_alt2_lts(i, j)
+
+
 def shared_32x16_to_local_64x8_layout_B_hcu_alt2(i, j):
     thread_id = 16 * (j // 4) + i // 2
     local = 4 * (i % 2) + j % 4
@@ -112,6 +119,20 @@ def shared_32x16_to_local_64x8_layout_B_hcu_alt2(i, j):
 def shared_16x32_to_local_64x8_layout_B_hcu_alt2(i, j):
     thread_id = 16 * (i // 4) + j // 2
     local = 4 * (j % 2) + i % 4
+    return thread_id, local
+
+
+def shared_32x32_to_local_64x8_layout_B_hcu_b8_alt2(i, j):
+    """B8 DS_READ_MT32x32_ALT2 layout, in (N, K) coordinates."""
+    thread_id = 16 * (j // 8) + i // 2
+    local = 8 * (i % 2) + j % 8
+    return thread_id, local
+
+
+def shared_32x32_to_local_64x8_layout_B_hcu_b8_alt2_transposed(i, j):
+    """B8 DS_READ_MT32x32_ALT2 layout, in (K, N) coordinates."""
+    thread_id = 16 * (i // 8) + j // 2
+    local = 8 * (j % 2) + i % 8
     return thread_id, local
 
 
@@ -438,7 +459,10 @@ def make_gemm_fragment_hcu(
             raise ValueError("B Alt2 C layout requires MMAC LIT=0 and LTS=1")
         if warp_n % 32 != 0:
             raise ValueError(f"B Alt2 C layout requires warp_n divisible by 32, got {warp_n}")
-        base = _fragment_from_layout_fn(shared_16x32_to_local_64x8_layout_C_hcu_alt2_lts, 16, 32).repeat([1, 1], repeat_on_thread=False)
+        c_layout = (
+            shared_16x32_to_local_64x8_layout_C_hcu_f16_alt2_lts if element_bits == 16 else shared_16x32_to_local_64x8_layout_C_hcu_alt2_lts
+        )
+        base = _fragment_from_layout_fn(c_layout, 16, 32).repeat([1, 1], repeat_on_thread=False)
         warp_n_atoms = warp_n // 32
     else:
         if b_interleave != 1:
@@ -536,11 +560,19 @@ def make_gemm_fragment_b_hcu(
 
     # gemm ``TransposeB``: spatial-leading micro-tile when ``transposed=True`` (``gemm_layouts.cc``).
     if interleave == 2:
-        if element_bits != 16 or k_pack != 1 or mk != 16:
-            raise ValueError("B Alt2 layout requires b16 with k_pack=1")
+        expected_mk = 32 if element_bits == 8 else 16
+        if element_bits not in (8, 16) or k_pack != 1 or mk != expected_mk:
+            raise ValueError("B Alt2 layout requires b8/b16 with k_pack=1")
         if warp_n % 32 != 0:
             raise ValueError(f"B Alt2 layout requires warp_n divisible by 32, got {warp_n}")
-        if transposed:
+        if element_bits == 8:
+            fn = (
+                shared_32x32_to_local_64x8_layout_B_hcu_b8_alt2
+                if transposed
+                else shared_32x32_to_local_64x8_layout_B_hcu_b8_alt2_transposed
+            )
+            base = _fragment_from_layout_fn(fn, 32, 32).repeat([1, 1], repeat_on_thread=False)
+        elif transposed:
             base = _fragment_from_layout_fn(shared_32x16_to_local_64x8_layout_B_hcu_alt2, 32, 16).repeat([1, 1], repeat_on_thread=False)
         else:
             base = _fragment_from_layout_fn(shared_16x32_to_local_64x8_layout_B_hcu_alt2, 16, 32).repeat([1, 1], repeat_on_thread=False)
