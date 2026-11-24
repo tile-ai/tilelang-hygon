@@ -34,9 +34,9 @@ struct HcuMmacModeInfo {
 };
 
 HcuMmacModeInfo ResolveHcuMmacMode(DataType a_dtype, DataType b_dtype,
-                                   bool a_is_fragment, bool b_is_fragment,
-                                   bool is_blockscaled, int block_k,
-                                   ScaleLdsFormat scale_format_a,
+                                   DataType c_dtype, bool a_is_fragment,
+                                   bool b_is_fragment, bool is_blockscaled,
+                                   int block_k, ScaleLdsFormat scale_format_a,
                                    ScaleLdsFormat scale_format_b, Target target,
                                    bool use_tf32 = false);
 

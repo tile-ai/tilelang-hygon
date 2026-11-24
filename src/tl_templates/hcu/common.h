@@ -269,10 +269,10 @@ TL_DEVICE float2 sub2(float2 a, float2 b) {
 }
 
 TL_DEVICE float2 mul2(float2 a, float2 b) {
-  float2 out;
-  out.x = a.x * b.x;
-  out.y = a.y * b.y;
-  return out;
+  float32x2 va = *reinterpret_cast<const float32x2 *>(&a);
+  float32x2 vb = *reinterpret_cast<const float32x2 *>(&b);
+  float32x2 vc = va * vb;
+  return *reinterpret_cast<const float2 *>(&vc);
 }
 
 TL_DEVICE float2 fma2(float2 a, float2 b, float2 c) {

@@ -146,6 +146,8 @@ def hcu_mls_ds_read_dtype_str(dtype) -> str:
         return "tl::bf8_t"
     if DataType(dtype).is_float4():
         return "tl::pk_fp4_t"
+    if s == "uint8":
+        return "uint8_t"
     if "bfloat16" in s or s == "bf16":
         return "bfloat16_t"
     if ("float16" in s or s in ("fp16", "half")) and "float8" not in s:
