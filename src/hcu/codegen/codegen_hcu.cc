@@ -2362,6 +2362,9 @@ void CodeGenTileLangHCU::EmitPackedX2Call(const std::string &tl_func,
   this->PrintType(t, stream);
   stream << ' ' << sret << "{};\n";
 
+  // Keep operand SSA temporaries local: fragment buffers may be updated
+  // between consecutive packed operations.
+  int ssa_scope = BeginScope();
   std::vector<std::string> packed_vecs;
   packed_vecs.reserve(args.size());
   for (const PrimExpr &arg : args) {
@@ -2379,6 +2382,7 @@ void CodeGenTileLangHCU::EmitPackedX2Call(const std::string &tl_func,
            << "(*(float2*)(&(" << packed_vecs[0] << "." << field
            << ")), *(float2*)(&(" << packed_vecs[1] << "." << field << ")));\n";
   }
+  EndScope(ssa_scope);
   os << sret;
 }
 
