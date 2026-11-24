@@ -2576,6 +2576,40 @@ def test_matrix_store_b16_standalone_odd_filter(dtype, torch_dtype):
     torch.testing.assert_close(module().cpu(), expected, atol=0, rtol=0)
 
 
+def test_matrix_store_reject_non_trans_annotation():
+    def store(src, dst):
+        call = T.matrix_store(src, dst)
+        return tvm.tirx.Call(call.dtype, call.op, call.args, annotations={"tl.mls_trans": tvm.tirx.IntImm("int32", 0)})
+
+    @T.prim_func
+    def kernel(C: T.Tensor((32, 32), "float16")):
+        with T.Kernel(1, threads=64):
+            local = T.alloc_fragment((32, 32), "float16")
+            T.clear(local)
+            T.evaluate(store(local, C))
+
+    with pytest.raises(Exception, match="matrix_store only supports trans=True"):
+        tl.compile(kernel, target={"kind": "hcu", "mcpu": "gfx946"}, execution_backend="cython")
+
+
+@pytest.mark.parametrize("lit,b_interleave", [(False, 1), (True, 1), (False, 2)])
+def test_matrix_store_reject_mmac_lts_fragment(lit, b_interleave):
+    from tilelang.hcu.intrinsics.hcu_mmac_layout import make_gemm_fragment_hcu
+
+    layout = make_gemm_fragment_hcu(32, 32, 1, 1, 1, 16, 16, lit=lit, lts=True, b_interleave=b_interleave)
+
+    @T.prim_func
+    def kernel(C: T.Tensor((32, 32), "float16")):
+        with T.Kernel(1, threads=64):
+            local = T.alloc_fragment((32, 32), "float16")
+            T.annotate_layout({local: layout})
+            T.clear(local)
+            T.matrix_store(local, C)
+
+    with pytest.raises(Exception, match="matrix_store source layout does not match"):
+        tl.compile(kernel, target={"kind": "hcu", "mcpu": "gfx946"}, execution_backend="cython")
+
+
 @pytest.mark.skipif(current_hcu_arch_string() != "gfx946", reason="gfx946 store validation")
 def test_matrix_store_reject_packed_b16_to_b32():
     @T.prim_func

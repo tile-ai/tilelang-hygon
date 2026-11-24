@@ -599,8 +599,9 @@ mls_store_tile(void *local_src_storage, DataType *p_data,
   static_assert(mls_elem_bits_v<DataType> == 16 ||
                     mls_elem_bits_v<DataType> == 32,
                 "VGPR MLS store supports only b16 or b32 data");
+  static_assert(Trans, "matrix_store only supports Trans=true");
   static_assert((mls_elem_bits_v<DataType> == 16 && Alt == 4) ||
-                    (mls_elem_bits_v<DataType> == 32 && Alt == 1 && Trans),
+                    (mls_elem_bits_v<DataType> == 32 && Alt == 1),
                 "gfx946 matrix_store requires b16 Alt=4, or b32 Alt=1 with "
                 "Trans=true");
 
@@ -614,9 +615,7 @@ mls_store_tile(void *local_src_storage, DataType *p_data,
                 "per warp");
   static_assert(
       (mls_elem_bits_v<DataType> == 16 &&
-       ((TileMN == 16 && TileK == 32 && Trans) ||
-        (TileMN == 32 && TileK == 16 && !Trans) ||
-        (TileMN == 32 && TileK == 32))) ||
+       ((TileMN == 16 && TileK == 32) || (TileMN == 32 && TileK == 32))) ||
           (mls_elem_bits_v<DataType> == 32 && TileMN == 16 && TileK == 16),
       "Unsupported VGPR MLS store atom");
 
@@ -670,25 +669,14 @@ mls_store_tile(void *local_src_storage, DataType *p_data,
                             : 0;
 
       uint8_t *ptr_offset = reinterpret_cast<uint8_t *>(p_data);
-      if constexpr (Trans) {
-        const ::tl::long_index_t offset_elems =
-            static_cast<::tl::long_index_t>(coord_mn) * mls_stride + coord_k;
-        ptr_offset += ::tl::mls::mls_storage_traits<
-            DataType>::logical_offset_to_byte_offset(offset_elems);
-      } else {
-        const ::tl::long_index_t offset_elems =
-            static_cast<::tl::long_index_t>(coord_k) * mls_stride + coord_mn;
-        ptr_offset += ::tl::mls::mls_storage_traits<
-            DataType>::logical_offset_to_byte_offset(offset_elems);
-      }
+      const ::tl::long_index_t offset_elems =
+          static_cast<::tl::long_index_t>(coord_mn) * mls_stride + coord_k;
+      ptr_offset += ::tl::mls::mls_storage_traits<
+          DataType>::logical_offset_to_byte_offset(offset_elems);
 
-      const ::tl::int32x4_t rsrc =
-          Trans ? ::tl::mls::make_mls_resource(
-                      static_cast<const void *>(ptr_offset), uniform_stride,
-                      k_filter, mn_filter, mfmt)
-                : ::tl::mls::make_mls_resource(
-                      static_cast<const void *>(ptr_offset), uniform_stride,
-                      mn_filter, k_filter, mfmt);
+      const ::tl::int32x4_t rsrc = ::tl::mls::make_mls_resource(
+          static_cast<const void *>(ptr_offset), uniform_stride, k_filter,
+          mn_filter, mfmt);
       const auto atom_index = atom_mn * AtomsPerWarpK + atom_k;
       const auto *atom_src = local_src + atom_index * ElementsPerThread;
       if constexpr (ElementsPerThread == 4 || ElementsPerThread == 8) {
