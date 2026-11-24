@@ -2300,6 +2300,22 @@ void CodeGenTileLangHCU::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
 void CodeGenTileLangHCU::PrintVecBinaryOp(const std::string &op, DataType t,
                                           PrimExpr lhs, PrimExpr rhs,
                                           std::ostream &os) { // NOLINT(*)
+  if (t.is_float() && t.bits() == 32 && t.lanes() >= 2 && t.lanes() % 2 == 0 &&
+      t.lanes() <= 4) {
+    std::string tl_func;
+    if (op == "+") {
+      tl_func = "add2";
+    } else if (op == "-") {
+      tl_func = "sub2";
+    } else if (op == "*") {
+      tl_func = "mul2";
+    }
+    if (!tl_func.empty()) {
+      EmitPackedX2Call(tl_func, t, {lhs, rhs}, os);
+      return;
+    }
+  }
+
   // Declare the result.
   std::string sret = name_supply_->FreshName("_");
   this->PrintIndent();
@@ -2328,6 +2344,43 @@ void CodeGenTileLangHCU::PrintVecBinaryOp(const std::string &op, DataType t,
       }
       PrintVecElemStore(sret, t, i, value_temp.str());
     }
+  }
+  EndScope(ssa_scope);
+  os << sret;
+}
+
+void CodeGenTileLangHCU::EmitPackedX2Call(const std::string &tl_func,
+                                          DataType t,
+                                          const std::vector<PrimExpr> &args,
+                                          std::ostream &os) { // NOLINT(*)
+  ICHECK(t.is_float() && t.bits() == 32 && t.lanes() >= 2 && t.lanes() <= 4 &&
+         t.lanes() % 2 == 0);
+  ICHECK(tl_func == "add2" || tl_func == "sub2" || tl_func == "mul2");
+
+  std::string sret = name_supply_->FreshName("_");
+  this->PrintIndent();
+  this->PrintType(t, stream);
+  stream << ' ' << sret << "{};\n";
+
+  // Keep operand SSA temporaries local: fragment buffers may be updated
+  // between consecutive packed operations.
+  int ssa_scope = BeginScope();
+  std::vector<std::string> packed_vecs;
+  packed_vecs.reserve(args.size());
+  for (const PrimExpr &arg : args) {
+    packed_vecs.push_back(SSAGetID(PrintExpr(arg), arg.dtype()));
+  }
+
+  static constexpr char kFields[] = {'x', 'y', 'z', 'w'};
+  for (int pair = 0; pair < t.lanes() / 2; ++pair) {
+    int field_index = pair * 2;
+    ICHECK_LT(field_index, 4);
+    std::string field(1, kFields[field_index]);
+
+    this->PrintIndent();
+    stream << "*(float2*)(&(" << sret << "." << field << ")) = tl::" << tl_func
+           << "(*(float2*)(&(" << packed_vecs[0] << "." << field
+           << ")), *(float2*)(&(" << packed_vecs[1] << "." << field << ")));\n";
   }
   EndScope(ssa_scope);
   os << sret;
@@ -3677,31 +3730,24 @@ void CodeGenTileLangHCU::VisitExpr_(const CallNode *op, std::ostream &os) {
       lit = ", " +
             std::to_string(GetF8F6F4RealABTypeId(*real_a_dtype, *real_b_dtype));
       if (prefix.find("_lit_lts") != std::string::npos) {
+        bool use_lit = false;
+        auto lit_hint = op->annotations.find("tl.hcu_use_lit");
+        if (lit_hint != op->annotations.end()) {
+          const auto *imm = (*lit_hint).second.as<IntImmNode>();
+          use_lit = imm && imm->value != 0;
+        }
         bool use_lts = false;
         auto lts_hint = op->annotations.find("tl.hcu_use_lts");
         if (lts_hint != op->annotations.end()) {
           const auto *imm = (*lts_hint).second.as<IntImmNode>();
           use_lts = imm && imm->value != 0;
         }
-        lts = use_lts ? ", 1, 1" : ", 1, 0";
+        lts = ", " + std::to_string(use_lit ? 1 : 0) + ", " +
+              std::to_string(use_lts ? 1 : 0);
       } else {
         lts = "";
       }
     }
-    if (prefix.find("_f8f6f4") != std::string::npos) {
-      auto real_a_dtype =
-          GetStringImmAnnotation(op->annotations, "tl.hcu_mmac_a_dtype");
-      auto real_b_dtype =
-          GetStringImmAnnotation(op->annotations, "tl.hcu_mmac_b_dtype");
-      ICHECK(real_a_dtype && real_b_dtype)
-          << "f8f6f4 MMAC requires tl.hcu_mmac_a_dtype and "
-             "tl.hcu_mmac_b_dtype annotations with the logical operand "
-             "types; packed uint8 register types are ambiguous";
-      lit = ", " +
-            std::to_string(GetF8F6F4RealABTypeId(*real_a_dtype, *real_b_dtype));
-      lts = prefix.find("_lit_lts") != std::string::npos ? ", 1, 0" : "";
-    }
-
     std::string accumulator =
         "*((" + dtype_map.at(C_dtype) + "*)" + c_ref + " + " + c_bias + ")";
     if (op->args.size() == 13U && !is_zero(op->args[12])) {

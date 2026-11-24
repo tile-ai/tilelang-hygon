@@ -570,28 +570,33 @@ Fragment MakeGemmFragmentAHCUInterleave2(int block_m, int block_k,
                                          int num_warp_m, int num_warp_n,
                                          int num_warp_k, int element_size,
                                          int k_pack, bool transposed) {
-  ICHECK_EQ(element_size, 16);
+  ICHECK(element_size == 8 || element_size == 16)
+      << "element bitwidth=" << element_size;
   ICHECK_EQ(k_pack, 1);
   ICHECK_EQ(block_m % num_warp_m, 0);
   ICHECK_EQ(block_k % num_warp_k, 0);
   const int warp_m = block_m / num_warp_m;
   const int warp_k = block_k / num_warp_k;
   ICHECK_EQ(warp_m % 32, 0);
-  ICHECK_EQ(warp_k % 16, 0);
+  const int atom_k = element_size == 8 ? 32 : 16;
+  ICHECK_EQ(warp_k % atom_k, 0);
   IterVar m = MakeIterVar("m", 32);
-  IterVar k = MakeIterVar("k", 16);
+  IterVar k = MakeIterVar("k", atom_k);
   IterVar rep = MakeIterVar("rep", 1);
+  const int values_per_lane = element_size == 8 ? 8 : 4;
   Fragment base(transposed ? Array<IterVar>{k, m} : Array<IterVar>{m, k},
-                {4 * FloorMod(m->var, 2) + FloorMod(k->var, 4)},
-                16 * FloorDiv(k->var, 4) + FloorDiv(m->var, 2), rep);
+                {values_per_lane * FloorMod(m->var, 2) +
+                 FloorMod(k->var, values_per_lane)},
+                16 * FloorDiv(k->var, values_per_lane) + FloorDiv(m->var, 2),
+                rep);
   base = base->Repeat({1, 1}, false, false);
   if (transposed) {
-    return base->Repeat({warp_k / 16, warp_m / 32}, false, true)
+    return base->Repeat({warp_k / atom_k, warp_m / 32}, false, true)
         ->Repeat({1, num_warp_m}, true, true)
         ->Replicate(num_warp_n)
         ->Repeat({num_warp_k, 1}, true, true);
   }
-  return base->Repeat({warp_m / 32, warp_k / 16}, false, false)
+  return base->Repeat({warp_m / 32, warp_k / atom_k}, false, false)
       ->Repeat({num_warp_m, 1}, true, true)
       ->Replicate(num_warp_n)
       ->Repeat({1, num_warp_k}, true, true);
@@ -603,7 +608,8 @@ makeGemmFragmentBHCUInterleave2(const int block_m, const int block_n,
                                 const int num_warp_n, const int num_warp_k,
                                 const int element_size, const int k_pack,
                                 bool transposed, const int min_n_per_warp) {
-  ICHECK_EQ(element_size, 16);
+  ICHECK(element_size == 8 || element_size == 16)
+      << "element bitwidth=" << element_size;
   ICHECK_EQ(k_pack, 1);
   ICHECK_EQ(block_n % min_n_per_warp, 0);
 
@@ -613,23 +619,28 @@ makeGemmFragmentBHCUInterleave2(const int block_m, const int block_n,
   const int n_recompute = num_warp_n / warp_n_no_recompute;
   const int warp_k = block_k / num_warp_k;
   ICHECK_EQ(warp_n % 32, 0);
-  ICHECK_EQ(warp_k % 16, 0);
+  const int atom_k = element_size == 8 ? 32 : 16;
+  ICHECK_EQ(warp_k % atom_k, 0);
   if (num_warp_k > 1) {
     ICHECK_EQ(n_recompute, 1);
   }
 
   IterVar n = MakeIterVar("n", 32);
-  IterVar k = MakeIterVar("k", 16);
+  IterVar k = MakeIterVar("k", atom_k);
   IterVar rep = MakeIterVar("rep", 1);
-  PrimExpr forward_thread = 16 * FloorDiv(k->var, 4) + FloorDiv(n->var, 2);
-  PrimExpr forward_index = 4 * FloorMod(n->var, 2) + FloorMod(k->var, 4);
+  const int values_per_lane = element_size == 8 ? 8 : 4;
+  PrimExpr forward_thread =
+      16 * FloorDiv(k->var, values_per_lane) + FloorDiv(n->var, 2);
+  PrimExpr forward_index =
+      values_per_lane * FloorMod(n->var, 2) + FloorMod(k->var, values_per_lane);
   Fragment base_layout(transposed ? ffi::Array<IterVar>{n, k}
                                   : ffi::Array<IterVar>{k, n},
                        {forward_index}, forward_thread, rep);
   base_layout = base_layout->Repeat({1, 1}, false, false);
   Fragment warp_layout =
-      transposed ? base_layout->Repeat({warp_n / 32, warp_k / 16}, false, false)
-                 : base_layout->Repeat({warp_k / 16, warp_n / 32}, false, true);
+      transposed
+          ? base_layout->Repeat({warp_n / 32, warp_k / atom_k}, false, false)
+          : base_layout->Repeat({warp_k / atom_k, warp_n / 32}, false, true);
   Fragment block_layout =
       transposed ? warp_layout->Replicate(num_warp_m)
                        ->Repeat({warp_n_no_recompute, num_warp_k}, true, false)

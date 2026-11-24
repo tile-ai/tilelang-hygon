@@ -246,15 +246,21 @@ class HCUMatrixCoreIntrinEmitter:
             self.mmac_suffix = suffix
             return
 
-        out_dtype_abbrv = {"float16": "f16", "float32": "f32", "int8": "i8", "int32": "i32"}[out_dtype]
+        out_dtype_abbrv = {
+            "float16": "f16",
+            "bfloat16": "bf16",
+            "float32": "f32",
+            "int8": "i8",
+            "int32": "i32",
+        }[out_dtype]
 
         if self.fp4_mmac_mode == "f8f6f4":
-            if out_dtype_abbrv != "f32":
-                raise AssertionError("HCU f8f6f4 MMAC currently only supports float32 accum")
+            if out_dtype_abbrv not in {"f16", "bf16", "f32"}:
+                raise AssertionError("HCU f8f6f4 MMAC supports float16, bfloat16, or float32 accum")
             if not (_is_f8f6f4_operand_dtype(self.a_dtype) and _is_f8f6f4_operand_dtype(self.b_dtype)):
                 raise AssertionError("HCU f8f6f4 MMAC requires f8/f6/f4 operands")
             suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_f8f6f4"
-            if has_lit_lts:
+            if has_lit_lts and (self.use_lit or self.use_lts):
                 suffix += "_lit_lts"
             self.mmac_suffix = suffix
             return

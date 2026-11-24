@@ -125,6 +125,7 @@ def _resolve_hcu_mls_meta(gemm_node, A, B, block_size: int, target: Target):
     mode = _ffi_api.ResolveHcuMmacMode(
         DataType(A.dtype),
         DataType(B.dtype),
+        DataType(gemm_node.cRegion.buffer.dtype),
         bool(is_fragment(A)),
         bool(is_fragment(B)),
         bool(getattr(gemm_node, "sfaRegion", None) is not None and getattr(gemm_node, "sfbRegion", None) is not None),
