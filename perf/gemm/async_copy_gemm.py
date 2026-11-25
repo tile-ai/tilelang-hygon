@@ -87,8 +87,6 @@ def _gemm_async_copy_vanilla(
             async_copy_b(B, B_shared_2, bx, 2)
 
             T.sync_warp()
-            async_copy_a(A, A_shared_3, by, 3)
-            async_copy_b(B, B_shared_3, bx, 3)
 
             T.ptx_wait_group(4)
             T.sync_warp()
@@ -96,6 +94,7 @@ def _gemm_async_copy_vanilla(
             T.copy(A_shared_0, A_local_0)
             T.copy(B_shared_0, B_local_0)
             T.s_waitcnt(0, "lgkmcnt")
+            T.ptx_wait_group(2)
             T.sync_warp()
             T.sched_barrier()
 
@@ -104,11 +103,13 @@ def _gemm_async_copy_vanilla(
                     k0 = kg * 4
 
                     # Phase 0
-                    async_copy_a(A, A_shared_0, by, k0 + 4)
-                    async_copy_b(B, B_shared_0, bx, k0 + 4)
+                    async_copy_b(B, B_shared_3, bx, k0 + 3)
+                    async_copy_a(A, A_shared_3, by, k0 + 3)
                     T.copy(A_shared_1, A_local_1)
                     T.copy(B_shared_1, B_local_1)
-                    T.ptx_wait_group(4)
+                    T.ptx_wait_group(2)
+                    T.sched_barrier()
+                    T.s_waitcnt(6, "lgkmcnt")
                     T.sync_warp()
 
                     # Phase 1
@@ -120,11 +121,13 @@ def _gemm_async_copy_vanilla(
 
                     # Phase 2
                     k1_if = kg * 4 + 1
-                    async_copy_a(A, A_shared_1, by, k1_if + 4)
-                    async_copy_b(B, B_shared_1, bx, k1_if + 4)
+                    async_copy_b(B, B_shared_0, bx, k1_if + 3)
+                    async_copy_a(A, A_shared_0, by, k1_if + 3)
                     T.copy(A_shared_2, A_local_0)
                     T.copy(B_shared_2, B_local_0)
-                    T.ptx_wait_group(4)
+                    T.ptx_wait_group(2)
+                    T.sched_barrier()
+                    T.s_waitcnt(6, "lgkmcnt")
                     T.sync_warp()
 
                     # Phase 3
@@ -136,11 +139,13 @@ def _gemm_async_copy_vanilla(
 
                     # Phase 4
                     k2_if = kg * 4 + 2
-                    async_copy_a(A, A_shared_2, by, k2_if + 4)
-                    async_copy_b(B, B_shared_2, bx, k2_if + 4)
+                    async_copy_b(B, B_shared_1, bx, k2_if + 3)
+                    async_copy_a(A, A_shared_1, by, k2_if + 3)
                     T.copy(A_shared_3, A_local_1)
                     T.copy(B_shared_3, B_local_1)
-                    T.ptx_wait_group(4)
+                    T.ptx_wait_group(2)
+                    T.sched_barrier()
+                    T.s_waitcnt(6, "lgkmcnt")
                     T.sync_warp()
 
                     # Phase 5
@@ -152,11 +157,13 @@ def _gemm_async_copy_vanilla(
 
                     # Phase 6
                     k3_if = kg * 4 + 3
-                    async_copy_a(A, A_shared_3, by, k3_if + 4)
-                    async_copy_b(B, B_shared_3, bx, k3_if + 4)
+                    async_copy_b(B, B_shared_2, bx, k3_if + 3)
+                    async_copy_a(A, A_shared_2, by, k3_if + 3)
                     T.copy(A_shared_0, A_local_0)
                     T.copy(B_shared_0, B_local_0)
-                    T.ptx_wait_group(4)
+                    T.ptx_wait_group(2)
+                    T.sched_barrier()
+                    T.s_waitcnt(6, "lgkmcnt")
                     T.sync_warp()
 
                     T.s_waitcnt(shared_0_wait, "lgkmcnt")
@@ -171,21 +178,23 @@ def _gemm_async_copy_vanilla(
                     T.copy(A_shared_1, A_local_1)
                     T.copy(B_shared_1, B_local_1)
                     T.call_extern("tl::promote_prio", dtype="void")
-                    async_copy_a(A, A_shared_0, by, k0 + 4)
-                    async_copy_b(B, B_shared_0, bx, k0 + 4)
+                    async_copy_b(B, B_shared_3, bx, k0 + 3)
+                    async_copy_a(A, A_shared_3, by, k0 + 3)
                     T.call_extern("tl::restore_prio", dtype="void")
                     T.s_waitcnt(steady_wait, "lgkmcnt")
                     T.sched_barrier()
                     T.gemm(A_local_0, B_local_0, C_local, transpose_B=transpose_B, annotations={"trans_c": True})
                     T.sched_barrier()
-                    T.ptx_wait_group(4)
+                    T.ptx_wait_group(2)
+                    T.sched_barrier()
+                    T.s_waitcnt(6, "lgkmcnt")
                     T.sync_warp()
 
                     # Phase 1
                     k1_else = kg * 4 + 1
                     T.call_extern("tl::promote_prio", dtype="void")
-                    async_copy_a(A, A_shared_1, by, k1_else + 4)
-                    async_copy_b(B, B_shared_1, bx, k1_else + 4)
+                    async_copy_b(B, B_shared_0, bx, k1_else + 3)
+                    async_copy_a(A, A_shared_0, by, k1_else + 3)
                     T.call_extern("tl::restore_prio", dtype="void")
                     T.copy(A_shared_2, A_local_0)
                     T.copy(B_shared_2, B_local_0)
@@ -197,13 +206,16 @@ def _gemm_async_copy_vanilla(
                     T.sched_barrier()
                     T.gemm(A_local_1, B_local_1, C_local, transpose_B=transpose_B, annotations={"trans_c": True})
                     T.sched_barrier()
+                    T.ptx_wait_group(2)
+                    T.sched_barrier()
+                    T.s_waitcnt(6, "lgkmcnt")
                     T.sync_warp()
 
                     # Phase 3
                     k2_else = kg * 4 + 2
                     T.call_extern("tl::promote_prio", dtype="void")
-                    async_copy_a(A, A_shared_2, by, k2_else + 4)
-                    async_copy_b(B, B_shared_2, bx, k2_else + 4)
+                    async_copy_b(B, B_shared_1, bx, k2_else + 3)
+                    async_copy_a(A, A_shared_1, by, k2_else + 3)
                     T.call_extern("tl::restore_prio", dtype="void")
                     T.copy(A_shared_3, A_local_1)
                     T.copy(B_shared_3, B_local_1)
@@ -215,13 +227,16 @@ def _gemm_async_copy_vanilla(
                     T.sched_barrier()
                     T.gemm(A_local_0, B_local_0, C_local, transpose_B=transpose_B, annotations={"trans_c": True})
                     T.sched_barrier()
+                    T.ptx_wait_group(2)
+                    T.sched_barrier()
+                    T.s_waitcnt(6, "lgkmcnt")
                     T.sync_warp()
 
                     # Phase 5
                     k3_else = kg * 4 + 3
                     T.call_extern("tl::promote_prio", dtype="void")
-                    async_copy_a(A, A_shared_3, by, k3_else + 4)
-                    async_copy_b(B, B_shared_3, bx, k3_else + 4)
+                    async_copy_b(B, B_shared_2, bx, k3_else + 3)
+                    async_copy_a(A, A_shared_2, by, k3_else + 3)
                     T.call_extern("tl::restore_prio", dtype="void")
                     T.copy(A_shared_0, A_local_0)
                     T.copy(B_shared_0, B_local_0)
@@ -233,7 +248,13 @@ def _gemm_async_copy_vanilla(
                     T.sched_barrier()
                     T.gemm(A_local_1, B_local_1, C_local, transpose_B=transpose_B, annotations={"trans_c": True})
                     T.sched_barrier()
+                    T.ptx_wait_group(2)
+                    T.sched_barrier()
+                    T.s_waitcnt(6, "lgkmcnt")
                     T.sync_warp()
+
+            async_copy_a(A, A_shared_3, by, k_groups * 4 - 1)
+            async_copy_b(B, B_shared_3, bx, k_groups * 4 - 1)
 
             T.copy(A_shared_1, A_local_1)
             T.copy(B_shared_1, B_local_1)
