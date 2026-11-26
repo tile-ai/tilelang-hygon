@@ -2800,6 +2800,35 @@ void CodeGenTileLangHCU::VisitExpr_(const CastNode *op, std::ostream &os) {
     return;
   }
 
+  // Convert adjacent FP32 values to BF16 pairs.
+  if (from_ty.is_float() && from_ty.bits() == 32 && target_ty.is_bfloat16() &&
+      (from_ty.lanes() == 2 || from_ty.lanes() == 4 || from_ty.lanes() == 8) &&
+      op->annotations.empty()) {
+    std::string sret = name_supply_->FreshName("_");
+    PrintIndent();
+    PrintType(target_ty, stream);
+    stream << ' ' << sret << ";\n";
+    // Fragment inputs may be updated between casts; do not reuse their SSA
+    // loads outside this expression.
+    int ssa_scope = BeginScope();
+    std::string src = SSAGetID(PrintExpr(op->value), from_ty);
+    static constexpr char kFields[] = {'x', 'y', 'z', 'w'};
+    for (int pair = 0; pair < from_ty.lanes() / 2; ++pair) {
+      PrintIndent();
+      stream << sret << '.' << kFields[pair]
+             << " = __builtin_bit_cast(unsigned int, "
+                "__builtin_hcu_cvt_pk_bf16_f32(";
+      PrintVecElemLoad(src, from_ty, 2 * pair, stream);
+      stream << ", ";
+      PrintVecElemLoad(src, from_ty, 2 * pair + 1, stream);
+      // No saturation: match the default round-to-nearest-even BF16 cast.
+      stream << ", false));\n";
+    }
+    EndScope(ssa_scope);
+    os << sret;
+    return;
+  }
+
   // Emit vector casts as per-lane unary ops (readable vs make_* packs).
   const char *type_cvt = NeedsFp8NumericCvt(from_ty, target_ty)
                              ? Fp8NumericCvtCast(from_ty, target_ty)
