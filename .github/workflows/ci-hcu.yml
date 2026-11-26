@@ -50,6 +50,8 @@ env:
   TILEKERNELS_DIR: ${{ github.workspace }}/TileKernels
   XDG_CACHE_HOME: ${{ github.workspace }}/.cache
   PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+  CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
 
 jobs:
   hcu-tests:
@@ -74,6 +76,35 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+
+      - name: Compute HCU build cache identity
+        id: cache-identity
+        shell: bash
+        run: |
+          echo "tvm_sha=$(git -C 3rdparty/tvm rev-parse HEAD 2>/dev/null || echo none)" >> "$GITHUB_OUTPUT"
+          echo "repo_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore pip and compiler caches
+        id: build-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/pip
+            .cache/ccache
+            .cache/tilelang
+          key: hcu-build-${{ runner.os }}-${{ runner.arch }}-${{ env.DTK_VERSION }}-torch${{ env.TORCH_VERSION }}-tvm${{ steps.cache-identity.outputs.tvm_sha }}-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'pyproject.toml', 'tilelang/**/*.py', 'tilelang/**/*.cc', 'tilelang/**/*.h') }}
+          restore-keys: |
+            hcu-build-${{ runner.os }}-${{ runner.arch }}-${{ env.DTK_VERSION }}-torch${{ env.TORCH_VERSION }}-tvm${{ steps.cache-identity.outputs.tvm_sha }}-
+            hcu-build-${{ runner.os }}-${{ runner.arch }}-${{ env.DTK_VERSION }}-
+
+      - name: Report cache configuration
+        shell: bash
+        run: |
+          echo "cache-hit=${{ steps.build-cache.outputs.cache-hit }}"
+          echo "PIP_CACHE_DIR=${PIP_CACHE_DIR}"
+          echo "CCACHE_DIR=${CCACHE_DIR}"
+          mkdir -p "$PIP_CACHE_DIR" "$CCACHE_DIR" "$XDG_CACHE_HOME/tilelang"
+          if command -v ccache >/dev/null 2>&1; then ccache --zero-stats; ccache --show-config; fi
 
       - name: Install DTK
         run: |
