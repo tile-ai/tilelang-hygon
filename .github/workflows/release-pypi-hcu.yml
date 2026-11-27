@@ -30,17 +30,20 @@ jobs:
     timeout-minutes: 180
     strategy:
       fail-fast: false
-      # .gitlab-ci.yml publish 矩阵: 26.04 x torch 2.10.0/2.11.0, 26.10 x torch 2.11.0
+      # 打包组合: 26.10 x torch 2.11.0 / 2.13.0, 26.04 x torch 2.11.0, 27.04 x torch 2.13.0
       matrix:
         include:
-          - dtk_version: "26.04"
-            torch_version: "2.10.0"
-            py_version: "3.10"
-          - dtk_version: "26.04"
-            torch_version: "2.11.0"
-            py_version: "3.10"
           - dtk_version: "26.10"
             torch_version: "2.11.0"
+            py_version: "3.12"
+          - dtk_version: "26.10"
+            torch_version: "2.13.0"
+            py_version: "3.12"
+          - dtk_version: "26.04"
+            torch_version: "2.11.0"
+            py_version: "3.10"
+          - dtk_version: "27.04"
+            torch_version: "2.13.0"
             py_version: "3.12"
     env:
       TORCH_VERSION: ${{ matrix.torch_version }}
