@@ -260,7 +260,7 @@ class HCUMatrixCoreIntrinEmitter:
             if not (_is_f8f6f4_operand_dtype(self.a_dtype) and _is_f8f6f4_operand_dtype(self.b_dtype)):
                 raise AssertionError("HCU f8f6f4 MMAC requires f8/f6/f4 operands")
             suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_f8f6f4"
-            if has_lit_lts and (self.use_lit or self.use_lts):
+            if has_lit_lts:
                 suffix += "_lit_lts"
             self.mmac_suffix = suffix
             return

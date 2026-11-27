@@ -171,11 +171,9 @@ def gemm_wasp_mls_4p4c4c_persistent(
 
     mls_annotations = {"no_implicit_async_commit_wait": T.int32(1)}
     b_ds_read_alt = 2
-    # B is loaded through DS_READ_FORMAT ALT2. Carry that fact into the GEMM
-    # layout inference so C uses the FP16 16x32 alt2 LTS fragment layout.
     mmac_annotations = {
-        "tl.hcu_mmac_lit": 0,
-        "trans_c": 1,
+        "tl.hcu_mmac_lit": 1,
+        "trans_c": 0,
         "tl.hcu_b_ds_read_alt": 2,
     }
 
@@ -217,6 +215,7 @@ def gemm_wasp_mls_4p4c4c_persistent(
             B_local1_pong = T.alloc_fragment((block_N, block_K), dtype)
             C_local1 = T.alloc_fragment((half_M, block_N), accum_dtype)
             C_store_local1 = T.alloc_fragment((half_M, block_N), out_dtype)
+            C_packed = T.alloc_local((8,), out_dtype)
 
             T.abarrier_init(A_FREE_PING, num_consumer_waves)
             T.abarrier_init(A_READY_PING, num_producer_waves)
@@ -428,10 +427,16 @@ def gemm_wasp_mls_4p4c4c_persistent(
                         T.matrix_store(
                             C_store_local,
                             C[by * block_M, bx * block_N],
+                            trans=False,
                         )
                         T.call_extern("tl::set_prio<0>", dtype="void")
                     else:
-                        T.copy(C_local, C[by * block_M, bx * block_N])
+                        for i, j in T.Parallel(half_M, block_N // 8):
+                            for v in T.unroll(8):
+                                C_packed[v] = C_local[i, j * 8 + v]
+                            for v in T.vectorized(8):
+                                if by * block_M + i < M and bx * block_N + j * 8 + v < N:
+                                    C[by * block_M + i, bx * block_N + j * 8 + v] = C_packed[v]
             else:
                 T.set_max_nreg(MLS_CONSUMER_MAX_NREG_3BR, 0)
                 T.abarrier_arrive(A_FREE_PING)
@@ -552,10 +557,16 @@ def gemm_wasp_mls_4p4c4c_persistent(
                         T.matrix_store(
                             C_store_local1,
                             C[by * block_M + half_M, bx * block_N],
+                            trans=False,
                         )
                         T.call_extern("tl::set_prio<0>", dtype="void")
                     else:
-                        T.copy(C_local1, C[by * block_M + half_M, bx * block_N])
+                        for i, j in T.Parallel(half_M, block_N // 8):
+                            for v in T.unroll(8):
+                                C_packed[v] = C_local1[i, j * 8 + v]
+                            for v in T.vectorized(8):
+                                if by * block_M + half_M + i < M and bx * block_N + j * 8 + v < N:
+                                    C[by * block_M + half_M + i, bx * block_N + j * 8 + v] = C_packed[v]
 
     return _gemm_wasp_mls_4p4c4c_persistent
 

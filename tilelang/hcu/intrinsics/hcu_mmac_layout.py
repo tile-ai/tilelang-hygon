@@ -97,6 +97,18 @@ def shared_16x16_to_local_64x4_layout_C_hcu_lit_lts(i, j):
     return thread_id, local
 
 
+def shared_16x32_to_local_64x8_layout_C_hcu_alt2(i, j):
+    return i + 16 * (j // 2 % 4), 4 * (j % 2) + j // 8
+
+
+def shared_16x32_to_local_64x8_layout_C_hcu_f16_alt2(i, j):
+    return i + 16 * (j // 4 % 4), 4 * (j % 2) + j // 2 % 2 + 2 * (j // 16)
+
+
+def shared_16x32_to_local_64x8_layout_C_hcu_alt2_lit(i, j):
+    return i + 16 * (j // 8), j // 2 % 4 + 4 * (j % 2)
+
+
 def shared_16x32_to_local_64x8_layout_C_hcu_alt2_lts(i, j):
     thread_id = 16 * (i % 4) + j // 2
     local = 4 * (j % 2) + i // 4
@@ -455,13 +467,19 @@ def make_gemm_fragment_hcu(
         raise ValueError(f"unsupported A interleave={a_interleave}")
 
     if b_interleave == 2:
-        if lit or not lts:
-            raise ValueError("B Alt2 C layout requires MMAC LIT=0 and LTS=1")
+        if lit and lts:
+            raise ValueError("B Alt2 C layout with MMAC LIT=1 requires LTS=0")
         if warp_n % 32 != 0:
             raise ValueError(f"B Alt2 C layout requires warp_n divisible by 32, got {warp_n}")
         c_layout = (
             shared_16x32_to_local_64x8_layout_C_hcu_f16_alt2_lts if element_bits == 16 else shared_16x32_to_local_64x8_layout_C_hcu_alt2_lts
         )
+        if not lts:
+            c_layout = (
+                shared_16x32_to_local_64x8_layout_C_hcu_f16_alt2 if element_bits == 16 else shared_16x32_to_local_64x8_layout_C_hcu_alt2
+            )
+        if lit:
+            c_layout = shared_16x32_to_local_64x8_layout_C_hcu_alt2_lit
         base = _fragment_from_layout_fn(c_layout, 16, 32).repeat([1, 1], repeat_on_thread=False)
         warp_n_atoms = warp_n // 32
     else:
