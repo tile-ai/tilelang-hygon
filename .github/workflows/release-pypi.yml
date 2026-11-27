@@ -1,0 +1,126 @@
+# Hygon HCU wheel 发布, 与 HYGON-AI/lightop .github/workflows/release-pypi.yml 同构,
+# 对应 .gitlab-ci.yml 的 `publish` 阶段:
+#   release 分支 push -> 编译 wheel -> CIUpload REPAIR -> CIUpload NIGHTLY 上传内网 devpi
+#
+# 变量按组织级配置: PYPI_URL / HARBOR_SITE / RESOURCE_SERVER_URL, secret: PYPI_PASSWORD
+name: release-pypi
+
+on:
+  push:
+    branches:
+      - "release/**"
+      - "*-release"
+
+  workflow_dispatch:
+    inputs:
+      dtk_version:
+        description: "DTK 版本"
+        required: false
+        default: "26.10"
+      torch_version:
+        description: "PyTorch 版本"
+        required: false
+        default: "2.11.0"
+      py_version:
+        description: "Python 版本"
+        required: false
+        default: "3.12"
+      commit:
+        description: "要构建的 commit SHA (空则使用当前分支最新提交)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+
+env:
+  PYPI_URL: ${{ vars.PYPI_URL }}
+
+jobs:
+  compile:
+    concurrency:
+      group: release-nightly-hcu-${{ github.ref }}-dtk${{ matrix.dtk_version }}-torch${{ matrix.torch_version }}-py${{ matrix.py_version }}
+      cancel-in-progress: true
+    runs-on: hygon-build
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      # .gitlab-ci.yml publish 矩阵: 26.04 x torch 2.10.0/2.11.0, 26.10 x torch 2.11.0
+      matrix: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('{{"include":[{{"dtk_version":"{0}","torch_version":"{1}","py_version":"{2}"}}]}}', inputs.dtk_version, inputs.torch_version, inputs.py_version)) || fromJSON('{"include":[{"dtk_version":"26.04","torch_version":"2.10.0","py_version":"3.10"},{"dtk_version":"26.04","torch_version":"2.11.0","py_version":"3.10"},{"dtk_version":"26.10","torch_version":"2.11.0","py_version":"3.12"}]}') }}
+    env:
+      TORCH_VERSION: ${{ matrix.torch_version }}
+      DTK_VERSION: ${{ matrix.dtk_version }}
+    container:
+      # DTK 装在镜像里, 自带 /opt/dtk
+      image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ matrix.dtk_version }}-rockylinux8.6-py${{ matrix.py_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 手动触发且填写了 commit 时才覆盖; push 一律用当前提交
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit || github.sha }}
+
+      - name: 配置 pip 源
+        shell: bash
+        run: |
+          {
+            echo "PIP_INDEX_URL=${PYPI_URL}/nightly/dtk${DTK_VERSION//./}/+simple/"
+            echo "PIP_TRUSTED_HOST=${PYPI_URL#*://}"
+          } >> "${GITHUB_ENV}"
+
+      - name: 安装 AICC
+        shell: bash
+        run: |
+          wget ${{ vars.RESOURCE_SERVER_URL }}/ai_cc/Nightly/hcu_llvm_installer.sh
+          bash hcu_llvm_installer.sh
+        env:
+          RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
+
+      - name: 安装 torch (编译前置依赖)
+        shell: bash
+        run: pip install --no-cache-dir torch==${TORCH_VERSION}
+
+      - name: 编译 wheel
+        shell: bash
+        run: |
+          source /opt/dtk/env.sh
+          # 版本后缀由 CIUpload REPAIR 追加, 构建时不带 toolchain/git 标签
+          NO_TOOLCHAIN_VERSION=1 NO_GIT_VERSION=1 bash das-build.sh
+
+      - name: CIUpload REPAIR
+        shell: bash
+        run: |
+          pip install --no-cache-dir ciupload
+          DTK_VER=$(cat /opt/dtk/.info/rocm_version | tr -d '.')
+          WHEEL_COMMIT_SHA="$(git rev-parse HEAD)"
+          CIUpload REPAIR \
+            --dtk_version "${DTK_VER}" \
+            --torch_version "${TORCH_VERSION}" \
+            --git_commit "${WHEEL_COMMIT_SHA}" \
+            --outputdir output \
+            -f dist/*.whl
+
+      - name: CIUpload NIGHTLY
+        if: ${{ github.event_name == 'push' }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          DTK_VER=$(cat /opt/dtk/.info/rocm_version | tr -d '.')
+          CIUpload NIGHTLY --devpi_url ${PYPI_URL} --password ${{ secrets.PYPI_PASSWORD }} \
+            --dtk_version ${DTK_VER} \
+            -f output/*.whl --record
+
+      - name: 归档 wheel
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tilelang-dtk${{ matrix.dtk_version }}-torch${{ matrix.torch_version }}-py${{ matrix.py_version }}
+          path: output/*.whl
+          if-no-files-found: error
+
+      - name: 清理 workspace
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
