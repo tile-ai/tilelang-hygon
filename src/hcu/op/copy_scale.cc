@@ -277,7 +277,8 @@ Stmt CopyScaleNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       ICHECK(!has_scale_view_)
           << "K-major copy_scale op_ctrl=1/2 requires a plain Identity LDS "
              "buffer, not a physically interleaved ScaleView";
-      ICHECK_EQ(scale_format, ScaleLdsFormat::kIdentity);
+      ICHECK_EQ(static_cast<int>(scale_format),
+                static_cast<int>(ScaleLdsFormat::kIdentity));
       ICHECK_EQ(row_order_, static_cast<int>(ScaleBufferRowOrder::kKInner))
           << "K-major copy_scale op_ctrl=1/2 requires KInner scale-buffer "
              "row order";

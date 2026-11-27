@@ -383,13 +383,13 @@ struct DsreadmFormatAttributeImpl_M32x32_B8_ALT2 {
   TL_DEVICE void operator()(TL_LDS_ADDR T *smem,
                             ::tl::ext_vector_t<T, kVectorLength> &ret,
                             ::tl::number<offset>) const {
-    // element:0x1, row:2, col:1, alt:1
+    // element:0x1, row:0x2, col:0x2, alt:0x1
     TL_LDS_ADDR unsigned char *ptr =
         reinterpret_cast<TL_LDS_ADDR unsigned char *>(smem);
     ret = ::tl::bit_cast<::tl::ext_vector_t<T, kVectorLength>>(
         __builtin_hcu_ds_read_matrix_format_u8(
             ptr, offset, static_cast<char>(0x2), static_cast<char>(0x2),
-            static_cast<char>(0x0)));
+            static_cast<char>(0x1)));
   }
 };
 
