@@ -335,6 +335,8 @@ MatrixLoad::MatrixLoad(Array<PrimExpr> args,
 
 MatrixStore::MatrixStore(Array<PrimExpr> args,
                          Map<String, ObjectRef> annotations) {
+  ICHECK(GetMlsTransFromAnnotations(annotations).value_or(true))
+      << "matrix_store only supports trans=True";
   ICHECK_EQ(args.size(), 4)
       << "matrix_store expects src_region, dst_region, mn_boundary, "
          "k_boundary";
@@ -1005,7 +1007,7 @@ Stmt MatrixStoreNode::Lower(const LowerArgs &T,
   CheckMatrixStoreDType(src, dst);
   const MatrixStoreTileConfig *config = GetMatrixStoreTileConfig(src->dtype);
   ICHECK(config != nullptr)
-      << "gfx946 matrix_store with LTS=1 supports only f16/bf16 Alt=4 or "
+      << "gfx946 matrix_store with trans=True supports only f16/bf16 Alt=4 or "
          "f32/u32 Alt=1, got dtype="
       << src->dtype;
   ICHECK(src->shape.size() >= 2)
