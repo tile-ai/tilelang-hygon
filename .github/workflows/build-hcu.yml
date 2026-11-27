@@ -1,22 +1,21 @@
-# Hygon HCU wheel 构建/发布, 与 HYGON-AI/lightop .github/workflows/release-pypi.yml 同构
+# Hygon HCU wheel 构建归档 (main 分支): 只编译并归档到 GitHub Actions artifact,
+# 不做 CIUpload, 不往内网 devpi 发包。
 #
-#   push main        -> 编译 wheel -> 归档到 GitHub Actions artifact (不走 CIUpload/devpi)
-#   push release 分支 -> 编译 wheel -> CIUpload REPAIR -> CIUpload NIGHTLY 上传内网 devpi
+#   push main -> 编译 wheel -> 归档 artifact
 #
-# 变量按组织级配置: PYPI_URL / HARBOR_SITE / RESOURCE_SERVER_URL, secret: PYPI_PASSWORD
-name: release-pypi
+# release 分支的发版见 release-pypi-hcu.yml
+# (两边的打包矩阵需保持一致)
+#
+# 变量按组织级配置: PYPI_URL / HARBOR_SITE / RESOURCE_SERVER_URL
+name: build-hcu
 
 on:
   push:
     branches:
       - main
-      - "release/**"
-      - "*-release"
 
 permissions:
   contents: read
-  pull-requests: read
-  checks: read
 
 env:
   PYPI_URL: ${{ vars.PYPI_URL }}
@@ -24,7 +23,7 @@ env:
 jobs:
   compile:
     concurrency:
-      group: release-nightly-hcu-${{ github.ref }}-dtk${{ matrix.dtk_version }}-torch${{ matrix.torch_version }}-py${{ matrix.py_version }}
+      group: hcu-build-${{ github.ref }}-dtk${{ matrix.dtk_version }}-torch${{ matrix.torch_version }}-py${{ matrix.py_version }}
       cancel-in-progress: true
     runs-on: hygon-build
     timeout-minutes: 180
@@ -79,43 +78,14 @@ jobs:
         shell: bash
         run: |
           source /opt/dtk/env.sh
-          # 版本后缀由 CIUpload REPAIR 追加 (release 分支), 构建时不带 toolchain/git 标签
+          # 不带 toolchain/git 版本标签, 产出的就是 VERSION 里的干净版本
           NO_TOOLCHAIN_VERSION=1 NO_GIT_VERSION=1 bash das-build.sh
-
-      # main 只打包归档, 不做 CIUpload; release 分支才 REPAIR + 上传 devpi
-      - name: CIUpload REPAIR
-        if: ${{ github.ref_name != 'main' }}
-        shell: bash
-        run: |
-          pip install --no-cache-dir ciupload
-          DTK_VER=$(cat /opt/dtk/.info/rocm_version | tr -d '.')
-          WHEEL_COMMIT_SHA="$(git rev-parse HEAD)"
-          CIUpload REPAIR \
-            --dtk_version "${DTK_VER}" \
-            --torch_version "${TORCH_VERSION}" \
-            --git_commit "${WHEEL_COMMIT_SHA}" \
-            --outputdir output \
-            -f dist/*.whl
-
-      - name: CIUpload NIGHTLY
-        if: ${{ github.ref_name != 'main' }}
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          DTK_VER=$(cat /opt/dtk/.info/rocm_version | tr -d '.')
-          CIUpload NIGHTLY --devpi_url ${PYPI_URL} --password ${{ secrets.PYPI_PASSWORD }} \
-            --dtk_version ${DTK_VER} \
-            -f output/*.whl --record
 
       - name: 归档 wheel
         uses: actions/upload-artifact@v4
         with:
           name: tilelang-hcu-dtk${{ matrix.dtk_version }}-torch${{ matrix.torch_version }}-py${{ matrix.py_version }}
-          # main 只有 dist (未 REPAIR), release 分支另有 output
-          path: |
-            dist/*.whl
-            output/*.whl
+          path: dist/*.whl
           if-no-files-found: error
 
       - name: 清理 workspace
